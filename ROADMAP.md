@@ -180,7 +180,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [OB16](#ob16--closing-an-index-from-another-thread-lost-the-writes-in-flight-on-it) … [OB19](#ob19--two-clustered-deadlocks-through-the-coordinators-mailbox) | **The pre-release concurrency audit** — eviction from another thread lost in-flight writes from search (464 of 600 in the test), schema edits and evolution overwrote each other, streaming search ran outside the concurrency limit, and two clustered mailbox deadlocks. All fixed and, where a test can force it, pinned | — | 2026-09-26 | ✅ |
 | [OB20](#ob20--a-fresh-cluster-can-keep-a-partial-ring-and-nothing-repairs-it) | **A fresh cluster can keep a partial ring** — 4 of 5 simultaneous starts left one node without a peer's shards (or alone), and nothing re-synced. Fixed with one connection per peer, a seed redial, and a 10 s shard-map pull; 5 of 5 now converge. Found by the new `cluster` validation suite | — | 2026-09-26 | ✅ |
 | [OB21](#ob21--a-peer-that-stops-answering-detected-refused-at-once-and-bounded-while-it-lasts) | **A peer that stops answering** — orchestrator forwards now share one deadline, stale peer references go on the first failure, and topology can no longer drop the newest ring. Also fixed: a kameo panic at shutdown (5.5), and a frozen peer is detected by ping within ~40 s, after which requests for it are answered at once (5.4) | — | 2026-09-26 | ✅ |
-| [OB22](#ob22--an-orchestrator-waited-on-peers-while-holding-its-mailbox) | **An orchestrator waited on peers while holding its mailbox** — schema canvasses and forwards ran inside it, so two nodes doing either at once waited on each other until a 5 s or 60 s timeout: bulk writes through every node all timed out, and new indexes created through every node ran at 0.1/s, most refused. Fixed; now 510 batches/s and 134 new indexes/s, none failed. Found by the cluster suite's new cross-node phase | — | 2026-09-26 | ✅ |
+| [OB22](#ob22--an-orchestrator-waited-on-peers-while-holding-its-mailbox) | **An orchestrator waited on peers while holding its mailbox** — schema canvasses and forwards ran inside it, so two nodes doing either at once waited on each other until a 5 s or 60 s timeout: bulk writes through every node all timed out, and new indexes created through every node ran at 0.1/s, most refused. Fixed; now 510 batches/s and 134 new indexes/s, none failed; several nodes minting one index at once settle it by node id, where 88 of 120 such writes were refused. Found by the cluster suite's new cross-node phase | — | 2026-09-26 | ✅ |
 | [F9](#f9--commit-on-a-clock-not-a-count) | **Commit on a clock, not a count** — bulk ingest 1.8–6.6×, a trickle searchable within 2 s, single writes unchanged | — | 2026-09-26 | ✅ |
 | [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
@@ -3142,9 +3142,24 @@ first-hop bulk's fan-out over an owned snapshot of the shard map and ring — is
 | storm: index deletes | 16, 13 × `503` and 2 timeouts | **1,195**, 19.9/s, p50 0.07 s, none refused |
 | suite | 31 of 33 | **34 of 34**, `ERROR` 0 on every node |
 
-**Not changed.** Two nodes creating the *same* index at the same moment still refuse each other
-with a retryable `503`, now at once rather than after 5 s; a tie-break that lets one of them win
-is the next step. A forwarded share, and a single write the router sent to its owner, still run
+**Fixed as well — the same index minted by several nodes at once.** With the canvass off the
+mailbox, two nodes minting one index refused each other at once (the mint gate above), and
+under a steady burst nobody won: first writes through every node to one new index, 6 at a time
+for 20 indexes, were refused 88 times in 120, and 11 of the 20 indexes were never created. Now a
+mint's canvass carries the asker's id (`GetRawSchema::minting_by`, defaulted), a node minting the
+same index answers `SchemaBeingMinted` (verdict `minting`) and records the asker as a rival, and
+each contender decides in `MintAfterCanvass` over every rival it heard of or was asked by: the
+lowest node id mints (`mint_winner`), the rest wait off the mailbox for its schema and adopt it
+(up to 5 s, then a retryable `503`). Any two contenders learn of each other, or one had already
+saved, because deciding and saving happen within one mailbox message — so they agree, and the
+lowest id never yields. An older peer reads the new verdict as a fault and refuses, as before.
+
+| first writes to one new index, 6 nodes' writers at the same moment, 20 indexes | before | after |
+|---|---|---|
+| writes answered | 32 of 120, 88 × `503` | **120 of 120**, p50 0.04 s, max 0.07 s |
+| indexes created | 9 of 20 | **20 of 20**, each minted by exactly one node |
+
+**Not changed.** A forwarded share, and a single write the router sent to its owner, still run
 inside the receiving node's mailbox — they wait on no peer, so they cannot deadlock, but they are
 served one at a time, which is most of a bulk mint's 0.33 s.
 

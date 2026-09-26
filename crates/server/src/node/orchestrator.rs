@@ -9,7 +9,7 @@ use super::*;
 
 use futures::future::join_all;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{
@@ -1396,6 +1396,12 @@ pub(super) enum PeerSchemaLookup {
     NoneHeld,
     /// The cluster could not be asked, so nothing can be concluded from the silence.
     Unreachable { reason: String },
+    /// No peer holds a schema, and these peers are minting one for the same index right now.
+    ///
+    /// A race, and one that must end with a single schema: the node that asked and each of
+    /// these know of one another, so every one of them settles it the same way — the lowest
+    /// node id mints and the rest adopt its schema. See `MintAfterCanvass`.
+    Contested { rivals: Vec<Uuid> },
 }
 
 /// Everything a canvass of the peers for a schema needs, and nothing that ties it to the actor.
@@ -1419,7 +1425,14 @@ impl SchemaCanvass {
     /// Three outcomes, and the difference between the last two is the whole point: "nobody has
     /// one" licenses this node to build a schema by sampling, while "I could not ask everybody"
     /// does not, and they are indistinguishable if unreachable peers are counted as silent.
-    pub(super) async fn peer_schema_for(&self, index: &str) -> PeerSchemaLookup {
+    ///
+    /// `minting_by` is this node's id when the canvass is for a mint of its own, so that a peer
+    /// minting the same index learns of the race too; `None` for a lookup that creates nothing.
+    pub(super) async fn peer_schema_for(
+        &self,
+        index: &str,
+        minting_by: Option<Uuid>,
+    ) -> PeerSchemaLookup {
         use crate::cluster_coordinator::{GetKnownPeers, GetStatus, KnownPeer};
 
         // The standalone arm, taken before anything is asked of anyone. A node with clustering
@@ -1478,6 +1491,7 @@ impl SchemaCanvass {
 
         let op = ClientOp::GetRawSchema {
             index: index.to_string(),
+            minting_by,
         };
         let answers = futures::future::join_all(peers.into_iter().map(|peer| {
             let op = op.clone();
@@ -1488,25 +1502,34 @@ impl SchemaCanvass {
                     let remote = pool
                         .get_orchestrator(node, ConnectionChannel::Operations)
                         .await
-                        .map_err(|e| format!("node {node} lookup failed: {e}"))?
-                        .ok_or_else(|| format!("node {node} has no reachable orchestrator"))?;
-                    remote
-                        .ask(&op)
-                        .await
-                        .map_err(|e| format!("node {node}: {e}"))
+                        .map_err(|e| PeerAnswer::Failed(format!("node {node} lookup failed: {e}")))?
+                        .ok_or_else(|| {
+                            PeerAnswer::Failed(format!("node {node} has no reachable orchestrator"))
+                        })?;
+                    // The verdict survives the hop, so a rival is told apart from a failure by
+                    // type. The peer is the one asked, so its id needs no parsing out of text.
+                    match remote_answer(remote.ask(&op).await) {
+                        Ok(value) => Ok(value),
+                        Err(err) if err.verdict() == RemoteVerdict::Minting => {
+                            Err(PeerAnswer::Minting(node))
+                        }
+                        Err(err) => Err(PeerAnswer::Failed(format!("node {node}: {err}"))),
+                    }
                 };
                 timeout(PEER_SCHEMA_LOOKUP_TIMEOUT, ask)
                     .await
-                    .unwrap_or_else(|_| Err(format!("node {node} timed out")))
+                    .unwrap_or_else(|_| Err(PeerAnswer::Failed(format!("node {node} timed out"))))
             }
         }))
         .await;
 
         let mut best: Option<IndexSchema> = None;
         let mut unreachable = Vec::new();
+        let mut rivals = Vec::new();
         for answer in answers {
             match answer {
-                Err(why) => unreachable.push(why),
+                Err(PeerAnswer::Failed(why)) => unreachable.push(why),
+                Err(PeerAnswer::Minting(node)) => rivals.push(node),
                 Ok(JsonValue::Null) => {}
                 Ok(value) => match serde_json::from_value::<IndexSchema>(value) {
                     Ok(mut schema) => {
@@ -1533,8 +1556,19 @@ impl SchemaCanvass {
                 reason: unreachable.join("; "),
             };
         }
+        if !rivals.is_empty() {
+            return PeerSchemaLookup::Contested { rivals };
+        }
         PeerSchemaLookup::NoneHeld
     }
+}
+
+/// One peer's answer to a canvass, when it is not a schema or `null`.
+enum PeerAnswer {
+    /// The peer is minting this index right now.
+    Minting(Uuid),
+    /// The peer could not be asked, or did not answer in time.
+    Failed(String),
 }
 
 /// The answer to [`ClientOp::FindSchemaInCluster`]: this node's own schema if it holds one,
@@ -1555,9 +1589,14 @@ pub(super) async fn find_schema_in_cluster(
     if let Some(schema) = held {
         return to_json(&schema);
     }
-    match canvass.peer_schema_for(&index).await {
+    match canvass.peer_schema_for(&index, None).await {
         PeerSchemaLookup::Found(schema) => to_json(&schema),
         PeerSchemaLookup::NoneHeld => Ok(JsonValue::Null),
+        // Being created, so not absent — and not yet there to report either.
+        PeerSchemaLookup::Contested { rivals } => Err(OrchestratorError::SchemaUnconfirmed {
+            index,
+            reason: format!("node(s) {rivals:?} are creating this index right now"),
+        }),
         // Not `null`: nobody said the index is absent, only that the cluster could not be
         // canvassed. A caller that reads a partial view as "absent" reports a missing index
         // while a node that holds it is merely unreachable.
@@ -2990,6 +3029,11 @@ pub(crate) struct NodeOrchestrator {
     /// a peer asking for it is told so rather than told there is none — see `GetRawSchema` in
     /// `handle_client_op`.
     pub(super) minting: HashMap<String, usize>,
+    /// Peers that asked about an index while this node was minting it, and were minting it too.
+    ///
+    /// Read when this node decides whether it mints or yields (`MintAfterCanvass`), and cleared
+    /// with `minting` once no write here is minting the index any more.
+    pub(super) mint_rivals: HashMap<String, BTreeSet<Uuid>>,
     /// Map of shard UUIDs to their microshard actors.
     ///
     /// `pub(crate)` rather than `pub(super)`, and the only field of this actor that is: the
@@ -3156,7 +3200,9 @@ impl NodeOrchestrator {
     /// What the cluster already knows about an index this node has no schema for — see
     /// [`SchemaCanvass::peer_schema_for`].
     pub(super) async fn peer_schema_for(&self, index: &str) -> PeerSchemaLookup {
-        self.schema_canvass().peer_schema_for(index).await
+        self.schema_canvass()
+            .peer_schema_for(index, Some(self.identity.uuid))
+            .await
     }
 
     /// What a canvass of the peers needs from this actor, detached from it, so the canvass can
@@ -3303,6 +3349,15 @@ impl NodeOrchestrator {
                     // recorded non-indexed, pending a rebuild — rather than being marked
                     // searchable as a first write's fields are.
                     is_initial_creation = false;
+                }
+                // `MintAfterCanvass` settles a race before it gets here and hands on `NoneHeld` to
+                // the winner, so this is a canvass that ran in place — no way to wait for the
+                // winner from inside the mailbox, so refuse and let the retry adopt its schema.
+                PeerSchemaLookup::Contested { rivals } => {
+                    return Err(OrchestratorError::SchemaUnconfirmed {
+                        index: index.to_string(),
+                        reason: format!("node(s) {rivals:?} are creating this index right now"),
+                    });
                 }
                 PeerSchemaLookup::Unreachable { reason } => {
                     tracing::warn!(
@@ -3936,6 +3991,7 @@ impl NodeOrchestrator {
         let mut orchestrator = Self {
             mailbox_lane: MailboxLane::new(),
             minting: HashMap::new(),
+            mint_rivals: HashMap::new(),
             shards: HashMap::new(),
             writer_liveness: Arc::new(WriterLiveness::default()),
             identity,
@@ -4919,7 +4975,9 @@ impl NodeOrchestrator {
                     .await
             }
             ClientOp::GetConfig { index } => self.orch_get_config(&index).await,
-            ClientOp::GetRawSchema { index } => self.raw_schema_for_peer(index).await,
+            ClientOp::GetRawSchema { index, minting_by } => {
+                self.raw_schema_for_peer(index, minting_by).await
+            }
             // Normally a worker's — see `OrchestratorEngine::execute`. Here only when no worker
             // took it, and still without holding this mailbox across the canvass for longer than
             // the peers take to answer; the answer is the same either way.
@@ -6255,23 +6313,31 @@ impl NodeOrchestrator {
     /// Read from durable state, not from the lazily-filled cache: this answer is what a peer
     /// uses to decide whether it may invent a schema, so "I have not looked yet" must not be
     /// reported as "there is none". See `durable_schema`.
-    async fn raw_schema_for_peer(&self, index: String) -> Result<JsonValue, OrchestratorError> {
+    async fn raw_schema_for_peer(
+        &mut self,
+        index: String,
+        minting_by: Option<Uuid>,
+    ) -> Result<JsonValue, OrchestratorError> {
         match self.durable_schema(&index).await? {
             Some(schema) => serde_json::to_value(&*schema)
                 .map_err(|e| OrchestratorError::Io(std::io::Error::other(e))),
             // Minting it now, and not saved yet. "None" would be false in the way that
             // matters: the asker is canvassing to decide whether it may sample a schema of
             // its own, and two nodes that each heard "none" mint two schemas for one index.
-            // An error counts as unreachable at the asker, which refuses with a retryable
-            // 503 — what it did before the canvass left the mailbox, when this question
-            // simply waited out its timeout behind the mint. Now it is refused at once.
+            //
+            // An asker minting the same index is recorded before answering, so that this
+            // node's own decision — still to come, in `MintAfterCanvass` — knows of it, just as
+            // the asker learns of this node from the answer. Both then settle it the same way.
             None if self.minting.contains_key(&index) => {
-                Err(OrchestratorError::SchemaUnconfirmed {
+                if let Some(rival) = minting_by {
+                    self.mint_rivals
+                        .entry(index.clone())
+                        .or_default()
+                        .insert(rival);
+                }
+                Err(OrchestratorError::SchemaBeingMinted {
                     index,
-                    reason: format!(
-                        "node {} is creating this index's schema right now",
-                        self.identity.uuid
-                    ),
+                    node: self.identity.uuid,
                 })
             }
             None => Ok(JsonValue::Null),
@@ -6337,15 +6403,17 @@ impl Message<ClientOp> for NodeOrchestrator {
             let (delegated, reply) = ctx.reply_sender();
             *self.minting.entry(index.clone()).or_default() += 1;
             let canvass = self.schema_canvass();
+            let me = self.identity.uuid;
             let orchestrator = ctx.actor_ref().downgrade();
             tokio::spawn(async move {
-                let lookup = canvass.peer_schema_for(&index).await;
+                let lookup = canvass.peer_schema_for(&index, Some(me)).await;
                 let answer = match orchestrator.upgrade() {
                     Some(orchestrator) => orchestrator
                         .ask(MintAfterCanvass {
                             index,
                             op: msg,
                             lookup,
+                            counted: true,
                         })
                         .await
                         .map_err(|err| {
@@ -6409,6 +6477,76 @@ pub(super) struct MintAfterCanvass {
     index: String,
     op: ClientOp,
     lookup: PeerSchemaLookup,
+    /// Whether this write holds a mark in `minting`, to be released when it has run. A write
+    /// that yielded and comes back to adopt the winner's schema holds none.
+    counted: bool,
+}
+
+/// How long a node that lost a race to mint an index waits for the winner's schema to appear.
+///
+/// The winner is mid-canvass or about to save, which takes milliseconds; the bound is for a
+/// winner that fails instead — its canvass could not reach a peer, say — after which the write
+/// is refused with a retryable `503` and its retry mints or adopts afresh.
+const MINT_YIELD_WAIT: Duration = Duration::from_secs(5);
+
+/// The rival this node yields to, if it yields at all: the lowest node id among the rivals,
+/// when that is lower than this node's own.
+///
+/// Every node in a race runs this over the same set — each knows of the others, from their
+/// answers to its canvass or from their questions during it — so all of them name the same
+/// winner, and that winner names none. Nothing to exchange and nobody to ask: the verdict is a
+/// pure function of the ids.
+pub(super) fn mint_winner(me: Uuid, rivals: impl IntoIterator<Item = Uuid>) -> Option<Uuid> {
+    rivals.into_iter().filter(|rival| *rival < me).min()
+}
+
+/// A write that lost a race to mint its index: wait, off the mailbox, for the winner's schema,
+/// then run the write against it.
+async fn adopt_when_minted(
+    canvass: SchemaCanvass,
+    orchestrator: kameo::actor::WeakActorRef<NodeOrchestrator>,
+    index: String,
+    op: ClientOp,
+    winner: Uuid,
+) -> Result<JsonValue, OrchestratorError> {
+    let deadline = Instant::now() + MINT_YIELD_WAIT;
+    let mut pause = Duration::from_millis(25);
+    loop {
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(Duration::from_millis(400));
+        // Asked as a lookup, not a mint: this node no longer competes, and the winner answers
+        // "minting" until it has saved and then answers with the schema.
+        if let PeerSchemaLookup::Found(schema) = canvass.peer_schema_for(&index, None).await {
+            let orchestrator = orchestrator.upgrade().ok_or_else(|| {
+                OrchestratorError::NotReady(
+                    "the orchestrator stopped before the write could run".to_string(),
+                )
+            })?;
+            let answer = orchestrator
+                .ask(MintAfterCanvass {
+                    index,
+                    op,
+                    lookup: PeerSchemaLookup::Found(schema),
+                    counted: false,
+                })
+                .await
+                .map_err(|err| {
+                    OrchestratorError::NotReady(format!(
+                        "the orchestrator stopped before the write could run: {err}"
+                    ))
+                })?;
+            return answer.resolve().await;
+        }
+        if Instant::now() >= deadline {
+            return Err(OrchestratorError::SchemaUnconfirmed {
+                index,
+                reason: format!(
+                    "node {winner} was creating this index and had not saved it after {}s",
+                    MINT_YIELD_WAIT.as_secs()
+                ),
+            });
+        }
+    }
 }
 
 impl Message<MintAfterCanvass> for NodeOrchestrator {
@@ -6419,14 +6557,65 @@ impl Message<MintAfterCanvass> for NodeOrchestrator {
     async fn handle(
         &mut self,
         msg: MintAfterCanvass,
-        _ctx: &mut Context<Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let class = OpClass::of(&msg.op);
+        let MintAfterCanvass {
+            index: minted,
+            op,
+            lookup,
+            counted,
+        } = msg;
+        let class = OpClass::of(&op);
         let started = Instant::now();
+
         // The schema may have been saved while the canvass ran — by another write to the same
         // index here, or adopted from a forwarded share. Staged validation reads it again and
         // then treats this write as an addition rather than a mint, and the canvass goes unused.
-        let result = match msg.op {
+        let held = self
+            .load_schema(&minted)
+            .await
+            .map(|schema| {
+                !schema.fields.is_empty() && schema.state != storage::SchemaState::Dropped
+            })
+            .unwrap_or(false);
+
+        // Settle a race. The rivals are the peers that answered this canvass "minting" and the
+        // peers that asked this node while it was minting; each of them knows of this node the
+        // same way, so all of them reach the same verdict. Deciding and saving happen within
+        // this one message, so no peer can ask in between and hear anything but "minting" or
+        // the saved schema.
+        let lookup = match lookup {
+            PeerSchemaLookup::NoneHeld | PeerSchemaLookup::Contested { .. } if counted && !held => {
+                let heard = match &lookup {
+                    PeerSchemaLookup::Contested { rivals } => rivals.clone(),
+                    _ => Vec::new(),
+                };
+                let asked = self.mint_rivals.get(&minted).cloned().unwrap_or_default();
+                match mint_winner(self.identity.uuid, heard.into_iter().chain(asked)) {
+                    None => PeerSchemaLookup::NoneHeld,
+                    Some(winner) => {
+                        info!(
+                            index = %minted,
+                            %winner,
+                            "Another node is creating this index; adopting its schema instead"
+                        );
+                        let rest = adopt_when_minted(
+                            self.schema_canvass(),
+                            ctx.actor_ref().downgrade(),
+                            minted.clone(),
+                            op,
+                            winner,
+                        );
+                        self.release_mint(&minted, counted);
+                        self.mailbox_lane.record_service(class, started.elapsed());
+                        return Answer::Later(Box::pin(rest));
+                    }
+                }
+            }
+            other => other,
+        };
+
+        let result = match op {
             ClientOp::Write {
                 index,
                 id,
@@ -6444,7 +6633,7 @@ impl Message<MintAfterCanvass> for NodeOrchestrator {
                     forwarded,
                     schema_body,
                     tenant.as_deref(),
-                    Some(msg.lookup),
+                    Some(lookup),
                 )
                 .await
                 .into(),
@@ -6461,21 +6650,33 @@ impl Message<MintAfterCanvass> for NodeOrchestrator {
                     forwarded,
                     schema_body,
                     tenant.as_deref(),
-                    Some(msg.lookup),
+                    Some(lookup),
                 )
                 .await
                 .into(),
             // `mint_canvass_needed` sends only the two ops above; anything else runs as usual.
             other => self.handle_client_op(other).await,
         };
-        if let Some(count) = self.minting.get_mut(&msg.index) {
-            *count -= 1;
-            if *count == 0 {
-                self.minting.remove(&msg.index);
-            }
-        }
+        self.release_mint(&minted, counted);
         self.mailbox_lane.record_service(class, started.elapsed());
         result
+    }
+}
+
+impl NodeOrchestrator {
+    /// Release one write's mark on an index it was minting, and forget the index's rivals once
+    /// no write here is minting it any more.
+    fn release_mint(&mut self, index: &str, counted: bool) {
+        if !counted {
+            return;
+        }
+        if let Some(count) = self.minting.get_mut(index) {
+            *count -= 1;
+            if *count == 0 {
+                self.minting.remove(index);
+                self.mint_rivals.remove(index);
+            }
+        }
     }
 }
 

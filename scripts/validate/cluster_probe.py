@@ -16,6 +16,7 @@ show the evidence. Nodes come from CLUSTER_NODES, a comma-separated list of base
   mints <seconds> <writers>                new-index writes with varied ids through every node
   bulks <seconds> <writers> <index>        bulk writes through every node into an existing index
   bulkmints <seconds> <writers>            each bulk write creates its own index, through every node
+  samemint <rounds> <writers>              every node writes to one new index at the same moment
   fault <seconds> <from> <to> <index>      node1's health, searches and writes while a peer is
                                            faulted between <from> and <to>; prints METRIC lines
 """
@@ -265,6 +266,52 @@ def cmd_bulkmints(seconds, writers):
         return status, t
 
     return cross_load("bulkmints", seconds, writers, request)
+
+
+def cmd_samemint(rounds, writers):
+    """First writes to one new index, through every node at the same moment, round after round.
+
+    The ids differ, so each write routes to its own owner and several nodes mint the same index
+    at once — a tenant's first burst into a new index behind a load balancer. Exactly one of
+    them may mint; the rest adopt its schema. Prints the index prefix on its last line so the
+    shell can count, from the node logs, how many nodes minted each index.
+    """
+    run = int(time.time()) % 100000
+    prefix = f"sm{run}r"
+    took, statuses = [], collections.Counter()
+    lock = threading.Lock()
+    threads_per_round = writers * len(NODES)
+    for r in range(rounds):
+        index = f"{prefix}{r}x"
+        gate = threading.Barrier(threads_per_round)
+
+        def write(node, k):
+            gate.wait()
+            status, t, _ = call("PUT", f"{node}/api/{index}/document",
+                                {"id": f"k{k}", "doc": {"title": f"t{k}", "n": k}},
+                                timeout=OP_TIMEOUT)
+            with lock:
+                took.append(t)
+                statuses[str(status)] += 1
+
+        threads = [threading.Thread(target=write, args=(node, n * writers + w), daemon=True)
+                   for n, node in enumerate(NODES) for w in range(writers)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(OP_TIMEOUT + 5)
+
+    ok = statuses.get("200", 0) + statuses.get("201", 0)
+    failed = {k: v for k, v in sorted(statuses.items()) if k not in ("200", "201")}
+    stalled = sum(1 for t in took if t > CROSS_STALL_SECS)
+    print(f"METRIC cross samemint {len(took):>4} writes to {rounds} indexes  ok {ok}  "
+          f"p50 {percentile(took, 50):5.2f}s  p99 {percentile(took, 99):5.2f}s  "
+          f"max {max(took, default=0):5.2f}s  not-ok {json.dumps(failed)}")
+    good = took and not failed and not stalled
+    print(("none failed or stalled" if good else
+           f"{sum(failed.values())} failed and {stalled} took over {CROSS_STALL_SECS:.0f}s")
+          + f"; index prefix {prefix}")
+    return 0 if good else 1
 
 
 def cmd_probe(timeout):
@@ -518,6 +565,8 @@ def main():
         return cmd_bulks(int(args[0]), int(args[1]), args[2])
     if cmd == "bulkmints":
         return cmd_bulkmints(int(args[0]), int(args[1]))
+    if cmd == "samemint":
+        return cmd_samemint(int(args[0]), int(args[1]))
     if cmd == "fault":
         return cmd_fault(int(args[0]), int(args[1]), int(args[2]), args[3])
     sys.exit(f"unknown subcommand: {cmd}")

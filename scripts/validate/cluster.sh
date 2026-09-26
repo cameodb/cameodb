@@ -7,8 +7,9 @@
 #               answering — the load that once deadlocked orchestrator and coordinator mailboxes
 #               across nodes (OB19)
 #   cross-node  requests through every node at once, as behind a load balancer: new indexes
-#               minted on every node by single and by bulk writes, and bulk writes whose shares
-#               cross between every pair of nodes; no request fails or stalls, and every node answers afterwards
+#               minted on every node by single and by bulk writes, one index minted by every
+#               node at the same moment (exactly one mints, the rest adopt), and bulk writes
+#               whose shares cross between every pair of nodes; no request fails or stalls, and every node answers afterwards
 #   restart     two of three nodes restarted together rejoin, converge and serve, and no
 #               committed document is lost
 #   frozen peer node3 paused: node1 keeps answering, and after it resumes the ring converges,
@@ -42,6 +43,7 @@ ROUNDS="${CLUSTER_RESTART_ROUNDS:-3}"
 FREEZE_SECS="${CLUSTER_FREEZE_SECS:-60}"
 CROSS_SECS="${CLUSTER_CROSS_SECS:-20}"
 CROSS_WRITERS="${CLUSTER_CROSS_WRITERS:-2}"
+SAMEMINT_ROUNDS="${CLUSTER_SAMEMINT_ROUNDS:-20}"
 SURVIVORS=30
 PROJECT="cameodb-validate"
 WORK=""
@@ -74,7 +76,9 @@ run_bounded() {
 
 compose() { run_bounded 120 docker compose -p "$PROJECT" -f "$WORK/compose.yml" "$@"; }
 
-probe() { python3 "$PROBE" "$@"; }
+probe() { python3 "$PROBE" "$@" | tee "$WORK/last-probe.out"; }
+# The index prefix a `samemint` probe printed on its last line.
+probe_last_prefix() { sed -n 's/.*index prefix \([a-z0-9]*\)$/\1/p' "$WORK/last-probe.out" | tail -1; }
 
 # check_cmd <description> <command...> — PASS or FAIL on the exit code, with the command's
 # last line as the evidence, and every line it printed shown above the verdict.
@@ -265,6 +269,26 @@ check_cmd "bulk writes through every node at once: none refused or stalled" \
     probe bulks "$CROSS_SECS" "$CROSS_WRITERS" crossbulk
 check_cmd "new indexes minted by bulk writes through every node at once: none refused or stalled" \
     probe bulkmints "$CROSS_SECS" "$CROSS_WRITERS"
+# Several nodes minting the *same* index at once: one of them must mint, the rest adopt its
+# schema. The writes all succeeding is half of it; the other half is in the logs, where a node
+# that minted says so — two for one index would be two schemas, built once and never merged.
+if check_cmd "one new index written through every node at the same moment ($SAMEMINT_ROUNDS rounds): none refused or stalled" \
+    probe samemint "$SAMEMINT_ROUNDS" "$CROSS_WRITERS"; then :; fi
+samemint_prefix="$(probe_last_prefix)"
+if [ -n "$samemint_prefix" ]; then
+    minted="$(for n in 1 2 3; do
+        run_bounded 30 docker logs "$PROJECT-node$n" 2>&1 | sed $'s/\x1b\\[[0-9;]*m//g' \
+            | grep -o "initial schema creation index=${samemint_prefix}[0-9]*x" | sort -u
+    done | sort | uniq -c)"
+    indexes="$(printf '%s\n' "$minted" | grep -c . || true)"
+    twice="$(printf '%s\n' "$minted" | awk '$1 > 1' | grep -c . || true)"
+    if [ "$indexes" -eq "$SAMEMINT_ROUNDS" ] && [ "$twice" -eq 0 ]; then
+        pass "each of those indexes was minted by exactly one node: $indexes of $SAMEMINT_ROUNDS"
+    else
+        fail "each of those indexes was minted by exactly one node" \
+            "$indexes of $SAMEMINT_ROUNDS minted, $twice by more than one node"
+    fi
+fi
 check_cmd "every node writes and deletes right after the cross-node load" probe probe 30
 check_cmd "the ring is still converged after the cross-node load" probe converge 10
 

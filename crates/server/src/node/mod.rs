@@ -531,6 +531,18 @@ pub enum OrchestratorError {
     #[error("no schema for '{index}' on this node; resend the write carrying the schema body")]
     SchemaBodyRequired { index: String },
 
+    /// This node is creating the schema for `index` right now and has not saved it yet — the
+    /// answer to a peer's [`ClientOp::GetRawSchema`] canvass in that window.
+    ///
+    /// Never "none": the asker is deciding whether it may sample a schema of its own, and two
+    /// nodes that each heard "none" mint two schemas for one index. A new peer reads it as a
+    /// rival for the same index and settles it by node id (see `MintAfterCanvass`); an older one
+    /// reads an unknown verdict as a fault and refuses its write, which is also safe.
+    ///
+    /// Never reaches a client: the canvass consumes it. If it somehow does, it is a `503`.
+    #[error("node {node} is creating the schema for '{index}' right now")]
+    SchemaBeingMinted { index: String, node: Uuid },
+
     /// A tenant's quota refuses what this request would add — another index past
     /// `max_indexes`, or more data once their indexes occupy `max_bytes`.
     ///
@@ -589,6 +601,10 @@ pub enum RemoteVerdict {
     /// A tenant quota refuses the request — see [`OrchestratorError::QuotaExceeded`]. Not the
     /// caller's mistake and not retryable as sent; room has to be made first.
     QuotaExceeded,
+    /// The peer is creating this index's schema right now — see
+    /// [`OrchestratorError::SchemaBeingMinted`]. Its own verdict because a canvassing node acts
+    /// on it: the peer is a rival for the same index, not a peer that failed to answer.
+    Minting,
 }
 
 impl RemoteVerdict {
@@ -601,6 +617,7 @@ impl RemoteVerdict {
             RemoteVerdict::ServerFault => "server-fault",
             RemoteVerdict::SchemaRequired => "schema-required",
             RemoteVerdict::QuotaExceeded => "quota-exceeded",
+            RemoteVerdict::Minting => "minting",
         }
     }
 
@@ -612,6 +629,7 @@ impl RemoteVerdict {
             "server-fault" => Some(RemoteVerdict::ServerFault),
             "schema-required" => Some(RemoteVerdict::SchemaRequired),
             "quota-exceeded" => Some(RemoteVerdict::QuotaExceeded),
+            "minting" => Some(RemoteVerdict::Minting),
             _ => None,
         }
     }
@@ -649,6 +667,8 @@ impl OrchestratorError {
             // it with any other "not now": the retry that answers it carries something extra,
             // and an ordinary `Unavailable` retry would repeat the same insufficient message.
             Self::SchemaBodyRequired { .. } => RemoteVerdict::SchemaRequired,
+
+            Self::SchemaBeingMinted { .. } => RemoteVerdict::Minting,
 
             Self::UnsortableField { .. } | Self::UnrunnableQuery { .. } => {
                 RemoteVerdict::BadRequest
@@ -930,6 +950,8 @@ impl From<OrchestratorError> for RemoteError {
             OrchestratorError::SchemaBodyRequired { index } => RemoteError::Io(format!(
                 "no schema for '{index}' on this node; resend the write carrying the schema body"
             )),
+            // Orchestrator to orchestrator only; a microshard never canvasses.
+            err @ OrchestratorError::SchemaBeingMinted { .. } => RemoteError::Io(err.to_string()),
             // A verdict from a further hop, mapped onto the kinds this type carries. `RemoteError`
             // is the microshard path and has no retryable kind of its own, so `Unavailable`
             // travels as `Io` here — a shard call does not produce one.
@@ -964,7 +986,8 @@ impl From<OrchestratorError> for RemoteError {
                 RemoteVerdict::NotFound => RemoteError::NotFound(message),
                 RemoteVerdict::Unavailable
                 | RemoteVerdict::ServerFault
-                | RemoteVerdict::SchemaRequired => RemoteError::Io(message),
+                | RemoteVerdict::SchemaRequired
+                | RemoteVerdict::Minting => RemoteError::Io(message),
             },
         }
     }
@@ -1198,7 +1221,17 @@ pub enum ClientOp {
     /// does not carry, `routing_field_name` among them, which silently changes which shard a
     /// document routes to. This carries the `IndexSchema` itself so a node can adopt a peer's
     /// declaration without reconstructing it.
-    GetRawSchema { index: String },
+    GetRawSchema {
+        index: String,
+        /// Set by a node canvassing because it is about to mint this index, to its own id.
+        ///
+        /// A receiver minting the same index records the asker as a rival, which is how both
+        /// sides of a race come to know of each other and settle it the same way — see
+        /// `MintAfterCanvass`. Unset for a lookup that creates nothing (an index delete's).
+        /// Defaulted, so an older peer's ask records nothing.
+        #[serde(default)]
+        minting_by: Option<Uuid>,
+    },
     /// The schema for an index from anywhere in the cluster, or `null` if no node holds one.
     ///
     /// This node's own store first, then its peers — so the common case, a node that holds the
