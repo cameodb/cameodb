@@ -8,7 +8,8 @@ use kameo::remote;
 use libp2p::{
     PeerId, identify,
     kad::{self, Mode as KadMode, store::MemoryStore},
-    swarm::NetworkBehaviour,
+    ping,
+    swarm::{NetworkBehaviour, behaviour::toggle::Toggle},
 };
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -62,6 +63,9 @@ pub struct DhtBehaviour {
     pub kademlia: kad::Behaviour<MemoryStore>,
     /// Identify protocol for peer recognition
     pub identify: identify::Behaviour,
+    /// Liveness pings on every connection; off when `ping_interval_secs` is `0`. A failed ping
+    /// is acted on in the swarm runtime, which closes the connection — libp2p no longer does.
+    pub ping: Toggle<ping::Behaviour>,
 }
 
 impl DhtBehaviour {
@@ -111,7 +115,14 @@ impl DhtBehaviour {
             kameo,
             kademlia,
             identify,
+            ping: Toggle::from(None),
         })
+    }
+
+    /// Turn on liveness pings with these settings; `None` leaves them off.
+    pub fn with_ping(mut self, ping: Option<ping::Config>) -> Self {
+        self.ping = Toggle::from(ping.map(ping::Behaviour::new));
+        self
     }
 
     /// Publish node UUID to DHT so peers can discover it

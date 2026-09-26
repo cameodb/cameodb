@@ -73,6 +73,7 @@ client moved to rustls.
 | `CLUSTER_STORM_SECS`, `CLUSTER_STORM_WRITERS`, `CLUSTER_STORM_DELETERS` | Storm length and load per node (default 60 s, 2, 1) |
 | `CLUSTER_FORM_ROUNDS`, `CLUSTER_FORM_SECS` | Fresh-start formation rounds, and how long each may take to converge (default 3, 60) |
 | `CLUSTER_IDLE_SECS`, `CLUSTER_RESTART_ROUNDS`, `CLUSTER_FREEZE_SECS` | Idle wait before the second probe, restart rounds, how long node3 stays frozen (default 60, 3, 60) |
+| `CLUSTER_NODE_ENV` | Extra `KEY=VALUE` settings for every node, space-separated — e.g. `CAMEODB_CLUSTER_PING_INTERVAL_SECS=5` to compare settings without a rebuild |
 | `CLUSTER_KEEP` | Keep the scratch directory — compose file, data, node logs — even on a clean run |
 | `REMOTE_SOURCE_1`, `REMOTE_SOURCE_2` | Override the fetched URLs for an offline network |
 | `BADSSL_URL` | Host used for the certificate-rejection check |

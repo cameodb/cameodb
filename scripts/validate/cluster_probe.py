@@ -11,6 +11,7 @@ show the evidence. Nodes come from CLUSTER_NODES, a comma-separated list of base
   seed <index> <count>                     write <count> documents, spread across the nodes
   count <index> <count>                    every node finds exactly <count> of them
   stats                                    the swarm counters from each node's health body
+  pings-clean                              no node has failed a liveness ping
   warm <index>                             a bulk batch through every node until each answers fast
   fault <seconds> <from> <to> <index>      node1's health, searches and writes while a peer is
                                            faulted between <from> and <to>; prints METRIC lines
@@ -239,6 +240,28 @@ def cmd_warm(index, limit=60):
         time.sleep(1)
 
 
+# Detection takes up to 2 × interval + timeout + 10 s: libp2p lets the first missed ping pass,
+# and the second is sent on a fresh stream whose opening has a fixed 10 s timeout. At the
+# defaults (10 s, 10 s) that is 40 s; a margin on top for the health poll.
+NOTICE_WITHIN_SECS = 45
+FAST_SECS = 2.0
+
+
+def cmd_pings_clean():
+    """Every node reports no failed liveness ping. Run after load: a busy node that answers
+    pings late would be declared lost while it is serving, which is worse than not detecting."""
+    reported = []
+    for node in NODES:
+        v = health(node) or {}
+        if "ping_failures" not in v:
+            print(f"{node} does not report ping_failures; this build has no liveness pings")
+            return 0
+        reported.append((node, v["ping_failures"]))
+    bad = [f"{n} {c}" for n, c in reported if c]
+    print("no node failed a liveness ping" if not bad else "failed pings: " + ", ".join(bad))
+    return 0 if not bad else 1
+
+
 def cmd_fault(seconds, fault_from, fault_to, index):
     """What the first node's clients see while another node is faulted.
 
@@ -335,9 +358,31 @@ def cmd_fault(seconds, fault_from, fault_to, index):
     print("METRIC fault node1 health noticed the fault "
           + (f"{noticed - fault_from:.0f}s after it began" if noticed is not None
              else f"never (stayed {healthy_view})"))
+
+    # RESULT lines are verdicts the shell side turns into PASS/FAIL, one per property.
+    within = NOTICE_WITHIN_SECS
+    if noticed is not None and noticed - fault_from <= within:
+        print(f"RESULT PASS node1 health noticed the frozen peer within {within}s "
+              f"({noticed - fault_from:.0f}s)")
+    else:
+        print(f"RESULT FAIL node1 health noticed the frozen peer within {within}s "
+              + ("(never)" if noticed is None else f"({noticed - fault_from:.0f}s)"))
+
+    # Once the peer is known lost, a request for it should be answered at once, not waited on.
+    if noticed is not None:
+        settled = noticed + 2
+        late = [e for e in events if e[1] in ("write", "bulk", "search")
+                and settled <= e[0] < fault_to - 1]
+        slowest = max((e[3] for e in late), default=0.0)
+        verdict = "PASS" if late and slowest < FAST_SECS else "FAIL"
+        print(f"RESULT {verdict} requests started after the loss was noticed answered within "
+              f"{FAST_SECS:.0f}s ({len(late)} requests, slowest {slowest:.2f}s)")
+
     failed = [e for e in health if e[2] != 200]
-    print(f"node1 health answered {len(health) - len(failed)} of {len(health)} polls within 5s")
-    return 0 if health and not failed else 1
+    verdict = "PASS" if health and not failed else "FAIL"
+    print(f"RESULT {verdict} node1 kept answering health while node3 was frozen "
+          f"({len(health) - len(failed)} of {len(health)} polls within 5s)")
+    return 0
 
 
 def main():
@@ -356,6 +401,8 @@ def main():
         return cmd_count(args[0], int(args[1]))
     if cmd == "stats":
         return cmd_stats()
+    if cmd == "pings-clean":
+        return cmd_pings_clean()
     if cmd == "warm":
         return cmd_warm(args[0])
     if cmd == "fault":

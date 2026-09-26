@@ -34,6 +34,7 @@ pub struct DistributedCluster {
     bootstrap_successes: u64,
     /// Count of dial/connect failures
     dial_failures: u64,
+    ping_failures: u64,
     /// Count of routing table update events
     routing_updates: u64,
     /// Kameo remote messaging max size in bytes (derived from max_record_size_mb)
@@ -94,6 +95,7 @@ impl DistributedCluster {
             swarm_handle: None,
             bootstrap_successes: 0,
             dial_failures: 0,
+            ping_failures: 0,
             routing_updates: 0,
             remote_message_size_bytes,
             remote_timeout_secs,
@@ -219,6 +221,11 @@ impl DistributedCluster {
         self.dial_failures = self.dial_failures.saturating_add(1);
     }
 
+    /// Increment the count of peer connections closed for failing a liveness ping.
+    pub fn ping_failed(&mut self) {
+        self.ping_failures = self.ping_failures.saturating_add(1);
+    }
+
     /// Get cluster status and health information
     pub fn get_cluster_status(&self) -> ClusterStatus {
         let connected_nodes = self
@@ -250,6 +257,7 @@ impl DistributedCluster {
             active_shards: 0, // Will be overridden by coordinator
             cluster_enabled: self.cluster_config.enabled,
             dial_failures: self.dial_failures,
+            ping_failures: self.ping_failures,
             bootstrap_successes: self.bootstrap_successes,
             routing_updates: self.routing_updates,
         }
@@ -278,6 +286,8 @@ pub struct ClusterStatus {
     pub active_shards: usize,
     pub cluster_enabled: bool,
     pub dial_failures: u64,
+    /// Peer connections closed because the peer stopped answering liveness pings.
+    pub ping_failures: u64,
     pub bootstrap_successes: u64,
     pub routing_updates: u64,
 }

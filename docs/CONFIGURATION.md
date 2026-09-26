@@ -550,7 +550,26 @@ seed_nodes = ["10.0.1.5:9580", "10.0.1.6:9580"]
 # port can join the swarm. Required by the internal and external profiles.
 # Exactly 64 hex characters: openssl rand -hex 32
 psk_file = "/etc/cameodb/cluster.psk"     # or psk = "…" / CAMEODB_CLUSTER_PSK
+
+# Liveness pings on every peer connection (default: 10 s, 10 s; interval 0 turns them off).
+ping_interval_secs = 10
+ping_timeout_secs = 10
 ```
+
+**Liveness pings.** A peer that hangs, is paused, or is cut off without its TCP connection
+closing still looks connected, and every request to it waits out its timeout. With pings, a
+connection whose peer misses **two in a row** is closed — libp2p lets the first miss pass, so a
+single slow answer never costs a live peer its connection. That takes up to
+`2 × ping_interval_secs + ping_timeout_secs + 10 s` (the last term is libp2p's fixed timeout for
+opening the second ping's stream): about 40 s by default, 35 s measured. When that was the last connection to it, the peer is marked lost: health
+reports it (`connected_nodes`, `ping_failures`), a write whose key it owns is answered `503`
+at once, and a search counts it in `stats.shards.failed` without waiting for it. Its shards stay
+assigned — nothing is moved — and the node keeps redialing it, so it is back as soon as it
+answers. Shorter settings detect sooner at the risk of declaring a node lost that is only
+slow; the validation suite checks that none is under its write-and-delete storm. Measured on
+a three-node cluster: 35 s to detect at the defaults, 25 s at 5 s / 5 s. Both can be set without
+editing the file: `--cluster-ping-interval-secs` / `CAMEODB_CLUSTER_PING_INTERVAL_SECS`, and
+`--cluster-ping-timeout-secs` / `CAMEODB_CLUSTER_PING_TIMEOUT_SECS`.
 
 Every node in a cluster must carry the same PSK; there is no rotation path short of stopping
 every node. Cluster peers are trusted by this key, which is why API-key index scoping is

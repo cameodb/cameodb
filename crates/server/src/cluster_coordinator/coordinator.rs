@@ -459,9 +459,25 @@ impl ClusterCoordinator {
 
     /// Evaluate cluster state and transition if needed (reactive, message-driven)
     /// Called after PeerDiscovered/PeerLost to update cluster state
+    /// Tell the peer pool which peers are lost, so forwards to them are answered at once.
+    /// Called wherever a peer's status can change.
+    fn publish_lost_peers(&self) {
+        if let Some(pool) = &self.remote_peer_pool {
+            pool.set_lost_peers(
+                self.cluster
+                    .peer_nodes
+                    .iter()
+                    .filter(|(_, peer)| peer.status == NodeStatus::Disconnected)
+                    .map(|(id, _)| *id)
+                    .collect(),
+            );
+        }
+    }
+
     fn evaluate_and_transition_state(&mut self) {
         // First, sync expected_nodes with current peer connections and shard counts
         self.sync_expected_nodes();
+        self.publish_lost_peers();
 
         // Count currently connected peers + local node
         let active_nodes = self
@@ -693,6 +709,13 @@ impl ClusterCoordinator {
                     if owner_node == self.cluster.local_node_id {
                         debug!(%shard_id, "RouteOperation: routing locally by key");
                         return RoutingDecision::Local;
+                    } else if self.peer_is_lost(&owner_node) {
+                        // Asking a lost owner waits out a timeout per attempt — 20 s for a
+                        // frozen one — and ends in the same "not now". Say it at once.
+                        debug!(%shard_id, node = %owner_node, "RouteOperation: owner is lost");
+                        return RoutingDecision::Unavailable {
+                            node_id: owner_node,
+                        };
                     } else if let Some(addr) = self.node_address(&owner_node) {
                         debug!(%shard_id, node = %owner_node, addr = %addr, "RouteOperation: routing remote by key");
                         return RoutingDecision::Remote {
@@ -914,6 +937,15 @@ impl ClusterCoordinator {
         self.shard_assignments.get(shard_id).map(|m| m.node_id)
     }
 
+    /// A peer this node knew and has lost: its last connection closed, or it failed a ping.
+    /// A node it has never heard of is not "lost" — that is the address-unknown case.
+    fn peer_is_lost(&self, node_id: &Uuid) -> bool {
+        self.cluster
+            .peer_nodes
+            .get(node_id)
+            .is_some_and(|peer| peer.status == NodeStatus::Disconnected)
+    }
+
     fn node_address(&self, node_id: &Uuid) -> Option<String> {
         self.cluster
             .peer_nodes
@@ -1116,6 +1148,13 @@ impl Message<InitSwarm> for ClusterCoordinator {
                                         warn!(error = %err, "ClusterCoordinator: failed to forward dial failed");
                                     }
                                 }
+                                CoordinatorEvent::PeerUnresponsive { peer_id, error } => {
+                                    if let Err(err) =
+                                        coordinator.ask(PeerUnresponsive { peer_id, error }).await
+                                    {
+                                        warn!(error = %err, "ClusterCoordinator: failed to forward peer unresponsive");
+                                    }
+                                }
                             }
                         }
                     });
@@ -1281,6 +1320,25 @@ impl Message<DialFailed> for ClusterCoordinator {
             peer = ?msg.peer_id,
             error = %msg.error,
             "ClusterCoordinator: dial failed"
+        );
+    }
+}
+
+impl Message<PeerUnresponsive> for ClusterCoordinator {
+    type Reply = ();
+
+    /// Counted only; the swarm has already closed the connection, and the peer is marked lost
+    /// through `PeerLost` if that was its last one.
+    async fn handle(
+        &mut self,
+        msg: PeerUnresponsive,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.cluster.ping_failed();
+        warn!(
+            peer = %msg.peer_id,
+            error = %msg.error,
+            "ClusterCoordinator: peer failed a liveness ping"
         );
     }
 }
@@ -1529,6 +1587,8 @@ impl Message<PeerNodeMetadataDiscovered> for ClusterCoordinator {
                 shard_count: msg.shard_count as usize,
             });
 
+        self.publish_lost_peers();
+
         // Check if we need to query individual shards
         // Only query if metadata indicates changes
         if let Some((last_gen, last_checksum)) = self.last_seen_state.get(&node_uuid)
@@ -1606,6 +1666,7 @@ impl Message<GetDeleteTargets> for ClusterCoordinator {
                     node_id: info.node_id,
                     node_name: info.node_name.clone(),
                     address: info.address.clone(),
+                    connected: info.status == NodeStatus::Connected,
                 })
                 .collect(),
             pool: self.remote_peer_pool.clone(),
@@ -1992,6 +2053,8 @@ impl Message<MergeRemoteShards> for ClusterCoordinator {
                     shard_count: owned_by_sender,
                 });
         }
+
+        self.publish_lost_peers();
 
         let node_identity = self.format_node_identity(node_id);
         debug!(
@@ -2493,6 +2556,7 @@ impl Message<GetKnownPeers> for ClusterCoordinator {
                 node_id: info.node_id,
                 node_name: info.node_name.clone(),
                 address: info.address.clone(),
+                connected: info.status == NodeStatus::Connected,
             })
             .collect()
     }

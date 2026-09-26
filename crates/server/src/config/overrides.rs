@@ -220,6 +220,18 @@ pub(crate) const OVERRIDES: &[Override] = &[
         },
     },
     Override {
+        flag: "--cluster-ping-interval-secs", env: "CAMEODB_CLUSTER_PING_INTERVAL_SECS",
+        kind: FlagKind::Value, placeholder: "<SECS>",
+        help: "Seconds between liveness pings to each peer (0 turns them off)",
+        apply: |c, v| { c.network.cluster.ping_interval_secs = v.parse()?; Ok(()) },
+    },
+    Override {
+        flag: "--cluster-ping-timeout-secs", env: "CAMEODB_CLUSTER_PING_TIMEOUT_SECS",
+        kind: FlagKind::Value, placeholder: "<SECS>",
+        help: "Seconds a liveness ping may go unanswered",
+        apply: |c, v| { c.network.cluster.ping_timeout_secs = v.parse()?; Ok(()) },
+    },
+    Override {
         flag: "--cluster-psk", env: "CAMEODB_CLUSTER_PSK", kind: FlagKind::Value,
         placeholder: "<HEX>", help: "Inline hex-encoded 32-byte cluster pre-shared key",
         apply: |c, v| { c.network.cluster.psk = Some(v.to_string()); Ok(()) },

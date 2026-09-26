@@ -218,6 +218,13 @@ seed_nodes = []
 # Alternatively, load from a file (useful for restricted permissions):
 # psk_file = "/etc/cameodb/cluster.psk"
 
+# Liveness pings. A peer that misses two in a row has its connection closed — within about
+# 2 × interval + timeout + 10 s, ~40 s at these values — and is marked lost when that was its
+# last connection: writes it owns get 503 at once and
+# searches stop waiting on it; its shards stay assigned. 0 turns pinging off.
+ping_interval_secs = 10
+ping_timeout_secs = 10
+
 [storage]
 data_paths = ["./data/cameodb"]
 disk_usage_threshold_percent = 90

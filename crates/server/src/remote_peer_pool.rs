@@ -19,7 +19,7 @@
 //! semantics without restructuring the pool.
 
 use kameo::actor::RemoteActorRef;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
@@ -78,6 +78,8 @@ pub struct RemotePeerPool {
     coordinator_refs: RwLock<HashMap<Uuid, CachedCoordinatorRef>>,
     /// The longest one [`converse`](Self::converse) waits on a peer: the node's remote timeout.
     peer_timeout: Duration,
+    /// Peers the coordinator has marked lost; [`converse`](Self::converse) answers them at once.
+    lost_peers: RwLock<HashSet<Uuid>>,
 }
 
 /// What [`RemotePeerPool::new`] waits on a peer, for a pool nobody configured: the default
@@ -96,7 +98,24 @@ impl RemotePeerPool {
             orchestrator_refs: RwLock::new(HashMap::new()),
             coordinator_refs: RwLock::new(HashMap::new()),
             peer_timeout,
+            lost_peers: RwLock::new(HashSet::new()),
         }
+    }
+
+    /// Replace the set of peers known to be lost. Written by the coordinator whenever a peer's
+    /// status may have changed, so a peer that is back is asked again at once.
+    pub fn set_lost_peers(&self, lost: HashSet<Uuid>) {
+        if let Ok(mut current) = self.lost_peers.write() {
+            *current = lost;
+        }
+    }
+
+    /// Whether the coordinator has marked this peer lost.
+    pub fn is_lost(&self, node_id: Uuid) -> bool {
+        self.lost_peers
+            .read()
+            .map(|lost| lost.contains(&node_id))
+            .unwrap_or(false)
     }
 
     /// Run one conversation with a peer — its lookup, its ask and any resend — under one
@@ -118,6 +137,13 @@ impl RemotePeerPool {
         node_id: Uuid,
         conversation: impl Future<Output = Result<T, OrchestratorError>>,
     ) -> Result<T, OrchestratorError> {
+        // A lost peer is not asked. With its connection closed, asking means a fresh dial that
+        // a frozen peer accepts at the TCP level and never completes, held until the deadline.
+        if self.is_lost(node_id) {
+            return Err(OrchestratorError::PeerUnreachable {
+                message: format!("node {node_id} is not reachable"),
+            });
+        }
         match tokio::time::timeout(self.peer_timeout, conversation).await {
             Ok(Ok(answer)) => Ok(answer),
             Ok(Err(answered @ OrchestratorError::Remote { .. })) => Err(answered),
@@ -421,6 +447,31 @@ mod tests {
             Err(OrchestratorError::PeerUnreachable { .. })
         ));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A peer marked lost is not asked at all, and is asked again once the mark is lifted.
+    #[tokio::test]
+    async fn a_lost_peer_is_answered_at_once_until_it_is_back() {
+        let pool = RemotePeerPool::new();
+        pool.set_lost_peers(HashSet::from([peer()]));
+        let asked = std::sync::atomic::AtomicBool::new(false);
+        let answer = pool
+            .converse(peer(), async {
+                asked.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, OrchestratorError>(1)
+            })
+            .await;
+        assert!(matches!(
+            answer,
+            Err(OrchestratorError::PeerUnreachable { .. })
+        ));
+        assert!(!asked.load(std::sync::atomic::Ordering::SeqCst));
+
+        pool.set_lost_peers(HashSet::new());
+        let answer = pool
+            .converse(peer(), async { Ok::<_, OrchestratorError>(1) })
+            .await;
+        assert_eq!(answer.unwrap(), 1);
     }
 
     #[tokio::test]

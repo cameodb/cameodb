@@ -104,6 +104,57 @@ mod tests {
         assert!(matches!(decision, RoutingDecision::Local));
     }
 
+    /// A coordinator whose one peer owns every key, with that peer in `status`.
+    fn owned_by_a_peer_that_is(status: NodeStatus) -> (ClusterCoordinator, Uuid) {
+        let mut cluster = make_cluster();
+        let owner = Uuid::new_v4();
+        cluster.peer_nodes.insert(
+            owner,
+            NodeInfo {
+                node_id: owner,
+                node_name: None,
+                address: "127.0.0.1:9000".into(),
+                status,
+                shard_count: 0,
+            },
+        );
+        let mut cc = ClusterCoordinator::new(cluster);
+        let shard_id = Uuid::new_v4();
+        cc.shard_assignments.insert(
+            shard_id,
+            ShardMetadata {
+                shard_id,
+                node_id: owner,
+                vnode_tokens: vec![1, 2, 3],
+                storage_bytes: 0,
+                document_count: 0,
+            },
+        );
+        cc.rebuild_ring();
+        (cc, owner)
+    }
+
+    /// A write for a lost owner is answered at once. Asking it waited out a timeout per
+    /// attempt — 20 s for a frozen peer — to reach the same "not now".
+    #[test]
+    fn a_key_owned_by_a_lost_peer_is_unavailable_rather_than_routed_to_it() {
+        let (cc, owner) = owned_by_a_peer_that_is(NodeStatus::Disconnected);
+        match cc.decide_route(Some("key".into()), OperationType::Write) {
+            RoutingDecision::Unavailable { node_id } => assert_eq!(node_id, owner),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    /// And the moment it is connected again, it is routed to as before — the shards never moved.
+    #[test]
+    fn the_same_owner_connected_again_is_routed_to() {
+        let (cc, owner) = owned_by_a_peer_that_is(NodeStatus::Connected);
+        match cc.decide_route(Some("key".into()), OperationType::Write) {
+            RoutingDecision::Remote { node_id, .. } => assert_eq!(node_id, owner),
+            other => panic!("expected Remote, got {other:?}"),
+        }
+    }
+
     #[test]
     fn decide_route_returns_remote_when_owner_known_with_addr() {
         let mut cluster = make_cluster();
@@ -227,6 +278,9 @@ mod tests {
                 }
                 RoutingDecision::Broadcast => {
                     *counts.entry(Uuid::nil()).or_insert(0usize) += 1;
+                }
+                RoutingDecision::Unavailable { node_id } => {
+                    panic!("no peer is lost in this cluster, yet {node_id} was reported lost")
                 }
             }
         }
