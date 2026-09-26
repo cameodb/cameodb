@@ -3,6 +3,7 @@
 #
 #   scripts/validate/all.sh                 # everything
 #   scripts/validate/all.sh posture tls     # named suites only
+#   scripts/validate/all.sh cluster         # opt-in: needs Docker, takes several minutes
 #
 # Requires a built binary (cargo build --release, or set CAMEODB_BIN).
 
@@ -12,6 +13,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 
 ALL_SUITES=(deps unit posture auth tls remote-sources artifact)
+# Run only when named: they need more than a binary.
+OPT_IN_SUITES=(cluster)
 SUITES=("${@:-}")
 [ -z "${SUITES[0]:-}" ] && SUITES=("${ALL_SUITES[@]}")
 
@@ -29,7 +32,8 @@ fi
 for suite in "${SUITES[@]}"; do
     script="$SCRIPT_DIR/$suite.sh"
     if [ ! -x "$script" ]; then
-        printf 'Unknown suite: %s (available: %s)\n' "$suite" "${ALL_SUITES[*]}" >&2
+        printf 'Unknown suite: %s (available: %s; opt-in: %s)\n' \
+            "$suite" "${ALL_SUITES[*]}" "${OPT_IN_SUITES[*]}" >&2
         exit 2
     fi
     printf '\n%s########## %s ##########%s\n' "$_c_bold" "$suite" "$_c_off"
