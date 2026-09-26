@@ -736,17 +736,6 @@ impl BulkCtx<'_> {
             OrchestratorError::NotReady("Remote peer pool not initialized".to_string())
         })?;
 
-        let remote = pool
-            .get_orchestrator(node_id, ConnectionChannel::Operations)
-            .await
-            .map_err(|e| {
-                warn!("❌ Remote actor lookup error: {}", e);
-                OrchestratorError::Io(std::io::Error::other(e.to_string()))
-            })?
-            .ok_or_else(|| OrchestratorError::PeerUnreachable {
-                message: format!("Remote orchestrator for node {} not found", node_id),
-            })?;
-
         // One bit, and no schema. `forwarded` tells the owner this share is someone else's
         // decision, so it neither samples nor canvasses; if it holds nothing to run the share
         // against it says so, and the resend below carries the body. Nothing about the schema
@@ -761,20 +750,24 @@ impl BulkCtx<'_> {
             tenant: None,
         };
 
-        let answer = match remote_answer(remote.ask(&op).await) {
-            Err(err) if matches!(err.verdict(), RemoteVerdict::SchemaRequired) => {
-                let Some(resend) = with_schema_body(&op, established) else {
-                    return Err(err);
-                };
-                debug!(
-                    %node_id,
-                    "Peer holds no schema for this index; resending the batch with the schema"
-                );
-                remote_answer(remote.ask(&resend).await)
-            }
-            other => other,
-        };
-        let res: serde_json::Value = answer?;
+        let res: serde_json::Value = pool
+            .converse(node_id, async {
+                let remote = lookup_peer_orchestrator(pool, node_id).await?;
+                match remote_answer(remote.ask(&op).await) {
+                    Err(err) if matches!(err.verdict(), RemoteVerdict::SchemaRequired) => {
+                        let Some(resend) = with_schema_body(&op, established) else {
+                            return Err(err);
+                        };
+                        debug!(
+                            %node_id,
+                            "Peer holds no schema for this index; resending the batch with the schema"
+                        );
+                        remote_answer(remote.ask(&resend).await)
+                    }
+                    other => other,
+                }
+            })
+            .await?;
 
         let Some(items_written) = res.get("items_written").and_then(|v| v.as_u64()) else {
             return Err(OrchestratorError::Io(std::io::Error::other(
@@ -819,14 +812,6 @@ impl BulkCtx<'_> {
             OrchestratorError::NotReady("Remote peer pool not initialized".to_string())
         })?;
 
-        let remote = pool
-            .get_orchestrator(node_id, ConnectionChannel::Operations)
-            .await
-            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-            .ok_or_else(|| OrchestratorError::PeerUnreachable {
-                message: format!("Remote orchestrator for node {} not found", node_id),
-            })?;
-
         // Kept so the peer's answer can be balanced against what it was actually given.
         let ids: Vec<String> = docs.iter().map(|doc| doc.id().to_string()).collect();
 
@@ -838,7 +823,12 @@ impl BulkCtx<'_> {
             forwarded: true,
         };
 
-        let answer: JsonValue = remote_answer(remote.ask(&op).await)?;
+        let answer: JsonValue = pool
+            .converse(node_id, async {
+                let remote = lookup_peer_orchestrator(pool, node_id).await?;
+                remote_answer(remote.ask(&op).await)
+            })
+            .await?;
 
         let deleted = (answer
             .get("items_deleted")
@@ -1352,6 +1342,19 @@ pub(super) fn describe_pending_reindex(outcome: &SchemaFieldUpdate) -> String {
 /// there is a reason to tune it, which a metadata read of a few hundred bytes is unlikely to
 /// give. A peer that misses this window counts as unreachable, which refuses the write rather
 /// than letting it invent a schema.
+/// A peer's orchestrator from the pool, for use inside [`RemotePeerPool::converse`].
+async fn lookup_peer_orchestrator(
+    pool: &RemotePeerPool,
+    node_id: Uuid,
+) -> Result<kameo::actor::RemoteActorRef<NodeOrchestrator>, OrchestratorError> {
+    pool.get_orchestrator(node_id, ConnectionChannel::Operations)
+        .await
+        .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
+        .ok_or_else(|| OrchestratorError::PeerUnreachable {
+            message: format!("Remote orchestrator for node {node_id} not found"),
+        })
+}
+
 pub(super) const PEER_SCHEMA_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The schema body to send after a receiver asked for it, or `None` if there is none to send.
@@ -5158,34 +5161,30 @@ impl NodeOrchestrator {
             OrchestratorError::NotReady("Remote peer pool not initialized".to_string())
         })?;
 
-        let remote = pool
-            .get_orchestrator(node_id, ConnectionChannel::Operations)
-            .await
-            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-            .ok_or_else(|| OrchestratorError::PeerUnreachable {
-                message: format!("Remote orchestrator for node {node_id} not found"),
-            })?;
-
         // One retry, and only for the one answer a retry can change. The peer holds no schema
         // for this index and said so rather than canvassing anyone, so the resend carries the
         // body — see [`CarriedSchema`]. Once per node per index; every other forward, and every
         // other failure, goes through here untouched.
-        match remote_answer(remote.ask(&op).await) {
-            Err(err) if matches!(err.verdict(), RemoteVerdict::SchemaRequired) => {
-                let Some(schema) = established else {
-                    return Err(err);
-                };
-                let Some(resend) = with_schema_body(&op, schema) else {
-                    return Err(err);
-                };
-                debug!(
-                    %node_id,
-                    "Peer holds no schema for this index; resending the write with the schema"
-                );
-                remote_answer(remote.ask(&resend).await)
+        pool.converse(node_id, async {
+            let remote = lookup_peer_orchestrator(pool, node_id).await?;
+            match remote_answer(remote.ask(&op).await) {
+                Err(err) if matches!(err.verdict(), RemoteVerdict::SchemaRequired) => {
+                    let Some(schema) = established else {
+                        return Err(err);
+                    };
+                    let Some(resend) = with_schema_body(&op, schema) else {
+                        return Err(err);
+                    };
+                    debug!(
+                        %node_id,
+                        "Peer holds no schema for this index; resending the write with the schema"
+                    );
+                    remote_answer(remote.ask(&resend).await)
+                }
+                other => other,
             }
-            other => other,
-        }
+        })
+        .await
     }
 
     /// Write many documents in one request — the slow half of the bulk-write path.

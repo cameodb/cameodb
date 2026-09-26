@@ -1717,6 +1717,16 @@ impl RouterActor {
                 }
             })?;
 
-        remote_answer(remote.ask(op).await)
+        // A failure kameo reports is the message not arriving — including an old ref to a peer
+        // that restarted, which answers "actor not running" until the peer's departure is
+        // noticed. Drop the peer's refs so the next call looks it up afresh. Not on this
+        // router's own timers: those fire on a slow answer as readily as on a lost one.
+        let answer = remote_answer(remote.ask(op).await);
+        if let Err(never_arrived) = &answer
+            && !matches!(never_arrived, OrchestratorError::Remote { .. })
+        {
+            self.remote_peer_pool.invalidate_peer(node_id);
+        }
+        answer
     }
 }

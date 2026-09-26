@@ -7,7 +7,8 @@
 //!
 //! ## Invalidation
 //!
-//! Cached refs are evicted when a peer disconnects (`invalidate_peer`) or on
+//! Cached refs are evicted when a peer disconnects (`invalidate_peer`), when a
+//! conversation with it fails to reach it ([`RemotePeerPool::converse`]), or on
 //! full topology changes (`invalidate_all`). On cache miss the pool falls back
 //! to a fresh `RemoteActorRef::lookup()`.
 //!
@@ -19,13 +20,14 @@
 
 use kameo::actor::RemoteActorRef;
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::RwLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::debug;
 use uuid::Uuid;
 
 use crate::cluster_coordinator::ClusterCoordinator;
-use crate::node::{NodeOrchestrator, orchestrator_remote_name};
+use crate::node::{NodeOrchestrator, OrchestratorError, orchestrator_remote_name};
 
 // ============================================================================
 // Connection Channel (replication-ready)
@@ -74,14 +76,66 @@ struct CachedCoordinatorRef {
 pub struct RemotePeerPool {
     orchestrator_refs: RwLock<HashMap<(Uuid, ConnectionChannel), CachedOrchestratorRef>>,
     coordinator_refs: RwLock<HashMap<Uuid, CachedCoordinatorRef>>,
+    /// The longest one [`converse`](Self::converse) waits on a peer: the node's remote timeout.
+    peer_timeout: Duration,
 }
+
+/// What [`RemotePeerPool::new`] waits on a peer, for a pool nobody configured: the default
+/// request timeout, which is also what the remote timeout follows when unset.
+const DEFAULT_PEER_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl RemotePeerPool {
     /// Create an empty pool.
     pub fn new() -> Self {
+        Self::with_peer_timeout(DEFAULT_PEER_TIMEOUT)
+    }
+
+    /// Create an empty pool whose conversations with a peer give up after `peer_timeout`.
+    pub fn with_peer_timeout(peer_timeout: Duration) -> Self {
         Self {
             orchestrator_refs: RwLock::new(HashMap::new()),
             coordinator_refs: RwLock::new(HashMap::new()),
+            peer_timeout,
+        }
+    }
+
+    /// Run one conversation with a peer — its lookup, its ask and any resend — under one
+    /// deadline, and forget the peer's cached refs when the conversation did not reach it.
+    ///
+    /// The orchestrator's forwards run on its mailbox, and each bounded only the transport,
+    /// step by step: a peer that stopped answering held that node's whole mailbox for the
+    /// remote timeout, twice when the schema resend followed, and the registry lookup before
+    /// them had no bound at all. Now the whole conversation gets the remote timeout once.
+    ///
+    /// A peer that answered — with a result or with its own error, which arrives as
+    /// [`OrchestratorError::Remote`] — is returned as it is. Anything else means the message
+    /// never got there: the cached ref may be the problem (a restarted peer answers an old ref
+    /// with "actor not running" until something notices it left), so it is dropped and the next
+    /// call looks the peer up afresh, and the caller hears `PeerUnreachable` — "not now", a
+    /// retryable `503`, rather than a failure of this node.
+    pub(crate) async fn converse<T>(
+        &self,
+        node_id: Uuid,
+        conversation: impl Future<Output = Result<T, OrchestratorError>>,
+    ) -> Result<T, OrchestratorError> {
+        match tokio::time::timeout(self.peer_timeout, conversation).await {
+            Ok(Ok(answer)) => Ok(answer),
+            Ok(Err(answered @ OrchestratorError::Remote { .. })) => Err(answered),
+            Ok(Err(never_arrived)) => {
+                self.invalidate_peer(node_id);
+                Err(OrchestratorError::PeerUnreachable {
+                    message: format!("node {node_id} could not be reached: {never_arrived}"),
+                })
+            }
+            Err(_) => {
+                self.invalidate_peer(node_id);
+                Err(OrchestratorError::PeerUnreachable {
+                    message: format!(
+                        "node {node_id} did not answer within {}s",
+                        self.peer_timeout.as_secs()
+                    ),
+                })
+            }
         }
     }
 
@@ -298,4 +352,83 @@ pub enum RemotePeerPoolError {
     #[error("remote actor not found: {0}")]
     #[allow(dead_code)] // Used by get_*_required methods
     NotFound(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::RemoteVerdict;
+
+    fn peer() -> Uuid {
+        Uuid::from_u128(7)
+    }
+
+    /// A peer that ran the request and refused it has answered. Its verdict is the caller's
+    /// answer, and nothing about the peer's reachability has been learned.
+    #[tokio::test]
+    async fn a_peer_s_own_error_comes_back_as_it_was() {
+        let pool = RemotePeerPool::new();
+        let refused = pool
+            .converse(peer(), async {
+                Err::<(), _>(OrchestratorError::Remote {
+                    verdict: RemoteVerdict::BadRequest,
+                    message: "field `n` is not an integer".to_string(),
+                })
+            })
+            .await;
+        assert!(matches!(
+            refused,
+            Err(OrchestratorError::Remote {
+                verdict: RemoteVerdict::BadRequest,
+                ..
+            })
+        ));
+    }
+
+    /// Anything else is the message not getting there — "not now", which the caller can retry.
+    #[tokio::test]
+    async fn a_message_that_never_arrived_is_peer_unreachable() {
+        let pool = RemotePeerPool::new();
+        let lost = pool
+            .converse(peer(), async {
+                Err::<(), _>(OrchestratorError::Io(std::io::Error::other(
+                    "network timeout",
+                )))
+            })
+            .await;
+        match lost {
+            Err(OrchestratorError::PeerUnreachable { message }) => {
+                assert!(message.contains("network timeout"), "{message}");
+            }
+            other => panic!("expected PeerUnreachable, got {other:?}"),
+        }
+    }
+
+    /// The deadline covers the whole conversation — lookup, ask and resend — once, so a peer
+    /// that stops answering half-way holds the caller no longer than the pool's timeout.
+    #[tokio::test]
+    async fn a_conversation_that_outlives_the_deadline_is_cut_off() {
+        let pool = RemotePeerPool::with_peer_timeout(Duration::from_millis(50));
+        let started = Instant::now();
+        let stalled = pool
+            .converse(peer(), async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok::<(), OrchestratorError>(())
+            })
+            .await;
+        assert!(matches!(
+            stalled,
+            Err(OrchestratorError::PeerUnreachable { .. })
+        ));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn an_answer_in_time_is_returned() {
+        let pool = RemotePeerPool::new();
+        let answer = pool
+            .converse(peer(), async { Ok::<_, OrchestratorError>(42) })
+            .await;
+        assert_eq!(answer.unwrap(), 42);
+    }
 }

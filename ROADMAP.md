@@ -179,6 +179,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput) | **Every refused request was an `ERROR` line** — synchronous on the write path's runtime, it halved single-write goodput under overload and failed health. Refusals are now counted into one periodic summary. Found by the M6 single-write arm, fixed the same day | — | 2026-09-25 | ✅ |
 | [OB16](#ob16--closing-an-index-from-another-thread-lost-the-writes-in-flight-on-it) … [OB19](#ob19--two-clustered-deadlocks-through-the-coordinators-mailbox) | **The pre-release concurrency audit** — eviction from another thread lost in-flight writes from search (464 of 600 in the test), schema edits and evolution overwrote each other, streaming search ran outside the concurrency limit, and two clustered mailbox deadlocks. All fixed and, where a test can force it, pinned | — | 2026-09-26 | ✅ |
 | [OB20](#ob20--a-fresh-cluster-can-keep-a-partial-ring-and-nothing-repairs-it) | **A fresh cluster can keep a partial ring** — 4 of 5 simultaneous starts left one node without a peer's shards (or alone), and nothing re-synced. Fixed with one connection per peer, a seed redial, and a 10 s shard-map pull; 5 of 5 now converge. Found by the new `cluster` validation suite | — | 2026-09-26 | ✅ |
+| [OB21](#ob21--a-peer-that-stops-answering-bounded-forwards-stale-references-and-what-is-still-unseen) | **A peer that stops answering** — orchestrator forwards now share one deadline, stale peer references go on the first failure, and topology can no longer drop the newest ring. Still open: a frozen peer is never detected (health stays green; 5.4, ping) and a kameo panic at shutdown (5.5) | — | 2026-09-26 | ◐ |
 | [F9](#f9--commit-on-a-clock-not-a-count) | **Commit on a clock, not a count** — bulk ingest 1.8–6.6×, a trickle searchable within 2 s, single writes unchanged | — | 2026-09-26 | ✅ |
 | [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
@@ -3042,6 +3043,45 @@ Storm and restart results are unchanged, as expected: the storm is bound by the 
 A Docker build also turned out able to link crates from an older build — the `target` cache is
 shared and cargo judges freshness by mtime, which `COPY` preserves — and it surfaced here as an
 image missing this week's storage changes. The build now touches the workspace sources first.
+
+### OB21 — A peer that stops answering: bounded forwards, stale references, and what is still unseen
+
+◐ **Partly fixed 2026-09-26.** The cluster suite gained a frozen-peer phase: node3 is paused for
+60 s (`docker pause` — the process stops, its TCP stays up) while node1 serves single writes, bulk
+writes and searches.
+
+**Fixed.** (1) The orchestrator's three forwards — bulk write, bulk delete, a write for a shard
+owned elsewhere — run on its mailbox, and only the transport bounded each step; the registry
+lookup had no bound and a schema resend doubled the wait. `RemotePeerPool::converse` now puts the
+lookup, the ask and the resend under one deadline (the remote timeout) and answers
+`PeerUnreachable`. (2) Peer references were evicted only on `PeerLost`; a request that fails to
+reach a peer now evicts them, so a restarted peer is looked up afresh. (3) Topology went to the
+orchestrator through a 16-slot queue that dropped the newest ring when full; it is a `watch`
+channel now. No dropped ring was seen in any saved log — the risk was latent.
+
+**Measured**, the same before and after, because none of this changes what a frozen peer costs:
+
+| during a 60 s freeze of node3 | result |
+|---|---|
+| single writes to keys node1 or node2 own | unaffected, 0.01 s |
+| single writes to node3's keys | `503` after 20 s (two router attempts at libp2p's 10 s stream-open timeout) |
+| bulk batches | node3's share fails after 10 s; the rest is written |
+| searches | complete at the 5 s broadcast timeout, without node3's hits |
+| node1's health | green, 3 connected, throughout |
+| requests already delivered to node3 when it froze | wait the full 60 s request timeout |
+
+**Open.** *5.4 — detect a frozen peer:* no ping runs, so a hung peer stays "connected" and every
+request to it pays its timeout; libp2p ping would close the connection, `PeerLost` would mark it
+(its shards stay assigned) and requests would fail fast. Deferred pending a decision. *5.5 — a
+panic at shutdown:* a peer ask the coordinator spawned while the node was shutting down was still
+waiting when the swarm stopped, and kameo 0.22 `unwrap`s the dropped reply channel
+(`request/ask.rs:1010`). Contained to that task, on a process already exiting, and seen once in
+the baseline runs.
+
+Two things skewed early runs and are worth knowing before reading any cluster numbers: the Mac
+sleeping mid-run (the suite now holds the Mac awake with `caffeinate`), and a fault landing
+while a restarted node was still canvassing peers for a schema — the suite now warms the index
+through every node first.
 
 ### F9 — Commit on a clock, not a count
 

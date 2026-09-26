@@ -41,7 +41,6 @@ use node::{
 };
 use remote_peer_pool::RemotePeerPool;
 use state::AppState;
-use tokio::sync::mpsc;
 
 /// Global shutdown flag to prevent double-shutdown issues.
 /// Set to true when shutdown begins, checked by signal handlers.
@@ -432,7 +431,9 @@ async fn main() -> Result<()> {
     );
 
     // Create shared remote peer pool for cached actor ref lookups
-    let remote_peer_pool = Arc::new(RemotePeerPool::new());
+    let remote_peer_pool = Arc::new(RemotePeerPool::with_peer_timeout(Duration::from_secs(
+        cameodb_config.effective_remote_timeout_secs(),
+    )));
 
     // Create ClusterCoordinator but DON'T start swarm yet
     let coordinator = if let Some(persisted) = persisted_cluster {
@@ -593,7 +594,7 @@ async fn main() -> Result<()> {
     }
 
     // Subscribe orchestrator to cluster topology updates to maintain global routing awareness
-    let (ring_tx, mut ring_rx) = mpsc::channel(16);
+    let (ring_tx, mut ring_rx) = tokio::sync::watch::channel(cluster::ConsistentRing::new());
     if let Err(e) = coordinator_actor
         .tell(SubscribeTopology {
             subscriber: ring_tx,
@@ -603,10 +604,12 @@ async fn main() -> Result<()> {
         tracing::warn!(error = %e, "Failed to subscribe orchestrator to topology updates");
     }
 
-    // Spawn task to forward topology updates from coordinator to orchestrator
+    // Spawn task to forward topology updates from coordinator to orchestrator. Rings that
+    // change while a `tell` waits on a busy mailbox collapse into the newest one.
     let orchestrator_for_updates = orchestrator_ref.clone();
     tokio::spawn(async move {
-        while let Some(ring) = ring_rx.recv().await {
+        while ring_rx.changed().await.is_ok() {
+            let ring = ring_rx.borrow_and_update().clone();
             if let Err(e) = orchestrator_for_updates.tell(UpdateTopology { ring }).await {
                 tracing::warn!(error = %e, "Failed to forward topology update to orchestrator");
             }

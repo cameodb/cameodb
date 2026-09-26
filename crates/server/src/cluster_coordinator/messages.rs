@@ -4,7 +4,6 @@
 use kameo::Reply;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::cluster_state::PersistedClusterConfig;
@@ -12,9 +11,14 @@ use crate::distributed::NodeInfo;
 use cluster::ConsistentRing;
 
 /// Message to subscribe to topology (ring) updates.
+///
+/// A `watch` channel: it holds the latest ring, and a subscriber that falls behind reads the
+/// newest one when it catches up. The bounded queue it replaced dropped the *newest* ring once
+/// full — a subscriber stalled behind a busy mailbox kept routing on an older one until the
+/// next change.
 #[derive(Debug, Clone)]
 pub struct SubscribeTopology {
-    pub subscriber: mpsc::Sender<ConsistentRing>,
+    pub subscriber: tokio::sync::watch::Sender<ConsistentRing>,
 }
 
 /// Message to initialize the distributed swarm.

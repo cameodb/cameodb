@@ -8,6 +8,8 @@
 #               across nodes (OB19)
 #   restart     two of three nodes restarted together rejoin, converge and serve, and no
 #               committed document is lost
+#   frozen peer node3 paused: node1 keeps answering, and after it resumes the ring converges,
+#               every node serves and no document is lost
 #   logs        no panic; plus the connection and peer-loss counts the cluster work moves
 #
 # Checks are PASS/FAIL. Lines starting METRIC are measurements, not verdicts: latency and
@@ -34,6 +36,7 @@ STORM_WRITERS="${CLUSTER_STORM_WRITERS:-2}"
 STORM_DELETERS="${CLUSTER_STORM_DELETERS:-1}"
 IDLE_SECS="${CLUSTER_IDLE_SECS:-60}"
 ROUNDS="${CLUSTER_RESTART_ROUNDS:-3}"
+FREEZE_SECS="${CLUSTER_FREEZE_SECS:-60}"
 SURVIVORS=30
 PROJECT="cameodb-validate"
 WORK=""
@@ -102,6 +105,12 @@ cleanup() {
     discard_work "$WORK"
 }
 trap cleanup EXIT
+
+# A Mac that sleeps mid-run suspends the probes and the VM together, and the run then measures
+# the sleep. Hold the machine awake for as long as this script lives.
+if command -v caffeinate > /dev/null 2>&1; then
+    caffeinate -i -s -w $$ &
+fi
 
 for p in "${PORTS[@]}"; do require_free_port "$p"; done
 WORK="$(mktemp -d)"
@@ -257,6 +266,34 @@ for r in $(seq 1 "$ROUNDS"); do
 done
 check_cmd "no committed document lost across $ROUNDS restarts" probe count survivor "$SURVIVORS"
 
+section "frozen peer (node3 paused ${FREEZE_SECS}s)"
+# A process that stops without closing its connections — hung, swapped out, paused — is the
+# failure a node cannot see from a closed socket. The kernel keeps its TCP up, so what the
+# others notice, and how long each request waits on it, is up to the cluster layer.
+check_cmd "writes to a fresh index before the freeze" probe seed frozen 3
+# Settle first: a node back from the restart rounds canvasses its peers for this index's
+# schema on its first write, and a freeze landing inside that canvass measures the timing.
+check_cmd "the fresh index answers fast through every node before the freeze" probe warm frozen
+fault_from=5
+fault_to=$((fault_from + FREEZE_SECS))
+probe fault $((fault_to + 20)) "$fault_from" "$fault_to" frozen > "$WORK/fault.txt" 2>&1 &
+fault_pid=$!
+sleep "$fault_from"
+run_bounded 60 docker pause "$PROJECT-node3" > /dev/null || fail "docker paused node3" "docker pause failed"
+sleep "$FREEZE_SECS"
+run_bounded 60 docker unpause "$PROJECT-node3" > /dev/null || fail "docker resumed node3" "docker unpause failed"
+wait "$fault_pid"
+fault_rc=$?
+grep '^METRIC' "$WORK/fault.txt"
+if [ "$fault_rc" -eq 0 ]; then
+    pass "node1 kept answering health while node3 was frozen: $(tail -1 "$WORK/fault.txt")"
+else
+    fail "node1 kept answering health while node3 was frozen" "$(tail -1 "$WORK/fault.txt")"
+fi
+check_cmd "node3 resumed: every node sees every node and the same ring" probe converge "$FORM_SECS"
+check_cmd "node3 resumed: every node writes and deletes" probe probe 30
+check_cmd "no committed document lost across the freeze" probe count survivor "$SURVIVORS"
+
 section "logs"
 collect_logs final
 panics=$(cat "$WORK"/logs/*.log | grep -c 'panicked' || true)
@@ -264,7 +301,7 @@ check_eq "no panic in any node log" 0 "$panics"
 # Node1 is never restarted, so what it logged is an exact count against a known truth: two
 # real peer departures per round.
 n1="$WORK/logs/final-node1.log"
-printf 'METRIC node1 peer-lost %s for %s real peer restarts, connections closed %s\n' \
+printf 'METRIC node1 peer-lost %s for %s real peer restarts and 1 freeze, connections closed %s\n' \
     "$(grep -c 'ClusterCoordinator: peer lost' "$n1")" "$((2 * ROUNDS))" \
     "$(grep -c 'Connection closed with' "$n1")"
 # Two peers each, so anything past two connections per node is a duplicate dial.
