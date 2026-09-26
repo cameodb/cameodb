@@ -2959,6 +2959,15 @@ fn a_verdict_survives_the_wire() {
             },
             RemoteVerdict::QuotaExceeded,
         ),
+        // A peer minting the index must arrive as a rival, not as a peer that failed to answer:
+        // the canvass settles the first and refuses on the second.
+        (
+            OrchestratorError::SchemaBeingMinted {
+                index: "books".into(),
+                node: Uuid::nil(),
+            },
+            RemoteVerdict::Minting,
+        ),
     ];
 
     for (err, expected) in cases {
@@ -3452,35 +3461,65 @@ fn first_write(index: &str) -> ClientOp {
 
 /// While this node is minting an index's schema, a peer asking for it is told so — never "none".
 ///
-/// The asker is canvassing to decide whether it may sample a schema of its own. Before the
-/// canvass left the mailbox this question waited behind the mint until it timed out, and the
-/// asker refused; answered "none" instead, it would mint a second schema for the same index.
-/// An error is what makes it refuse, and now it hears it at once.
+/// The asker is canvassing to decide whether it may sample a schema of its own; answered
+/// "none", it would mint a second schema for the same index. It is told who is minting, and an
+/// asker minting the same index is recorded as a rival, so the two settle the race the same way.
 #[tokio::test]
 async fn a_schema_being_minted_is_not_reported_absent() {
     let dir = tempfile::tempdir().expect("temp dir");
     let mut orchestrator = clustered_orchestrator(dir.path()).await;
-    let ask = || ClientOp::GetRawSchema {
-        index: "books".to_string(),
+    let me = orchestrator.identity.uuid;
+    let rival = Uuid::new_v4();
+    let ask = |index: &str, minting_by| ClientOp::GetRawSchema {
+        index: index.to_string(),
+        minting_by,
     };
 
-    let before = orchestrator.handle_client_op(ask()).await.resolve().await;
+    let before = orchestrator
+        .handle_client_op(ask("books", Some(rival)))
+        .await
+        .resolve()
+        .await;
     assert!(
         matches!(&before, Ok(JsonValue::Null)),
         "nothing held and nothing minting is plainly absent, got {before:?}"
     );
+    assert!(
+        orchestrator.mint_rivals.is_empty(),
+        "an asker is a rival only while this node is minting the same index"
+    );
 
     orchestrator.minting.insert("books".to_string(), 1);
-    let during = orchestrator.handle_client_op(ask()).await.resolve().await;
+    let lookup = orchestrator
+        .handle_client_op(ask("books", None))
+        .await
+        .resolve()
+        .await;
     assert!(
-        matches!(&during, Err(OrchestratorError::SchemaUnconfirmed { index, .. }) if index == "books"),
-        "an index being minted must not read as absent, got {during:?}"
+        matches!(&lookup, Err(OrchestratorError::SchemaBeingMinted { index, node }) if index == "books" && *node == me),
+        "an index being minted must not read as absent, got {lookup:?}"
+    );
+    assert!(
+        orchestrator.mint_rivals.is_empty(),
+        "a lookup that creates nothing is not a rival"
+    );
+
+    let _ = orchestrator
+        .handle_client_op(ask("books", Some(rival)))
+        .await
+        .resolve()
+        .await;
+    assert_eq!(
+        orchestrator
+            .mint_rivals
+            .get("books")
+            .map(|r| r.contains(&rival)),
+        Some(true),
+        "a peer minting the same index must be recorded as a rival"
     );
 
     let other = orchestrator
-        .handle_client_op(ClientOp::GetRawSchema {
-            index: "films".to_string(),
-        })
+        .handle_client_op(ask("films", Some(rival)))
         .await
         .resolve()
         .await;
@@ -3488,6 +3527,33 @@ async fn a_schema_being_minted_is_not_reported_absent() {
         matches!(&other, Ok(JsonValue::Null)),
         "only the index being minted is affected, got {other:?}"
     );
+}
+
+/// A race to mint one index is won by the lowest node id, and every contender agrees on it.
+///
+/// Each contender runs the same function over the others' ids, so the one with the lowest id
+/// finds no one to yield to and every other one yields to it — one schema, with nothing
+/// exchanged but the ids the canvass already carried.
+#[test]
+fn the_lowest_node_id_wins_a_race_to_mint() {
+    let mut ids: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
+    ids.sort();
+    let lowest = ids[0];
+
+    for me in &ids {
+        let rivals = ids.iter().copied().filter(|id| id != me);
+        let verdict = mint_winner(*me, rivals);
+        if *me == lowest {
+            assert_eq!(verdict, None, "the lowest id mints");
+        } else {
+            assert_eq!(
+                verdict,
+                Some(lowest),
+                "every other contender yields to the lowest"
+            );
+        }
+    }
+    assert_eq!(mint_winner(lowest, []), None, "no rivals, no race");
 }
 
 /// Only a clustered first write to an index with no schema leaves the mailbox to canvass.
@@ -3537,6 +3603,7 @@ async fn only_a_clustered_first_write_canvasses_outside_the_mailbox() {
 
     let read = ClientOp::GetRawSchema {
         index: "books".to_string(),
+        minting_by: None,
     };
     assert_eq!(orchestrator.mint_canvass_needed(&read).await, None);
 

@@ -140,6 +140,9 @@ impl AppError {
             // so it is a `503` for the same reason `Unavailable` is: nothing about the request
             // is wrong and retrying is the right move.
             RemoteVerdict::SchemaRequired => Self::service_unavailable(err.to_string()),
+            // A canvass consumes it; reaching a client means a mint lost a race it could not
+            // wait out, which is retryable like any other "not now".
+            RemoteVerdict::Minting => Self::service_unavailable(err.to_string()),
             // The tenant is at a ceiling. The message names which one and how to make room, so
             // it is shown rather than masked — it is the caller's to act on.
             RemoteVerdict::QuotaExceeded => Self::forbidden(err.to_string()),

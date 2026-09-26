@@ -25,9 +25,10 @@ pub(super) fn tool_error(err: OrchestratorError) -> ToolError {
         RemoteVerdict::BadRequest | RemoteVerdict::NotFound | RemoteVerdict::QuotaExceeded => {
             ToolError::caller(err.to_string())
         }
-        RemoteVerdict::Unavailable | RemoteVerdict::SchemaRequired | RemoteVerdict::ServerFault => {
-            ToolError::internal(err.to_string())
-        }
+        RemoteVerdict::Unavailable
+        | RemoteVerdict::SchemaRequired
+        | RemoteVerdict::Minting
+        | RemoteVerdict::ServerFault => ToolError::internal(err.to_string()),
     }
 }
 

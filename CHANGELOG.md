@@ -122,6 +122,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stalled the same way: 12 of 12 refused or timed out. The forward now runs in a task that
   answers the caller when the peer does. 354 such batches in 20 s, p50 0.33 s, none failed.
 
+- **Several nodes creating the same index at once settle it instead of refusing each other.**
+  A tenant's first burst into a new index behind a load balancer reaches several owners, and
+  each mints. They refused each other with `503`, and under a steady burst nobody won: 88 of
+  120 such writes were refused and 11 of 20 indexes were never created. A mint now tells the
+  peers it asks that it is minting, a peer minting the same index says so, and every contender
+  settles it the same way — the lowest node id mints and the others wait for its schema and
+  adopt it. 120 of 120 written, p50 0.04 s, each index minted by exactly one node.
+
 - **A refused request no longer costs a log line, and single-write overload no longer halves
   goodput.** Every `503` was logged at `ERROR` — twice, by the trace layer and by the error
   handler — synchronously on the runtime the write path shares. A default node filters at
