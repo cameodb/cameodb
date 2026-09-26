@@ -3159,9 +3159,26 @@ lowest id never yields. An older peer reads the new verdict as a fault and refus
 | writes answered | 32 of 120, 88 × `503` | **120 of 120**, p50 0.04 s, max 0.07 s |
 | indexes created | 9 of 20 | **20 of 20**, each minted by exactly one node |
 
-**Not changed.** A forwarded share, and a single write the router sent to its owner, still run
-inside the receiving node's mailbox — they wait on no peer, so they cannot deadlock, but they are
-served one at a time, which is most of a bulk mint's 0.33 s.
+**Fixed as well — a peer's ops on a lane of their own.** A forwarded share, a single write the
+router sent to its owner and the local half of a peer's search still ran inside the receiving
+node's mailbox. They waited on no peer, so they could not deadlock, but they were served one at a
+time. `Message<ClientOp>` is now the peer entry only: what the worker lane can serve
+(`worker_eligible`) runs on a peer lane — `engine.execute` in a task, under a semaphore sized like
+the worker pool's in-flight capacity — and one that needs the actor comes back as `OnActor`, the
+message this node's own router now uses, so a declined op is never offered to a worker twice.
+The lane is separate from the worker pool on purpose: first hops on workers wait on peers' lanes,
+and the lanes' work waits on no peer, so they always drain. Full, the op waits on the mailbox as
+before, which is the back-pressure a peer used to get.
+
+| 8 writers per node, 20 s, fresh cluster each | mailbox | peer lane |
+|---|---|---|
+| bulk batches through every node | 446–582/s, p99 0.15–0.29 s | **1,165–1,312/s**, p99 0.04–0.07 s |
+| single writes through every node | 3,802–3,948/s | 3,887–4,108/s |
+| new indexes by bulk writes | 18.3/s, p50 1.34 s | 18.4/s, p50 1.34 s |
+
+A bulk mint's cost did not move, so it is not the mailbox, as this entry first guessed: it is the
+mint itself — saving the schema and opening the index on every shard of every node — which is
+the actor's by design. Single writes were never mailbox-bound at this load.
 
 ### F9 — Commit on a clock, not a count
 

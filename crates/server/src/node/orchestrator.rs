@@ -1658,6 +1658,41 @@ impl OwnedBulkView {
     }
 }
 
+/// Whether the worker lane serves this op — on a worker for this node's own requests, on the
+/// peer lane for a peer's.
+///
+/// What is left out needs `&mut NodeOrchestrator` (config and schema edits, index deletes) or
+/// is answered from actor state alone. An op in the list that turns out to need the actor after
+/// all — a write that must grow a schema, a share with none to run against — is handed back as
+/// [`WorkerOutcome::UseActor`].
+pub(crate) fn worker_eligible(op: &ClientOp) -> bool {
+    matches!(
+        op,
+        ClientOp::Write { .. }
+            | ClientOp::Delete { .. }
+            | ClientOp::Search { .. }
+            | ClientOp::Stream { .. }
+            // Bulk ops fan out over the same snapshots the rest of the engine reads. What they
+            // cannot do off the mailbox is *decide* a schema — a bulk write that needs one written
+            // hands itself back as `UseActor`, which is the fast/slow split the single-write path
+            // already uses.
+            | ClientOp::BulkWrite { .. }
+            | ClientOp::BulkDelete { .. }
+            // A metadata read with no actor state behind it. On the mailbox it queued behind
+            // whatever write was there; the pool answers it from an ArcSwap.
+            | ClientOp::GetIdentity
+            // The index listing asks only `&self` questions of the shard map — stats gathered per
+            // shard, one schema per index, an identity that never changes. `ListClusterIndexes`
+            // lands here only as the local half of a broadcast, which is the same listing
+            // (ROADMAP CH12).
+            | ClientOp::ListIndexes { .. }
+            | ClientOp::ListClusterIndexes { .. }
+            // Waits on peers, so it must not wait on this node's mailbox: see the engine's arm
+            // for it in `execute`.
+            | ClientOp::FindSchemaInCluster { .. }
+    )
+}
+
 /// What a worker did with an op.
 ///
 /// The engine cannot serve every op — schema evolution and bulk writes need `&mut
@@ -3029,6 +3064,9 @@ pub(crate) struct NodeOrchestrator {
     /// a peer asking for it is told so rather than told there is none — see `GetRawSchema` in
     /// `handle_client_op`.
     pub(super) minting: HashMap<String, usize>,
+    /// Permits for peers' ops served off the mailbox — see `Message<ClientOp>`. Sized like the
+    /// worker pool's in-flight capacity, and set with it; `None` until the pool exists.
+    pub(super) peer_lane: Option<Arc<tokio::sync::Semaphore>>,
     /// Peers that asked about an index while this node was minting it, and were minting it too.
     ///
     /// Read when this node decides whether it mints or yields (`MintAfterCanvass`), and cleared
@@ -3991,6 +4029,7 @@ impl NodeOrchestrator {
         let mut orchestrator = Self {
             mailbox_lane: MailboxLane::new(),
             minting: HashMap::new(),
+            peer_lane: None,
             mint_rivals: HashMap::new(),
             shards: HashMap::new(),
             writer_liveness: Arc::new(WriterLiveness::default()),
@@ -4239,6 +4278,9 @@ impl NodeOrchestrator {
         );
         self.engine = Some(engine);
         self.worker_count = tx.len();
+        self.peer_lane = Some(Arc::new(tokio::sync::Semaphore::new(
+            self.worker_count.max(1) * ORCHESTRATOR_WORKER_MAX_IN_FLIGHT,
+        )));
         self.worker_tx = Some(tx);
         self.worker_threads = worker_threads;
 
@@ -6386,13 +6428,98 @@ impl NodeOrchestrator {
 
 #[remote_message("cameo.orchestrator.client_op")]
 impl Message<ClientOp> for NodeOrchestrator {
-    /// Delegated so that an op whose answer waits on peers can release the mailbox while it
-    /// waits — see [`NodeOrchestrator::mint_canvass_needed`]. Every other op is answered before
-    /// `handle` returns, exactly as it was. The value on the wire is the same
+    /// Delegated so that an op whose answer waits — on peers, or on the peer lane — can release
+    /// the mailbox while it waits. The value on the wire is the same
     /// `Result<JsonValue, OrchestratorError>` either way, so peers of any version read it.
     type Reply = DelegatedReply<Result<JsonValue, OrchestratorError>>;
 
+    /// An op from a peer: a forwarded share, a write the router sent to its owner, the local
+    /// half of a peer's search. This node's own requests arrive as [`OnActor`] instead.
+    ///
+    /// What the worker lane can serve runs on the peer lane, off the mailbox and several at a
+    /// time. The mailbox served every one of them in turn, so a node receiving shares from two
+    /// peers wrote them one after the other however many shards and cores it had; and a share
+    /// that needs a schema written still comes back here, as [`OnActor`], because only the actor
+    /// may write one. The peer lane is its own, separate from the worker pool: a first hop on a
+    /// worker waits on a peer's lane, and the lane's work waits on no peer, so it always drains
+    /// — two nodes whose workers were all waiting on each other could not otherwise serve the
+    /// shares both were waiting for.
     async fn handle(&mut self, msg: ClientOp, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+        if worker_eligible(&msg)
+            && let (Some(engine), Some(lane)) = (self.engine.clone(), self.peer_lane.clone())
+        {
+            // Full means the lane is as busy as the worker pool can be. The op is served here
+            // instead, one at a time — which is what pushes back on the peers sending it, as the
+            // mailbox always did — rather than parked in an unbounded pile of waiting tasks.
+            if let Ok(permit) = lane.try_acquire_owned() {
+                let (delegated, reply) = ctx.reply_sender();
+                let orchestrator = ctx.actor_ref().downgrade();
+                tokio::spawn(async move {
+                    let result = match engine.execute(msg).await {
+                        WorkerOutcome::Done(result) => result,
+                        WorkerOutcome::UseActor(op) => {
+                            drop(permit);
+                            on_actor(&orchestrator, *op).await
+                        }
+                    };
+                    if let Some(reply) = reply {
+                        reply.send(result);
+                    }
+                });
+                return delegated;
+            }
+            debug!("peer lane full; serving a peer's op on the mailbox");
+        }
+        self.run_on_actor(msg, ctx).await
+    }
+}
+
+/// Run an op on the actor itself: this node's own requests that a worker handed back or could
+/// not take, and anything the peer lane does not serve.
+///
+/// Its own message rather than a [`ClientOp`], so that an op a worker declined is never offered
+/// to a worker again — `ClientOp` is the peer entry, and it sends what a worker can serve to the
+/// peer lane.
+pub(crate) struct OnActor(pub(crate) ClientOp);
+
+impl Message<OnActor> for NodeOrchestrator {
+    type Reply = DelegatedReply<Result<JsonValue, OrchestratorError>>;
+
+    async fn handle(&mut self, msg: OnActor, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+        self.run_on_actor(msg.0, ctx).await
+    }
+}
+
+/// Send an op back to the actor from a task, and wait for its answer.
+async fn on_actor(
+    orchestrator: &kameo::actor::WeakActorRef<NodeOrchestrator>,
+    op: ClientOp,
+) -> Result<JsonValue, OrchestratorError> {
+    let Some(orchestrator) = orchestrator.upgrade() else {
+        return Err(OrchestratorError::NotReady(
+            "the orchestrator stopped before the op could run".to_string(),
+        ));
+    };
+    match orchestrator.ask(OnActor(op)).await {
+        Ok(result) => Ok(result),
+        Err(kameo::error::SendError::HandlerError(err)) => Err(err),
+        Err(other) => Err(OrchestratorError::NotReady(format!(
+            "the orchestrator stopped before the op could run: {other}"
+        ))),
+    }
+}
+
+impl NodeOrchestrator {
+    /// The actor's own handling of an op — see [`OnActor`].
+    ///
+    /// A first write that must canvass, and any op whose remaining work waits on a peer, is
+    /// answered through the delegated reply from a task, so the mailbox moves on; everything
+    /// else is answered before this returns.
+    async fn run_on_actor(
+        &mut self,
+        msg: ClientOp,
+        ctx: &mut Context<Self, DelegatedReply<Result<JsonValue, OrchestratorError>>>,
+    ) -> DelegatedReply<Result<JsonValue, OrchestratorError>> {
         // Dequeue-to-answer for the mailbox lane: this actor is serialised, so nothing else is
         // running inside this span and it holds no queue wait. The gate in `RouterActor`
         // predicts against what is folded here.

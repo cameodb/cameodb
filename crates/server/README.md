@@ -75,7 +75,12 @@ The `RouterActor` is the primary ingress for database operations on a node.
   - Registers shard assignments with `ClusterCoordinator`
   - Spawns worker pool for concurrent hot-path operations
 - **Message handling:**
-  - `Message<ClientOp>` delegates to `handle_client_op` or worker pool
+  - `Message<ClientOp>` is the peer entry: what a worker can serve (`worker_eligible`) runs on
+    the peer lane — `engine.execute` in a task, bounded by a semaphore sized like the worker
+    pool — and falls back to the actor when the lane is full or the op needs the actor
+  - `Message<OnActor>` is the actor's own handling, used by this node's router for ops a worker
+    declined or could not take; an op whose rest waits on a peer (a canvass, a forward) is
+    answered through a `DelegatedReply` from a task, so the mailbox never waits on a peer
   - Hot-path operations (Write, Search) bypass actor mailbox via worker pool
   - Uses `spawn_blocking` for all redb/tantivy calls
   - A worker re-checks the deadline when it dequeues a job: time spent since the request
