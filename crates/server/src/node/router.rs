@@ -321,6 +321,9 @@ impl RouterActor {
                     // broadcast, which is the same listing (ROADMAP CH12).
                     | ClientOp::ListIndexes { .. }
                     | ClientOp::ListClusterIndexes { .. }
+                    // Waits on peers, so it must not wait on this node's mailbox: see the
+                    // engine's arm for it in `execute`.
+                    | ClientOp::FindSchemaInCluster { .. }
             );
             if is_worker_eligible {
                 // Refuse before queueing, not after waiting. The dequeue check below this is
@@ -622,6 +625,18 @@ impl RouterActor {
                 | ClientOp::CreateConfig { .. }
                 | ClientOp::UpdateSchema { .. }
         ) {
+            return self.handle_client_op(op).await;
+        }
+
+        // A bulk op runs on the node that received it, whatever its documents' keys say. The
+        // fan-out splits the batch by document and forwards each share to its owner, so no
+        // route chosen for the batch as a whole can save a hop — one chosen by its first
+        // document cost one. It shipped the whole batch to that document's owner, two batches
+        // in three behind a load balancer, and it arrived there in the orchestrator's mailbox
+        // rather than the worker pool. That node then forwarded the other shares from inside
+        // its mailbox, and two nodes doing so at once waited on each other's mailboxes until
+        // the 60 s peer timeout: every bulk sent through all three nodes at once stalled.
+        if matches!(op, ClientOp::BulkWrite { .. } | ClientOp::BulkDelete { .. }) {
             return self.handle_client_op(op).await;
         }
 

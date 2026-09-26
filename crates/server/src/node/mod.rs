@@ -102,7 +102,6 @@ pub(crate) use admission::{OpClass, QueueLoad, WorkerPoolReport};
 pub(crate) use orchestrator::NodeOrchestrator;
 pub(crate) use quota::TenantQuotas;
 pub(crate) use router::{RouterActor, ShardAffineConfig, StreamingSearchConfig};
-pub(crate) use routing::routing_key_without_schema;
 pub(crate) use search::{
     APPROXIMATE_SORT_FIELD, DISCARDED_CLAUSES_FIELD, NARROWED_DEFAULT_FIELDS, SearchWindow,
     order_hit_blocks, renumber_reasons,

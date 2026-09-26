@@ -13,6 +13,9 @@ show the evidence. Nodes come from CLUSTER_NODES, a comma-separated list of base
   stats                                    the swarm counters from each node's health body
   pings-clean                              no node has failed a liveness ping
   warm <index>                             a bulk batch through every node until each answers fast
+  mints <seconds> <writers>                new-index writes with varied ids through every node
+  bulks <seconds> <writers> <index>        bulk writes through every node into an existing index
+  bulkmints <seconds> <writers>            each bulk write creates its own index, through every node
   fault <seconds> <from> <to> <index>      node1's health, searches and writes while a peer is
                                            faulted between <from> and <to>; prints METRIC lines
 """
@@ -158,6 +161,110 @@ def cmd_storm(seconds, writers, deleters):
               f"p50 {percentile(t, 50):5.2f}s  p99 {percentile(t, 99):5.2f}s  "
               f"max {max(t, default=0):5.2f}s  not-ok {json.dumps(other)}")
     return 0
+
+
+# A request slower than this under the cross-node load is a stall, not a slow disk: every
+# one of them does a few milliseconds of local work, and the stalls this looks for end at a
+# 5 s or 60 s timeout.
+CROSS_STALL_SECS = 5.0
+
+
+def cross_load(label, seconds, writers, request):
+    """Run `request(node, tag, i)` from `writers` threads per node for `seconds`.
+
+    Prints one METRIC line and exits 1 if any request failed or stalled. Every node takes
+    requests at once, as it does behind a load balancer: that is what sends forwards both ways
+    between nodes, which a single entry node never does.
+    """
+    took, statuses = [], collections.Counter()
+    lock = threading.Lock()
+    stop = time.time() + seconds
+
+    def loop(node, tag):
+        i = 0
+        while time.time() < stop:
+            status, t = request(node, tag, i)
+            with lock:
+                took.append(t)
+                statuses[str(status)] += 1
+            i += 1
+
+    threads = [threading.Thread(target=loop, args=(node, f"{k}{w}"), daemon=True)
+               for k, node in enumerate(NODES) for w in range(writers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(seconds + OP_TIMEOUT + 70)
+
+    ok = statuses.get("200", 0) + statuses.get("201", 0)
+    failed = {k: v for k, v in sorted(statuses.items()) if k not in ("200", "201")}
+    stalled = sum(1 for t in took if t > CROSS_STALL_SECS)
+    print(f"METRIC cross {label:<10} {len(took):>6} ops {ok / seconds:8.1f} ok/s  "
+          f"p50 {percentile(took, 50):5.2f}s  p99 {percentile(took, 99):5.2f}s  "
+          f"max {max(took, default=0):5.2f}s  over {CROSS_STALL_SECS:.0f}s {stalled}  "
+          f"not-ok {json.dumps(failed)}")
+    good = took and not failed and not stalled
+    print(f"{len(took)} requests, none failed or took over {CROSS_STALL_SECS:.0f}s" if good else
+          f"{sum(failed.values())} failed and {stalled} took over {CROSS_STALL_SECS:.0f}s "
+          f"of {len(took)}")
+    return 0 if good else 1
+
+
+def cmd_mints(seconds, writers):
+    """New-index writes through every node, each with its own id.
+
+    Unlike the storm, whose writes all carry id "a" and so mint every index on the one node
+    that owns that key, varied ids spread the mints over every node — which is what tenants
+    creating indexes behind a load balancer do. Each node then canvasses its peers for a schema
+    while they canvass it.
+    """
+    run = int(time.time()) % 100000
+
+    def request(node, tag, i):
+        status, t, _ = call("PUT", f"{node}/api/m{run}n{tag}x{i}/document",
+                            {"id": f"k{tag}x{i}", "doc": {"title": f"t{i}", "n": i}},
+                            timeout=OP_TIMEOUT)
+        return status, t
+
+    return cross_load("mints", seconds, writers, request)
+
+
+def cmd_bulks(seconds, writers, index):
+    """Bulk writes of 30 documents through every node into an index every node already holds.
+
+    Each batch spreads over every shard, so every node forwards shares to every other node at
+    the same time. The timeout is past the peer timeout (60 s), so a forward that waits it out
+    shows as its latency rather than as this client giving up first.
+    """
+    def request(node, tag, i):
+        docs = [{"id": f"x{tag}b{i}d{d}", "doc": {"title": "cross", "n": d}} for d in range(30)]
+        status, t, body = call("POST", f"{node}/api/{index}/_bulk", docs, timeout=75)
+        # A batch can answer 200 with documents refused inside it — a node whose shard map is
+        # missing a peer's shards does exactly that — so a refused document fails the batch.
+        if status in (200, 201) and isinstance(body, dict) and body.get("errors"):
+            return "partial", t
+        return status, t
+
+    return cross_load("bulks", seconds, writers, request)
+
+
+def cmd_bulkmints(seconds, writers):
+    """Bulk writes through every node, each into an index of its own that does not exist yet.
+
+    The node that receives one mints the schema from the whole batch, then forwards each other
+    node its share. Minting needs the orchestrator's mailbox, so this is the fan-out that ran
+    from inside it: two nodes doing so at once waited on each other's mailboxes.
+    """
+    run = int(time.time()) % 100000
+
+    def request(node, tag, i):
+        docs = [{"id": f"x{tag}b{i}d{d}", "doc": {"title": "minted", "n": d}} for d in range(30)]
+        status, t, body = call("POST", f"{node}/api/bm{run}n{tag}x{i}/_bulk", docs, timeout=75)
+        if status in (200, 201) and isinstance(body, dict) and body.get("errors"):
+            return "partial", t
+        return status, t
+
+    return cross_load("bulkmints", seconds, writers, request)
 
 
 def cmd_probe(timeout):
@@ -405,6 +512,12 @@ def main():
         return cmd_pings_clean()
     if cmd == "warm":
         return cmd_warm(args[0])
+    if cmd == "mints":
+        return cmd_mints(int(args[0]), int(args[1]))
+    if cmd == "bulks":
+        return cmd_bulks(int(args[0]), int(args[1]), args[2])
+    if cmd == "bulkmints":
+        return cmd_bulkmints(int(args[0]), int(args[1]))
     if cmd == "fault":
         return cmd_fault(int(args[0]), int(args[1]), int(args[2]), args[3])
     sys.exit(f"unknown subcommand: {cmd}")

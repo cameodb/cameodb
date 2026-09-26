@@ -63,17 +63,12 @@ pub(super) fn routing_key_for(
 /// The rungs of the routing precedence that need no schema: the caller's key, then the id, then
 /// a hash of the document.
 ///
-/// Split out because the HTTP layer has to pick a *node* for a request before anyone has
-/// resolved the index's schema, so it can only climb from here down — where
-/// [`effective_routing_key`] starts one rung higher, at the schema's routing field. Two callers,
-/// one ladder: they were written out separately and had drifted into using different hashes of
-/// different byte ranges, so a hint and the key it was standing in for could disagree.
-///
-/// A disagreement costs a forwarding hop rather than a misplaced document — per-document shard
-/// placement is decided by `effective_routing_key` alone, and a hint that points at the wrong
-/// node is corrected by the forward OB3 bounded. That is why this unifies on the orchestrator's
-/// existing derivation rather than the HTTP layer's: the hint is free to change, and the shard a
-/// document lands on is not.
+/// [`effective_routing_key`] starts one rung higher, at the schema's routing field, and falls
+/// through to this. It was split out for the HTTP layer, which picked a node for a bulk batch
+/// from its first document before any schema was resolved; the two copies had drifted onto
+/// different hashes of different byte ranges, and unifying kept the orchestrator's, because the
+/// shard a document lands on must not change across an upgrade. That hint is gone — a bulk op
+/// now runs where it was received (see `route_and_handle_inner`) — and this ladder stays one.
 pub(crate) fn routing_key_without_schema(
     routing_key: Option<String>,
     id: &str,
