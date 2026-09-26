@@ -234,4 +234,52 @@ mod tests {
         assert!(counts.get(&n1).copied().unwrap_or(0) > 0);
         assert!(counts.get(&n2).copied().unwrap_or(0) > 0);
     }
+
+    /// Signals when it is dropped — which is what cancelling a task does to what it holds.
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    /// A peer ask still waiting when the swarm stops panics inside kameo, so shutdown has to
+    /// end these tasks before it stops the swarm. One parked forever — as an ask to a peer that
+    /// will never answer is — must be gone once `ShutdownSwarm` has been answered.
+    #[tokio::test]
+    async fn shutdown_ends_a_peer_task_that_is_still_waiting() {
+        let cc = ClusterCoordinator::new(make_cluster());
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let guard = DropSignal(Some(dropped_tx));
+        cc.spawn_peer_task(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+
+        let actor = <ClusterCoordinator as kameo::actor::Spawn>::spawn(cc);
+        actor.ask(ShutdownSwarm).await.expect("shutdown answered");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), dropped_rx)
+            .await
+            .expect("the waiting peer task was ended by shutdown")
+            .expect("the task's state was dropped, not leaked");
+    }
+
+    /// And one spawned after shutdown began — an exchange triggered by a peer event that arrived
+    /// during it, which is how the panic was seen — never starts talking to anyone.
+    #[tokio::test]
+    async fn a_peer_task_spawned_after_shutdown_does_not_run() {
+        let cc = ClusterCoordinator::new(make_cluster());
+        cc.peer_tasks.cancel();
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&ran);
+        cc.spawn_peer_task(async move {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
 }

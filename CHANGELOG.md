@@ -81,6 +81,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behind a busy mailbox could keep routing on an older one until the next change. A `watch`
   channel now holds the latest ring, and a backlog collapses into one update.
 
+- **A clustered node no longer panics while it shuts down.** A peer ask the coordinator had
+  spawned — a shard exchange triggered by a peer event arriving during shutdown — could still be
+  waiting when the swarm stopped, and kameo unwraps the reply channel the swarm drops. The
+  coordinator's peer tasks are now cancelled before the swarm stops, and none start after.
+
 - **A refused request no longer costs a log line, and single-write overload no longer halves
   goodput.** Every `503` was logged at `ERROR` — twice, by the trace layer and by the error
   handler — synchronously on the runtime the write path shares. A default node filters at

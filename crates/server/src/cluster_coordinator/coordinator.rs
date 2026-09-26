@@ -46,6 +46,9 @@ pub struct ClusterCoordinator {
 
     // Subscribers for topology updates
     pub(crate) topology_subscribers: Vec<tokio::sync::watch::Sender<ConsistentRing>>,
+    /// Cancels every task this coordinator spawned to talk to a peer. Fired before the swarm
+    /// stops: see [`ClusterCoordinator::spawn_peer_task`].
+    pub(crate) peer_tasks: tokio_util::sync::CancellationToken,
 
     // DHT Bootstrap tracking - DHT is used only during bootstrap, then push-only
     pub(crate) bootstrap_complete: bool,
@@ -113,6 +116,7 @@ impl ClusterCoordinator {
             local_orchestrator: None,
             expected_shards: HashMap::new(),
             topology_subscribers: Vec::new(),
+            peer_tasks: tokio_util::sync::CancellationToken::new(),
             bootstrap_complete: false,
             last_persisted_generation: 0,
             push_failure_count: HashMap::new(),
@@ -248,6 +252,7 @@ impl ClusterCoordinator {
             local_orchestrator: None,
             expected_shards,
             topology_subscribers: Vec::new(),
+            peer_tasks: tokio_util::sync::CancellationToken::new(),
             bootstrap_complete: false, // Will be set after initial DHT queries complete
             last_persisted_generation: generation,
             push_failure_count: HashMap::new(),
@@ -544,7 +549,7 @@ impl ClusterCoordinator {
                             shard_checksum: local_checksum,
                         };
                         let pool_clone = pool.clone();
-                        task::spawn(async move {
+                        self.spawn_peer_task(async move {
                             let coord_opt = if let Some(pool) = &pool_clone {
                                 pool.get_coordinator(peer_id).await.ok().flatten()
                             } else {
@@ -880,6 +885,27 @@ impl ClusterCoordinator {
         }
     }
 
+    /// Spawn a task that talks to a peer, and end it when the node starts shutting down.
+    ///
+    /// A peer ask still waiting when the swarm stops panics inside kameo 0.22: the swarm drops
+    /// the reply channel and `ask` unwraps it (`request/ask.rs:1010`). Seen at shutdown, on an
+    /// exchange spawned while the node was already going down. `ShutdownSwarm` cancels these
+    /// before it stops the swarm, so a waiting task is dropped mid-await instead, and one spawned
+    /// after that returns at once.
+    pub(super) fn spawn_peer_task(
+        &self,
+        work: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        let stop = self.peer_tasks.clone();
+        task::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = stop.cancelled() => {}
+                _ = work => {}
+            }
+        });
+    }
+
     fn route_for_key(&self, key: &str) -> Option<Uuid> {
         self.ring.get_owner(key)
     }
@@ -1113,6 +1139,9 @@ impl Message<ShutdownSwarm> for ClusterCoordinator {
         _msg: ShutdownSwarm,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        // Before the swarm goes: a peer ask still waiting when it stops panics in kameo.
+        self.peer_tasks.cancel();
+
         // `swarm_handle` is Some even in standalone, where it holds an inert handle for a
         // swarm that never started. `is_running()` is the predicate `Drop` already uses to
         // tell the two apart.
@@ -1316,7 +1345,7 @@ impl Message<PeerDiscovered> for ClusterCoordinator {
             let node_id = msg.node_id;
             let pool = self.remote_peer_pool.clone();
 
-            task::spawn(async move {
+            self.spawn_peer_task(async move {
                 if let Some(self_ref) = self_weak.upgrade() {
                     // Retry loop with exponential backoff for coordinator lookup
                     let mut remote_coord_opt = None;
@@ -2181,7 +2210,7 @@ impl Message<ExchangeShardsWithPeer> for ClusterCoordinator {
             node_id: self.cluster.local_node_id,
             node_name: self.cluster.local_node_name.clone(),
         };
-        task::spawn(async move {
+        self.spawn_peer_task(async move {
             // Clone shards for fallback in case the main exchange fails
             let fallback_shards = msg.shards.clone();
 
@@ -2283,7 +2312,7 @@ impl Message<SyncShardMaps> for ClusterCoordinator {
         for peer in peers {
             let pool = Arc::clone(&pool);
             let self_ref = self_ref.clone();
-            task::spawn(async move {
+            self.spawn_peer_task(async move {
                 let lookup =
                     tokio::time::timeout(SHARD_MAP_FETCH_TIMEOUT, pool.get_coordinator(peer));
                 let remote = match lookup.await {
