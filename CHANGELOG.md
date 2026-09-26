@@ -40,6 +40,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   own while the peer did the same; neither ask had a timeout. The coordinator now only answers
   who to reach, and both round trips run outside its mailbox. A standalone node was not affected.
 
+- **A fresh cluster no longer keeps a partial ring.** Started together, one node often held only
+  some of its peers' shards and never caught up (4 of 5 starts in the new cluster suite). A shard
+  merge skipped any push whose generation and checksum it had recorded for that peer before —
+  from the peer's DHT metadata, or from an earlier pull, which always carries `(0, 0)` — so only a
+  node's first pull from a peer ever merged; and the stable-phase exchange never pushed, because
+  its state query recorded the caller's state and then asked whether it had seen it. Merges are
+  no longer deduplicated (they are idempotent, and move the generation only when shards move),
+  the query answers by checksum, and every node pulls its peers' maps every 10 s.
+
+- **A node started before its seeds joins once they are up.** Seeds were dialed once, at startup;
+  a node whose dials were refused stayed alone for good. A node with no peers now redials its
+  seeds with backoff (1 s, doubling to 30 s), and a routing failure asks for a redial at once.
+
+- **A live peer is no longer marked lost when one of its connections closes.** Every node held
+  four or five connections to each peer, and the first to close — an idle one reaching the idle
+  timeout — marked the peer lost. A peer is now lost with its last connection, discovered with
+  its first, and a Kademlia routing update no longer dials a peer already connected or being
+  dialed: one connection per peer on first contact, down from four or five.
+
+- **A Docker image could contain crates from an older build.** The builder's `target` cache is
+  shared between builds and cargo judges freshness by mtime, which `COPY` preserves, so sources
+  older than the cached artifacts were not recompiled. The build now touches the workspace
+  sources first.
+
 - **A refused request no longer costs a log line, and single-write overload no longer halves
   goodput.** Every `503` was logged at `ERROR` — twice, by the trace layer and by the error
   handler — synchronously on the runtime the write path shares. A default node filters at

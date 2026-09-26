@@ -4,7 +4,7 @@
 use super::*;
 
 use anyhow::Result;
-use kameo::actor::RemoteActorRef;
+use kameo::actor::{ActorRef, RemoteActorRef};
 use kameo::message::{Context, Message};
 use kameo::{Actor, RemoteActor, remote_message};
 use serde_json::Value as JsonValue;
@@ -312,39 +312,6 @@ impl ClusterCoordinator {
         }
 
         hasher.finish()
-    }
-
-    /// Check if remote node needs our cluster state based on generation and checksum
-    fn remote_needs_update(
-        &self,
-        remote_generation: u64,
-        remote_checksum: u64,
-        node_id: Uuid,
-    ) -> bool {
-        let local_generation = self.generation;
-        let local_checksum = self.calculate_shard_checksum();
-
-        // Check if we've seen this exact state from this node before
-        if let Some((last_gen, last_checksum)) = self.last_seen_state.get(&node_id) {
-            // If this node is sending us the same state we've already recorded, skip
-            if *last_gen == remote_generation && *last_checksum == remote_checksum {
-                return false;
-            }
-        }
-
-        // If data is identical (same checksum) but generations differ, we need to sync generations
-        if local_checksum == remote_checksum {
-            // Data is the same, but we need to converge on the highest generation
-            return remote_generation > local_generation;
-        }
-
-        // Data differs - we need to exchange
-        true
-    }
-
-    /// Update the last seen state for a node
-    fn update_last_seen_state(&mut self, node_id: Uuid, generation: u64, checksum: u64) {
-        self.last_seen_state.insert(node_id, (generation, checksum));
     }
 
     /// Update local generation to match higher remote generation when data is identical
@@ -877,7 +844,7 @@ impl Message<GetShardAssignments> for ClusterCoordinator {
         _msg: GetShardAssignments,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        info!(
+        debug!(
             shard_count = self.shard_assignments.len(),
             "ClusterCoordinator: GetShardAssignments (local or remote)"
         );
@@ -1921,7 +1888,6 @@ impl Message<MergeRemoteShards> for ClusterCoordinator {
         // Check if data is identical - if so, just sync generations and skip merge
         if local_checksum == remote_checksum {
             self.sync_generation_if_needed(remote_generation, remote_checksum);
-            self.update_last_seen_state(node_id, remote_generation, remote_checksum);
             debug!(
                 remote_node = %node_id,
                 remote_generation,
@@ -1933,31 +1899,29 @@ impl Message<MergeRemoteShards> for ClusterCoordinator {
             return;
         }
 
-        // If we get here, data differs and we need to do the full merge
-        if !self.remote_needs_update(remote_generation, remote_checksum, node_id) {
-            debug!(
-                remote_node = %node_id,
-                remote_generation,
-                remote_checksum,
-                local_generation,
-                local_checksum,
-                "ClusterCoordinator: skipping redundant shard push"
-            );
-            return;
-        }
-
-        // Always update last seen state after checking needs_update
-        self.update_last_seen_state(node_id, remote_generation, remote_checksum);
-
-        info!(
+        // No "seen this state from this node before" skip. It keyed on the (generation,
+        // checksum) a push carried, and three handlers wrote that key with three meanings: a
+        // peer's DHT metadata, a state query, and a merge. A push whose pair matched the peer's
+        // DHT metadata was dropped as a repeat before its shards were ever merged, and every pull
+        // carries the placeholder pair (0, 0), so only a node's first pull from a peer merged —
+        // a ring that missed a peer in the formation burst stayed partial for good (OB20). The
+        // merge is idempotent and what it costs is decided below by what actually changed.
+        debug!(
             remote_node = %node_id,
             remote_generation,
             remote_checksum,
-            "ClusterCoordinator: processing needed shard push"
+            "ClusterCoordinator: processing shard push"
         );
 
         // Skip tracking if this is our own node (avoid double-counting in peer_nodes)
         let is_local_node = node_id == self.cluster.local_node_id;
+
+        // What the sender owns, not what it sent: a push carries the sender's whole map, other
+        // nodes' shards included.
+        let owned_by_sender = actual_shards
+            .values()
+            .filter(|meta| meta.node_id == node_id)
+            .count();
 
         if !is_local_node {
             // Ensure node is tracked in peer_nodes (may arrive before PeerDiscovered event)
@@ -1968,7 +1932,7 @@ impl Message<MergeRemoteShards> for ClusterCoordinator {
                     if !node_name.is_empty() {
                         peer.node_name = Some(node_name.clone());
                     }
-                    peer.shard_count = actual_shards.len();
+                    peer.shard_count = owned_by_sender;
                     peer.status = NodeStatus::Connected;
                 })
                 .or_insert_with(|| NodeInfo {
@@ -1980,7 +1944,7 @@ impl Message<MergeRemoteShards> for ClusterCoordinator {
                     },
                     address: String::new(), // Will be updated by PeerDiscovered
                     status: NodeStatus::Connected,
-                    shard_count: actual_shards.len(),
+                    shard_count: owned_by_sender,
                 });
 
             // Ensure node is tracked in expected_nodes (authoritative registry)
@@ -1990,7 +1954,7 @@ impl Message<MergeRemoteShards> for ClusterCoordinator {
                     if !node_name.is_empty() {
                         expected.node_name = Some(node_name.clone());
                     }
-                    expected.shard_count = actual_shards.len();
+                    expected.shard_count = owned_by_sender;
                     expected.status = NodeStatus::Connected;
                 })
                 .or_insert_with(|| NodeInfo {
@@ -2002,12 +1966,12 @@ impl Message<MergeRemoteShards> for ClusterCoordinator {
                     },
                     address: String::new(),
                     status: NodeStatus::Connected,
-                    shard_count: actual_shards.len(),
+                    shard_count: owned_by_sender,
                 });
         }
 
         let node_identity = self.format_node_identity(node_id);
-        info!(
+        debug!(
             node = %node_identity,
             shard_count = actual_shards.len(),
             "ClusterCoordinator: receiving remote shard push"
@@ -2098,11 +2062,20 @@ impl Message<MergeRemoteShards> for ClusterCoordinator {
             true
         });
 
+        // Only a change to where shards live moves the generation, the ring and the snapshot.
+        // Document counts and sizes differ between any two nodes under writes, so a merge that
+        // bumped the generation for them would do so on nearly every periodic sync.
         let mut merged_count = 0;
         for (shard_id, actual_meta) in actual_shards {
+            let routing_changed = self.shard_assignments.get(&shard_id).is_none_or(|known| {
+                known.node_id != actual_meta.node_id
+                    || known.vnode_tokens != actual_meta.vnode_tokens
+            });
             // Always use the node's reported state as source of truth
             self.shard_assignments.insert(shard_id, actual_meta);
-            merged_count += 1;
+            if routing_changed {
+                merged_count += 1;
+            }
 
             // Remove from expected if present (now confirmed)
             self.expected_shards.remove(&shard_id);
@@ -2139,16 +2112,15 @@ impl Message<QueryClusterState> for ClusterCoordinator {
     ) -> Self::Reply {
         let (local_generation, local_checksum) = self.get_cluster_state_info();
 
-        // Always update last seen state first
-        self.update_last_seen_state(msg.node_id, msg.generation, msg.shard_checksum);
-
         // Check if data is identical - if so, sync generations
         if local_checksum == msg.shard_checksum {
             self.sync_generation_if_needed(msg.generation, msg.shard_checksum);
         }
 
-        let needs_full_sync =
-            self.remote_needs_update(msg.generation, msg.shard_checksum, msg.node_id);
+        // The caller needs our map when it holds different data. This used to record the
+        // caller's state first and then ask whether that state had been seen before — which it
+        // always just had, so the answer was always "no" and the exchange never pushed (OB20).
+        let needs_full_sync = local_checksum != msg.shard_checksum;
 
         debug!(
             remote_node = %msg.node_id,
@@ -2259,6 +2231,105 @@ impl Message<ExchangeShardsWithPeer> for ClusterCoordinator {
     }
 }
 
+/// How often each node pulls its peers' shard maps.
+const SHARD_MAP_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+/// Bound on each step of one pull — the lookup and the ask — so a dead peer costs a task a
+/// few seconds, not forever: kameo remote asks carry no reply timeout of their own.
+const SHARD_MAP_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Start the periodic shard-map sync for a clustered node.
+///
+/// Shard maps otherwise move only when a node's own shards change, and a fresh cluster trades
+/// them in one burst of tens of milliseconds, so a map missed in that burst stayed missed (OB20).
+/// Each tick pulls every connected peer's map and merges it; a map that matches costs one ask per
+/// peer and changes nothing. Nodes are phase-shifted by their id, so three nodes started together
+/// do not pull from each other in the same instant. The task ends with the coordinator.
+pub fn spawn_shard_map_sync(coordinator: &ActorRef<ClusterCoordinator>, node_id: Uuid) {
+    let weak = coordinator.downgrade();
+    let phase = std::time::Duration::from_millis(u64::from(node_id.as_bytes()[0]) * 20);
+    task::spawn(async move {
+        let start = tokio::time::Instant::now() + SHARD_MAP_SYNC_INTERVAL + phase;
+        let mut ticks = tokio::time::interval_at(start, SHARD_MAP_SYNC_INTERVAL);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticks.tick().await;
+            let Some(coordinator) = weak.upgrade() else {
+                break;
+            };
+            if coordinator.tell(SyncShardMaps).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+impl Message<SyncShardMaps> for ClusterCoordinator {
+    type Reply = ();
+
+    /// Snapshots who to ask and fetches from a task per peer: the fetch waits on the peer's
+    /// coordinator, and awaiting it here would hold this mailbox while the peer runs the same
+    /// sync against it (the OB19 shape). What comes back arrives as `MergeRemoteShards`.
+    async fn handle(
+        &mut self,
+        _msg: SyncShardMaps,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let Some(pool) = self.remote_peer_pool.clone() else {
+            return;
+        };
+        let local_node_id = self.cluster.local_node_id;
+        let peers: Vec<Uuid> = self
+            .cluster
+            .peer_nodes
+            .iter()
+            .filter(|(id, info)| **id != local_node_id && info.status == NodeStatus::Connected)
+            .map(|(id, _)| *id)
+            .collect();
+        let self_ref = ctx.actor_ref().downgrade();
+        for peer in peers {
+            let pool = Arc::clone(&pool);
+            let self_ref = self_ref.clone();
+            task::spawn(async move {
+                let lookup =
+                    tokio::time::timeout(SHARD_MAP_FETCH_TIMEOUT, pool.get_coordinator(peer));
+                let remote = match lookup.await {
+                    Ok(Ok(Some(remote))) => remote,
+                    Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
+                        debug!(peer = %peer, "shard-map sync: peer coordinator not reachable");
+                        return;
+                    }
+                };
+                let fetch =
+                    tokio::time::timeout(SHARD_MAP_FETCH_TIMEOUT, remote.ask(&GetShardAssignments));
+                let shards = match fetch.await {
+                    Ok(Ok(shards)) => shards,
+                    Ok(Err(e)) => {
+                        debug!(peer = %peer, error = %e, "shard-map sync: fetch failed");
+                        return;
+                    }
+                    Err(_) => {
+                        debug!(peer = %peer, "shard-map sync: fetch timed out");
+                        return;
+                    }
+                };
+                if let Some(coordinator) = self_ref.upgrade() {
+                    let _ = coordinator
+                        .tell(MergeRemoteShards {
+                            node_id: peer,
+                            node_name: String::new(),
+                            shards,
+                            // A pull has no pair of its own to report; the merge no longer keys
+                            // on it, and (0, 0) never equals a real checksum.
+                            generation: 0,
+                            shard_checksum: 0,
+                        })
+                        .await;
+                }
+            });
+        }
+    }
+}
+
 /// What a shard exchange reads of this coordinator, taken before it leaves the actor.
 struct LocalShardExchange {
     pool: Option<Arc<RemotePeerPool>>,
@@ -2303,16 +2374,14 @@ impl Message<RequestBootstrapRedial> for ClusterCoordinator {
         msg: RequestBootstrapRedial,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // Stub for future resilience: when remote operations fail,
-        // this message can trigger re-dialing bootstrap peers.
-        warn!(
-            reason = %msg.reason,
-            "RequestBootstrapRedial: redial requested (stub - no action taken)"
-        );
-        // Future implementation:
-        // 1. Check if swarm is still running
-        // 2. Re-dial bootstrap peers via swarm handle
-        // 3. Update cluster state after successful connections
+        // The swarm decides: it redials only when the node has no peer at all, so a caller
+        // that hits a routing failure on a connected node costs one channel send.
+        debug!(reason = %msg.reason, "RequestBootstrapRedial: asking the swarm to check its seeds");
+        if let Some(handle) = self.cluster.swarm_handle()
+            && let Err(e) = handle.request_seed_redial()
+        {
+            warn!(reason = %msg.reason, error = %e, "RequestBootstrapRedial: swarm unavailable");
+        }
         Ok(())
     }
 }

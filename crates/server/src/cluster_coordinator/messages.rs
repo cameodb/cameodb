@@ -177,6 +177,11 @@ pub struct PeerShardDiscovered {
     pub shard: ShardMetadata,
 }
 
+/// Periodic tick: pull every connected peer's shard map and merge it (see
+/// `spawn_shard_map_sync`). Local only; never crosses the wire.
+#[derive(Debug, Clone)]
+pub struct SyncShardMaps;
+
 /// Message to merge remote shard assignments into local coordinator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MergeRemoteShards {
