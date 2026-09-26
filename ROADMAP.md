@@ -178,6 +178,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) | **A timed-out request never leaves the worker pool** — a `DashMap` self-deadlock in `should_commit_writer` parked every shard writer thread past a 30s TTL. Found by the first [M6](#m6--close-and-re-measure-the-bulk-lane) arm, fixed and pinned the same day | — | 2026-09-25 | ✅ |
 | [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput) | **Every refused request was an `ERROR` line** — synchronous on the write path's runtime, it halved single-write goodput under overload and failed health. Refusals are now counted into one periodic summary. Found by the M6 single-write arm, fixed the same day | — | 2026-09-25 | ✅ |
 | [OB16](#ob16--closing-an-index-from-another-thread-lost-the-writes-in-flight-on-it) … [OB19](#ob19--two-clustered-deadlocks-through-the-coordinators-mailbox) | **The pre-release concurrency audit** — eviction from another thread lost in-flight writes from search (464 of 600 in the test), schema edits and evolution overwrote each other, streaming search ran outside the concurrency limit, and two clustered mailbox deadlocks. All fixed and, where a test can force it, pinned | — | 2026-09-26 | ✅ |
+| [OB20](#ob20--a-fresh-cluster-can-keep-a-partial-ring-and-nothing-repairs-it) | **A fresh cluster can keep a partial ring** — 4 of 5 simultaneous starts left one node without a peer's shards (or alone), and nothing re-syncs: the stable-phase exchange never pushes, and seeds are dialed once. Found by the new `cluster` validation suite | — | 2026-09-26 | 📋 |
 | [F9](#f9--commit-on-a-clock-not-a-count) | **Commit on a clock, not a count** — bulk ingest 1.8–6.6×, a trickle searchable within 2 s, single writes unchanged | — | 2026-09-26 | ✅ |
 | [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
@@ -2972,6 +2973,42 @@ timeout by default. The coordinator now answers `GetDeleteTargets` from its own 
 task runs `delete_index_cluster`; the exchange snapshots what it reads and runs in a spawned task,
 its results arriving as `MergeRemoteShards` messages. Not pinned by a test: reproducing either
 needs a two-node cluster and an interleaving the suite cannot force.
+
+### OB20 — A fresh cluster can keep a partial ring, and nothing repairs it
+
+📋 **Found 2026-09-26** by the new cluster suite (`scripts/validate/cluster.sh`, opt-in: three
+nodes in Docker). Started together, **4 of 5** fresh clusters failed to converge within 60 s:
+three times one node held 8 of the 12 shards for the whole minute, all three nodes reporting
+`connected_nodes` 3; once node3 stayed connected to no one. Started seeds first, and after
+every restart of two nodes, the ring converged within a second.
+
+**Why the ring stays partial.** On a fresh start the shard maps change hands in one burst of
+about 50 ms. The node that ended at 8 fetched `GetShardAssignments` only from node1, five times
+(one per duplicate connection) and each time before node1 had merged node3; node3's pushes to it
+are fire-and-forget `tell`s and did not arrive. After that, shard maps move only when a node's
+*own* shards change (`RegisterLocalShards` triggers the stable-phase exchange), so a map missed in
+the burst is missed until the next local shard change. The exchange that should repair it cannot:
+`QueryClusterState` records the caller's state in `last_seen_state` and then asks
+`remote_needs_update`, whose first test is whether the caller's state equals `last_seen_state`, so
+`needs_full_sync` is always `false` and the exchange never pushes.
+
+**Why node3 stayed alone.** Seeds are dialed once at startup; a dial that finds the seed not yet
+listening is never retried (`RequestBootstrapRedial` is a stub).
+
+**Baseline**, `cameodb:validate` at `f2df2ab`, OrbStack on an M5 Pro, two runs:
+
+| | run 1 | run 2 |
+|---|---|---|
+| fresh start converged | 1 of 1 | 1 of 5 |
+| storm: new-index writes, cluster-wide | 47 ops, 0.75 ok/s, p50 10.1 s | 47 ops, 0.78 ok/s, p50 10.1 s |
+| storm: index deletes | 16, 13 × `503`, 1 timeout | 16, 13 × `503` |
+| every node answers after the storm, and 60 s later | yes | yes |
+| restart rounds converged / data intact | 3 of 3 / 30 of 30 | 3 of 3 / 30 of 30 |
+| node1: connections established; closed; peer-lost for 6 real restarts | 34; 26; 6 | 34; 26; 6 |
+
+The storm numbers are the schema-canvass stall — each new-index write waits on peers'
+orchestrator mailboxes — and are what the cluster Phase 3 work moves. The connection counts are
+the duplicate dials: two peers, and four or five connections to each on first contact.
 
 ### F9 — Commit on a clock, not a count
 
