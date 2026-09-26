@@ -86,6 +86,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   waiting when the swarm stopped, and kameo unwraps the reply channel the swarm drops. The
   coordinator's peer tasks are now cancelled before the swarm stops, and none start after.
 
+- **A peer that hangs is detected, and requests for it are answered at once.** A node that stops
+  answering without closing its connections — hung, paused, cut off — stayed "connected": health
+  stayed green, every write it owned waited 20 s before a `503`, every search waited 5 s for it,
+  and requests already delivered to it waited the full 60 s. Nodes now ping each connection
+  (`[network.cluster] ping_interval_secs`, `ping_timeout_secs`, 10 s each, or
+  `CAMEODB_CLUSTER_PING_INTERVAL_SECS` / `_TIMEOUT_SECS`; two misses in a row close it — 35 s
+  measured at the defaults, 25 s at 5 s / 5 s). A lost peer's writes are answered `503` at once, searches
+  count it as a failed node without waiting, bulk and forwarded shares for it fail at once, health
+  reports it, and the node keeps redialing it — including when other peers are still connected.
+  Its shards stay assigned. Those `503`s are logged at `DEBUG`, not one `ERROR` each.
+
 - **A refused request no longer costs a log line, and single-write overload no longer halves
   goodput.** Every `503` was logged at `ERROR` — twice, by the trace layer and by the error
   handler — synchronously on the runtime the write path shares. A default node filters at

@@ -168,6 +168,7 @@ write_compose() {
       - CAMEODB_SEED_NODES=node1:9580,node2:9580
       - CAMEODB_CLUSTER_NODES=node1:9580,node2:9580,node3:9580
       - CAMEODB_CLUSTER_PSK=$PSK
+$(for kv in ${CLUSTER_NODE_ENV:-}; do printf '      - %s\n' "$kv"; done)
     ports:
       - "127.0.0.1:${PORTS[$((n - 1))]}:9480"
     volumes:
@@ -246,6 +247,7 @@ check_cmd "every node writes and deletes right after the storm" probe probe 30
 sleep "$IDLE_SECS"
 check_cmd "every node writes and deletes after ${IDLE_SECS}s idle" probe probe 30
 check_cmd "the ring is still converged after the storm" probe converge 10
+check_cmd "no node was declared lost for answering pings late under the storm" probe pings-clean
 
 section "restart (node2 and node3 together, $ROUNDS rounds)"
 check_cmd "seed documents written" probe seed survivor "$SURVIVORS"
@@ -283,13 +285,14 @@ run_bounded 60 docker pause "$PROJECT-node3" > /dev/null || fail "docker paused 
 sleep "$FREEZE_SECS"
 run_bounded 60 docker unpause "$PROJECT-node3" > /dev/null || fail "docker resumed node3" "docker unpause failed"
 wait "$fault_pid"
-fault_rc=$?
 grep '^METRIC' "$WORK/fault.txt"
-if [ "$fault_rc" -eq 0 ]; then
-    pass "node1 kept answering health while node3 was frozen: $(tail -1 "$WORK/fault.txt")"
-else
-    fail "node1 kept answering health while node3 was frozen" "$(tail -1 "$WORK/fault.txt")"
-fi
+while IFS= read -r line; do
+    case "$line" in
+        "RESULT PASS "*) pass "${line#RESULT PASS }" ;;
+        "RESULT FAIL "*) fail "${line#RESULT FAIL }" ;;
+    esac
+done < <(grep '^RESULT' "$WORK/fault.txt")
+grep -q '^RESULT' "$WORK/fault.txt" || fail "the fault probe reported" "$(tail -3 "$WORK/fault.txt" | tr '\n' ' ')"
 check_cmd "node3 resumed: every node sees every node and the same ring" probe converge "$FORM_SECS"
 check_cmd "node3 resumed: every node writes and deletes" probe probe 30
 check_cmd "no committed document lost across the freeze" probe count survivor "$SURVIVORS"

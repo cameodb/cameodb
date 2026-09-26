@@ -27,6 +27,11 @@ pub struct AppError {
     /// rather than failing at it. Logged at `DEBUG` rather than `ERROR`: under overload it is
     /// the most frequent answer the node gives, and `ShedLog` summarises it (ROADMAP OB15).
     pub shed: bool,
+    /// The answer is "a peer this node already knows is lost": a request for its keys, refused
+    /// at once. Logged at `DEBUG` — the loss itself was reported once, as a `WARN` when the peer
+    /// was lost and in health's `connected_nodes` and `ping_failures`, and one `ERROR` per
+    /// request for it is the per-refusal logging OB15 measured costing half the goodput.
+    pub quiet: bool,
 }
 
 impl AppError {
@@ -37,6 +42,7 @@ impl AppError {
             status: Some(StatusCode::BAD_REQUEST),
             retry_after_secs: None,
             shed: false,
+            quiet: false,
         }
     }
 
@@ -51,6 +57,7 @@ impl AppError {
             status: Some(StatusCode::SERVICE_UNAVAILABLE),
             retry_after_secs: None,
             shed: false,
+            quiet: false,
         }
     }
 
@@ -61,6 +68,7 @@ impl AppError {
             status: Some(StatusCode::FORBIDDEN),
             retry_after_secs: None,
             shed: false,
+            quiet: false,
         }
     }
 
@@ -71,6 +79,7 @@ impl AppError {
             status: Some(StatusCode::NOT_FOUND),
             retry_after_secs: None,
             shed: false,
+            quiet: false,
         }
     }
 
@@ -91,6 +100,7 @@ impl AppError {
             status: Some(StatusCode::TOO_MANY_REQUESTS),
             retry_after_secs: Some(retry_after_secs),
             shed: false,
+            quiet: false,
         }
     }
 
@@ -119,6 +129,7 @@ impl AppError {
             err,
             OrchestratorError::Overloaded { .. } | OrchestratorError::ReadDeadlineExpired { .. }
         );
+        let quiet = matches!(err, OrchestratorError::PeerUnreachable { .. });
         let mut app = match err.verdict() {
             RemoteVerdict::NotFound => Self::not_found(err.to_string()),
             RemoteVerdict::BadRequest => Self::bad_request(err.to_string()),
@@ -138,6 +149,7 @@ impl AppError {
         };
         app.retry_after_secs = retry_after_secs;
         app.shed = shed;
+        app.quiet = quiet;
         app
     }
 }
@@ -160,6 +172,9 @@ impl IntoResponse for AppError {
         match status {
             _ if self.shed => {
                 tracing::debug!("API refused: {} -> {}", status, error_msg);
+            }
+            _ if self.quiet => {
+                tracing::debug!("API unavailable: {} -> {}", status, error_msg);
             }
             StatusCode::TOO_MANY_REQUESTS => {
                 tracing::debug!("API refused: {} -> {}", status, error_msg);
@@ -217,6 +232,7 @@ where
             status: None,
             retry_after_secs: None,
             shed: false,
+            quiet: false,
         }
     }
 }
@@ -264,6 +280,25 @@ mod tests {
         assert!(!unreachable.shed);
         assert_eq!(unreachable.status, Some(StatusCode::SERVICE_UNAVAILABLE));
         assert!(!AppError::service_unavailable("schema unavailable").shed);
+    }
+
+    /// A request for a lost peer's keys is refused at once and often — every write it owns, for
+    /// as long as it is gone — so it is logged quietly, not as an `ERROR` each. Load shedding is
+    /// not what happened, so it stays out of `ShedLog`'s summary; nothing else goes quiet.
+    #[test]
+    fn a_request_for_a_lost_peer_is_answered_quietly_and_is_not_shedding() {
+        let unreachable = AppError::from_route(OrchestratorError::PeerUnreachable {
+            message: "the node that owns this key is not reachable".to_string(),
+        });
+        assert!(unreachable.quiet);
+        assert!(!unreachable.shed);
+        assert_eq!(unreachable.status, Some(StatusCode::SERVICE_UNAVAILABLE));
+        let overloaded = AppError::from_route(OrchestratorError::Overloaded {
+            predicted_wait_ms: 900,
+            budget_ms: 1000,
+        });
+        assert!(!overloaded.quiet);
+        assert!(!AppError::service_unavailable("schema unavailable").quiet);
     }
 
     /// Every other 503 still advises the fixed second — only a refusal carrying the backlog

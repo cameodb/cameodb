@@ -678,6 +678,15 @@ impl RouterActor {
             Ok(RoutingDecision::Remote { node_id, peer_addr }) => {
                 self.handle_remote(op, node_id, peer_addr).await
             }
+            // No redial request: the peer's absence is already known, and reconnecting to it
+            // is the swarm's job. The answer is "not now", a `503` the caller can retry.
+            Ok(RoutingDecision::Unavailable { node_id }) => {
+                Err(OrchestratorError::PeerUnreachable {
+                    message: format!(
+                        "the node that owns this key ({node_id}) is not reachable; retry once it is back"
+                    ),
+                })
+            }
             Err(err) => {
                 let reason = format!("routing failed: {}", err);
                 let _ = self
@@ -901,7 +910,16 @@ impl RouterActor {
                     let remote_router = remote_router.clone();
                     let node_id = peer.node_id;
                     let peer_addr = peer.address;
+                    let connected = peer.connected;
                     async move {
+                        // A lost peer is still counted — as a node that did not answer, so the
+                        // response says it is incomplete — but not waited on for the timeout.
+                        if !connected {
+                            let lost = Err(OrchestratorError::PeerUnreachable {
+                                message: format!("node {node_id} is not reachable"),
+                            });
+                            return (dispatch_ordinal, node_id, Ok(lost));
+                        }
                         let outcome = timeout(
                             remote_timeout,
                             remote_router.try_remote(&op_clone, node_id, &peer_addr),

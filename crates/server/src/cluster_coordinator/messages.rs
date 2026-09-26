@@ -41,6 +41,13 @@ pub struct GetStatus;
 #[derive(Debug, Clone)]
 pub struct RoutingUpdated;
 
+/// A peer connection failed a liveness ping and the swarm closed it.
+#[derive(Debug, Clone)]
+pub struct PeerUnresponsive {
+    pub peer_id: String,
+    pub error: String,
+}
+
 /// Dial/connect failure event from swarm.
 #[derive(Debug, Clone)]
 pub struct DialFailed {
@@ -97,6 +104,10 @@ pub enum RoutingDecision {
     Remote { node_id: Uuid, peer_addr: String },
     /// Broadcast to all nodes (scatter-gather).
     Broadcast,
+    /// The owning node is known but lost — its last connection closed, or it stopped answering
+    /// liveness pings. Answered at once rather than asked and waited on; its shards stay
+    /// assigned to it, so nothing is routed elsewhere.
+    Unavailable { node_id: Uuid },
 }
 
 /// Message to determine routing for an operation based on routing key.
@@ -130,6 +141,14 @@ pub struct KnownPeer {
     pub node_id: Uuid,
     pub node_name: Option<String>,
     pub address: String,
+    /// `false` once the peer is lost. A search still counts it — as a node that did not answer
+    /// — but does not wait on it.
+    #[serde(default = "known_peer_connected")]
+    pub connected: bool,
+}
+
+fn known_peer_connected() -> bool {
+    true
 }
 
 /// Message when node metadata is discovered via DHT.

@@ -68,6 +68,8 @@ pub enum CoordinatorEvent {
         peer_id: Option<String>,
         error: String,
     },
+    /// A connection to this peer failed a liveness ping and was closed.
+    PeerUnresponsive { peer_id: String, error: String },
     PeerUuidDiscovered {
         peer_id: String,
         node_uuid: String,
@@ -437,7 +439,8 @@ async fn create_production_swarm(
         node_name,
         remote_message_size_bytes,
         remote_timeout_secs,
-    )?;
+    )?
+    .with_ping(ping_config(config));
 
     info!("🏗️  Created Kademlia DHT behaviour for peer discovery");
 
@@ -795,6 +798,7 @@ fn launch_swarm_runtime(
         let mut metrics = SwarmRuntimeMetrics::default();
         let mut peer_book = PeerBook::default();
         let mut redial = SeedRedial::new(seeds);
+        let mut lost = LostPeerRedial::default();
 
         loop {
             select! {
@@ -810,7 +814,11 @@ fn launch_swarm_runtime(
                 },
                 event = swarm.select_next_some() => {
                     metrics.total_events += 1;
+                    lost.observe(&event);
                     handle_swarm_event(event, &mut metrics, &event_tx, &mut swarm, &mut peer_book);
+                }
+                _ = tokio::time::sleep_until(lost.next_due()), if lost.has_peers() => {
+                    lost.redial_due(&mut swarm);
                 }
                 _ = tokio::time::sleep_until(redial.next_check), if redial.has_seeds() => {
                     redial.check(&mut swarm, &mut metrics);
@@ -905,6 +913,77 @@ impl SeedRedial {
         metrics.bootstrapped = false;
         self.next_check = now + self.backoff;
         self.backoff = (self.backoff * 2).min(SEED_REDIAL_MAX);
+    }
+}
+
+/// Redials peers this node has lost, until a connection to each is back.
+///
+/// The seed redial covers a node with no peers at all. A node that loses one peer and keeps
+/// another — the lost one frozen, or cut off from this node alone — has nothing that dials it
+/// again: seeds are not redialed while any peer is connected, and Kademlia raises no event for a
+/// peer it already knows. Dialed by peer id, so Kademlia supplies the addresses it holds, and
+/// only when not connected or dialing, so a dial left hanging on a frozen peer is not stacked on:
+/// it completes when the peer resumes.
+#[derive(Default)]
+struct LostPeerRedial {
+    peers: HashMap<PeerId, (Duration, tokio::time::Instant)>,
+}
+
+impl LostPeerRedial {
+    fn has_peers(&self) -> bool {
+        !self.peers.is_empty()
+    }
+
+    fn next_due(&self) -> tokio::time::Instant {
+        self.peers
+            .values()
+            .map(|(_, due)| *due)
+            .min()
+            .unwrap_or_else(|| tokio::time::Instant::now() + SEED_REDIAL_MAX)
+    }
+
+    /// Start tracking a peer whose last connection closed; stop once one is established.
+    fn observe(&mut self, event: &SwarmEvent<DhtBehaviourEvent>) {
+        match event {
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                num_established: 0,
+                ..
+            } => {
+                self.peers.insert(
+                    *peer_id,
+                    (
+                        SEED_REDIAL_FIRST,
+                        tokio::time::Instant::now() + SEED_REDIAL_FIRST,
+                    ),
+                );
+            }
+            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                self.peers.remove(peer_id);
+            }
+            _ => {}
+        }
+    }
+
+    fn redial_due(&mut self, swarm: &mut libp2p::Swarm<DhtBehaviour>) {
+        let now = tokio::time::Instant::now();
+        for (peer, (backoff, due)) in self.peers.iter_mut() {
+            if *due > now {
+                continue;
+            }
+            if swarm.is_connected(peer) {
+                continue;
+            }
+            let opts = DialOpts::peer_id(*peer)
+                .condition(PeerCondition::DisconnectedAndNotDialing)
+                .build();
+            match swarm.dial(opts) {
+                Ok(()) => debug!(%peer, next_in_secs = backoff.as_secs(), "📞 Redialing lost peer"),
+                Err(e) => debug!(%peer, error = %e, "📞 Lost-peer redial not started"),
+            }
+            *due = now + *backoff;
+            *backoff = (*backoff * 2).min(SEED_REDIAL_MAX);
+        }
     }
 }
 
@@ -1110,6 +1189,66 @@ fn handle_behaviour_event(
         }
         DhtBehaviourEvent::Identify(identify_event) => {
             handle_identify_event(identify_event, metrics, event_tx, swarm, peer_book);
+        }
+        DhtBehaviourEvent::Ping(ping_event) => {
+            handle_ping_event(ping_event, event_tx, swarm);
+        }
+    }
+}
+
+/// The ping settings for this node, or `None` when pinging is turned off.
+fn ping_config(config: &ClusterConfig) -> Option<libp2p::ping::Config> {
+    if config.ping_interval_secs == 0 {
+        info!("💓 Peer liveness pings disabled (ping_interval_secs = 0)");
+        return None;
+    }
+    let interval = Duration::from_secs(config.ping_interval_secs);
+    let timeout = Duration::from_secs(config.ping_timeout_secs.max(1));
+    info!(
+        interval_secs = interval.as_secs(),
+        timeout_secs = timeout.as_secs(),
+        "💓 Peer liveness pings enabled"
+    );
+    Some(
+        libp2p::ping::Config::new()
+            .with_interval(interval)
+            .with_timeout(timeout),
+    )
+}
+
+/// Close a connection whose peer stopped answering pings.
+///
+/// A peer that hangs, is paused, or is cut off without its TCP connection closing stays
+/// "connected" as far as the transport knows, and every request to it waits out its full
+/// timeout. libp2p reports the failed ping but no longer closes anything itself; closing here
+/// fails the requests in flight on that connection at once, and — when it was the peer's last
+/// connection — raises `PeerLost`, which marks the peer disconnected (its shards stay assigned).
+///
+/// `Unsupported` is a peer without the protocol — an older node in a rolling upgrade — not a
+/// dead one, and is left alone.
+fn handle_ping_event(
+    event: libp2p::ping::Event,
+    event_tx: &UnboundedSender<CoordinatorEvent>,
+    swarm: &mut libp2p::Swarm<DhtBehaviour>,
+) {
+    use libp2p::ping::Failure;
+    match event.result {
+        Ok(rtt) => debug!(peer = %event.peer, rtt_ms = rtt.as_millis(), "💓 ping"),
+        Err(Failure::Unsupported) => {
+            debug!(peer = %event.peer, "💓 peer does not support ping; not monitoring it")
+        }
+        Err(failure) => {
+            warn!(
+                peer = %event.peer,
+                connection = ?event.connection,
+                error = %failure,
+                "💔 Peer failed a liveness ping; closing the connection"
+            );
+            swarm.close_connection(event.connection);
+            let _ = event_tx.send(CoordinatorEvent::PeerUnresponsive {
+                peer_id: event.peer.to_string(),
+                error: failure.to_string(),
+            });
         }
     }
 }

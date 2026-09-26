@@ -524,9 +524,30 @@ pub struct ClusterConfig {
     #[serde(default)]
     pub psk_file: Option<PathBuf>,
 
+    /// Seconds between liveness pings on each peer connection. `0` turns pinging off.
+    ///
+    /// A peer that stops answering without closing its connections — hung, paused, cut off by
+    /// the network — otherwise stays "connected", and every request to it waits out its timeout.
+    #[serde(default = "default_ping_interval_secs")]
+    pub ping_interval_secs: u64,
+
+    /// Seconds a ping may go unanswered. Two misses in a row close the connection — libp2p lets
+    /// the first pass — and the peer counts as lost if it was its last one. Detection takes up
+    /// to `2 × interval + timeout + 10 s`, the last term libp2p's fixed stream-open timeout.
+    #[serde(default = "default_ping_timeout_secs")]
+    pub ping_timeout_secs: u64,
+
     /// Messaging configuration
     #[serde(default)]
     pub messaging: MessagingConfig,
+}
+
+fn default_ping_interval_secs() -> u64 {
+    10
+}
+
+fn default_ping_timeout_secs() -> u64 {
+    10
 }
 
 impl fmt::Debug for ClusterConfig {
@@ -542,6 +563,8 @@ impl fmt::Debug for ClusterConfig {
             .field("bootstrap_peers", &self.bootstrap_peers)
             .field("psk", &self.psk.as_ref().map(|_| "<redacted>"))
             .field("psk_file", &self.psk_file)
+            .field("ping_interval_secs", &self.ping_interval_secs)
+            .field("ping_timeout_secs", &self.ping_timeout_secs)
             .field("messaging", &self.messaging)
             .finish()
     }
@@ -1631,6 +1654,8 @@ impl Default for ClusterConfig {
             bootstrap_peers: Vec::new(),
             psk: None,
             psk_file: None,
+            ping_interval_secs: default_ping_interval_secs(),
+            ping_timeout_secs: default_ping_timeout_secs(),
             messaging: MessagingConfig::default(),
         }
     }

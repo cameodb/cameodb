@@ -87,6 +87,8 @@ pub struct HealthResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dial_failures: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub ping_failures: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bootstrap_successes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routing_updates: Option<u64>,
@@ -306,6 +308,7 @@ pub(super) async fn health_handler(
         mailbox_predicted_wait_ms,
         mailbox_service_p90_ms: state.router.mailbox_service_p90_ms(),
         dial_failures: cluster_status.as_ref().map(|s| s.dial_failures),
+        ping_failures: cluster_status.as_ref().map(|s| s.ping_failures),
         bootstrap_successes: cluster_status.as_ref().map(|s| s.bootstrap_successes),
         routing_updates: cluster_status.as_ref().map(|s| s.routing_updates),
         degraded: (!degraded.is_empty())
