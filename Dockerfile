@@ -3,10 +3,15 @@
 ################################################################################
 # STAGE 1: Builder
 ################################################################################
-ARG RUST_VERSION=1.95
+# The exact release, not a channel: the fallback below downloads rust-std by version, and
+# `rustup default` then names the toolchain the image already carries rather than fetching one.
+ARG RUST_VERSION=1.98.1
 ARG TARGET_ABI=musl
 FROM rust:${RUST_VERSION}-slim AS builder
 
+# Re-declared: an ARG before FROM is not visible inside the stage, so `rustup default` and the
+# rust-std fallback below saw it empty.
+ARG RUST_VERSION
 ARG TARGET_ABI
 ARG TARGETARCH
 
@@ -113,7 +118,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     rustup target add "${TARGET_TRIPLE}" || \
     rustup component add rust-std --target "${TARGET_TRIPLE}" || ( \
         echo "rustup failed, trying manual download..."; \
-        RUST_STD_URL="https://static.rust-lang.org/dist/1.95.0/rust-std-1.95.0-${TARGET_TRIPLE}.tar.xz"; \
+        RUST_STD_URL="https://static.rust-lang.org/dist/rust-std-${RUST_VERSION}-${TARGET_TRIPLE}.tar.xz"; \
         curl -k -L -o /tmp/rust-std.tar.xz "${RUST_STD_URL}" && \
         mkdir -p /tmp/rust-std && \
         tar -xJf /tmp/rust-std.tar.xz -C /tmp/rust-std --strip-components=1 && \
