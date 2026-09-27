@@ -181,6 +181,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [OB20](#ob20--a-fresh-cluster-can-keep-a-partial-ring-and-nothing-repairs-it) | **A fresh cluster can keep a partial ring** — 4 of 5 simultaneous starts left one node without a peer's shards (or alone), and nothing re-synced. Fixed with one connection per peer, a seed redial, and a 10 s shard-map pull; 5 of 5 now converge. Found by the new `cluster` validation suite | — | 2026-09-26 | ✅ |
 | [OB21](#ob21--a-peer-that-stops-answering-detected-refused-at-once-and-bounded-while-it-lasts) | **A peer that stops answering** — orchestrator forwards now share one deadline, stale peer references go on the first failure, and topology can no longer drop the newest ring. Also fixed: a kameo panic at shutdown (5.5), and a frozen peer is detected by ping within ~40 s, after which requests for it are answered at once (5.4) | — | 2026-09-26 | ✅ |
 | [OB22](#ob22--an-orchestrator-waited-on-peers-while-holding-its-mailbox) | **An orchestrator waited on peers while holding its mailbox** — schema canvasses and forwards ran inside it, so two nodes doing either at once waited on each other until a 5 s or 60 s timeout: bulk writes through every node all timed out, and new indexes created through every node ran at 0.1/s, most refused. Fixed; now 510 batches/s and 134 new indexes/s, none failed; several nodes minting one index at once settle it by node id, where 88 of 120 such writes were refused. Found by the cluster suite's new cross-node phase | — | 2026-09-26 | ✅ |
+| [OB23](#ob23--recreating-an-index-after-dropping-its-schema-lost-most-of-what-was-written) | **Recreating an index after dropping its schema lost most of what was written** — the drop's record read as a schema, the node re-minted the index from every batch, and a retyped column killed the Tantivy writer, which stayed dead until restart. 1,030 of 16,559 documents landed; now all do, a dying writer is retired and replayed, and the loader counts every failure by its file line | — | 2026-09-27 | ✅ |
 | [F9](#f9--commit-on-a-clock-not-a-count) | **Commit on a clock, not a count** — bulk ingest 1.8–6.6×, a trickle searchable within 2 s, single writes unchanged | — | 2026-09-26 | ✅ |
 | [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
@@ -3194,6 +3195,55 @@ and schema edits. It now passes `handle_client_op`, as the non-streaming path do
 **A single node pays nothing for any of it.** A standalone A/B against the commit before this
 entry, closed- and open-loop, found every arm inside run-to-run spread — see
 [M6](#m6--close-and-re-measure-the-bulk-lane), session 4.
+
+### OB23 — Recreating an index after dropping its schema lost most of what was written
+
+✅ **Found and fixed 2026-09-27**, loading `examples/data/booksummaries.tsv` after
+`delete books --delete-schema` on a running node: `loaded=1030 failed=500` for 16,559 documents,
+reasons that contradicted each other (`title` "expected I64" in one batch, `publication_date` in
+another), and `An index writer was killed` on every batch to one shard. Reproduced on a fresh node
+with the current build; a plain load, and an upgrade from 0.3.3 or 0.3.4, were never affected.
+
+**Four defects, one chain.**
+
+1. **The drop's record read as a schema.** `delete_schema` keeps a row versioned above the dropped
+   schema so a write in flight cannot reinstall it. `GET /_config` returned it (no fields), so the
+   loader saw a schema, applied none of the types the file's header declares, and the node typed
+   every field from its documents.
+2. **The minted schema was never cached** — the root cause. A write cached its schema only if it
+   evolved or nothing was cached. A mint's sampling adds the fields itself, so nothing evolved, and
+   the record stayed cached: every later batch read "no schema" and minted again from its own
+   sample — 42 mints in one load — each overwriting the stored types while each shard's Tantivy
+   index kept the first mint's.
+3. **The writer added values by the stored type, not the built column.** When the two disagreed an
+   integer reached a date column, Tantivy's indexing thread died (`Expected a Date for field
+   "publication_date"`), and the dead writer stayed cached: every later write refused, every commit
+   failed, nothing buffered since the last commit committed — until restart.
+4. **The loader under-reported.** It counted the hundred reasons the node lists and ignored
+   `suppressed_errors`, and each batch's line numbers restarted at 1.
+
+**Fixed, in the same order.** A dropped index reads as absent everywhere a schema is reported —
+`404` from `GET /_config`, "no schema" to a peer's canvass on either end, so an older peer still
+sending the record is judged too — and the index minted over it is versioned above the record.
+A write caches whatever schema validation settled on (`SchemaCache::keep_settled`: the handle is
+no longer the cached `Arc`), so an index is minted once. Values are added by the built column
+(`writable_type`) on the write, batch and replay paths, and saving a schema that retypes a built
+column logs a warning — refusing it would break the designed edit-then-rebuild flow. A writer that
+dies anyway is retired: the next use reopens the index and replays from the checkpoint, and a
+write that met it is answered as written, since it was durable in redb first. The loader counts
+listed plus suppressed, names each reason by its file line (or JSON document number), and treats a
+schema with no fields as none.
+
+| `booksummaries.tsv`, load → `delete --delete-schema` → load | before | after |
+|---|---|---|
+| second load | 1,030 written, "500" failed | **16,559 written, 0 failed** |
+| mints in the second load | 42 | 0 (the loader declares the header's types) |
+| writes without a declared schema after the drop, then commit | writer dead, **0 of 60 searchable** | 60 of 60 |
+| a declared type that refuses 4,150 rows | `failed=` the listed 100 per batch | `loaded=12409 failed=4150`, lines as in the file |
+
+Each test fails against the code it pins: `a_dropped_index_is_minted_once_by_the_writes_that_recreate_it`
+(0 of 60 searchable on the old caching rule), `a_value_is_added_by_the_column_the_index_built`,
+and the two dead-writer tests, which fail with retirement disabled.
 
 ### F9 — Commit on a clock, not a count
 

@@ -1260,11 +1260,18 @@ impl HybridStore {
                             if let Some(tantivy_field) = indexed_fields.get(field_name)
                                 && let Some(field_value) = json_obj.get(field_name)
                             {
+                                // By the column, as the write path adds: replaying a value
+                                // under a declaration its column cannot take kills this writer
+                                // exactly as it killed the one being recovered from.
+                                let built = schema
+                                    .get_field_entry(*tantivy_field)
+                                    .field_type()
+                                    .value_type();
                                 add_json_value_to_doc(
                                     &mut tantivy_doc,
                                     *tantivy_field,
                                     field_name,
-                                    &field_def.field_type,
+                                    &writable_type(&field_def.field_type, built),
                                     field_value,
                                     BadValue::SkipAndWarn,
                                 )?;
@@ -1443,10 +1450,12 @@ impl HybridStore {
         }
 
         let schema = schema_builder.build();
+        let built_types = SchemaFields::built_types_of(&schema, &indexed_fields);
         let fields = SchemaFields {
             id: id_field,
             seq: None,
             indexed_fields,
+            built_types,
         };
 
         (schema, fields)
@@ -1476,10 +1485,12 @@ impl HybridStore {
             indexed_fields.insert(name.to_string(), field);
         }
 
+        let built_types = SchemaFields::built_types_of(&schema, &indexed_fields);
         Ok(SchemaFields {
             id,
             seq,
             indexed_fields,
+            built_types,
         })
     }
 
@@ -2138,7 +2149,17 @@ impl HybridStore {
 
         let committed_seq = {
             let mut writer = lock_writer(&writer_arc, index);
-            self.commit_locked_writer(index, &mut writer)?
+            match self.commit_locked_writer(index, &mut writer) {
+                Ok(seq) => seq,
+                Err(e) => {
+                    // A failed commit leaves a writer Tantivy does not promise is usable, and
+                    // one whose indexing thread died fails every commit from here on. The
+                    // checkpoint has not moved, so the next open replays what it held.
+                    drop(writer);
+                    self.retire_dead_writer(index, &writer_arc, &e);
+                    return Err(e);
+                }
+            }
         };
 
         // All post-commit operations happen WITHOUT holding the writer lock
@@ -2383,6 +2404,39 @@ impl HybridStore {
         live.then_some(guard)
     }
 
+    /// Drop a writer whose indexing threads have died, so the next use of the index reopens it.
+    ///
+    /// Tantivy's indexing thread fails — a value of the wrong kind for its column, an I/O error
+    /// — by exiting, and from then on every `add_document` on that writer answers "An index
+    /// writer was killed" and every commit fails. Kept cached, the writer made the index
+    /// unwritable on this shard until the process restarted, and nothing it had buffered since
+    /// its last commit was ever committed.
+    ///
+    /// Retiring it loses nothing. Every document the dead writer held is durable in redb with a
+    /// WAL entry, the checkpoint has not moved past it, and opening the index replays from the
+    /// checkpoint (`recover_index`) — so the next open rebuilds exactly what died with it.
+    /// Removed only while it is still the writer held for `index`, so a writer another thread
+    /// has already reopened is never the one dropped.
+    fn retire_dead_writer(
+        &self,
+        index: &str,
+        writer_arc: &Arc<Mutex<IndexWriter>>,
+        cause: &dyn std::fmt::Display,
+    ) {
+        let retired = self
+            .writers
+            .remove_if(index, |_, held| Arc::ptr_eq(held, writer_arc))
+            .is_some();
+        if retired {
+            tracing::error!(
+                index = %index,
+                error = %cause,
+                "Tantivy writer died; retired it, and the index reopens on its next use, \
+                 replaying everything since its last commit"
+            );
+        }
+    }
+
     /// This index's schema lock, which every read-modify-write of its schema row holds from
     /// the read to the cache update.
     ///
@@ -2538,7 +2592,7 @@ impl HybridStore {
                             &mut tantivy_doc,
                             *tantivy_field,
                             field_name,
-                            &field_def.field_type,
+                            &fields.write_type(field_name, &field_def.field_type),
                             field_value,
                             BadValue::Refuse,
                         )?;
@@ -2629,7 +2683,16 @@ impl HybridStore {
                     let term = tantivy::Term::from_field_text(fields.id, &id);
                     writer.delete_term(term);
                 }
-                writer.add_document(tantivy_doc)?;
+                if let Err(died) = writer.add_document(tantivy_doc) {
+                    // The document is durable above, so it is written: reopening the index
+                    // replays it along with everything else the dead writer held.
+                    drop(writer);
+                    self.retire_dead_writer(index, &writer_arc, &died);
+                    drop(writer_arc);
+                    self.get_or_create_index(index)?;
+                    self.invalidate_size_cache(index);
+                    return Ok(seq_id);
+                }
 
                 // Counted before the writer is released, so a commit never sees the document
                 // without the count that makes it commit it.
@@ -2941,6 +3004,30 @@ impl HybridStore {
     ) -> Result<(), StoreError> {
         let schema_lock = self.lock_schema(index);
         let _schema_guard = schema_lock.lock().unwrap_or_else(|p| p.into_inner());
+
+        // A declaration that retypes a column the index has already built is legitimate while
+        // its rebuild is pending, and a defect otherwise — a schema re-minted from a later batch
+        // did exactly this. Either way the writer adds by the built column (`writable_type`), so
+        // it is not fatal; it is said once here rather than discovered as missing documents.
+        if let Some(fields) = self.fields_cache.get(index) {
+            let mut retyped: Vec<String> = schema
+                .fields
+                .iter()
+                .filter(|(name, def)| {
+                    def.indexed && fields.write_type(name, &def.field_type) != def.field_type
+                })
+                .map(|(name, def)| format!("{name} ({} declared)", def.field_type.to_string()))
+                .collect();
+            if !retyped.is_empty() {
+                retyped.sort();
+                tracing::warn!(
+                    index = %index,
+                    fields = %retyped.join(", "),
+                    "A stored schema retypes columns this index has already built; values are \
+                     added by the built columns until the index is rebuilt"
+                );
+            }
+        }
 
         // Persist to redb first
         self.store_schema(index, schema)?;
@@ -3472,7 +3559,7 @@ impl HybridStore {
                                 &mut tantivy_doc,
                                 *tantivy_field,
                                 field_name,
-                                &field_def.field_type,
+                                &fields.write_type(field_name, &field_def.field_type),
                                 field_value,
                                 BadValue::Refuse,
                             )?;
@@ -3640,12 +3727,26 @@ impl HybridStore {
         let mut new_documents_count = 0usize;
         let mut replaced_documents = 0usize;
         {
+            let mut died = None;
             for FinalEntry {
                 id,
                 existed_before,
                 op,
             } in final_ops
             {
+                if let FinalOp::Add(_) = &op {
+                    if existed_before {
+                        replaced_documents += 1;
+                    } else {
+                        new_documents_count += 1;
+                    }
+                }
+                // Past a dead writer the rest are counted and not added: the reopen below
+                // replays them from redb, where the transaction above already put them.
+                if died.is_some() {
+                    continue;
+                }
+
                 // A version to remove: one this batch is replacing, or one it is deleting. A
                 // delete always issues the term even where redb held no row, which is what keeps
                 // the batch a repair for an index holding a document the store does not.
@@ -3654,14 +3755,22 @@ impl HybridStore {
                     writer.delete_term(term);
                 }
 
-                if let FinalOp::Add(tantivy_doc) = op {
-                    writer.add_document(tantivy_doc)?;
-                    if existed_before {
-                        replaced_documents += 1;
-                    } else {
-                        new_documents_count += 1;
-                    }
+                if let FinalOp::Add(tantivy_doc) = op
+                    && let Err(e) = writer.add_document(tantivy_doc)
+                {
+                    died = Some(e);
                 }
+            }
+
+            if let Some(died) = died {
+                // The batch is durable in redb, so it is written: reopening the index replays
+                // it along with everything else the dead writer held since its last commit.
+                drop(writer);
+                self.retire_dead_writer(index, &writer_arc, &died);
+                drop(writer_arc);
+                self.get_or_create_index(index)?;
+                self.invalidate_size_cache(index);
+                return Ok((seq_ids, new_documents_count));
             }
 
             // Increment operations counter by batch size for threshold tracking.

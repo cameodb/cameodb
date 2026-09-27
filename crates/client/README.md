@@ -87,6 +87,39 @@ cameodb client data load myindex https://external.com/data.csv --insecure-source
 - `schema load <index> <file> [--delimiter ...]` – detect schema from CSV, TSV, JSON, JSONL, or NDJSON and apply it to an index. Supports local files and HTTP(S) URLs. Automatically decompresses Gzip (.gz/.gzip) and Zip archives.
 - `data load <index> <file> [--delimiter ...] [--batch-size N]` – ingest CSV, TSV, JSON, JSONL, or NDJSON data in batches. Supports local files and HTTP(S) URLs. Automatically decompresses Gzip (.gz/.gzip) and Zip archives. Default batch size is 4000 documents.
 
+### How CSV/TSV cells are read
+
+A delimited file has no types, so each cell is read by the type of the field it lands in — the
+index's schema when it has one, or the schema detected from the first 200 rows when it does not.
+Nothing is sent until those rows have settled how every column is read.
+
+| Field type | Cell handling |
+|---|---|
+| `text`, `string` | Sent as written (trimmed): `007` stays `007`, `NA` stays `NA` |
+| `i64`, `u64`, `f64`, `date`, `boolean`, `ip` | `NA`, `N/A`, `#N/A`, `NaN`, `null`, `None`, `nil` and `-` (any case) mean *no value*: the row loads without that field |
+| `date` | Sent as text whenever the text is a date, so `20240315` and `2024` are dates, not seconds since 1970; a number the node does not read as a date string (seconds before 2000, or negative) is sent as epoch seconds. The accepted shapes are listed in the [date handling reference](../server/README.md#71-write-path-date-normalization) |
+| `boolean` | `true`/`false`, `yes`/`no`, `y`/`n`, `1`/`0`, in any case |
+| a column no field describes | Read by its look: numbers, booleans, else text |
+
+**Date order.** The node reads a slash date month first (`03/04/2024` is March 4th) and a dotted
+date day first (`03.04.2024` is April 3rd). The loader decides per date column, and per separator,
+from its sample: a column holding a value only the other order can read and none only the node's
+order can is written the other way round, and its dates are sent as ISO, with a line saying which
+column was read that way.
+
+| Column's sample holds | Read as | Sent as |
+|---|---|---|
+| `15/03/2024` and no `03/15/2024`-style value | slashes day first | `03/04/2024` → `2024-04-03`, `15/03/2024 16:13` → `2024-03-15 16:13` |
+| `03.15.2024` and no `15.03.2024`-style value | dots month first | `03.04.2024` → `2024-03-04` |
+| no such value, or both kinds | the node's order | as written |
+
+When a column keeps the node's order, a date only the other order can read is refused with its
+line. The same decision types the column when `schema detect` or `schema load` samples the file,
+so a day-first slash column is detected as a `date`.
+
+**Refusals** are reported with the file line the row starts on — right for LF and CRLF files,
+quoted fields spanning lines, and blank lines — and counted in the closing `loaded=… failed=…`.
+
 ### 🗜️ Compression & Remote Sources
 
 The CLI client features robust support for compressed data and remote HTTP(S) sources:

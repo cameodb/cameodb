@@ -236,3 +236,105 @@ async fn the_name_is_usable_again_after_the_race() {
         serde_json::to_string_pretty(&config).unwrap_or_default()
     );
 }
+
+/// After an index is dropped with its schema, the next write mints it once — not once per write.
+///
+/// The drop leaves a record in place of the schema, so a write still carrying the old one cannot
+/// reinstall it. A write that then mints the index by sampling its documents added the fields
+/// itself, so nothing "evolved", and the node went on caching the record: every later batch read
+/// "no schema" and minted again from its own documents. Each mint overwrote the stored types
+/// while the Tantivy index kept the first one's, until a value the built column could not hold
+/// reached the writer and killed it — loading `booksummaries.tsv` after `delete --delete-schema`
+/// lost 15,000 of 16,559 documents that way.
+///
+/// So `when`, which the first batch types as a date, must stay a date when a second batch whose
+/// sample would type it as an integer arrives. Measured on the old rule: the re-mint typed it
+/// `I64`, every shard's writer died on `Expected a Date for field "when"`, the next batches were
+/// refused, and the commit failed — no document written after the drop was searchable.
+#[tokio::test]
+async fn a_dropped_index_is_minted_once_by_the_writes_that_recreate_it() {
+    let node = TestNode::start().await;
+    let client = node.client();
+    let batch = |prefix: &str, when: serde_json::Value| -> Vec<serde_json::Value> {
+        (0..20)
+            .map(|i| {
+                json!({"id": format!("{prefix}-{i}"),
+                       "doc": {"title": format!("{prefix} title {i}"), "when": when}})
+            })
+            .collect()
+    };
+
+    client
+        .bulk_index("remade", &batch("old", json!("2019-03-04")))
+        .await
+        .expect("seed the index that will be dropped");
+    let dropped_at = client
+        .get_index_config("remade")
+        .await
+        .expect("config before the drop")
+        .version;
+    client
+        .delete_index("remade", true)
+        .await
+        .expect("drop the index and its schema");
+    assert!(
+        client.get_index_config("remade").await.is_err(),
+        "a dropped index has no schema to report; answering with the drop's record told a loader \
+         the index already had one"
+    );
+
+    let batches = [
+        ("first", json!("2020-01-05")),
+        // Epoch seconds: a date field holds them, and a sample of this batch alone reads `I64`.
+        ("second", json!(1_600_000_000)),
+        ("third", json!("2021-06-07")),
+    ];
+    for (name, when) in batches {
+        let answer = client
+            .bulk_index("remade", &batch(name, when))
+            .await
+            .expect("bulk write");
+        assert_eq!(
+            answer["items_written"],
+            json!(20),
+            "the {name} batch should land whole; a writer killed by a re-mint refuses it: {answer}"
+        );
+    }
+
+    let config = client
+        .get_index_config("remade")
+        .await
+        .expect("config after the writes");
+    let when_type = config
+        .fields
+        .iter()
+        .find(|f| f["name"] == "when")
+        .map(|f| f["type"].clone());
+    assert_eq!(
+        when_type,
+        Some(json!("date")),
+        "the first mint typed `when`, and no later batch may retype it"
+    );
+    // The drop's record sits one above the dropped schema; the index minted over it sits above
+    // the record, so neither the record nor a write still carrying the dropped schema can be
+    // installed over it.
+    assert!(
+        config.version > dropped_at + 1,
+        "the recreated index is versioned above the drop's record ({} after {dropped_at})",
+        config.version
+    );
+
+    client
+        .admin_index_commit("remade")
+        .await
+        .expect("the commit succeeds: no writer died on a value its column cannot hold");
+    let hits = client
+        .search("remade", "title:title", Some(100), None, None, None)
+        .await
+        .expect("content search");
+    assert_eq!(
+        hits["total_hits"],
+        json!(60),
+        "every document written after the drop is searchable: {hits}"
+    );
+}

@@ -356,7 +356,7 @@ impl CameoClient {
             anyhow::bail!(
                 "Health check failed: {} - {}{}",
                 status,
-                text,
+                refusal_text(&text),
                 self.refusal_hint(status)
             );
         }
@@ -421,7 +421,7 @@ impl CameoClient {
                 format!(
                     "Search failed: {} - {}{}",
                     status,
-                    text,
+                    refusal_text(&text),
                     self.refusal_hint(status)
                 ),
             )
@@ -461,7 +461,7 @@ impl CameoClient {
             anyhow::bail!(
                 "Failed to set index config: {} - {}{}",
                 status,
-                text,
+                refusal_text(&text),
                 self.refusal_hint(status)
             );
         }
@@ -484,7 +484,7 @@ impl CameoClient {
             anyhow::bail!(
                 "Delete index failed: {} - {}{}",
                 status,
-                text,
+                refusal_text(&text),
                 self.refusal_hint(status)
             );
         }
@@ -530,7 +530,7 @@ impl CameoClient {
                 format!(
                     "Write failed: {} - {}{}",
                     status,
-                    text,
+                    refusal_text(&text),
                     self.refusal_hint(status)
                 ),
             )
@@ -572,7 +572,7 @@ impl CameoClient {
             anyhow::bail!(
                 "Delete document failed: {} - {}{}",
                 status,
-                text,
+                refusal_text(&text),
                 self.refusal_hint(status)
             );
         }
@@ -603,7 +603,7 @@ impl CameoClient {
             anyhow::bail!(
                 "Bulk delete failed: {} - {}{}",
                 status,
-                text,
+                refusal_text(&text),
                 self.refusal_hint(status)
             );
         }
@@ -627,7 +627,7 @@ impl CameoClient {
                 format!(
                     "Bulk ingest failed: {} - {}{}",
                     status,
-                    text,
+                    refusal_text(&text),
                     self.refusal_hint(status)
                 ),
             )
@@ -656,7 +656,7 @@ impl CameoClient {
             anyhow::bail!(
                 "Streaming ingest failed: {} - {}{}",
                 status,
-                text,
+                refusal_text(&text),
                 self.refusal_hint(status)
             );
         }
@@ -685,7 +685,7 @@ impl CameoClient {
             anyhow::bail!(
                 "Admin memory stats failed: {} - {}{}",
                 status,
-                text,
+                refusal_text(&text),
                 self.refusal_hint(status)
             );
         }
@@ -706,7 +706,7 @@ impl CameoClient {
             anyhow::bail!(
                 "Admin memory purge failed: {} - {}{}",
                 status,
-                text,
+                refusal_text(&text),
                 self.refusal_hint(status)
             );
         }
@@ -726,7 +726,7 @@ impl CameoClient {
             anyhow::bail!(
                 "Admin index commit failed: {} - {}{}",
                 status,
-                text,
+                refusal_text(&text),
                 self.refusal_hint(status)
             );
         }
@@ -750,7 +750,7 @@ impl CameoClient {
             anyhow::bail!(
                 "Admin index evict-writer failed: {} - {}{}",
                 status,
-                text,
+                refusal_text(&text),
                 self.refusal_hint(status)
             );
         }
@@ -768,7 +768,7 @@ impl CameoClient {
             anyhow::bail!(
                 "Admin workers stats failed: {} - {}{}",
                 status,
-                text,
+                refusal_text(&text),
                 self.refusal_hint(status)
             );
         }
@@ -850,6 +850,35 @@ pub struct IndexConfigResponse {
     pub field_count: usize,
     #[serde(default)]
     pub fields: Vec<JsonValue>,
+    /// Raised by every change to the schema, and above a dropped index's when the name is
+    /// reused. Defaulted, so an older node that does not send it still parses.
+    #[serde(default)]
+    pub version: u64,
+}
+
+/// The readable part of a refusal body.
+///
+/// A node answers a refusal `{"error": ..., "details": ...}`, and for a client error the two carry
+/// the same text — so printed raw, every refusal said everything twice. A body that is only those
+/// two fields is shown as its message, once, with `details` added only when it says something
+/// `error` does not. Anything else — a body carrying counts, such as a stream stopped part way, or
+/// text that is not JSON — is shown whole, so nothing a caller could act on is dropped.
+pub(crate) fn refusal_text(body: &str) -> String {
+    let Ok(JsonValue::Object(fields)) = serde_json::from_str::<JsonValue>(body) else {
+        return body.to_string();
+    };
+    if fields.keys().any(|key| key != "error" && key != "details") {
+        return body.to_string();
+    }
+    let error = fields.get("error").and_then(JsonValue::as_str);
+    let details = fields.get("details").and_then(JsonValue::as_str);
+    match (error, details) {
+        (Some(error), Some(details)) if !details.is_empty() && details != error => {
+            format!("{error} ({details})")
+        }
+        (Some(message), _) | (None, Some(message)) => message.to_string(),
+        (None, None) => body.to_string(),
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1327,7 +1356,7 @@ mod key_id_digest_tests {
 
 #[cfg(test)]
 mod http_failure_tests {
-    use super::{HttpFailure, failure_status};
+    use super::{HttpFailure, failure_status, refusal_text};
 
     /// The whole point of the type is that it changes nothing a reader sees. `Display` is the
     /// message the call site wrote, and because the status rides *in* the error rather than as
@@ -1366,5 +1395,36 @@ mod http_failure_tests {
     fn a_transport_failure_has_no_status() {
         let err = anyhow::anyhow!("connection refused");
         assert_eq!(failure_status(&err), None);
+    }
+
+    /// A refusal is shown once, not as its message twice.
+    ///
+    /// The node answers a client error with the same text under `error` and `details`, and the
+    /// raw body made `search ... sort publication_date:desc` print "cannot sort by
+    /// 'publication_date' …" twice in one line.
+    #[test]
+    fn a_refusal_says_its_message_once() {
+        let same = r#"{"error":"cannot sort by 'when'","details":"cannot sort by 'when'"}"#;
+        assert_eq!(refusal_text(same), "cannot sort by 'when'");
+
+        let different = r#"{"error":"Invalid request","details":"limit must be positive"}"#;
+        assert_eq!(
+            refusal_text(different),
+            "Invalid request (limit must be positive)"
+        );
+
+        // A masked server error carries no details.
+        assert_eq!(
+            refusal_text(r#"{"error":"Internal server error"}"#),
+            "Internal server error"
+        );
+
+        // Counts a caller can act on are kept, and so is anything that is not JSON.
+        let counted = r#"{"error":"too many requests","items_written":1200,"lines_received":1300}"#;
+        assert_eq!(refusal_text(counted), counted);
+        assert_eq!(
+            refusal_text("Too many concurrent requests"),
+            "Too many concurrent requests"
+        );
     }
 }

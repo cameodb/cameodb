@@ -10,6 +10,7 @@ use reqwest::Url;
 use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
 use serde_json::json;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Cursor, Read};
@@ -256,10 +257,11 @@ pub(crate) fn finalize_csv_schema(
 
 /// Build the schema a buffered CSV sample describes: the shadow for a non-`id` source
 /// column, one evolution pass per sampled row, then the CSV finalization.
-pub(crate) fn csv_sample_schema(
+pub(crate) fn csv_sample_schema<'a>(
     headers: &[(String, Option<TantivyFieldType>)],
     id_detection: &IdFieldDetection,
-    rows: &[csv::StringRecord],
+    rows: impl IntoIterator<Item = &'a csv::StringRecord>,
+    date_orders: &[DateOrders],
 ) -> Result<JsonValue> {
     let mut schema = IndexSchema::default();
     if id_detection.is_shadow {
@@ -274,7 +276,8 @@ pub(crate) fn csv_sample_schema(
         let mut obj: JsonMap<String, JsonValue> = JsonMap::new();
         for (idx, value) in row.iter().enumerate() {
             if let Some((header, _)) = headers.get(idx) {
-                obj.insert(header.clone(), parse_csv_cell(value));
+                let dates = date_orders.get(idx).copied().unwrap_or_default();
+                obj.insert(header.clone(), sample_cell(value, &dates));
             }
         }
         if let Some(raw_id) = row.get(id_detection.index) {
@@ -295,6 +298,7 @@ pub(crate) fn csv_sample_schema(
 pub(crate) fn csv_ndjson_line(
     record: &csv::StringRecord,
     headers: &[(String, Option<TantivyFieldType>)],
+    columns: &[ColumnShape],
     id_detection: &IdFieldDetection,
     id_header: &str,
 ) -> Result<Vec<u8>> {
@@ -303,10 +307,14 @@ pub(crate) fn csv_ndjson_line(
         .unwrap_or_default()
         .trim()
         .to_string();
+    let unknown = ColumnShape::default();
     let mut doc_obj: JsonMap<String, JsonValue> = JsonMap::new();
     for (idx, value) in record.iter().enumerate() {
         if let Some((header, _)) = headers.get(idx) {
-            doc_obj.insert(header.clone(), parse_csv_cell(value));
+            doc_obj.insert(
+                header.clone(),
+                csv_cell(value, columns.get(idx).unwrap_or(&unknown)),
+            );
         }
     }
     doc_obj.insert("id".to_string(), JsonValue::String(id_value.clone()));
@@ -326,11 +334,16 @@ pub(crate) fn csv_ndjson_line(
 /// the sample buffer, then stream) both write through it.
 pub(crate) struct CsvIngest {
     pub(crate) headers: Vec<(String, Option<TantivyFieldType>)>,
+    /// How each column's cells are read, settled from the index's schema and the sample before
+    /// the first row is sent.
+    pub(crate) columns: Vec<ColumnShape>,
     pub(crate) id_detection: IdFieldDetection,
     pub(crate) id_header: String,
     pub(crate) batch_size: usize,
     pub(crate) batch_body: Vec<u8>,
     pub(crate) docs_in_batch: usize,
+    /// The file line each row in `batch_body` was read from, in order. See [`SourceLines`].
+    pub(crate) batch_lines: Vec<u64>,
     pub(crate) total_sent: usize,
     pub(crate) total_failed: usize,
 }
@@ -344,50 +357,84 @@ impl CsvIngest {
     ) -> Self {
         Self {
             headers,
+            columns: Vec::new(),
             id_detection,
             id_header,
             batch_size: batch_size.max(1),
             batch_body: Vec::new(),
             docs_in_batch: 0,
+            batch_lines: Vec::new(),
             total_sent: 0,
             total_failed: 0,
         }
     }
 
+    /// Queue one row, read from file line `line`.
     pub(crate) async fn push_row(
         &mut self,
         client: &CameoClient,
         index: &str,
         record: &csv::StringRecord,
+        line: u64,
     ) -> Result<()> {
-        let line = csv_ndjson_line(record, &self.headers, &self.id_detection, &self.id_header)?;
-        self.batch_body.extend_from_slice(&line);
+        let payload = csv_ndjson_line(
+            record,
+            &self.headers,
+            &self.columns,
+            &self.id_detection,
+            &self.id_header,
+        )?;
+        self.batch_body.extend_from_slice(&payload);
         self.docs_in_batch += 1;
+        self.batch_lines.push(line);
         if self.docs_in_batch >= self.batch_size {
             self.flush(client, index).await?;
         }
         Ok(())
     }
 
-    /// Build the schema the buffered rows describe, install it, then replay the rows as
-    /// ordinary data — the order matters, the index must have its schema first.
-    pub(crate) async fn create_schema_and_drain(
+    /// Settle how each column is read, then send the sampled rows as ordinary data.
+    ///
+    /// The field types are the index's when it has a schema. When it has none, the sample's
+    /// schema is built, installed, and read back — the index must have its schema before any
+    /// row is sent. Either way the sample decides which date columns are written day first.
+    pub(crate) async fn settle_and_drain(
         &mut self,
         client: &CameoClient,
         index: &str,
-        sample_rows: &mut Vec<csv::StringRecord>,
+        sample: &mut Vec<(csv::StringRecord, u64)>,
+        existing: Option<HashMap<String, TantivyFieldType>>,
     ) -> Result<()> {
-        let schema_json = csv_sample_schema(&self.headers, &self.id_detection, sample_rows)?;
-        client
-            .put_index_config(index, &schema_json)
-            .await
-            .with_context(|| format!("Failed to create schema for index '{}'", index))?;
-        println!(
-            "Schema was missing; detected and applied schema to index '{}'",
-            index
-        );
-        for row in sample_rows.drain(..) {
-            self.push_row(client, index, &row).await?;
+        let date_orders =
+            date_orders_by_column(sample.iter().map(|(row, _)| row), self.headers.len());
+        let field_types = match existing {
+            Some(field_types) => field_types,
+            None => {
+                let schema_json = csv_sample_schema(
+                    &self.headers,
+                    &self.id_detection,
+                    sample.iter().map(|(row, _)| row),
+                    &date_orders,
+                )?;
+                client
+                    .put_index_config(index, &schema_json)
+                    .await
+                    .with_context(|| format!("Failed to create schema for index '{}'", index))?;
+                println!(
+                    "Schema was missing; detected and applied schema to index '{}'",
+                    index
+                );
+                schema_field_types(&schema_json)
+            }
+        };
+        self.columns = column_shapes(&self.headers, &field_types, &date_orders);
+        for ((name, _), shape) in self.headers.iter().zip(&self.columns) {
+            for departure in shape.dates.departures() {
+                println!("Column '{name}' writes {departure}; loading them as YYYY-MM-DD");
+            }
+        }
+        for (row, line) in sample.drain(..) {
+            self.push_row(client, index, &row, line).await?;
         }
         Ok(())
     }
@@ -397,6 +444,7 @@ impl CsvIngest {
             client,
             index,
             &mut self.batch_body,
+            SourceLines::File(std::mem::take(&mut self.batch_lines)),
             &mut self.total_sent,
             &mut self.total_failed,
         )
@@ -423,7 +471,6 @@ pub(crate) async fn detect_schema_from_csv(
     let id_detection = detect_id_field(&headers);
 
     let mut schema = IndexSchema::default();
-    let mut sampled = 0usize;
 
     // Add a single shadow field for the detected id source when its name is not "id"
     if id_detection.is_shadow {
@@ -466,8 +513,16 @@ pub(crate) async fn detect_schema_from_csv(
             .collect();
     id_like_candidates.sort_by_key(|(priority, _, _, _, _, _)| *priority);
 
-    for record in reader.records() {
-        let record = record.context("Failed to read CSV record")?;
+    // The sample is read whole first: which date columns are written day first is a question
+    // about the column, answered before any one of its cells is typed.
+    let sample: Vec<csv::StringRecord> = reader
+        .records()
+        .take(SCHEMA_SAMPLE_LIMIT)
+        .collect::<Result<_, _>>()
+        .context("Failed to read CSV record")?;
+    let date_orders = date_orders_by_column(&sample, headers.len());
+
+    for record in &sample {
         let mut obj: JsonMap<String, JsonValue> = JsonMap::new();
 
         let canonical_id_raw = record.get(id_detection.index).unwrap_or("");
@@ -485,8 +540,8 @@ pub(crate) async fn detect_schema_from_csv(
         // Process all fields in CSV column order
         for (idx, value) in record.iter().enumerate() {
             if let Some((header, _)) = headers.get(idx) {
-                let parsed = parse_csv_cell(value);
-                obj.insert(header.clone(), parsed);
+                let dates = date_orders.get(idx).copied().unwrap_or_default();
+                obj.insert(header.clone(), sample_cell(value, &dates));
             }
         }
 
@@ -499,11 +554,6 @@ pub(crate) async fn detect_schema_from_csv(
         }
 
         schema.evolve_from_document(&JsonValue::Object(obj));
-
-        sampled += 1;
-        if sampled >= SCHEMA_SAMPLE_LIMIT {
-            break;
-        }
     }
 
     // If canonical name was "id", promote the first candidate whose values always matched
@@ -1464,8 +1514,102 @@ pub(crate) fn build_doc_payload_from_json_document(
     }))
 }
 
+/// Whether the index already has a schema to load into, or the loader should apply the one it
+/// detects from the source.
+///
+/// A schema with no fields is none. A node on an older build answers a dropped index with the
+/// record of the drop — no fields — and taken as a schema it made the loader skip the declared
+/// types in the file's header, leaving the node to type every field by guesswork from its
+/// documents.
+pub(crate) async fn index_has_schema(client: &CameoClient, index: &str) -> bool {
+    index_field_types(client, index).await.is_some()
+}
+
+/// Each field's type, as the index's schema declares it; `None` when the index has no schema,
+/// or one with no fields.
+pub(crate) async fn index_field_types(
+    client: &CameoClient,
+    index: &str,
+) -> Option<HashMap<String, TantivyFieldType>> {
+    let config = client.get_index_config(index).await.ok()?;
+    let field_types: HashMap<String, TantivyFieldType> = config
+        .fields
+        .iter()
+        .filter_map(|field| {
+            let name = field.get("name")?.as_str()?.to_string();
+            let field_type = serde_json::from_value(field.get("type")?.clone()).ok()?;
+            Some((name, field_type))
+        })
+        .collect();
+    (!config.fields.is_empty()).then_some(field_types)
+}
+
+/// Each field's type in a schema the loader built, as it will be stored.
+pub(crate) fn schema_field_types(schema_json: &JsonValue) -> HashMap<String, TantivyFieldType> {
+    schema_json
+        .get("fields")
+        .and_then(JsonValue::as_object)
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(|(name, field)| {
+                    let field_type = field.get("field_type")?.clone();
+                    Some((name.clone(), serde_json::from_value(field_type).ok()?))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Where each line of a batch's body came from in the source.
+///
+/// The node names a refused document by its line in the request body, and every batch is a
+/// request of its own — so "line 3" meant the third document of whichever batch, and a load of
+/// several batches reported line 1 several times over. This is what turns the node's line back
+/// into a place in the source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SourceLines {
+    /// The file line each body line was read from, in order: a delimited file.
+    File(Vec<u64>),
+    /// Documents numbered through the whole source, and the number of the body's first: a JSON
+    /// source, where one document need not be one line.
+    Documents { first: u64 },
+}
+
+impl SourceLines {
+    /// The source position of line `body_line` (1-based) of the request, as a reason names it.
+    pub(crate) fn locate(&self, body_line: u64) -> Option<String> {
+        let index = body_line.checked_sub(1)?;
+        match self {
+            SourceLines::File(lines) => usize::try_from(index)
+                .ok()
+                .and_then(|i| lines.get(i))
+                .map(|line| format!("line {line}")),
+            SourceLines::Documents { first } => Some(format!("document {}", first + index)),
+        }
+    }
+}
+
+/// A reason the node gave, with its request line replaced by the source position it came from.
+/// Anything that does not start `line <N>:` is returned as it was.
+pub(crate) fn relocate_reason(reason: &str, lines: &SourceLines) -> String {
+    let relocated = reason.strip_prefix("line ").and_then(|rest| {
+        let (number, tail) = rest.split_once(':')?;
+        let position = lines.locate(number.parse().ok()?)?;
+        Some(format!("{position}:{tail}"))
+    });
+    relocated.unwrap_or_else(|| reason.to_string())
+}
+
+/// Tally one batch's answer and report what it refused.
+///
+/// The node lists the first hundred reasons and counts the rest in `suppressed_errors`. Only the
+/// list used to be counted, so a batch refusing 3,900 of 4,000 documents added 100 to `failed`,
+/// and the load's closing line — `loaded=1030 failed=500` for 16,559 documents sent — accounted
+/// for fewer than a tenth of them. `items_written` plus every reason is every document sent.
 pub(crate) fn record_ingest_response(
     response: &JsonValue,
+    lines: &SourceLines,
     total_sent: &mut usize,
     total_failed: &mut usize,
 ) {
@@ -1473,24 +1617,27 @@ pub(crate) fn record_ingest_response(
         .get("items_written")
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as usize;
-    let errors_json = response.get("errors").and_then(|v| v.as_array());
-    let error_count = errors_json.map(|e| e.len()).unwrap_or(0);
+    let listed = response.get("errors").and_then(|v| v.as_array());
+    let suppressed = response
+        .get("suppressed_errors")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let failed = listed.map_or(0, |e| e.len()) + suppressed;
 
     *total_sent += written;
-    *total_failed += error_count;
+    *total_failed += failed;
 
-    if error_count > 0 {
-        eprintln!(
-            "⚠️  Batch warning: {} items failed validation.",
-            error_count
-        );
-        if let Some(errs) = errors_json {
-            for err in errs.iter().take(3) {
-                eprintln!("   - {}", err.as_str().unwrap_or("Unknown error"));
-            }
-            if errs.len() > 3 {
-                eprintln!("   ... and {} more", errs.len() - 3);
-            }
+    if failed > 0 {
+        eprintln!("⚠️  Batch warning: {failed} items were not written.");
+        let shown = listed.map_or(&[][..], |e| e.as_slice());
+        for err in shown.iter().take(3) {
+            eprintln!(
+                "   - {}",
+                relocate_reason(err.as_str().unwrap_or("Unknown error"), lines)
+            );
+        }
+        if failed > 3 {
+            eprintln!("   ... and {} more", failed - shown.len().min(3));
         }
     }
 }
@@ -1691,6 +1838,7 @@ pub(crate) async fn flush_ndjson_batch(
     client: &CameoClient,
     index: &str,
     batch_body: &mut Vec<u8>,
+    lines: SourceLines,
     total_sent: &mut usize,
     total_failed: &mut usize,
 ) -> Result<()> {
@@ -1701,7 +1849,7 @@ pub(crate) async fn flush_ndjson_batch(
     let response = client
         .stream_index_ndjson(index, std::mem::take(batch_body))
         .await?;
-    record_ingest_response(&response, total_sent, total_failed);
+    record_ingest_response(&response, &lines, total_sent, total_failed);
     Ok(())
 }
 
@@ -1710,7 +1858,11 @@ pub(crate) async fn flush_ndjson_batch(
 /// the buffer fills — and once at the end with whatever is left.
 pub(crate) enum JsonIngestEvent {
     CreateSchema(JsonSourceAnalysis),
-    DataBatch(Vec<u8>),
+    /// A batch's NDJSON body, and the number of its first document in the source.
+    DataBatch {
+        body: Vec<u8>,
+        first_document: u64,
+    },
 }
 
 /// The single-pass JSON ingest protocol both loaders run: buffer up to
@@ -1728,6 +1880,9 @@ pub(crate) struct JsonIngestPipeline {
     pub(crate) seen_fields: HashSet<String>,
     pub(crate) batch_body: Vec<u8>,
     pub(crate) docs_in_batch: usize,
+    /// Documents in the batches already emitted, so each batch knows where in the source it
+    /// starts. See [`SourceLines::Documents`].
+    pub(crate) documents_batched: u64,
     pub(crate) id_field: Option<String>,
     pub(crate) samples_flushed: bool,
 }
@@ -1743,6 +1898,7 @@ impl JsonIngestPipeline {
             seen_fields: HashSet::new(),
             batch_body: Vec::new(),
             docs_in_batch: 0,
+            documents_batched: 0,
             id_field: None,
             samples_flushed: false,
         }
@@ -1789,10 +1945,7 @@ impl JsonIngestPipeline {
             self.flush_samples(events)?;
         }
         if !self.batch_body.is_empty() {
-            events.push(JsonIngestEvent::DataBatch(std::mem::take(
-                &mut self.batch_body,
-            )));
-            self.docs_in_batch = 0;
+            self.emit_batch(events);
         }
         Ok(())
     }
@@ -1834,12 +1987,19 @@ impl JsonIngestPipeline {
         self.batch_body.extend_from_slice(&line);
         self.docs_in_batch += 1;
         if self.docs_in_batch >= self.batch_size {
-            events.push(JsonIngestEvent::DataBatch(std::mem::take(
-                &mut self.batch_body,
-            )));
-            self.docs_in_batch = 0;
+            self.emit_batch(events);
         }
         Ok(())
+    }
+
+    /// Ship the buffered batch, numbered from where it starts in the source.
+    fn emit_batch(&mut self, events: &mut Vec<JsonIngestEvent>) {
+        events.push(JsonIngestEvent::DataBatch {
+            body: std::mem::take(&mut self.batch_body),
+            first_document: self.documents_batched + 1,
+        });
+        self.documents_batched += self.docs_in_batch as u64;
+        self.docs_in_batch = 0;
     }
 }
 
@@ -1868,9 +2028,19 @@ pub(crate) async fn deliver_json_ingest_event(
                 index
             );
         }
-        JsonIngestEvent::DataBatch(batch_body) => {
-            let response = client.stream_index_ndjson(index, batch_body).await?;
-            record_ingest_response(&response, total_sent, total_failed);
+        JsonIngestEvent::DataBatch {
+            body,
+            first_document,
+        } => {
+            let response = client.stream_index_ndjson(index, body).await?;
+            record_ingest_response(
+                &response,
+                &SourceLines::Documents {
+                    first: first_document,
+                },
+                total_sent,
+                total_failed,
+            );
         }
     }
     Ok(())
@@ -2049,14 +2219,14 @@ pub(crate) async fn load_data_from_source(
 
     match format {
         SourceFormat::CsvLike => {
-            let schema_exists = client.get_index_config(index).await.is_ok();
+            let field_types = index_field_types(client, index).await;
             load_data_from_csv_single_pass(
                 client,
                 index,
                 source,
                 delimiter,
                 batch_size,
-                schema_exists,
+                field_types,
             )
             .await
         }
@@ -2064,7 +2234,7 @@ pub(crate) async fn load_data_from_source(
             Err(anyhow!("Schema JSON object cannot be loaded as index data"))
         }
         SourceFormat::JsonDocument | SourceFormat::JsonArray | SourceFormat::JsonLines => {
-            let schema_exists = client.get_index_config(index).await.is_ok();
+            let schema_exists = index_has_schema(client, index).await;
             let compression = detect_compression(source);
 
             if is_http_source(source) && compression == Compression::None {
@@ -2113,7 +2283,7 @@ pub(crate) async fn load_data_from_csv_single_pass(
     source: &str,
     delimiter: Delimiter,
     batch_size: usize,
-    schema_exists: bool,
+    field_types: Option<HashMap<String, TantivyFieldType>>,
 ) -> Result<()> {
     let mut spinner = ProgressSpinner::new();
     let mut reader = open_csv_reader(client, source, delimiter).await?;
@@ -2127,13 +2297,20 @@ pub(crate) async fn load_data_from_csv_single_pass(
     let id_header = id_detection.original_field_name.clone();
     let mut ingest = CsvIngest::new(headers, id_detection, id_header, batch_size);
 
-    // Rows whose id cell is empty are skipped. Until the schema exists the rows are
-    // only buffered — the sample must name the fields before anything can be sent.
-    let mut sample_rows: Vec<csv::StringRecord> = Vec::new();
-    let mut needs_schema = !schema_exists;
+    let mut lines = RecordLines::after_header(&raw_headers, reader.position().line());
 
-    for record in reader.records() {
-        let record = record.context("Failed to read CSV record")?;
+    // Rows whose id cell is empty are skipped. Nothing is sent until the sample has settled
+    // how each column is read — and, for an index with no schema, what its schema is.
+    let mut field_types = field_types;
+    let mut settled = false;
+    let mut sample: Vec<(csv::StringRecord, u64)> = Vec::new();
+    let mut record = csv::StringRecord::new();
+
+    while reader
+        .read_record(&mut record)
+        .context("Failed to read CSV record")?
+    {
+        let line = lines.locate(&record, reader.position().line());
         if record
             .get(ingest.id_detection.index)
             .unwrap_or_default()
@@ -2143,24 +2320,24 @@ pub(crate) async fn load_data_from_csv_single_pass(
             continue;
         }
 
-        if needs_schema {
-            sample_rows.push(record.clone());
-            if sample_rows.len() >= SCHEMA_SAMPLE_LIMIT {
+        if !settled {
+            sample.push((record.clone(), line));
+            if sample.len() >= SCHEMA_SAMPLE_LIMIT {
                 ingest
-                    .create_schema_and_drain(client, index, &mut sample_rows)
+                    .settle_and_drain(client, index, &mut sample, field_types.take())
                     .await?;
-                needs_schema = false;
+                settled = true;
             }
             continue;
         }
 
-        ingest.push_row(client, index, &record).await?;
+        ingest.push_row(client, index, &record, line).await?;
     }
 
-    // A source smaller than the sample limit describes its schema at the end instead.
-    if needs_schema && !sample_rows.is_empty() {
+    // A source smaller than the sample is settled at its end instead.
+    if !settled && !sample.is_empty() {
         ingest
-            .create_schema_and_drain(client, index, &mut sample_rows)
+            .settle_and_drain(client, index, &mut sample, field_types)
             .await?;
     }
 
@@ -2209,6 +2386,347 @@ pub(crate) fn parse_csv_cell(raw: &str) -> JsonValue {
 
     // Fallback to string (dates/IPs will be inferred from string content)
     JsonValue::String(trimmed.to_string())
+}
+
+/// What spreadsheets and data-frame exports write in a cell that has no value.
+///
+/// Only a field that cannot hold text reads these as missing: in a text column `NA` is as likely
+/// to be a value — Namibia, a grade, an answer — as the absence of one.
+const MISSING_MARKERS: &[&str] = &["na", "n/a", "#n/a", "nan", "null", "none", "nil", "-"];
+
+pub(crate) fn is_missing_marker(cell: &str) -> bool {
+    MISSING_MARKERS
+        .iter()
+        .any(|marker| cell.eq_ignore_ascii_case(marker))
+}
+
+/// The order of day and month in a numeric date written with the year last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DateOrder {
+    MonthFirst,
+    DayFirst,
+}
+
+impl DateOrder {
+    fn other(self) -> Self {
+        match self {
+            DateOrder::MonthFirst => DateOrder::DayFirst,
+            DateOrder::DayFirst => DateOrder::MonthFirst,
+        }
+    }
+}
+
+/// The separators a numeric date is written with, and the order the node reads each in: slashes
+/// American, month first; dots European, day first.
+const NODE_DATE_ORDERS: [(char, DateOrder); 2] =
+    [('/', DateOrder::MonthFirst), ('.', DateOrder::DayFirst)];
+
+/// How one column writes its numeric dates, per separator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DateOrders {
+    pub(crate) slash: DateOrder,
+    pub(crate) dot: DateOrder,
+}
+
+/// The node's reading, which a column keeps unless its sample says otherwise.
+impl Default for DateOrders {
+    fn default() -> Self {
+        Self {
+            slash: DateOrder::MonthFirst,
+            dot: DateOrder::DayFirst,
+        }
+    }
+}
+
+impl DateOrders {
+    fn of(&self, separator: char) -> DateOrder {
+        if separator == '/' {
+            self.slash
+        } else {
+            self.dot
+        }
+    }
+
+    fn set(&mut self, separator: char, order: DateOrder) {
+        if separator == '/' {
+            self.slash = order;
+        } else {
+            self.dot = order;
+        }
+    }
+
+    /// What this column does that the node would read the other way, said with an example.
+    pub(crate) fn departures(&self) -> Vec<&'static str> {
+        let mut departures = Vec::new();
+        if self.slash == DateOrder::DayFirst {
+            departures.push("slash dates day first (such as 15/03/2024)");
+        }
+        if self.dot == DateOrder::MonthFirst {
+            departures.push("dotted dates month first (such as 03.15.2024)");
+        }
+        departures
+    }
+}
+
+/// A numeric date with a four-digit year last: `15/03/2024`, `03.15.2024 16:13`.
+struct NumericDate<'a> {
+    separator: char,
+    first: u32,
+    second: u32,
+    year: &'a str,
+    time: Option<&'a str>,
+}
+
+fn numeric_date_parts(cell: &str) -> Option<NumericDate<'_>> {
+    let (date, time) = match cell.split_once(' ') {
+        Some((date, time)) => (date, Some(time.trim())),
+        None => (cell, None),
+    };
+    let separator = date.chars().find(|c| !c.is_ascii_digit())?;
+    if !NODE_DATE_ORDERS
+        .iter()
+        .any(|(known, _)| *known == separator)
+    {
+        return None;
+    }
+    let mut parts = date.split(separator);
+    let (first, second, year) = (parts.next()?, parts.next()?, parts.next()?);
+    let is_number = |part: &str, digits: std::ops::RangeInclusive<usize>| {
+        digits.contains(&part.len()) && part.bytes().all(|b| b.is_ascii_digit())
+    };
+    if parts.next().is_some()
+        || !is_number(first, 1..=2)
+        || !is_number(second, 1..=2)
+        || !is_number(year, 4..=4)
+    {
+        return None;
+    }
+    Some(NumericDate {
+        separator,
+        first: first.parse().ok()?,
+        second: second.parse().ok()?,
+        year,
+        time,
+    })
+}
+
+/// What one numeric date says about its column's order, when only one reading of it is a date:
+/// `15/03/2024` can only be day first, `03.15.2024` only month first, and `03/04/2024` says
+/// nothing.
+pub(crate) fn numeric_date_order(cell: &str) -> Option<(char, DateOrder)> {
+    let date = numeric_date_parts(cell)?;
+    match (date.first, date.second) {
+        (13..=31, 1..=12) => Some((date.separator, DateOrder::DayFirst)),
+        (1..=12, 13..=31) => Some((date.separator, DateOrder::MonthFirst)),
+        _ => None,
+    }
+}
+
+/// How each column writes its numeric dates, judged from the sample.
+///
+/// The node reads each separator one way, always, so that one value never decides how another
+/// is read. The column is what knows its convention: a sample holding a date only the other
+/// order can read, and none only the node's order can, is written the other way — a slash column
+/// holding `15/03/2024` is day first, and its `03/04/2024` is the 3rd of April; a dotted column
+/// holding `03.15.2024` is month first. A sample holding both kinds is not a convention at all
+/// and keeps the node's order, so its other dates are refused, each by its line, not guessed.
+pub(crate) fn date_orders_by_column<'a>(
+    rows: impl IntoIterator<Item = &'a csv::StringRecord>,
+    width: usize,
+) -> Vec<DateOrders> {
+    // Per column, the (separator, order) pairs some sampled value could only be read as.
+    let mut seen: Vec<Vec<(char, DateOrder)>> = vec![Vec::new(); width];
+    for row in rows {
+        for (column, cell) in row.iter().enumerate().take(width) {
+            if let Some(evidence) = numeric_date_order(cell.trim())
+                && !seen[column].contains(&evidence)
+            {
+                seen[column].push(evidence);
+            }
+        }
+    }
+    seen.into_iter()
+        .map(|evidence| {
+            let mut orders = DateOrders::default();
+            for (separator, node_order) in NODE_DATE_ORDERS {
+                let other = node_order.other();
+                if evidence.contains(&(separator, other))
+                    && !evidence.contains(&(separator, node_order))
+                {
+                    orders.set(separator, other);
+                }
+            }
+            orders
+        })
+        .collect()
+}
+
+/// A numeric date the node would read the other way, as the ISO date the column means, its time
+/// kept: in a day-first slash column `15/03/2024 16:13` becomes `2024-03-15 16:13`. `None` for a
+/// date the node reads as meant, anything that is not a numeric date, or a day the calendar
+/// does not have.
+pub(crate) fn reordered_date(cell: &str, orders: &DateOrders) -> Option<String> {
+    let date = numeric_date_parts(cell)?;
+    let order = orders.of(date.separator);
+    if order == DateOrders::default().of(date.separator) {
+        return None;
+    }
+    let (day, month) = match order {
+        DateOrder::DayFirst => (date.first, date.second),
+        DateOrder::MonthFirst => (date.second, date.first),
+    };
+    let ymd = format!("{}-{month:02}-{day:02}", date.year);
+    let iso = match date.time {
+        Some(time) => format!("{ymd} {time}"),
+        None => ymd,
+    };
+    storage::parse_date_to_timestamp_secs(&iso).map(|_| iso)
+}
+
+/// How the loader reads one column: the type its field declares, and how it writes its numeric
+/// dates.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct ColumnShape {
+    pub(crate) field_type: Option<TantivyFieldType>,
+    pub(crate) dates: DateOrders,
+}
+
+/// Each header's shape, from the index's field types and the sample's date orders. Only a date
+/// field reorders its dates; any other column keeps what it holds.
+pub(crate) fn column_shapes(
+    headers: &[(String, Option<TantivyFieldType>)],
+    field_types: &HashMap<String, TantivyFieldType>,
+    date_orders: &[DateOrders],
+) -> Vec<ColumnShape> {
+    headers
+        .iter()
+        .enumerate()
+        .map(|(column, (name, _))| {
+            let field_type = field_types.get(name).cloned();
+            let dates = match field_type {
+                Some(TantivyFieldType::Date) => {
+                    date_orders.get(column).copied().unwrap_or_default()
+                }
+                _ => DateOrders::default(),
+            };
+            ColumnShape { field_type, dates }
+        })
+        .collect()
+}
+
+/// A sampled cell as schema inference should see it: a missing marker is no value, and a column
+/// written the other way round has its dates read as the dates they are — `15/03/2024` would
+/// otherwise make the column text, because the node cannot read it.
+pub(crate) fn sample_cell(raw: &str, dates: &DateOrders) -> JsonValue {
+    let trimmed = raw.trim();
+    if is_missing_marker(trimmed) {
+        return JsonValue::Null;
+    }
+    if let Some(iso) = reordered_date(trimmed, dates) {
+        return JsonValue::String(iso);
+    }
+    parse_csv_cell(raw)
+}
+
+/// A CSV cell as the value its field can hold.
+///
+/// A CSV cell has no type; the field it lands in does, and reading the cell by its own look
+/// instead was how a load went wrong in three ways. `NA` in a count column was sent as text and
+/// the row refused. `20240315` in a date column was sent as a number, which a date field reads
+/// as seconds since 1970 — the row landed in August 1970. And a text column's `007` was sent as
+/// the number 7. A column no field describes is still read by its look, as it always was.
+pub(crate) fn csv_cell(raw: &str, shape: &ColumnShape) -> JsonValue {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return JsonValue::Null;
+    }
+    match &shape.field_type {
+        Some(TantivyFieldType::Text | TantivyFieldType::String) => {
+            JsonValue::String(trimmed.to_string())
+        }
+        Some(
+            TantivyFieldType::I64
+            | TantivyFieldType::U64
+            | TantivyFieldType::F64
+            | TantivyFieldType::Date
+            | TantivyFieldType::Boolean
+            | TantivyFieldType::Ip,
+        ) if is_missing_marker(trimmed) => JsonValue::Null,
+        Some(TantivyFieldType::Date) => date_cell(trimmed, &shape.dates),
+        Some(TantivyFieldType::Boolean) => boolean_cell(trimmed),
+        _ => parse_csv_cell(raw),
+    }
+}
+
+/// A date cell as the node's date parser reads it. Sent as the text it is whenever that text is
+/// a date — `20240315` and `2024` are dates as text and seconds as numbers — and as a number only
+/// when it is not: seconds before 2000, or before 1970, which the parser does not take as text.
+fn date_cell(trimmed: &str, dates: &DateOrders) -> JsonValue {
+    if let Some(iso) = reordered_date(trimmed, dates) {
+        return JsonValue::String(iso);
+    }
+    if storage::parse_date_to_timestamp_secs(trimmed).is_none()
+        && let Ok(seconds) = trimmed.parse::<i64>()
+    {
+        return JsonValue::Number(seconds.into());
+    }
+    JsonValue::String(trimmed.to_string())
+}
+
+/// A boolean cell, in the spellings that cannot mean anything else in a boolean column.
+fn boolean_cell(trimmed: &str) -> JsonValue {
+    match trimmed.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "y" | "1" => JsonValue::Bool(true),
+        "false" | "no" | "n" | "0" => JsonValue::Bool(false),
+        _ => JsonValue::String(trimmed.to_string()),
+    }
+}
+
+/// Where each record of a delimited file starts, as `sed -n <N>p` counts lines.
+///
+/// The reader's `position()` for a record is taken before it skips blank lines, and — after a
+/// record ending CRLF — before the `\n` of that ending, which it consumes as the next record
+/// starts. So on a Windows-saved file every line reported was the one above the row, and after a
+/// blank line every one after it was short again. The reader's position *after* a record has
+/// consumed all of that: the record's first line is there, less the lines its quoted fields
+/// span, less its own line ending when the reader has already consumed it — which it has after
+/// `\n` and has not yet after `\r\n`, as the header's ending tells.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecordLines {
+    ending_pending: bool,
+    next_start: u64,
+}
+
+fn line_breaks_in(record: &csv::StringRecord) -> u64 {
+    record
+        .iter()
+        .map(|field| field.bytes().filter(|b| *b == b'\n').count() as u64)
+        .sum()
+}
+
+impl RecordLines {
+    /// From the header and the reader's line after reading it.
+    pub(crate) fn after_header(header: &csv::StringRecord, reader_line: u64) -> Self {
+        let header_breaks = line_breaks_in(header);
+        Self {
+            ending_pending: reader_line == 1 + header_breaks,
+            next_start: header_breaks + 2,
+        }
+    }
+
+    /// The line `record` starts on, from the reader's line after reading it. Called for every
+    /// record, in order, skipped or not.
+    pub(crate) fn locate(&mut self, record: &csv::StringRecord, reader_line: u64) -> u64 {
+        let breaks = line_breaks_in(record);
+        let own_ending = u64::from(!self.ending_pending);
+        // Never above where the previous record ended: the last record of a file without a
+        // final line ending has no ending to subtract.
+        let start = reader_line
+            .saturating_sub(breaks + own_ending)
+            .max(self.next_start);
+        self.next_start = start + breaks + 1;
+        start
+    }
 }
 
 pub(crate) async fn open_csv_source(

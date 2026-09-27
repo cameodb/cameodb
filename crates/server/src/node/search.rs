@@ -1066,12 +1066,13 @@ pub(super) fn collect_narrowed_default_fields(
 
 /// Produce a comparable sort key for a hit's raw field value.
 ///
-/// Date fields are parsed to epoch seconds so that cross-node merges order them
-/// chronologically (matching each shard's FAST-field ordering) rather than by
-/// lexicographic string comparison, which breaks across mixed date formats/offsets.
-/// Every other value passes through unchanged — the merge comparator handles the
-/// numeric-vs-string distinction. Returns `None` when the value cannot be keyed
-/// (e.g. an unparseable date string), in which case the hit sorts last.
+/// Date fields are keyed by the epoch second their fast column holds, so that cross-node merges
+/// order them chronologically (matching each shard's FAST-field ordering) rather than by
+/// lexicographic string comparison, which breaks across mixed date formats/offsets — and read
+/// in every shape the writer indexes, epoch seconds included. Every other value passes through
+/// unchanged — the merge comparator handles the numeric-vs-string distinction. Returns `None`
+/// when the value cannot be keyed (e.g. an unparseable date string), in which case the hit
+/// sorts last.
 pub(super) fn normalize_sort_key(
     value: &JsonValue,
     field_def: Option<&FieldDef>,
@@ -1079,10 +1080,7 @@ pub(super) fn normalize_sort_key(
     if let Some(def) = field_def
         && matches!(def.field_type, TantivyFieldType::Date)
     {
-        return value
-            .as_str()
-            .and_then(storage::parse_date_to_timestamp_secs)
-            .map(|ts| JsonValue::Number(ts.into()));
+        return storage::date_sort_secs(value).map(|ts| JsonValue::Number(ts.into()));
     }
     Some(value.clone())
 }

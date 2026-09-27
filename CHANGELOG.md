@@ -9,6 +9,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Recreating an index after `delete --delete-schema` no longer loses most of what is written
+  to it.** The drop leaves a record in place of the schema, so a write already in flight cannot
+  reinstall the old one — and that record was treated as a schema. `GET /_config` answered with
+  it, so the loader applied none of the types a file declared; and the node never cached the
+  schema the next write minted from its documents, because the mint added the fields itself and
+  nothing "evolved". Every later batch minted again from its own sample, each overwriting the
+  stored types while the Tantivy index kept the first one's, until a value its column could not
+  hold killed the writer. Loading `booksummaries.tsv` that way wrote 1,030 of 16,559 documents
+  and reported 500 failures. Now a write caches whatever schema it settles on, so an index is
+  minted once; a dropped index reads as one that never existed — `404` from `GET /_config`, absent
+  from `/_indexes`, "no schema" to a peer's canvass, including from a peer on an older build that
+  still sends the record — and the index created over it is versioned above the record. The same
+  load now writes all 16,559.
+
+- **A Tantivy writer that dies no longer takes its index down on that shard until restart.** A
+  value added under the stored schema's type rather than its column's killed Tantivy's indexing
+  thread, and the dead writer stayed cached: every later write to the index answered "An index
+  writer was killed", every commit failed, and nothing buffered since the last commit was
+  committed. Values are now added by the column the index built, so a schema that disagrees with
+  its column — an edit waiting for its rebuild, or a defect — cannot kill the writer, and saving
+  one logs a warning naming the fields. A writer that dies anyway, on an I/O error, is retired:
+  the next write reopens the index and replays from its last commit everything the dead writer
+  held, and a write that met the dead writer is answered as written, because it was durable in
+  redb before Tantivy was asked.
+
+- **`data load` counts every failed document and names it by its place in the file.** The node
+  lists the first hundred reasons per request and counts the rest in `suppressed_errors`, which
+  the loader ignored — so `loaded` plus `failed` fell thousands short of what was sent. And each
+  batch is its own request, so a reason's line number restarted at 1 per batch; it is now the
+  line of the source file, or the document's number in a JSON source. An index whose schema has
+  no fields is treated as having none, so the loader applies the one it detects. And a refusal is
+  shown once: the node sends a client error's message as both `error` and `details`, and the CLI
+  printed the raw body, so `search … sort publication_date:desc` on an index without a fast date
+  column said "cannot sort by 'publication_date' …" twice. The response itself is unchanged.
+
+- **A CSV cell is read by the type of the field it lands in.** The loader typed each cell by its
+  look, which went wrong three ways on real exports. `NA` — what R and pandas write for a missing
+  value — in a count column was sent as text and refused its row: `youtube_ted_2024.csv` loaded
+  4,517 of 4,641 talks. A date cell such as `20240315` or `2024` was sent as a number, which a
+  date field reads as seconds since 1970, so the row indexed in 1970. And a text column's `007`
+  became the number 7. Now `NA`, `N/A`, `NaN`, `null`, `None`, `-` and the like are no value in a
+  numeric, date, boolean or ip field (and stay text in a text field), a date goes as the text it
+  is, a text cell as written, and a boolean takes `yes`/`no` and `1`/`0`. Schema detection reads
+  missing markers the same way. The ted example loads all 4,641.
+
+- **A refused row is named by the file line it starts on, in a CRLF file too.** The CSV reader
+  positions a record before consuming the `\n` of the previous record's `\r\n`, and before any
+  blank lines, so on a Windows-saved file every reported line was the one above the row. The
+  line is now taken from where the reader stands after the record.
+
+- **A date with a two-digit year is refused instead of read as the first century.** chrono reads
+  `%Y` from any number of digits, so `24-03-15` was indexed as the 15th of March in the year 24,
+  sorting before every real date. Every naive date shape now needs its year written as four
+  digits; `0476-09-04` is still a date.
+
+- **A date sent as epoch seconds sorts in its place across shards.** The writer indexes a number
+  in a date field as epoch seconds, and each shard ordered it correctly, but the merge keyed dates
+  by their text alone: such a hit had no key and sorted among the undated ones, after every other
+  row ascending. The merge now reads a date in every shape the writer indexes.
+
 - **Closing an index from another thread no longer loses the writes in flight on it.** Past the
   open-index cap, admitting an index closes a colder one from whichever thread is opening — a
   search on the read pool, an index creation — and closing commits. A write held its index
@@ -651,6 +711,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remote deadline now follows the HTTP one as it was always documented to.
 
 ### Added
+
+- **More date shapes: slash and dotted dates with the year last, named months and RFC 2822.** A
+  date field now takes `03/15/2024` (American, always month first), `15.03.2024` (European, always
+  day first), either with an optional time, `Mar 15, 2024`, `15 March 2024` and
+  `Fri, 15 Mar 2024 16:13:13 +0000`, besides the ISO, compact, epoch, year-month and year forms it
+  took before; inference and query literals read the same list. A value only the other order can
+  read (`15/03/2024`, `03.15.2024`) is refused rather than guessed. The full list is in the server
+  README's date section.
+
+- **`data load` reads a date column in the order it is written.** The node reads each separator
+  one way, so the loader decides per column from its sample: a slash column holding `15/03/2024`
+  and nothing only month-first can read is day first, a dotted column holding `03.15.2024` and
+  nothing only day-first can read is month first, and such dates are sent as ISO
+  (`03/04/2024` → `2024-04-03`), with a line naming the column. A sample with no such evidence, or
+  evidence both ways, keeps the node's order. `schema detect` and `schema load` decide the same
+  way, so such a column is typed `date`.
 
 - **`[security.limits] min_prefix_length` puts a floor under prefix queries, default 2.**
   `field:pre*` runs as a range over the term dictionary, and a range has no ceiling: its cost is

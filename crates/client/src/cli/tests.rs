@@ -380,4 +380,316 @@ mod tests {
         assert_eq!(start, 15);
         assert!(pairs.iter().any(|p| p.replacement == "title:"));
     }
+
+    /// A refused document is named by where it is in the source, not by its line in one batch.
+    ///
+    /// Every batch is a request of its own and the node counts lines per request, so a load of
+    /// several batches reported "line 1" once per batch. A delimited file maps back to the line
+    /// the row was read from; a JSON source, where a document need not be one line, to the
+    /// document's number in the source.
+    #[test]
+    fn a_refusal_names_its_place_in_the_source() {
+        let file = SourceLines::File(vec![4001, 4002, 4005]);
+        assert_eq!(
+            relocate_reason("line 3: Type mismatch for field 'when'", &file),
+            "line 4005: Type mismatch for field 'when'"
+        );
+        let json = SourceLines::Documents { first: 8001 };
+        assert_eq!(
+            relocate_reason("line 2: not an object", &json),
+            "document 8002: not an object"
+        );
+        // Nothing to map: left as the node wrote it rather than guessed at.
+        assert_eq!(relocate_reason("line 9: gone", &file), "line 9: gone");
+        assert_eq!(
+            relocate_reason("document 2: shard did not take the batch", &file),
+            "document 2: shard did not take the batch"
+        );
+    }
+
+    /// The failed count is every document not written, not the reasons the node chose to list.
+    ///
+    /// The node lists a hundred and counts the rest in `suppressed_errors`; counting only the
+    /// list reported `loaded=1030 failed=500` for a load of 16,559 documents.
+    #[test]
+    fn every_refusal_is_counted_including_those_not_listed() {
+        let (mut sent, mut failed) = (0, 0);
+        let listed: Vec<String> = (1..=100).map(|n| format!("line {n}: refused")).collect();
+        record_ingest_response(
+            &serde_json::json!({
+                "items_written": 100,
+                "errors": listed,
+                "suppressed_errors": 3800,
+            }),
+            &SourceLines::Documents { first: 1 },
+            &mut sent,
+            &mut failed,
+        );
+        assert_eq!((sent, failed), (100, 3900));
+        assert_eq!(sent + failed, 4000, "written plus refused is what was sent");
+    }
+
+    /// Each batch a JSON source emits knows the number of its first document in the source.
+    #[test]
+    fn json_batches_are_numbered_through_the_source() {
+        let mut pipeline = JsonIngestPipeline::new(2, true);
+        let mut events = Vec::new();
+        for n in 0..5 {
+            pipeline
+                .push(
+                    &serde_json::json!({"id": format!("d{n}"), "n": n}),
+                    &mut events,
+                )
+                .expect("push");
+        }
+        pipeline.finish(&mut events).expect("finish");
+        let firsts: Vec<u64> = events
+            .iter()
+            .filter_map(|event| match event {
+                JsonIngestEvent::DataBatch { first_document, .. } => Some(*first_document),
+                JsonIngestEvent::CreateSchema(_) => None,
+            })
+            .collect();
+        assert_eq!(firsts, vec![1, 3, 5]);
+    }
+}
+
+/// How a CSV cell is read: by the field it lands in, and by its column's date order.
+#[cfg(test)]
+mod csv_cell_tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use storage::TantivyFieldType;
+
+    fn typed(field_type: TantivyFieldType) -> ColumnShape {
+        ColumnShape {
+            field_type: Some(field_type),
+            dates: DateOrders::default(),
+        }
+    }
+
+    fn dated(slash: DateOrder, dot: DateOrder) -> ColumnShape {
+        ColumnShape {
+            field_type: Some(TantivyFieldType::Date),
+            dates: DateOrders { slash, dot },
+        }
+    }
+
+    fn rows(csv_text: &str) -> Vec<csv::StringRecord> {
+        csv::ReaderBuilder::new()
+            .delimiter(b';')
+            .has_headers(false)
+            .from_reader(csv_text.as_bytes())
+            .records()
+            .collect::<Result<_, _>>()
+            .expect("rows")
+    }
+
+    /// `NA` in a count column is a count nobody reported, and the row loads without it. The ted
+    /// example has 134 of them; each refused its row as text in an integer field.
+    #[test]
+    fn a_missing_marker_is_no_value_in_a_field_that_cannot_hold_text() {
+        for field_type in [
+            TantivyFieldType::I64,
+            TantivyFieldType::F64,
+            TantivyFieldType::Date,
+            TantivyFieldType::Boolean,
+        ] {
+            for marker in ["NA", "n/a", "#N/A", "NaN", "null", "None", "-"] {
+                assert_eq!(
+                    csv_cell(marker, &typed(field_type.clone())),
+                    JsonValue::Null,
+                    "{marker} under {field_type:?}"
+                );
+            }
+        }
+        // In a text column it may be the value itself — Namibia's country code, for one.
+        assert_eq!(csv_cell("NA", &typed(TantivyFieldType::Text)), json!("NA"));
+    }
+
+    /// A date cell goes as text whenever the text is a date, so the node's parser reads it as
+    /// written. As numbers, `20240315` and `2024` were seconds since 1970.
+    #[test]
+    fn a_date_cell_is_sent_as_the_date_it_writes() {
+        let date = typed(TantivyFieldType::Date);
+        assert_eq!(csv_cell("20240315", &date), json!("20240315"));
+        assert_eq!(csv_cell("2024", &date), json!("2024"));
+        assert_eq!(csv_cell("20240315161313", &date), json!("20240315161313"));
+        assert_eq!(csv_cell("1710519193", &date), json!("1710519193"));
+        // Seconds the parser does not read as text stay seconds.
+        assert_eq!(csv_cell("946684799", &date), json!(946_684_799));
+        assert_eq!(csv_cell("-86400", &date), json!(-86_400));
+        // Anything else goes as written, for the node to refuse by its reason.
+        assert_eq!(csv_cell("soon", &date), json!("soon"));
+    }
+
+    #[test]
+    fn a_text_cell_keeps_the_text_it_holds() {
+        let text = typed(TantivyFieldType::Text);
+        assert_eq!(csv_cell(" 007 ", &text), json!("007"));
+        assert_eq!(csv_cell("TRUE", &text), json!("TRUE"));
+        // A column no field describes is read by its look, as before.
+        assert_eq!(csv_cell("007", &ColumnShape::default()), json!(7));
+    }
+
+    #[test]
+    fn a_boolean_cell_takes_the_spellings_that_cannot_mean_anything_else() {
+        let flag = typed(TantivyFieldType::Boolean);
+        for yes in ["TRUE", "yes", "Y", "1"] {
+            assert_eq!(csv_cell(yes, &flag), json!(true), "{yes}");
+        }
+        for no in ["false", "No", "n", "0"] {
+            assert_eq!(csv_cell(no, &flag), json!(false), "{no}");
+        }
+        assert_eq!(csv_cell("maybe", &flag), json!("maybe"));
+    }
+
+    /// A slash column whose sample has a date only day-first can read, and none only month-first
+    /// can, is day first — and its ambiguous dates are read that way too.
+    #[test]
+    fn a_slash_column_that_writes_day_first_is_read_day_first() {
+        let sample = rows("a;03/04/2024;x\nb;15/03/2024;y\nc;01/02/2024 16:13;z\n");
+        let orders = date_orders_by_column(&sample, 3);
+        assert_eq!(orders[1].slash, DateOrder::DayFirst);
+        assert_eq!(orders[0], DateOrders::default());
+        assert_eq!(orders[2], DateOrders::default());
+
+        let shape = dated(DateOrder::DayFirst, DateOrder::DayFirst);
+        assert_eq!(csv_cell("03/04/2024", &shape), json!("2024-04-03"));
+        assert_eq!(csv_cell("15/03/2024", &shape), json!("2024-03-15"));
+        assert_eq!(
+            csv_cell("01/02/2024 16:13", &shape),
+            json!("2024-02-01 16:13")
+        );
+        // Not a slash date: sent as written, as in any date column.
+        assert_eq!(csv_cell("2024-03-15", &shape), json!("2024-03-15"));
+        // A dotted date the node reads as meant is sent as written.
+        assert_eq!(csv_cell("15.03.2024", &shape), json!("15.03.2024"));
+    }
+
+    /// The mirror for dots: the node reads them day first, and a column whose sample has a date
+    /// only month-first can read, and none only day-first can, is month first.
+    #[test]
+    fn a_dotted_column_that_writes_month_first_is_read_month_first() {
+        let sample = rows("03.04.2024\n03.15.2024\n");
+        let orders = date_orders_by_column(&sample, 1);
+        assert_eq!(orders[0].dot, DateOrder::MonthFirst);
+        assert_eq!(orders[0].slash, DateOrder::MonthFirst);
+
+        let shape = dated(DateOrder::MonthFirst, DateOrder::MonthFirst);
+        assert_eq!(csv_cell("03.04.2024", &shape), json!("2024-03-04"));
+        assert_eq!(
+            csv_cell("03.15.2024 16:13:13", &shape),
+            json!("2024-03-15 16:13:13")
+        );
+    }
+
+    /// With no evidence, or evidence both ways, a column keeps the node's order for that
+    /// separator, and its dates go as written for the node to read.
+    #[test]
+    fn a_column_keeps_the_nodes_order_unless_its_sample_says_otherwise() {
+        for sample in [
+            "03/04/2024\n05/06/2024\n",
+            "03/15/2024\n03/04/2024\n",
+            "15/03/2024\n03/15/2024\n",
+            "03.04.2024\n15.03.2024\n",
+            "15.03.2024\n03.15.2024\n",
+        ] {
+            assert_eq!(
+                date_orders_by_column(&rows(sample), 1),
+                vec![DateOrders::default()],
+                "{sample:?}"
+            );
+        }
+        let as_the_node_reads = typed(TantivyFieldType::Date);
+        assert_eq!(
+            csv_cell("03/04/2024", &as_the_node_reads),
+            json!("03/04/2024")
+        );
+        assert_eq!(
+            csv_cell("03.04.2024", &as_the_node_reads),
+            json!("03.04.2024")
+        );
+    }
+
+    /// Each separator is judged on its own evidence.
+    #[test]
+    fn slashes_and_dots_in_one_column_are_judged_apart() {
+        let sample = rows("15/03/2024\n03.15.2024\n");
+        assert_eq!(
+            date_orders_by_column(&sample, 1),
+            vec![DateOrders {
+                slash: DateOrder::DayFirst,
+                dot: DateOrder::MonthFirst,
+            }]
+        );
+    }
+
+    /// The order is only taken for a date field, so a text column of slash dates keeps them as
+    /// written.
+    #[test]
+    fn only_a_date_column_is_reordered() {
+        let headers = vec![("when".to_string(), None), ("note".to_string(), None)];
+        let field_types = HashMap::from([
+            ("when".to_string(), TantivyFieldType::Date),
+            ("note".to_string(), TantivyFieldType::Text),
+        ]);
+        let day_first = DateOrders {
+            slash: DateOrder::DayFirst,
+            dot: DateOrder::DayFirst,
+        };
+        let shapes = column_shapes(&headers, &field_types, &[day_first, day_first]);
+        assert_eq!(shapes[0].dates, day_first);
+        assert_eq!(shapes[1].dates, DateOrders::default());
+    }
+
+    /// With no schema, inference sees a day-first column's dates as dates. `15/03/2024` is text
+    /// to the node, so the column would have been typed text and never sorted.
+    #[test]
+    fn a_day_first_sample_infers_a_date_field() {
+        let headers = vec![("id".to_string(), None), ("when".to_string(), None)];
+        let detection = detect_id_field(&headers);
+        let sample = rows("a;15/03/2024\nb;03/04/2024\nc;NA\n");
+        let date_orders = date_orders_by_column(&sample, 2);
+        let schema =
+            csv_sample_schema(&headers, &detection, &sample, &date_orders).expect("schema");
+        assert_eq!(
+            schema_field_types(&schema).get("when"),
+            Some(&TantivyFieldType::Date)
+        );
+    }
+
+    /// Each record's line as `sed -n <N>p` counts: with LF or CRLF endings, a quoted field over
+    /// two lines, blank lines, and no final line ending. The reader's own position was one line
+    /// early on every CRLF record, and short again after each blank line.
+    #[test]
+    fn a_record_is_located_on_the_line_it_starts() {
+        let cases = [
+            ("a;b\n1;x\n2;\"multi\nline\"\n3;z\n", vec![2, 3, 5]),
+            (
+                "a;b\r\n1;x\r\n2;\"multi\r\nline\"\r\n3;z\r\n",
+                vec![2, 3, 5],
+            ),
+            ("a;b\r\n1;x\r\n2;\"multi\nline\"\r\n3;z\r\n", vec![2, 3, 5]),
+            ("a;b\n1;x\n\n\n2;y\n3;z\n", vec![2, 5, 6]),
+            ("a;b\r\n1;x\r\n\r\n\r\n2;y\r\n3;z\r\n", vec![2, 5, 6]),
+            ("a;b\n1;x\n2;y", vec![2, 3]),
+            ("a;b\r\n1;x\r\n2;y", vec![2, 3]),
+        ];
+        for (text, expected) in cases {
+            let mut reader = csv::ReaderBuilder::new()
+                .delimiter(b';')
+                .flexible(true)
+                .from_reader(text.as_bytes());
+            let header = reader.headers().expect("header").clone();
+            let mut lines = RecordLines::after_header(&header, reader.position().line());
+            let mut record = csv::StringRecord::new();
+            let mut found = Vec::new();
+            while reader.read_record(&mut record).expect("record") {
+                found.push(lines.locate(&record, reader.position().line()));
+            }
+            assert_eq!(found, expected, "{text:?}");
+        }
+    }
 }
