@@ -17,7 +17,7 @@ mod write;
 use crate::ratelimit::Caller;
 
 pub(crate) use catalogue::validate_index_name;
-pub(crate) use health::HEALTH_PATH;
+pub(crate) use health::{HEALTH_PATH, IndexCounts};
 pub(crate) use routes::{RouterConfig, create_router};
 
 /// Who the rate limiter charges for this request.

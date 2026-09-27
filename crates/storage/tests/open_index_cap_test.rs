@@ -215,3 +215,62 @@ fn closing_an_index_from_another_thread_loses_no_write_in_flight() {
         "every acknowledged write must be searchable after closes from another thread"
     );
 }
+
+/// A write that finds its index closed under it reopens the index, and succeeds.
+///
+/// A close on another thread can land between a write fetching the index's writer and locking
+/// it; the write then holds a writer that is no longer the index's and retries. It retried
+/// while still holding that writer, and Tantivy's lockfile belongs to the writer until its last
+/// reference is dropped — so the reopen failed with `LockBusy`, and a write that had merely lost
+/// a race answered 500. Seen once in the cluster suite, on the first write to a new index on a
+/// node holding thousands of indexes, where the open-index cap closes one on nearly every open.
+#[test]
+fn a_write_that_loses_a_race_with_a_close_reopens_the_index() {
+    const WRITES: usize = 1_500;
+
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(HybridStore::new(capped_config(dir.path(), 1), 1).expect("store"));
+    store
+        .store_schema_and_cache("busy", &schema())
+        .expect("schema");
+    write_one(&store, "other", "doc-1");
+    store.commit_index("other").expect("commit");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let closers: Vec<_> = (0..3)
+        .map(|_| {
+            let (store, stop) = (Arc::clone(&store), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    // Opening `other` for a search closes `busy` (cap of one), and the explicit
+                    // close lands at any point of a write in between.
+                    let _ = store.search_documents("other", "title:other", 1, None);
+                    store.close_index("busy");
+                }
+            })
+        })
+        .collect();
+
+    let mut failures = Vec::new();
+    for i in 0..WRITES {
+        if let Err(err) = store.apply_write(
+            "busy",
+            WalOp::Put {
+                id: format!("w{i}"),
+                json_blob: Some(json!({ "title": "in busy" })),
+            },
+        ) {
+            failures.push(err.to_string());
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    for closer in closers {
+        closer.join().expect("closer thread");
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {WRITES} writes failed, first: {:?}",
+        failures.len(),
+        failures.first()
+    );
+}

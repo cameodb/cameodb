@@ -6,9 +6,125 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::time::{Instant, timeout_at};
-use tracing::error;
+use tracing::{error, warn};
+
+use crate::node::RouterActor;
+
+/// How old the index counts in the expanded body may be before a probe starts a fresh count.
+///
+/// The counts are informational — nothing routes or refuses on them — and producing them walks
+/// every index on every shard, so a probe serves the last reading and counts again at most this
+/// often, in the background. See [`IndexCounts`].
+const INDEX_COUNTS_MAX_AGE: Duration = Duration::from_secs(30);
+
+/// One count of this node's indexes, and when it was taken.
+#[derive(Clone, Copy, Debug)]
+pub struct IndexCountsReading {
+    at: Instant,
+    total: usize,
+    with_data: usize,
+}
+
+/// `total_indexes` and `indexes_with_data` for the health body, counted off the request path.
+///
+/// Counting reads stats for every index on every shard: sizes, document counts, the fields the
+/// built index has. Done on every probe, a health check cost more the more indexes the node
+/// held — about 0.2 s at 3,000, and past its 5 s budget at 9,000, where it reported the node
+/// degraded for being large. A probe now serves the last reading and, when it is older than
+/// [`INDEX_COUNTS_MAX_AGE`], starts one count in the background; only the first probe after
+/// start waits for one, inside its usual budget. So a probe costs the same at ten indexes or
+/// ten thousand, and the count runs at most every 30 s, and only while someone is asking.
+pub struct IndexCounts {
+    latest: tokio::sync::watch::Sender<Option<IndexCountsReading>>,
+    counting: AtomicBool,
+}
+
+impl Default for IndexCounts {
+    fn default() -> Self {
+        Self {
+            latest: tokio::sync::watch::Sender::new(None),
+            counting: AtomicBool::new(false),
+        }
+    }
+}
+
+impl IndexCounts {
+    fn latest(&self) -> Option<IndexCountsReading> {
+        *self.latest.borrow()
+    }
+
+    /// Start a count in the background unless one is already running.
+    fn refresh(self: &Arc<Self>, router: RouterActor) {
+        if self.counting.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let counts = Arc::clone(self);
+        tokio::spawn(async move {
+            // Cleared however the task ends, a panic included: stuck set, no count would run
+            // again and the body would serve one reading for the life of the process.
+            struct Done(Arc<IndexCounts>);
+            impl Drop for Done {
+                fn drop(&mut self) {
+                    self.0.counting.store(false, Ordering::Release);
+                }
+            }
+            let done = Done(counts);
+            let listing = router
+                .handle_client_op(ClientOp::ListIndexes {
+                    include_data_size: false,
+                })
+                .await;
+            match listing {
+                Ok(listing) => {
+                    let (total, with_data) = count_indexes(&listing);
+                    done.0.latest.send_replace(Some(IndexCountsReading {
+                        at: Instant::now(),
+                        total,
+                        with_data,
+                    }));
+                }
+                Err(err) => warn!(error = %err, "health: counting this node's indexes failed"),
+            }
+        });
+    }
+
+    /// Wait for the first reading, up to `deadline`.
+    async fn first(&self, deadline: Instant) -> Option<IndexCountsReading> {
+        let mut rx = self.latest.subscribe();
+        match timeout_at(deadline, rx.wait_for(Option::is_some)).await {
+            Ok(Ok(reading)) => *reading,
+            _ => None,
+        }
+    }
+}
+
+/// `(total, with data)` from an index listing.
+fn count_indexes(listing: &serde_json::Value) -> (usize, usize) {
+    let total = listing
+        .get("total_indexes")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let with_data = listing
+        .get("indexes")
+        .and_then(|arr| arr.as_array())
+        .map(|indexes| {
+            indexes
+                .iter()
+                .filter(|idx| {
+                    idx.get("document_count")
+                        .and_then(|c| c.as_u64())
+                        .unwrap_or(0)
+                        > 0
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    (total, with_data)
+}
 
 /// Ceiling on what the expanded body may spend waiting on actors, and the value used when the
 /// node's request timeout is larger than anything worth waiting for.
@@ -63,6 +179,11 @@ pub struct HealthResponse {
     pub active_shards: usize,
     pub total_indexes: usize,
     pub indexes_with_data: usize,
+    /// How many seconds ago the two counts above were taken. They are counted off the request
+    /// path, at most every 30 s, so a body can carry a reading that old. Absent when there is
+    /// no reading yet — see `degraded`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_counts_age_secs: Option<u64>,
 
     // Read-pool saturation gauge: reads executing now, and the pool's blocking width. A read
     // approaching the second is a node shedding read load; equal and stuck is what turns it red.
@@ -243,40 +364,25 @@ pub(super) async fn health_handler(
         }
     };
 
-    // Get index statistics for health check
-    let (total_indexes, indexes_with_data) = match timeout_at(
-        actor_deadline,
-        state.router.handle_client_op(ClientOp::ListIndexes {
-            include_data_size: false,
-        }),
-    )
-    .await
-    {
-        Ok(Ok(result)) => {
-            let total = result
-                .get("total_indexes")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as usize;
-            let empty_vec = vec![];
-            let indexes_array = result
-                .get("indexes")
-                .and_then(|arr| arr.as_array())
-                .unwrap_or(&empty_vec);
-            let with_data = indexes_array
-                .iter()
-                .filter(|idx| {
-                    idx.get("document_count")
-                        .and_then(|c| c.as_u64())
-                        .unwrap_or(0)
-                        > 0
-                })
-                .count();
-            (total, with_data)
-        }
-        Ok(Err(_)) | Err(_) => {
-            error!("health actor budget exhausted or error: ListIndexes");
+    // Served from the last count rather than counted here — see `IndexCounts`. Only the first
+    // probe after start waits, and only inside the same budget as every call above.
+    let counts = &state.index_counts;
+    let reading = counts.latest();
+    if reading.is_none_or(|r| r.at.elapsed() >= INDEX_COUNTS_MAX_AGE) {
+        counts.refresh(state.router.clone());
+    }
+    let reading = match reading {
+        Some(reading) => Some(reading),
+        None => counts.first(actor_deadline).await,
+    };
+    let (total_indexes, indexes_with_data, index_counts_age_secs) = match reading {
+        Some(r) => (r.total, r.with_data, Some(r.at.elapsed().as_secs())),
+        None => {
+            // Not a fault: the first count on a node with many indexes can take longer than a
+            // probe may wait. It carries on in the background and the next probe reads it.
+            warn!("health: this node's indexes are still being counted");
             degraded.push("total_indexes");
-            (0, 0) // Fallback to 0 if index listing fails
+            (0, 0, None)
         }
     };
 
@@ -299,6 +405,7 @@ pub(super) async fn health_handler(
         active_shards: shard_count,
         total_indexes,
         indexes_with_data,
+        index_counts_age_secs,
         read_pool_in_flight,
         read_pool_capacity,
         read_pool_abandoned,
@@ -354,10 +461,51 @@ fn worst_status(
 #[cfg(test)]
 mod tests {
     use super::{
-        HEALTH_ACTOR_BUDGET_MAX, HEALTH_ACTOR_BUDGET_MIN, degrade_status, health_actor_budget,
-        worst_status,
+        HEALTH_ACTOR_BUDGET_MAX, HEALTH_ACTOR_BUDGET_MIN, IndexCounts, IndexCountsReading,
+        count_indexes, degrade_status, health_actor_budget, worst_status,
     };
     use std::time::Duration;
+    use tokio::time::Instant;
+
+    /// The counts come from the listing's total and the indexes in it that hold documents.
+    #[test]
+    fn index_counts_read_the_total_and_the_indexes_with_documents() {
+        let listing = serde_json::json!({
+            "total_indexes": 3,
+            "indexes": [
+                {"name": "a", "document_count": 5},
+                {"name": "b", "document_count": 0},
+                {"name": "c"},
+            ],
+        });
+        assert_eq!(count_indexes(&listing), (3, 1));
+        assert_eq!(count_indexes(&serde_json::json!({})), (0, 0));
+    }
+
+    /// Only the first probe waits for a count, and only until its deadline; a reading arriving
+    /// while it waits is what it answers with.
+    #[tokio::test]
+    async fn the_first_probe_waits_for_a_count_until_its_deadline() {
+        let counts = IndexCounts::default();
+        let soon = Instant::now() + Duration::from_millis(20);
+        assert!(counts.first(soon).await.is_none(), "no count yet, so none");
+
+        let reading = IndexCountsReading {
+            at: Instant::now(),
+            total: 9_000,
+            with_data: 8_000,
+        };
+        let later = Instant::now() + Duration::from_secs(5);
+        let (seen, ()) = tokio::join!(counts.first(later), async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            counts.latest.send_replace(Some(reading));
+        });
+        assert_eq!(seen.map(|r| (r.total, r.with_data)), Some((9_000, 8_000)));
+        assert!(
+            counts.latest().is_some(),
+            "and later probes read it without waiting"
+        );
+    }
 
     /// The property the fixed 5s constant did not have: the wait has to be shorter than the
     /// budget it is taken out of, or `TimeoutLayer` abandons the request as a 408 before the

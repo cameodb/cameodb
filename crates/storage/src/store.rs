@@ -135,6 +135,34 @@ pub(crate) fn tantivy_checkpoint_seq(tantivy_index: &Index) -> Option<u64> {
 /// inside the few microseconds between opening it and locking its writer.
 const LIVE_WRITER_ATTEMPTS: usize = 3;
 
+/// Open an index's writer, waiting out a close that is still letting go of the previous one.
+///
+/// Tantivy's lockfile belongs to the `IndexWriter` and is released when it is dropped, which is
+/// when its last `Arc` goes. A close on another thread detaches the writer and drops its guard
+/// before it drops its own clone, so a write that reopens the index in that instant finds the
+/// lock still held. A few milliseconds settle it; anything longer is a real second writer and
+/// is reported as the error it is.
+fn open_writer_past_a_close(
+    tantivy_index: &Index,
+    options: tantivy::indexer::IndexWriterOptions,
+) -> Result<IndexWriter, tantivy::TantivyError> {
+    const ATTEMPTS: u32 = 20;
+    const PAUSE: Duration = Duration::from_millis(5);
+    let mut attempt = 1;
+    loop {
+        match tantivy_index.writer_with_options(options.clone()) {
+            Err(tantivy::TantivyError::LockFailure(
+                tantivy::directory::error::LockError::LockBusy,
+                _,
+            )) if attempt < ATTEMPTS => {
+                attempt += 1;
+                std::thread::sleep(PAUSE);
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Lock an index writer, recovering it from a poisoned mutex: a panic applying one write is
 /// caught per operation and the writer rebuilt, so poison is not a reason to fail the next.
 fn lock_writer<'w>(writer: &'w Mutex<IndexWriter>, index: &str) -> MutexGuard<'w, IndexWriter> {
@@ -1780,7 +1808,7 @@ impl HybridStore {
             .memory_budget_per_thread(memory_per_thread)
             .num_merge_threads(num_merge_threads)
             .build();
-        let mut writer = tantivy_index.writer_with_options(writer_options)?;
+        let mut writer = open_writer_past_a_close(&tantivy_index, writer_options)?;
 
         tracing::info!(
             index = %index,
@@ -2405,6 +2433,11 @@ impl HybridStore {
             if attempt >= LIVE_WRITER_ATTEMPTS {
                 return Err(StoreError::WriterClosed(index.to_string()));
             }
+            // Let go of the detached writer before reopening. Tantivy's lockfile is released
+            // when the `IndexWriter` is dropped, which is when its last `Arc` goes; held
+            // through the retry, it made the reopen below fail with `LockBusy` — a write that
+            // lost its race with a close answered 500 instead of reopening the index.
+            drop(writer_arc);
             return self.apply_write_attempt(index, op, attempt + 1);
         };
 
@@ -3327,6 +3360,11 @@ impl HybridStore {
             if attempt >= LIVE_WRITER_ATTEMPTS {
                 return Err(StoreError::WriterClosed(index.to_string()));
             }
+            // Let go of the detached writer before reopening. Tantivy's lockfile is released
+            // when the `IndexWriter` is dropped, which is when its last `Arc` goes; held
+            // through the retry, it made the reopen below fail with `LockBusy` — a write that
+            // lost its race with a close answered 500 instead of reopening the index.
+            drop(writer_arc);
             return self.apply_batch_attempt(index, ops, attempt + 1);
         };
 

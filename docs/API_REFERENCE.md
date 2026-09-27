@@ -866,6 +866,7 @@ round-trip, so a probe flood cannot become mailbox pressure.
   "active_shards": 4,
   "total_indexes": 1,
   "indexes_with_data": 1,
+  "index_counts_age_secs": 4,
   "read_pool_in_flight": 0,
   "read_pool_capacity": 2,
   "read_pool_abandoned": 0,
@@ -878,7 +879,13 @@ round-trip, so a probe flood cannot become mailbox pressure.
 ```
 
 `status` is `green`, `yellow` or `red`, and it is the real status in both bodies — a health
-check that cannot go yellow is not one. A writer that exited abnormally or stalled mid-batch,
+check that cannot go yellow is not one.
+
+`total_indexes` and `indexes_with_data` are counted in the background, at most every 30
+seconds and only while health is being asked, and `index_counts_age_secs` says how old the
+reading is. Counting walks every index on every shard, so a probe that did it itself cost more
+the more indexes the node held. The first probe after start waits for a count inside its usual
+budget; if the count is not done by then, both read `0` and `degraded` names `total_indexes`. A writer that exited abnormally or stalled mid-batch,
 or a read pool saturated with no progress, turns the node `red`.
 
 The load fields are what an operator reads when a node starts answering `503`:

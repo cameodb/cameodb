@@ -840,9 +840,8 @@ impl RouterActor {
     /// future were all written twice — once here and once in `handle_broadcast_streaming` —
     /// and had already drifted: the streaming half answered a paged search with page 1
     /// (ROADMAP OB8) and dropped a source when it thought it could stop early. What stays
-    /// per-caller is the local future — `handle_broadcast` runs the op through
-    /// `handle_client_op`'s worker-pool dispatch, the streaming path asks the orchestrator
-    /// directly — and the merge.
+    /// per-caller is the local future and the merge; both callers now pass
+    /// `handle_client_op`, the worker-pool dispatch.
     ///
     /// `op` arrives already widened by [`widen_broadcast_op`]; the window it was widened
     /// from is reported back on [`BroadcastFanout::window`] so the merge can page with it.
@@ -1400,9 +1399,11 @@ impl RouterActor {
     ///
     /// The fan-out is [`broadcast_fanout`](Self::broadcast_fanout) — the same one
     /// [`handle_broadcast`](Self::handle_broadcast) uses. What is streaming about this path is
-    /// the local future (a direct ask on the orchestrator rather than `handle_client_op`'s
-    /// worker-pool dispatch) and the merge below, which keeps each source's block keyed by
-    /// the identity it arrived under.
+    /// the merge below, which keeps each source's block keyed by the identity it arrived under.
+    ///
+    /// The local half runs on the worker pool, like every other search. It was a direct ask on
+    /// the orchestrator, which put the local half of every clustered search without a routing
+    /// key — streaming is on by default — through the actor's mailbox, one search at a time.
     ///
     /// The page is read before the arm below destructures the op — `Search` and `Stream`
     /// share the arm and only one of them can be paged, so the distinction is drawn in
@@ -1462,7 +1463,7 @@ impl RouterActor {
                 let sort = sort.clone();
 
                 let fanout = self
-                    .broadcast_fanout(op, window, |op| self.ask_orchestrator_unguarded(op))
+                    .broadcast_fanout(op, window, |op| self.handle_client_op(op))
                     .await;
                 let BroadcastFanout {
                     window,
