@@ -16,6 +16,7 @@ show the evidence. Nodes come from CLUSTER_NODES, a comma-separated list of base
   mints <seconds> <writers>                new-index writes with varied ids through every node
   bulks <seconds> <writers> <index>        bulk writes through every node into an existing index
   writes <seconds> <writers> <index>       single writes with varied ids through every node
+  searches <seconds> <writers> <index>     searches through every node, each a cluster-wide fan-out
   bulkmints <seconds> <writers>            each bulk write creates its own index, through every node
   samemint <rounds> <writers>              every node writes to one new index at the same moment
   fault <seconds> <from> <to> <index>      node1's health, searches and writes while a peer is
@@ -263,6 +264,21 @@ def cmd_writes(seconds, writers, index):
         return status, t
 
     return cross_load("writes", seconds, writers, request)
+
+
+def cmd_searches(seconds, writers, index):
+    """Searches through every node at once, each one fanned out to every node.
+
+    A search with no routing key asks every node's shards; the receiving node serves its own
+    half locally and gathers the peers'. Many at once is what shows whether either half is
+    served one at a time.
+    """
+    def request(node, tag, i):
+        status, t, _ = call("POST", f"{node}/api/{index}/search",
+                            {"query": "title:cross", "limit": 10}, timeout=OP_TIMEOUT)
+        return status, t
+
+    return cross_load("searches", seconds, writers, request)
 
 
 def cmd_bulkmints(seconds, writers):
@@ -581,6 +597,8 @@ def main():
         return cmd_bulks(int(args[0]), int(args[1]), args[2])
     if cmd == "writes":
         return cmd_writes(int(args[0]), int(args[1]), args[2])
+    if cmd == "searches":
+        return cmd_searches(int(args[0]), int(args[1]), args[2])
     if cmd == "bulkmints":
         return cmd_bulkmints(int(args[0]), int(args[1]))
     if cmd == "samemint":

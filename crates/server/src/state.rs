@@ -16,6 +16,9 @@ use crate::ratelimit::RateLimiter;
 #[derive(Clone)]
 pub struct AppState {
     pub router: RouterActor,
+    /// The health body's index counts, kept between probes — see
+    /// [`IndexCounts`](crate::http_server::IndexCounts).
+    pub index_counts: Arc<crate::http_server::IndexCounts>,
     pub coordinator: ActorRef<ClusterCoordinator>,
     /// Number of documents per micro-batch for NDJSON write-stream ingestion
     pub stream_batch_size: usize,

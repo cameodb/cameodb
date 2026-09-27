@@ -130,6 +130,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   settles it the same way — the lowest node id mints and the others wait for its schema and
   adopt it. 120 of 120 written, p50 0.04 s, each index minted by exactly one node.
 
+- **A write that loses a race with an index close reopens the index instead of failing.** Past
+  the open-index cap, opening one index closes a colder one from whichever thread is opening. A
+  write that fetched an index's writer just before a close retried with that writer still in
+  hand, and Tantivy's lockfile belongs to a writer until its last reference is dropped — so the
+  reopen failed with `LockBusy` and the write answered `500`. The retry now lets go of it first,
+  and opening a writer waits out the few milliseconds a close on another thread takes to let go
+  of its own. Seen in the cluster suite on the first write to a new index on a node holding
+  thousands; the new stress test lost 113 of 3,000 writes to it before the fix and none after.
+
+- **A health check no longer costs more the more indexes a node holds.** The expanded body's
+  `total_indexes` and `indexes_with_data` were counted on every probe, by reading stats for
+  every index on every shard: about 0.2 s at 3,000 indexes, and past the probe's 5 s budget at
+  9,000, where the node reported itself degraded for being large. They are now counted in the
+  background, at most every 30 s and only while someone is asking, and `index_counts_age_secs`
+  says how old the reading is. A probe answered in 0.18 s at 2,900 indexes; it answers in about
+  1 ms.
+
 - **A refused request no longer costs a log line, and single-write overload no longer halves
   goodput.** Every `503` was logged at `ERROR` — twice, by the trace layer and by the error
   handler — synchronously on the runtime the write path shares. A default node filters at
@@ -298,6 +315,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   could not otherwise serve the shares both were waiting for — and when it is full the op waits
   its turn on the mailbox, as before. Measured with 8 writers per node: 446–582 bulk batches/s
   before, 1,165–1,312 after, p99 0.15–0.29 s to 0.04–0.07 s.
+
+- **A clustered search no longer waits behind the actor's work for its local half.** With
+  streaming search on (the default), a search with no routing key asked this node's own shards
+  through the orchestrator's mailbox, one search at a time and behind whatever else was queued
+  there — a new index being created, a schema edit. It now runs on the worker pool like the
+  non-streaming path. Measured while new indexes were being created on every node: 39.5
+  searches/s, p50 0.15 s before; 164/s, p50 under 0.01 s after. With the mailbox idle the gain is
+  10–16%.
 
 - **Writes become searchable on a clock, not a count: bulk ingest 1.8–6.6× faster.** A commit
   is what makes writes visible to search, and it was triggered at 1,000 operations on a new

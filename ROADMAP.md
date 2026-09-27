@@ -3180,6 +3180,17 @@ A bulk mint's cost did not move, so it is not the mailbox, as this entry first g
 mint itself — saving the schema and opening the index on every shard of every node — which is
 the actor's by design. Single writes were never mailbox-bound at this load.
 
+**Fixed as well — a streaming search's local half.** With `enable_streaming_search` on (the
+default), `handle_broadcast_streaming` asked this node's own shards through the orchestrator's
+mailbox — kept that way by the L16 refactor to preserve behaviour, not for a reason — so every
+clustered search with no routing key served its local half one at a time, behind index creation
+and schema edits. It now passes `handle_client_op`, as the non-streaming path does.
+
+| searches through every node, 2 per node, 18 s | mailbox | worker pool |
+|---|---|---|
+| while bulk writes create indexes on every node | 39.5/s, p50 0.15 s, p99 0.50 s | **164/s**, p50 < 0.01 s, p99 0.32 s |
+| mailbox idle | 1,671–1,721/s | 1,877/s |
+
 ### F9 — Commit on a clock, not a count
 
 ✅ **Done 2026-09-26.** Found by the same pre-release profiling session: stack samples of bulk at

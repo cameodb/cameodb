@@ -640,6 +640,7 @@ async fn main() -> Result<()> {
     let audit_sink = audit::AuditSink::start(&cameodb_config.security.audit);
 
     let app_state = AppState {
+        index_counts: Default::default(),
         router: router_actor,
         coordinator: coordinator_actor.clone(),
         stream_batch_size: cameodb_config.search.stream_batch_size,
