@@ -885,7 +885,8 @@ check that cannot go yellow is not one.
 seconds and only while health is being asked, and `index_counts_age_secs` says how old the
 reading is. Counting walks every index on every shard, so a probe that did it itself cost more
 the more indexes the node held. The first probe after start waits for a count inside its usual
-budget; if the count is not done by then, both read `0` and `degraded` names `total_indexes`. A writer that exited abnormally or stalled mid-batch,
+budget; if the count is not done by then, both read `0` and `degraded` names `total_indexes`. `node_id`, `node_name` and
+`active_shards` are read without waiting on anything, so they are never degraded. A writer that exited abnormally or stalled mid-batch,
 or a read pool saturated with no progress, turns the node `red`.
 
 The load fields are what an operator reads when a node starts answering `503`:

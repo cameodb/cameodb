@@ -19,6 +19,12 @@ pub struct AppState {
     /// The health body's index counts, kept between probes — see
     /// [`IndexCounts`](crate::http_server::IndexCounts).
     pub index_counts: Arc<crate::http_server::IndexCounts>,
+    /// Who this node is, for the health body. Fixed for the life of the process, so health
+    /// reads it here rather than asking the orchestrator — an ask that queued behind writes
+    /// and ran out of health's budget on every probe under write overload (ROADMAP M6,
+    /// session 4).
+    pub node_id: uuid::Uuid,
+    pub node_name: String,
     pub coordinator: ActorRef<ClusterCoordinator>,
     /// Number of documents per micro-batch for NDJSON write-stream ingestion
     pub stream_batch_size: usize,

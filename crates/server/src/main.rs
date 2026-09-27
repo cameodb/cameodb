@@ -408,6 +408,7 @@ async fn main() -> Result<()> {
 
     // Capture node_id early for remote registration
     let node_id = orchestrator.identity().uuid;
+    let node_name = orchestrator.identity().name.clone();
 
     // Initialize cluster state store for persistent metadata
     let state_store = Arc::new(
@@ -641,6 +642,8 @@ async fn main() -> Result<()> {
 
     let app_state = AppState {
         index_counts: Default::default(),
+        node_id,
+        node_name,
         router: router_actor,
         coordinator: coordinator_actor.clone(),
         stream_batch_size: cameodb_config.search.stream_batch_size,

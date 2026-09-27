@@ -230,9 +230,10 @@ pub struct HealthResponse {
     /// Which parts of this body could not be filled in before the actor budget ran out.
     ///
     /// Absent on a healthy answer. Present, it names the fields whose values below are
-    /// fallbacks rather than readings — a node reporting `active_shards: 0` because it is busy
-    /// looks identical to one reporting it because it has no shards, and only this tells them
-    /// apart. The liveness fields beside it are atomics and are never degraded.
+    /// fallbacks rather than readings — a node reporting `total_indexes: 0` because its first
+    /// count is not done looks identical to one that holds no indexes, and only this tells them
+    /// apart. The liveness fields beside it, the node's identity and its shard count are read
+    /// without waiting on anything and are never degraded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub degraded: Option<Vec<String>>,
 }
@@ -277,8 +278,8 @@ pub(super) async fn health_handler(
     // sequence, so a per-call wait bounds none of them: four calls at the old fixed 5s was a
     // 20s worst case on a node whose whole request budget might be 1s. `degraded` names
     // whichever did not answer inside it, because the fallbacks below are indistinguishable
-    // from real values — 0 shards, 0 indexes, an unknown node id — and a body that looks
-    // broken is worse to act on than one that says it is incomplete.
+    // from real values — no cluster view, 0 indexes — and a body that looks broken is worse to
+    // act on than one that says it is incomplete.
     let actor_deadline = Instant::now() + health_actor_budget(state.request_timeout);
     let mut degraded: Vec<&'static str> = Vec::new();
 
@@ -326,43 +327,14 @@ pub(super) async fn health_handler(
         None => (None, None),
     };
 
-    // Get basic shard count and node info from orchestrator. These can queue behind real work,
-    // so the expanded body uses bounded waits; on timeout we fall back to defaults rather than
-    // let a slow node fail its own health probe.
-    // One call for all three, because `GetIdentity` already reports the shard count and the
-    // separate `shard_count()` ask returned the same `shards.len()` from the same actor. It
-    // cost health a whole round-trip out of a shared deadline, and being ahead of this in the
-    // queue it could spend the budget that this needed.
-    let (node_id, node_name, shard_count) = match timeout_at(
-        actor_deadline,
-        state.router.handle_client_op(ClientOp::GetIdentity),
-    )
-    .await
-    {
-        Ok(Ok(result)) => {
-            let node_id = result
-                .get("node_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("local")
-                .to_string();
-            let node_name = result
-                .get("node_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-            let shards = result
-                .get("total_shards")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as usize;
-            (node_id, node_name, shards)
-        }
-        Ok(Err(_)) | Err(_) => {
-            error!("health actor budget exhausted or error: GetIdentity");
-            degraded.push("node_id");
-            degraded.push("active_shards");
-            ("local".to_string(), "unknown".to_string(), 0)
-        }
-    };
+    // Read, not asked for. They used to come from `GetIdentity`, which a worker answers — so
+    // under write overload the ask queued behind the writes, ran out of this budget on nearly
+    // every probe, and each such probe logged an `ERROR` and reported `node_id` and
+    // `active_shards` as degraded (ROADMAP M6, session 4). The identity is fixed for the life
+    // of the process and the shard count is a lock-free snapshot, so neither needs a queue.
+    let node_id = state.node_id.to_string();
+    let node_name = state.node_name.clone();
+    let shard_count = state.router.live_shard_count();
 
     // Served from the last count rather than counted here — see `IndexCounts`. Only the first
     // probe after start waits, and only inside the same budget as every call above.
