@@ -80,9 +80,7 @@ async fn main() -> Result<()> {
     // open-loop path warms up inside its own runner, so each arm takes the snapshot at the
     // point where its warmup is already done.
     let before;
-    let after;
-
-    match &args.load {
+    let after = match &args.load {
         args::Load::Closed { concurrency } => {
             if !args.warmup.is_zero() {
                 println!(
@@ -99,7 +97,7 @@ async fn main() -> Result<()> {
                 workload::run(Arc::clone(&client), &args, *concurrency, args.duration).await?;
             let wall = started.elapsed();
             report.print(wall);
-            after = client.admin_worker_stats().await.ok();
+            client.admin_worker_stats().await.ok()
         }
         args::Load::Open(open) => {
             // The open-loop runner does its own warmup, so the snapshot has to sit inside it
@@ -108,9 +106,9 @@ async fn main() -> Result<()> {
             let reports = openloop::run(Arc::clone(&client), &args, open).await?;
             before = None;
             openloop::print(reports, open);
-            after = client.admin_worker_stats().await.ok();
+            client.admin_worker_stats().await.ok()
         }
-    }
+    };
 
     match (before, after) {
         (Some(before), Some(after)) => workload::print_worker_delta(&before, &after),
