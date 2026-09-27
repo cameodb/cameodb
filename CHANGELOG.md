@@ -147,6 +147,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   says how old the reading is. A probe answered in 0.18 s at 2,900 indexes; it answers in about
   1 ms.
 
+- **A health check no longer waits behind writes for the node's own identity.** `node_id`,
+  `node_name` and `active_shards` came from a `GetIdentity` ask that a worker answers, so under
+  write overload it queued behind the writes, spent the probe's whole budget — half the request
+  timeout — and logged an `ERROR` on nearly every probe while reporting both fields degraded.
+  The identity is now read from state set at startup and the shard count from the lock-free
+  shard placement, so neither is asked for and neither can be degraded. Under bulk overload at
+  a 1 s request timeout, health p99 fell from 502 ms to 0.9 ms and the node's log from 116
+  `ERROR` lines to none.
+
+- **A search whose every shard was shed answers `503`, not `500`.** When each shard's read
+  outlived its budget waiting for a read thread, the gather folded the refusals into "no shard
+  could run this query" and classified it as a server fault: a `500` telling the client not to
+  retry, and an `ERROR` line per search. It now answers with the shed itself — the `503` with
+  `Retry-After` any other shed request gets, counted rather than logged. A shed shard also no
+  longer turns a query the other shards refused as the caller's mistake into a `500`: the shards
+  that ran the query decide whose fault it was. Measured on reads against a large, merging index
+  at a 1 s timeout: 49 `500`s and 405 `ERROR` lines per run before, none after.
+
 - **A refused request no longer costs a log line, and single-write overload no longer halves
   goodput.** Every `503` was logged at `ERROR` — twice, by the trace layer and by the error
   handler — synchronously on the runtime the write path shares. A default node filters at

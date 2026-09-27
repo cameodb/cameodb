@@ -287,6 +287,15 @@ impl RouterActor {
             .map(|load| load.dispatch_stats.service_hist.estimate_us() / 1_000)
     }
 
+    /// Shards serving on this node, read from the placement snapshot.
+    ///
+    /// The same count `GetIdentity` answers with: every shard enters the shard map and is
+    /// activated here in the same step, and none ever leaves. Asking for it instead put health
+    /// in a worker queue behind the writes it is meant to report on.
+    pub(crate) fn live_shard_count(&self) -> usize {
+        self.placement.load().live.len()
+    }
+
     /// Handles client operations.
     ///
     /// Hot-path ops (Write, Search, Stream) and the bulk fan-outs are dispatched to the

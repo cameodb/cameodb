@@ -431,6 +431,21 @@ pub(super) fn no_shard_answered(
         return None;
     }
 
+    // Every shard was shed — refused before it started, because the request's budget was spent
+    // waiting for a read thread. Nothing about the request or the data is wrong: the node was
+    // behind. So the answer is the shed itself, the `503` every other shed op answers, which
+    // `ShedLog` counts rather than logging. Folded into `NoShardAnswered` it was a fault — a
+    // `500` telling the client not to retry, and an `ERROR` line per search (ROADMAP M6,
+    // session 4).
+    if let Some(shed) = failures
+        .iter()
+        .map(|(_, err)| shed_again(err))
+        .collect::<Option<Vec<_>>>()
+        .and_then(|sheds| sheds.into_iter().next())
+    {
+        return Some(shed);
+    }
+
     let mut reasons: Vec<String> = Vec::new();
     for (_, err) in failures {
         let reason = match err {
@@ -445,8 +460,36 @@ pub(super) fn no_shard_answered(
     Some(OrchestratorError::NoShardAnswered {
         index: index.to_string(),
         reasons: reasons.join("; "),
-        caller_error: failures.iter().all(|(_, err)| is_caller_error(err)),
+        // A shed shard never ran the query, so it says nothing about whose fault it was: the
+        // shards that did run it decide. Counting it against the caller would turn a query the
+        // caller must fix into a `500` whenever the node was also busy.
+        caller_error: failures
+            .iter()
+            .filter(|(_, err)| shed_again(err).is_none())
+            .all(|(_, err)| is_caller_error(err)),
     })
+}
+
+/// `err` again when it is shed work — refused before it started because the node was behind —
+/// and `None` for anything else. The two kinds `AppError::from_route` answers as a shed.
+fn shed_again(err: &OrchestratorError) -> Option<OrchestratorError> {
+    match *err {
+        OrchestratorError::ReadDeadlineExpired {
+            waited_ms,
+            budget_ms,
+        } => Some(OrchestratorError::ReadDeadlineExpired {
+            waited_ms,
+            budget_ms,
+        }),
+        OrchestratorError::Overloaded {
+            predicted_wait_ms,
+            budget_ms,
+        } => Some(OrchestratorError::Overloaded {
+            predicted_wait_ms,
+            budget_ms,
+        }),
+        _ => None,
+    }
 }
 
 /// The per-shard failures as a response reports them, one line each, naming the shard.

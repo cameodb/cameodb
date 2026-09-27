@@ -3244,6 +3244,116 @@ fn a_gather_that_answered_nowhere_refuses_and_says_whose_fault_it_was() {
     );
 }
 
+/// A gather where every shard was shed answers as the shed — `503`, retry — not as a fault.
+///
+/// Measured before the fix: a search whose every shard outlived its budget waiting for a read
+/// thread answered `500 Internal Server Error`, which tells a client not to retry the one
+/// request it should, and logged an `ERROR` for each (ROADMAP M6, session 4).
+#[test]
+fn a_gather_whose_every_shard_was_shed_is_a_shed_not_a_fault() {
+    let shard = Uuid::nil();
+    let shed = |waited_ms| {
+        (
+            shard,
+            OrchestratorError::ReadDeadlineExpired {
+                waited_ms,
+                budget_ms: 1000,
+            },
+        )
+    };
+    let io = |kind, text: &str| {
+        (
+            shard,
+            OrchestratorError::Io(std::io::Error::new(kind, text.to_string())),
+        )
+    };
+
+    let answer = no_shard_answered("papers", 0, &[shed(1000), shed(1001)]);
+    assert!(
+        matches!(
+            answer,
+            Some(OrchestratorError::ReadDeadlineExpired {
+                budget_ms: 1000,
+                ..
+            })
+        ),
+        "every shard shed is the shed itself, got {answer:?}"
+    );
+    assert_eq!(
+        answer.map(|err| err.verdict()),
+        Some(RemoteVerdict::Unavailable)
+    );
+
+    // A shed shard never ran the query, so the shards that did decide whose fault it was.
+    let Some(OrchestratorError::NoShardAnswered { caller_error, .. }) = no_shard_answered(
+        "papers",
+        0,
+        &[
+            shed(1000),
+            io(std::io::ErrorKind::InvalidInput, "field not found: added"),
+        ],
+    ) else {
+        panic!("a query the shards that ran it refused is still a refusal");
+    };
+    assert!(
+        caller_error,
+        "the node being busy elsewhere does not make the caller's query a fault"
+    );
+
+    let Some(OrchestratorError::NoShardAnswered { caller_error, .. }) = no_shard_answered(
+        "papers",
+        0,
+        &[
+            shed(1000),
+            io(std::io::ErrorKind::PermissionDenied, "cannot open index"),
+        ],
+    ) else {
+        panic!("a shard that failed is still a refusal");
+    };
+    assert!(
+        !caller_error,
+        "a shard that could not read its data stays this node's problem"
+    );
+}
+
+/// Health reads the shard count from the placement snapshot, so it must be the shard map's.
+///
+/// It was asked for through `GetIdentity`, which a worker answers from the shard map — and under
+/// write overload that ask queued behind the writes and ran out of health's budget on nearly
+/// every probe (ROADMAP M6, session 4). The placement is lock-free and never queues; this pins
+/// that it counts the same shards.
+#[tokio::test]
+async fn the_placement_counts_the_same_shards_as_the_shard_map() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    // Both paths: a shard is placed under `storage_paths`, whose default is the working
+    // directory's `./data`, not under `storage_path`.
+    let mut orchestrator = NodeOrchestrator::new(
+        NodeConfig {
+            storage_path: dir.path().to_path_buf(),
+            storage_paths: vec![dir.path().to_path_buf()],
+            ..NodeConfig::default()
+        },
+        NodeIdentity::new(),
+        10,
+        4,
+    )
+    .await
+    .expect("an orchestrator with no shards");
+    let placement = orchestrator.shard_placement();
+    assert_eq!(placement.load().live.len(), 0);
+
+    for created in 1..=2 {
+        orchestrator
+            .handle_propose_shard(ProposeShard {
+                shard_id: Uuid::new_v4(),
+            })
+            .await
+            .expect("a shard under the cap starts");
+        assert_eq!(placement.load().live.len(), created);
+        assert_eq!(orchestrator.shard_count(), created);
+    }
+}
+
 /// A shadow field as the schema records one: the caller's name for the key, carrying no
 /// column of its own.
 fn shadow_field(name: &str) -> FieldDef {

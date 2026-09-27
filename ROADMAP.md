@@ -52,7 +52,7 @@ on one.
 | 14 — Security hardening (posture items C3–C8) | ✅ Done | C3–C8 all closed; C8 by M3 on 2026-09-20 |
 | Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8–CH12 done, CH2's server half absorbed by the split, CH2's storage half closed out by L12 |
 | L — Post-0.3.4 review: the refactor cycle | ✅ Done | All twenty closed — four defects, six security remainder items, three decompositions, six simplifications, and the retrospective (L20, run 2026-09-19) |
-| M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed; M1, M2, M3, M4, M5 and M7 done — the blocker is cleared, the surface is metered, and tenants are bounded and isolated per index. No feature build remains; M8 closed with the prefix floor and default-field cap, the clause cap deferred. M6 done: the open-loop arms show goodput degrading rather than collapsing on the bulk, single-write and read lanes, after fixing the two defects its arms found — [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) and [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput). What is left is the release cut |
+| M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed; M1, M2, M3, M4, M5 and M7 done — the blocker is cleared, the surface is metered, and tenants are bounded and isolated per index. No feature build remains; M8 closed with the prefix floor and default-field cap, the clause cap deferred. M6 done: the open-loop arms show goodput degrading rather than collapsing on the bulk, single-write and read lanes, after fixing the two defects its arms found — [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) and [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput), and its confirmation run on 2026-09-27 found OB22 costs a single node nothing measurable. What is left is the release cut |
 
 ## Reconciliation, 2026-08-26
 
@@ -186,7 +186,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
 | [K3](#k3--the-surface) | The surface: a `metrics` block, the SDK, and the MCP reference | 19 | 2026-08-27 | 📋 |
 | [L1](#l1--size-cache-invalidation-by-substring-evicts-neighbouring-indexes) … [L20](#l20--the-retrospective-and-the-sequence-into-the-next-cycle) | Post-0.3.4 review group — all twenty closed; the retrospective's output is [M](#m-the-035-goal-set--multi-tenant-exposure--planned) | — | 2026-09-19 | ✅ |
-| [M0](#m0--the-architecture-review-and-the-order-of-work) … [M8](#m8--re-decide-the-query-complexity-caps) | The 0.3.5 goal set — a node exposed on the internet serving several tenants from one process; M0 closed, the M1 blocker cleared, and M2–M8 done; M6's open-loop arms found and fixed [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) and [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput). The release cut remains | — | 2026-09-25 | ◐ |
+| [M0](#m0--the-architecture-review-and-the-order-of-work) … [M8](#m8--re-decide-the-query-complexity-caps) | The 0.3.5 goal set — a node exposed on the internet serving several tenants from one process; M0 closed, the M1 blocker cleared, and M2–M8 done; M6's open-loop arms found and fixed [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) and [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput), and were confirmed on the cut binary 2026-09-27. The release cut remains | — | 2026-09-27 | ◐ |
 
 ---
 
@@ -3191,6 +3191,10 @@ and schema edits. It now passes `handle_client_op`, as the non-streaming path do
 | while bulk writes create indexes on every node | 39.5/s, p50 0.15 s, p99 0.50 s | **164/s**, p50 < 0.01 s, p99 0.32 s |
 | mailbox idle | 1,671–1,721/s | 1,877/s |
 
+**A single node pays nothing for any of it.** A standalone A/B against the commit before this
+entry, closed- and open-loop, found every arm inside run-to-run spread — see
+[M6](#m6--close-and-re-measure-the-bulk-lane), session 4.
+
 ### F9 — Commit on a clock, not a count
 
 ✅ **Done 2026-09-26.** Found by the same pre-release profiling session: stack samples of bulk at
@@ -4989,7 +4993,8 @@ which does not hold the 'write' capability`, with writes elsewhere still `200`.
 
 ### M6 — Close and re-measure the bulk lane
 
-✅ **Done 2026-09-25 — the exit criterion is met; see session 3 below.** ◐ until then: measurement
+✅ **Done 2026-09-25 — the exit criterion is met; see session 3 below. Confirmed on the cut
+binary 2026-09-27, session 4, with OB22 in it.** ◐ until then: measurement
 only, and the first session found a blocker. Corrected 2026-09-25.
 This entry was written on
 2026-09-19 claiming [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path) item 3 as the
@@ -5236,6 +5241,82 @@ that difference is noise and not M8's query preparation.
 than collapsing, on the bulk lane and the single-write lane, with the read lane holding too. What
 remains is the short confirmation arm at the cut, which is release mechanics rather than this
 item.
+
+**Session 4, 2026-09-27 — the confirmation run, and OB22 costs a single node nothing.** The
+question this time was narrower than the criterion: [OB22](#ob22--an-orchestrator-waited-on-peers-while-holding-its-mailbox)
+rebuilt how the orchestrator answers — deferred answers, a peer lane, bulk always handled
+locally, health counting indexes off the request path — and was measured only on a cluster.
+So an A/B on one standalone node: `a05e5bd` (the last commit before OB22) against `9c0fd9a`, both
+release builds, M5 Pro, harness co-located, each binary from a wiped volume, two rounds with the
+order reversed in the second so drift lands on both. The two arms that looked borderline after
+two rounds were given four more.
+
+*Closed loop, F5 protocol* (defaults, 4 shards, `wal_sync`, 5,000 seeded, 5 s + 20 s per arm):
+
+| arm | `a05e5bd` | `9c0fd9a` | Δ |
+|---|---|---|---|
+| search c8 / c16, ok/s | 22,353 / 31,010 | 22,454 / 30,774 | +0.5% / −0.8% |
+| write c8 / c16, ok/s | 376 / 602 | 377 / 609 | +0.3% / +1.2% |
+| mixed c8, search / write ok/s | 19,573 / 360 | 19,582 / 360 | 0% |
+| mixed c16, search ok/s, n = 6 | 22,128 | 21,803 | −1.5% |
+| bulk c4 / c16, batch 500, docs/s | 48,492 / 131,367 | 47,963 / 129,764 | −1.1% / −1.2% |
+| bulk c64 × batch 2,000, docs/s, n = 6 | 303,707 | 301,648 | −0.7% |
+
+After two rounds the bulk peak read −3.9% and mixed-c16 search −2.5%; neither survived the extra
+rounds. The bulk peak's ranges overlap (293k–314k against 298k–310k) and mixed-c16's paired
+differences run from −4.8% to +3.1% — while the box itself drifted ~10% between rounds, on both
+binaries alike.
+
+*Open loop, the session 3 protocol*, with the bulk lane pushed further because its capacity has
+moved (below):
+
+| lane | offered/s | `a05e5bd` ok/s | `9c0fd9a` ok/s | refused |
+|---|---|---|---|---|
+| bulk, batch 500 | 60 / 120 / 300 | 59 / 118 / 300 | 59 / 119 / 302 | ≤ 29 × 503 |
+| | 600 | 540 (270k docs/s) | 545 (272k docs/s) | 9–11% × 503 |
+| | 1,500 | 536 | 536 | 64% × 503, 27–46 transport, **0 × 408** |
+| single write | 2,000 / 4,000 / 8,000 | 1,987 / 2,630 / 2,487 | 1,987 / 2,634 / 2,437 | 503 only, **0 × 408** |
+| read, 200k docs | 1,000 / 2,000 / 4,000 | 730 / 722 / 711 | 717 / 707 / 703 | 503 only, **0 × 408** |
+| relief: bulk / write / read | 1,500 → 60, 8,000 → 300, 4,000 → 300 | full rate from the first second | the same | none after the drop |
+
+Goodput is flat from just over capacity to about 3× it on the bulk and single-write lanes, and
+to about 5× on reads, the excess refused as `503`. After every arm on both binaries
+`jobs_dropped` and `in_flight` read 0, and all 8,250 health probes answered `200`. **The criterion still holds on the binary
+being cut, and nothing in OB22 moved a single node's numbers outside run-to-run spread.**
+
+*Two absolute shifts since session 3, on both binaries, so not OB22's and not isolated here.*
+The bulk lane went from 116 ok/s at 300 offered to ~540 sustained — nearly 5× — which is most
+likely [F9](#f9--commit-on-a-clock-not-a-count): session 3's commit by count committed on nearly
+every batch of a bulk load. Reads went the other way, 703–730 against 836–884; that one is
+unexplained and wants its own A/B before it is called anything.
+
+*Three findings, all on both binaries. The first two are fixed — ✅ 2026-09-27, below — and the
+third is a sizing note:*
+
+- **A health probe's `GetIdentity` ask runs past its budget under write overload** — half of a 1 s
+  request timeout, so health p99 sits at ~505 ms and every such probe logs an `ERROR` line.
+  `9c0fd9a` logged half as many (1,241 against 2,377 over the session), because OB22's index
+  counts took the `ListIndexes` ask off the probe; `GetIdentity` is the other half. The node's
+  identity does not change while it runs, so the ask is avoidable, and a line per probe is
+  [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput)'s
+  shape on a smaller scale. **Fixed:** health reads the identity from state set at startup and
+  the shard count from the lock-free shard placement — every shard enters the shard map and the
+  placement's live set in one step and none leaves, which a test now pins. Nothing on the probe
+  asks the orchestrator any more. Under bulk overload health p99 fell from 502 ms to 0.9 ms and
+  the node's `ERROR` lines from 116 to none.
+- **A search whose every shard was abandoned for budget answers `500 Internal Server Error`** —
+  "no shard could run this query … spent 1000ms of a 1000ms budget before a worker could start
+  it". That is F7's shed, and a shed should be the `503` the rest of the node answers; `500`
+  tells a client not to retry what it should retry. **Fixed:** a gather whose every shard was
+  shed answers with the shed itself, and a shed shard no longer outvotes the shards that refused
+  a query as the caller's mistake. The test fails against the old code with exactly the measured
+  shape. On the large-index read arm: 49 `500`s and 405 `ERROR` lines per run before, none
+  after, with health p99 at 0.8 ms against 506 ms.
+- **Reads on a large, still-merging index collapse under a 1 s timeout.** A first pass ran the
+  read arm after the bulk and write arms, against ~5M documents, and took 7–31 ok/s with ~1,000
+  `408`s per step on both binaries. That arm was discarded as a comparison against session 3 —
+  which read a freshly seeded 200k — but the regime is real: at `search_threads = 2`, searches
+  over that index cost close to the whole budget.
 
 ### M7 — Redact the cluster PSK in `Debug`
 
