@@ -3,7 +3,7 @@
 use crate::*;
 use std::collections::{HashMap, HashSet};
 
-use chrono::{NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize, de::Error as DeserializeError};
 use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
@@ -37,8 +37,57 @@ pub(crate) const NAIVE_DATETIME_FORMATS: &[&str] = &[
     "%Y.%m.%dT%H:%M",
 ];
 
-pub(crate) const NAIVE_DATE_FORMATS: &[&str] =
-    &["%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y%m%d", "%Y-%m", "%Y"];
+pub(crate) const NAIVE_DATE_FORMATS: &[&str] = &["%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y%m%d"];
+
+/// Dates written with the year last: slashes month first, dots day first, and named months.
+///
+/// Each separator has one reading, always: a slash date is American, `03/04/2024` is March 4th;
+/// a dotted date is European, `03.04.2024` is the 3rd of April. Deciding per value would read
+/// one file's dates two ways — `03/04/2024` month first beside `15/03/2024` day first — with
+/// nothing to say which rows were which. So a value only the other order can read (`15/03/2024`,
+/// `03.15.2024`) is refused. A source written the other way round is the loader's to recognise:
+/// it decides a column's order from its sample and sends such dates as ISO.
+///
+/// A year is four digits here as in every naive form — see [`parse_naive_datetime`].
+pub(crate) const YEAR_LAST_FORMATS: &[&str] = &[
+    "%m/%d/%Y",
+    "%m/%d/%Y %H:%M:%S",
+    "%m/%d/%Y %H:%M",
+    "%d.%m.%Y",
+    "%d.%m.%Y %H:%M:%S",
+    "%d.%m.%Y %H:%M",
+    "%b %d, %Y",
+    "%B %d, %Y",
+    "%b %d %Y",
+    "%B %d %Y",
+    "%d %b %Y",
+    "%d %B %Y",
+];
+
+/// A date or datetime written without an offset, read as UTC.
+///
+/// The one list both inference and the writer read, so a column inferred as a date is one the
+/// writer can index — two lists had already drifted once, and a field typed `date` whose values
+/// the writer then skipped is a field that silently never matches.
+pub(crate) fn parse_naive_datetime(s: &str) -> Option<NaiveDateTime> {
+    let midnight = |date: NaiveDate| date.and_hms_opt(0, 0, 0);
+    let parse = |fmt: &&str| {
+        NaiveDateTime::parse_from_str(s, fmt)
+            .ok()
+            .or_else(|| NaiveDate::parse_from_str(s, fmt).ok().and_then(midnight))
+    };
+    // chrono reads `%Y` from any number of digits, so `03/15/24` parsed as the year 24 and
+    // `15.03.24` — through `%Y.%m.%d` — as the 24th of March in the year 15: dates that sort
+    // before every real one and that nobody wrote. The year has to be written out, as four
+    // digits, which still admits a real early year such as `0476-09-04`.
+    let year_written_out = |parsed: &NaiveDateTime| s.contains(&format!("{:04}", parsed.year()));
+    NAIVE_DATETIME_FORMATS
+        .iter()
+        .chain(NAIVE_DATE_FORMATS)
+        .chain(YEAR_LAST_FORMATS)
+        .filter_map(parse)
+        .find(year_written_out)
+}
 
 /// Longest token, in bytes, that `default` and `en_stem` keep.
 ///
@@ -430,12 +479,11 @@ impl FieldDef {
             }
             JsonValue::Bool(_) => TantivyFieldType::Boolean,
             JsonValue::String(s) => {
-                // 1) RFC3339 (full timestamp with offset)
+                // 1) A timestamp with an offset: RFC 3339, or RFC 2822 as mail and HTTP write it
                 if chrono::DateTime::parse_from_rfc3339(s).is_ok()
-                    // 2) Naive datetime with common formats
-                    || Self::is_naive_datetime(s)
-                    // 3) Date-only formats
-                    || Self::is_naive_date(s)
+                    || chrono::DateTime::parse_from_rfc2822(s).is_ok()
+                    // 2) A date or datetime without one
+                    || parse_naive_datetime(s).is_some()
                 {
                     TantivyFieldType::Date
                 // 4) IP detection
@@ -502,30 +550,6 @@ impl FieldDef {
             }
             _ => None,
         }
-    }
-
-    /// Check common naive datetime formats (no timezone) such as
-    /// - 2024-05-01 12:30:00
-    /// - 2024-05-01 12:30
-    /// - 2024-05-01T12:30:00
-    /// - 2024-05-01T12:30:00.123
-    /// - 2024/05/01 12:30:00
-    /// - 2024.05.01T12:30:00
-    pub(crate) fn is_naive_datetime(s: &str) -> bool {
-        NAIVE_DATETIME_FORMATS
-            .iter()
-            .any(|fmt| NaiveDateTime::parse_from_str(s, fmt).is_ok())
-    }
-
-    /// Check common date-only formats such as
-    /// - 2024-05-01
-    /// - 2024/05/01
-    /// - 2024.05.01
-    /// - 20240501
-    pub(crate) fn is_naive_date(s: &str) -> bool {
-        NAIVE_DATE_FORMATS
-            .iter()
-            .any(|fmt| NaiveDate::parse_from_str(s, fmt).is_ok())
     }
 }
 
@@ -760,36 +784,39 @@ pub fn is_date_value(value: &JsonValue) -> bool {
     }
 }
 
+/// The epoch second a date field's fast column holds for this value, as the writer indexed it.
+///
+/// For ordering a merge the way each shard's column is ordered, so it reads every shape the
+/// writer indexes: a string, whole seconds, and a list, whose *first* value is the one the column
+/// sorts by. Reading strings alone left a date sent as epoch seconds without a key, and a hit
+/// without a key sorts with the ones that have no date at all.
+pub fn date_sort_secs(value: &JsonValue) -> Option<i64> {
+    match value {
+        JsonValue::String(s) => parse_date_to_timestamp_secs(s),
+        JsonValue::Array(items) => items.first().and_then(date_sort_secs),
+        _ => value.as_i64().map(|secs| epoch_seconds_to_tantivy(secs).2),
+    }
+}
+
 pub(crate) fn parse_date_str_to_tantivy(s: &str) -> Option<(DateTime, i64, i64)> {
-    // RFC3339 with offset
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+    // A timestamp with an offset: RFC 3339, or RFC 2822 (`Fri, 15 Mar 2024 16:13:13 +0000`)
+    if let Ok(dt) =
+        chrono::DateTime::parse_from_rfc3339(s).or_else(|_| chrono::DateTime::parse_from_rfc2822(s))
+    {
         let ts = dt.timestamp();
         let clamped = ts.clamp(TANTIVY_MIN_TIMESTAMP_SECS, TANTIVY_MAX_TIMESTAMP_SECS);
         let tantivy_dt = DateTime::from_timestamp_secs(clamped);
         return Some((tantivy_dt, ts, clamped));
     }
 
-    // Naive datetime (no timezone) -> assume UTC
-    if let Some(ndt) = NAIVE_DATETIME_FORMATS
-        .iter()
-        .find_map(|fmt| NaiveDateTime::parse_from_str(s, fmt).ok())
-    {
+    // A date or datetime without one, read as UTC: year first with `-`, `/` or `.`, year last
+    // with slashes month first, dots day first or a named month (see `YEAR_LAST_FORMATS`), and
+    // `YYYYMMDD`.
+    if let Some(ndt) = parse_naive_datetime(s) {
         let ts = Utc.from_utc_datetime(&ndt).timestamp();
         let clamped = ts.clamp(TANTIVY_MIN_TIMESTAMP_SECS, TANTIVY_MAX_TIMESTAMP_SECS);
         let tantivy_dt = DateTime::from_timestamp_secs(clamped);
         return Some((tantivy_dt, ts, clamped));
-    }
-
-    // Date-only formats that NaiveDate can parse directly (YYYY-MM-DD, YYYY/MM/DD, YYYY.MM.DD, YYYYMMDD)
-    for fmt in &["%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y%m%d"] {
-        if let Ok(nd) = NaiveDate::parse_from_str(s, fmt)
-            && let Some(ndt) = nd.and_hms_opt(0, 0, 0)
-        {
-            let ts = Utc.from_utc_datetime(&ndt).timestamp();
-            let clamped = ts.clamp(TANTIVY_MIN_TIMESTAMP_SECS, TANTIVY_MAX_TIMESTAMP_SECS);
-            let tantivy_dt = DateTime::from_timestamp_secs(clamped);
-            return Some((tantivy_dt, ts, clamped));
-        }
     }
 
     // Compact datetime: YYYYMMDDHHMMSS or YYYYMMDDHHMM (no separators)
@@ -1766,6 +1793,89 @@ pub struct SchemaFields {
     pub(crate) seq: Option<Field>,
     /// Map of schema field name -> Tantivy field (only indexed fields are present)
     pub(crate) indexed_fields: HashMap<String, Field>,
+    /// The kind of value each of those columns was built to take, read from the index itself.
+    ///
+    /// The stored schema declares a type; this is what the column is. The two can disagree —
+    /// an edit waiting for its rebuild, or a schema that should never have been saved — and a
+    /// value added under the declaration rather than the column reaches Tantivy's indexing
+    /// thread as the wrong type and kills the writer. See [`SchemaFields::write_type`].
+    pub(crate) built_types: HashMap<String, tantivy::schema::Type>,
+}
+
+impl SchemaFields {
+    /// The type a value of `field` is added under: the declaration when the built column takes
+    /// that kind of value, and the column's own kind when it does not. See [`writable_type`].
+    pub(crate) fn write_type(&self, field: &str, declared: &TantivyFieldType) -> TantivyFieldType {
+        match self.built_types.get(field) {
+            Some(built) => writable_type(declared, *built),
+            None => declared.clone(),
+        }
+    }
+
+    /// The built kind of every indexed column, from the index's own schema.
+    pub(crate) fn built_types_of(
+        schema: &tantivy::schema::Schema,
+        indexed_fields: &HashMap<String, Field>,
+    ) -> HashMap<String, tantivy::schema::Type> {
+        indexed_fields
+            .iter()
+            .map(|(name, field)| {
+                (
+                    name.clone(),
+                    schema.get_field_entry(*field).field_type().value_type(),
+                )
+            })
+            .collect()
+    }
+}
+
+/// The type to add a value under, given the kind of value its column was built to take.
+///
+/// **The built column decides, not the declaration.** Tantivy fixes a column's type when the
+/// index is built, and its indexing thread refuses a value of any other kind by failing — which
+/// kills the `IndexWriter`, so every later write to that index on the shard fails too, and
+/// nothing buffered since the last commit is ever committed. A stored schema that disagrees with
+/// its column is not supposed to exist, but it has: a schema re-minted from a later batch's
+/// sample typed a built date column `I64`, and one integer killed the writer. Adding by the
+/// column makes that state harmless. A value the column cannot hold is skipped, the same as any
+/// value `add_json_value_to_doc` cannot convert, and the declaration still governs validation.
+///
+/// The text-like declarations all add text, so any of them fits a text column.
+pub(crate) fn writable_type(
+    declared: &TantivyFieldType,
+    built: tantivy::schema::Type,
+) -> TantivyFieldType {
+    use tantivy::schema::Type;
+    let fits = matches!(
+        (declared, built),
+        (
+            TantivyFieldType::Text | TantivyFieldType::String | TantivyFieldType::Json,
+            Type::Str
+        ) | (TantivyFieldType::Json, Type::Json)
+            | (TantivyFieldType::I64, Type::I64)
+            | (TantivyFieldType::U64, Type::U64)
+            | (TantivyFieldType::F64, Type::F64)
+            | (TantivyFieldType::Date, Type::Date)
+            | (TantivyFieldType::Boolean, Type::Bool)
+            | (TantivyFieldType::Bytes, Type::Bytes)
+            | (TantivyFieldType::Ip, Type::IpAddr)
+            | (TantivyFieldType::Facet, Type::Facet)
+    );
+    if fits {
+        return declared.clone();
+    }
+    match built {
+        Type::Str => TantivyFieldType::Text,
+        Type::Json => TantivyFieldType::Json,
+        Type::I64 => TantivyFieldType::I64,
+        Type::U64 => TantivyFieldType::U64,
+        Type::F64 => TantivyFieldType::F64,
+        Type::Date => TantivyFieldType::Date,
+        Type::Bool => TantivyFieldType::Boolean,
+        Type::Bytes => TantivyFieldType::Bytes,
+        Type::IpAddr => TantivyFieldType::Ip,
+        Type::Facet => TantivyFieldType::Facet,
+    }
 }
 
 /// The fields an unqualified term searches, and whether the cap cut the set short.

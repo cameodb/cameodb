@@ -915,6 +915,27 @@ impl SchemaCache {
         });
     }
 
+    /// Cache the schema a write's validation settled on, if it is not already the cached one.
+    ///
+    /// Validation changes a schema only through `Arc::make_mut`, so a handle that is no longer
+    /// the cached `Arc` is a schema that changed — a mint, a peer's schema adopted, an
+    /// evolution — and one that still is changed nothing. The rule used to be "an evolution, or
+    /// nothing cached", which missed a mint over a dropped index's record: sampling adds the
+    /// fields itself, so nothing evolved and the record stayed cached. Every later write then
+    /// read "no schema" and minted again from its own documents, each overwriting the stored
+    /// types while the Tantivy index kept the first mint's, until a shard's writer died on a
+    /// value its column could not hold.
+    pub(super) fn keep_settled(&self, index: &str, settled: &Arc<IndexSchema>) {
+        if self
+            .get(index)
+            .is_none_or(|cached| !Arc::ptr_eq(&cached, settled))
+        {
+            // `put_arc`, not `put`: the handle is already an `Arc`, and `put` would deep-copy
+            // the field map to build one.
+            self.put_arc(index, Arc::clone(settled));
+        }
+    }
+
     /// Drop the cached entry outright. Deletion uses this before caching the record of the
     /// drop — an empty entry gives [`put`](Self::put) nothing to compare against, so a write
     /// in flight that resolved against the old schema would install it again.
@@ -1356,6 +1377,30 @@ async fn lookup_peer_orchestrator(
         })
 }
 
+/// What a peer's answer to a schema canvass says it holds: a schema, none, or nothing readable.
+///
+/// **A dropped index's record is none.** The record exists so a write still carrying the dropped
+/// schema cannot reinstall it, not to describe an index — its fields are gone. Read as a schema,
+/// it was adopted: the index then counted as existing, so every field of the write that asked
+/// became an addition, recorded but not searchable, which is the failure the record was kept to
+/// prevent. A schema with no fields is none for the same reason `schema_to_carry` never sends
+/// one. A peer on an older build still answers with the record, so this side judges it too.
+///
+/// A peer that answered with something unreadable is not a peer that answered "no schema": the
+/// error counts it as unreachable, so it cannot license sampling.
+pub(super) fn held_schema(answer: JsonValue) -> Result<Option<IndexSchema>, String> {
+    if answer.is_null() {
+        return Ok(None);
+    }
+    let mut schema = serde_json::from_value::<IndexSchema>(answer)
+        .map_err(|e| format!("unreadable schema from a peer: {e}"))?;
+    if schema.state == storage::SchemaState::Dropped || schema.fields.is_empty() {
+        return Ok(None);
+    }
+    schema.normalize_after_deserialization();
+    Ok(Some(schema))
+}
+
 pub(super) const PEER_SCHEMA_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The schema body to send after a receiver asked for it, or `None` if there is none to send.
@@ -1530,18 +1575,15 @@ impl SchemaCanvass {
             match answer {
                 Err(PeerAnswer::Failed(why)) => unreachable.push(why),
                 Err(PeerAnswer::Minting(node)) => rivals.push(node),
-                Ok(JsonValue::Null) => {}
-                Ok(value) => match serde_json::from_value::<IndexSchema>(value) {
-                    Ok(mut schema) => {
-                        schema.normalize_after_deserialization();
+                Ok(value) => match held_schema(value) {
+                    Ok(Some(schema)) => {
                         best = Some(match best.take() {
                             None => schema,
                             Some(current) => NodeOrchestrator::preferred_schema(current, schema),
                         });
                     }
-                    // A peer that answered with something unreadable is not a peer that answered
-                    // "no schema". Counted as unreachable so it cannot license sampling.
-                    Err(e) => unreachable.push(format!("unreadable schema from a peer: {e}")),
+                    Ok(None) => {}
+                    Err(why) => unreachable.push(why),
                 },
             }
         }
@@ -3438,7 +3480,19 @@ impl NodeOrchestrator {
 
             // Whatever this settles on describes a live index. Set before the merge so the
             // schema persisted below never carries a deletion it has just undone.
-            Arc::make_mut(schema_cache).state = storage::SchemaState::Active;
+            //
+            // Over a dropped index's record this is a new index, not the old one resumed: it
+            // takes a version above the record's — so neither a write still carrying the
+            // dropped schema nor the record itself can be installed over it — and it starts
+            // its own clock.
+            let minted = Arc::make_mut(schema_cache);
+            if minted.state == storage::SchemaState::Dropped {
+                minted.version = minted.version.saturating_add(1);
+                let now = chrono::Utc::now().timestamp();
+                minted.created_at = now;
+                minted.updated_at = now;
+            }
+            minted.state = storage::SchemaState::Active;
 
             // The index's mint is the one moment ownership is decided, so it is the one place
             // the stamp is written. Not refreshed on later writes: whoever created the index
@@ -5224,11 +5278,7 @@ impl NodeOrchestrator {
             )
             .await?;
 
-        if validation_summary.evolution_needed || self.schema_cache.get(index).is_none() {
-            // `put_arc`, not `put`: the handle is already an `Arc`, and `put` would deep-copy
-            // the field map to build one.
-            self.schema_cache.put_arc(index, Arc::clone(&schema_mut));
-        }
+        self.schema_cache.keep_settled(index, &schema_mut);
 
         if !validation_summary.errors.is_empty() {
             // One document, so its position adds nothing to the message.
@@ -5505,11 +5555,7 @@ impl NodeOrchestrator {
             )
             .await?;
 
-        if validation_summary.evolution_needed || self.schema_cache.get(index).is_none() {
-            // `put_arc`, not `put`: the handle is already an `Arc`, and `put` would deep-copy
-            // the field map to build one.
-            self.schema_cache.put_arc(index, Arc::clone(&schema_mut));
-        }
+        self.schema_cache.keep_settled(index, &schema_mut);
 
         // Documents that failed validation are dropped, and their reasons travel to the caller
         // in the response's `errors`. Rejecting the whole batch is the other defensible policy
@@ -6003,7 +6049,13 @@ impl NodeOrchestrator {
 
         for (shard_id, shard) in &self.shards {
             if let Some(store) = &shard.store {
-                let schema = schema_from_store(store, index).await?;
+                // A dropped index's record is not a schema. It is kept only so a write still
+                // carrying the dropped schema cannot reinstall it; answered here, it told a
+                // loader the index already had a schema, so the loader applied none and the
+                // index was typed by guesswork from its documents instead.
+                let schema = schema_from_store(store, index)
+                    .await?
+                    .filter(|s| s.state != storage::SchemaState::Dropped);
                 tracing::debug!(
                     index = %index,
                     shard_id = %shard_id,
@@ -6360,7 +6412,13 @@ impl NodeOrchestrator {
         index: String,
         minting_by: Option<Uuid>,
     ) -> Result<JsonValue, OrchestratorError> {
-        match self.durable_schema(&index).await? {
+        // A dropped index's record is answered as no schema: see `held_schema`, which judges
+        // the same answer on the asking side for peers that still send the record.
+        let held = self
+            .durable_schema(&index)
+            .await?
+            .filter(|schema| schema.state != storage::SchemaState::Dropped);
+        match held {
             Some(schema) => serde_json::to_value(&*schema)
                 .map_err(|e| OrchestratorError::Io(std::io::Error::other(e))),
             // Minting it now, and not saved yet. "None" would be false in the way that

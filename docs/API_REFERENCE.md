@@ -601,6 +601,17 @@ Only `text`, `string`, `i64`, `u64`, `f64` and `date` can carry a column. On a `
 column is built for those types and reporting `true` would describe an index that does not exist. A
 sort naming one of them is refused with `400` saying so.
 
+**Date values.** A `date` field takes a string in any of the shapes listed in the
+[date handling reference](../crates/server/README.md#71-write-path-date-normalization) — ISO 8601 /
+RFC 3339, RFC 2822, `YYYY-MM-DD` with `-`, `/` or `.`, `YYYYMMDD`, American `MM/DD/YYYY`, European
+`DD.MM.YYYY`, named months such as `Mar 15, 2024`, `YYYY-MM` and `YYYY` — or a JSON number of whole
+seconds since the epoch. A value without an offset is read as UTC. Each separator has one reading:
+a slash date is **month first** and a dotted date **day first**, so `03/04/2024` is March 4th,
+`03.04.2024` is April 3rd, and a value only the other order can read (`15/03/2024`, `03.15.2024`)
+is refused with `400` rather than guessed. A year must be written as four digits. The document is
+stored exactly as sent; only the indexed value is normalized. The same shapes are accepted in
+query literals.
+
 **Response:**
 ```json
 {
@@ -779,6 +790,14 @@ curl -s -X DELETE http://localhost:9480/api/books
   "errors": null
 }
 ```
+
+By default the schema is kept, so the name keeps its declared fields and the next write rebuilds
+the data against them — the rebuild path above. `?delete_schema=true` drops the schema too: the
+index then reads as one that never existed (`GET /api/{index}/_config` answers `404`, and
+`/_indexes` does not list it), and the next write — or `PUT /api/{index}/_config`, or a load that
+declares its types — creates it afresh. Internally the node keeps a record of the drop, versioned
+above the dropped schema, so a write that was already in flight when the index was deleted
+cannot bring the old schema back; that record is never reported as a schema.
 
 #### List All Indexes
 Get comprehensive information about all available indexes.

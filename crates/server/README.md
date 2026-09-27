@@ -385,12 +385,39 @@ CameoDB provides flexible date handling that accepts multiple input formats duri
 
 When documents are indexed with date fields, the storage layer (`crates/storage`) automatically detects and normalizes various date formats:
 
-**Supported Input Formats:**
-- **RFC3339 with timezone**: `2024-01-05T12:00:00Z`, `2024-01-05T12:00:00+01:00`
-- **Naive datetime** (no timezone, assumed UTC): `2024-01-05 12:00:00`, `2024-01-05T12:00:00`
-- **Date-only** (midnight UTC): `2024-01-05`, `2024/01/05`, `20240105`
-- **Year-month** (first day of month, midnight UTC): `2024-06`, `2001-12`
-- **Year-only** (Jan 1 midnight UTC): `2024`, `2001`
+**Supported Input Formats** (one parser, `parse_date_str_to_tantivy`, serves writes, WAL replay and query literals alike):
+
+| Shape | Examples | Read as |
+|---|---|---|
+| RFC 3339 with an offset | `2024-01-05T12:00:00Z`, `2024-01-05T12:00:00+01:00`, `2024-01-05T12:00:00.123Z` | that instant |
+| RFC 2822 (mail and HTTP headers) | `Fri, 05 Jan 2024 12:00:00 +0000` | that instant |
+| Naive datetime, year first | `2024-01-05 12:00:00`, `2024-01-05T12:00`, `2024/01/05 12:00:00`, `2024.01.05T12:00:00` | UTC |
+| Date, year first | `2024-01-05`, `2024/01/05`, `2024.01.05`, `20240105` | midnight UTC |
+| Slash date, year last: month first (American) | `01/05/2024`, `1/5/2024`, `01/05/2024 12:00`, `01/05/2024 12:00:00` | January 5th, UTC |
+| Dotted date, year last: day first (European) | `05.01.2024`, `5.1.2024`, `05.01.2024 12:00`, `05.01.2024 12:00:00` | January 5th, UTC |
+| Named month | `Jan 5, 2024`, `January 5, 2024`, `Jan 5 2024`, `5 Jan 2024`, `5 January 2024` | midnight UTC |
+| Compact datetime | `20240105120000`, `202401051200` | UTC |
+| Epoch seconds as text | `1704456000` (10–11 digits, 2000 onward) | that second |
+| Year-month | `2024-06` | first day of the month |
+| Year | `2024` | January 1st |
+
+A JSON **number** in a date field is whole seconds since the epoch, never milliseconds: guessing the
+unit from the magnitude would silently move a date by decades.
+
+**One reading per separator.** A slash date is always read month first and a dotted date always
+day first, so `03/04/2024` is March 4th and `03.04.2024` is April 3rd. A value only the other order
+can read — `15/03/2024`, `03.15.2024` — is refused rather than read that way: accepting it would
+read one field's dates two ways, with nothing to say which row used which. The year must be
+written out as four digits in every naive shape (`0476-09-04` is fine), so `01/05/24`, `24-01-05`
+and `Jan 5, 24` are refused — chrono would read each as the year 24. A refused value refuses its
+document with `400`, naming the field.
+
+**Sources written the other way round.** `cameodb client data load` decides the order per date
+column and per separator from its sample. A column whose sample holds a value only the other order
+can read (`15/03/2024` with slashes, `03.15.2024` with dots) and none only the node's order can is
+read that way, and its cells are sent as ISO dates (`2024-03-15`) — so the node always receives a
+date it reads one way. With no such evidence, or evidence both ways, the column keeps the node's
+order. See the client README.
 
 **Indexing Behavior:**
 1. Original JSON document stored unchanged in redb (preserves exact input)
@@ -413,10 +440,13 @@ Stored in redb as-is, but indexed in Tantivy as `2001-01-01T00:00:00Z` for effic
 
 The `FieldDef::infer_type_from_value` method automatically detects date strings during schema evolution:
 
-1. Checks if string matches RFC3339 format
-2. Checks if string matches naive datetime formats
-3. Checks if string matches date-only formats
-4. If any match, field type is set to `TantivyFieldType::Date`
+1. Checks if string matches RFC 3339 or RFC 2822
+2. Checks if string matches a naive date or datetime shape — the same list the writer parses
+   (`parse_naive_datetime`), so a column inferred as a date is one the writer can index
+3. If any match, field type is set to `TantivyFieldType::Date`
+
+Epoch seconds, compact datetimes, year-month and year-only strings are parsed on write but not
+inferred: as a string, `2024` or `1704456000` is as likely an identifier as a date.
 
 This enables automatic date field detection when ingesting CSV/JSON data without explicit schema definition.
 
@@ -443,27 +473,17 @@ Date fields in Tantivy are indexed with:
 
 ### 7.4 Implementation Details
 
-**Parser Location**: `crates/storage/src/lib.rs`
+**Parser location**: `crates/storage/src/schema.rs` — `parse_date_str_to_tantivy` returns
+`(tantivy_datetime, original_timestamp, clamped_timestamp)`; `parse_naive_datetime` holds the
+naive shapes both it and inference read.
 
-```rust
-fn parse_date_str_to_tantivy(s: &str) -> Option<(DateTime, i64, i64)> {
-    // Returns (tantivy_datetime, original_timestamp, clamped_timestamp)
-    // Handles RFC3339, naive datetime, date-only, year-only
-}
-```
+**Writing**: `add_json_value_to_doc` is the one place a JSON value becomes a Tantivy value, called
+by single writes, batch writes and WAL replay, so a document indexes on recovery exactly as it did
+on write. A date field takes a parseable string or whole epoch seconds; a list is several values.
 
-**Single Write** (line ~1494):
-```rust
-TantivyFieldType::Date => {
-    if let Some(s) = field_value.as_str()
-        && let Some((tantivy_dt, ts, clamped)) = parse_date_str_to_tantivy(s)
-    {
-        tantivy_doc.add_date(*tantivy_field, tantivy_dt);
-    }
-}
-```
-
-**Batch Write** (line ~2203): Uses identical logic for consistency.
+**Sorting across shards**: each shard orders by its fast column, and the gather merges by
+`storage::date_sort_secs`, which reads a value in every shape the writer indexes — text, epoch
+seconds, or a list's first value — so the merged order is the shards' order.
 
 ---
 

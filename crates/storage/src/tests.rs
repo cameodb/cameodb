@@ -2504,3 +2504,154 @@ mod schema_cache_tests {
         );
     }
 }
+
+/// The shapes a date field's value may be written in, and the ones it may not.
+#[cfg(test)]
+mod date_shape_tests {
+    use crate::schema::{FieldDef, TantivyFieldType, parse_date_to_timestamp_secs};
+    use chrono::{NaiveDate, TimeZone, Utc};
+    use serde_json::json;
+
+    fn at(y: i32, m: u32, d: u32, h: u32, min: u32, s: u32) -> Option<i64> {
+        let date = NaiveDate::from_ymd_opt(y, m, d)?.and_hms_opt(h, min, s)?;
+        Some(Utc.from_utc_datetime(&date).timestamp())
+    }
+
+    /// A slash date with the year last is American: month, then day. Always, so one file's dates
+    /// are never read two ways.
+    #[test]
+    fn a_slash_date_is_read_month_first() {
+        assert_eq!(
+            parse_date_to_timestamp_secs("03/04/2024"),
+            at(2024, 3, 4, 0, 0, 0)
+        );
+        assert_eq!(
+            parse_date_to_timestamp_secs("3/4/2024"),
+            at(2024, 3, 4, 0, 0, 0)
+        );
+        assert_eq!(
+            parse_date_to_timestamp_secs("03/15/2024"),
+            at(2024, 3, 15, 0, 0, 0)
+        );
+        assert_eq!(
+            parse_date_to_timestamp_secs("03/15/2024 16:13:13"),
+            at(2024, 3, 15, 16, 13, 13)
+        );
+        assert_eq!(
+            parse_date_to_timestamp_secs("03/15/2024 16:13"),
+            at(2024, 3, 15, 16, 13, 0)
+        );
+    }
+
+    /// A dotted date with the year last is European: day, then month. Always, as slashes are
+    /// always month first.
+    #[test]
+    fn a_dotted_date_is_read_day_first() {
+        assert_eq!(
+            parse_date_to_timestamp_secs("03.04.2024"),
+            at(2024, 4, 3, 0, 0, 0)
+        );
+        assert_eq!(
+            parse_date_to_timestamp_secs("15.03.2024"),
+            at(2024, 3, 15, 0, 0, 0)
+        );
+        assert_eq!(
+            parse_date_to_timestamp_secs("5.3.2024"),
+            at(2024, 3, 5, 0, 0, 0)
+        );
+        assert_eq!(
+            parse_date_to_timestamp_secs("15.03.2024 16:13:13"),
+            at(2024, 3, 15, 16, 13, 13)
+        );
+        assert_eq!(
+            parse_date_to_timestamp_secs("15.03.2024 16:13"),
+            at(2024, 3, 15, 16, 13, 0)
+        );
+    }
+
+    /// A value only the separator's other order can read is refused, not read that way: taking
+    /// `15/03/2024` day first would read `03/04/2024` in the same column the other way.
+    #[test]
+    fn a_date_only_the_other_order_can_read_is_refused() {
+        assert_eq!(parse_date_to_timestamp_secs("15/03/2024"), None);
+        assert_eq!(parse_date_to_timestamp_secs("03.15.2024"), None);
+    }
+
+    /// chrono takes `%Y` from any number of digits; a two-digit year is not the year 24.
+    #[test]
+    fn a_two_digit_year_is_not_read_as_the_first_century() {
+        assert_eq!(parse_date_to_timestamp_secs("03/15/24"), None);
+        assert_eq!(parse_date_to_timestamp_secs("Mar 15, 24"), None);
+        assert_eq!(parse_date_to_timestamp_secs("15.03.24"), None);
+        assert_eq!(parse_date_to_timestamp_secs("24-03-15"), None);
+        // A year written out is a year, however early.
+        assert!(parse_date_to_timestamp_secs("0476-09-04").is_some());
+    }
+
+    #[test]
+    fn a_named_month_is_read_in_either_order() {
+        let day = at(2024, 3, 15, 0, 0, 0);
+        for written in [
+            "Mar 15, 2024",
+            "March 15, 2024",
+            "Mar 15 2024",
+            "15 Mar 2024",
+            "15 March 2024",
+        ] {
+            assert_eq!(parse_date_to_timestamp_secs(written), day, "{written}");
+        }
+    }
+
+    #[test]
+    fn a_mail_header_date_is_read_with_its_offset() {
+        assert_eq!(
+            parse_date_to_timestamp_secs("Fri, 15 Mar 2024 18:13:13 +0200"),
+            at(2024, 3, 15, 16, 13, 13)
+        );
+    }
+
+    /// The shapes accepted before are read as they were.
+    #[test]
+    fn the_year_first_shapes_are_unchanged() {
+        for (written, expected) in [
+            ("2024-03-15", at(2024, 3, 15, 0, 0, 0)),
+            ("2024/03/15", at(2024, 3, 15, 0, 0, 0)),
+            ("2024.03.15", at(2024, 3, 15, 0, 0, 0)),
+            ("20240315", at(2024, 3, 15, 0, 0, 0)),
+            ("2024-03-15 16:13:13", at(2024, 3, 15, 16, 13, 13)),
+            ("2024-03-15T16:13:13.123", at(2024, 3, 15, 16, 13, 13)),
+            ("2024-03-15T18:13:13+02:00", at(2024, 3, 15, 16, 13, 13)),
+            ("20240315161313", at(2024, 3, 15, 16, 13, 13)),
+            ("1710519193", at(2024, 3, 15, 16, 13, 13)),
+            ("2024-03", at(2024, 3, 1, 0, 0, 0)),
+            ("2024", at(2024, 1, 1, 0, 0, 0)),
+        ] {
+            assert_eq!(parse_date_to_timestamp_secs(written), expected, "{written}");
+        }
+    }
+
+    /// A value inference calls a date is one the writer indexes as one, and the other way round.
+    #[test]
+    fn inference_reads_dates_by_the_writers_rules() {
+        for written in [
+            "03/15/2024",
+            "15.03.2024",
+            "Mar 15, 2024",
+            "Fri, 15 Mar 2024 16:13:13 +0000",
+            "2024-03-15",
+        ] {
+            assert_eq!(
+                FieldDef::infer_type_from_value(&json!(written)),
+                TantivyFieldType::Date,
+                "{written}"
+            );
+        }
+        for written in ["15/03/2024", "03.15.2024", "03/15/24"] {
+            assert_eq!(
+                FieldDef::infer_type_from_value(&json!(written)),
+                TantivyFieldType::Text,
+                "{written}"
+            );
+        }
+    }
+}

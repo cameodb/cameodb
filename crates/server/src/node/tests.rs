@@ -2779,6 +2779,31 @@ fn normalize_sort_key_converts_dates_to_epoch_seconds() {
     assert!(normalize_sort_key(&json!("not-a-date"), Some(&date_def)).is_none());
 }
 
+/// A date the writer indexed from epoch seconds is keyed by them. Only strings were read, so such
+/// a hit went unkeyed and a merged sort put it among the hits with no date — after every other
+/// row ascending, before none of them descending — while each shard had ordered it correctly.
+#[test]
+fn a_date_sent_as_epoch_seconds_is_keyed_where_its_column_sorts_it() {
+    let date_def = FieldDef::new("published".to_string(), TantivyFieldType::Date);
+    let written = normalize_sort_key(&json!("2024-03-15T16:13:13Z"), Some(&date_def)).unwrap();
+
+    assert_eq!(
+        normalize_sort_key(&json!(1_710_519_193), Some(&date_def)),
+        Some(written.clone()),
+        "whole seconds key to the same second as the written form"
+    );
+    // A list is several values, and the column sorts by the first one written.
+    assert_eq!(
+        normalize_sort_key(&json!([1_710_519_193, "1999-01-01"]), Some(&date_def)),
+        Some(written)
+    );
+    // Seconds past what tantivy holds are clamped as the writer clamps them.
+    assert_eq!(
+        normalize_sort_key(&json!(i64::MAX), Some(&date_def)),
+        normalize_sort_key(&json!(i64::MAX - 1), Some(&date_def))
+    );
+}
+
 #[test]
 fn normalize_sort_key_passes_through_non_date_values() {
     let numeric_def = FieldDef::new("year".to_string(), TantivyFieldType::I64);
@@ -3814,4 +3839,47 @@ fn only_what_a_worker_can_serve_leaves_the_mailbox() {
     ] {
         assert!(!worker_eligible(&op), "{op:?} must stay on the actor");
     }
+}
+
+/// A peer's dropped-index record, or a schema with no fields, is no schema to a canvass.
+///
+/// Adopted as one, the asking node counted the index as existing, so every field of the write
+/// that asked became an addition — recorded, not searchable. A peer on an older build still
+/// sends the record, so the asking side judges it rather than relying on the answer.
+#[test]
+fn a_canvass_reads_a_dropped_record_as_no_schema() {
+    let mut live = IndexSchema::default();
+    live.fields.insert(
+        "title".to_string(),
+        FieldDef::new("title".to_string(), TantivyFieldType::Text),
+    );
+    let as_answer = |schema: &IndexSchema| serde_json::to_value(schema).expect("serializes");
+
+    let held = held_schema(as_answer(&live)).expect("a readable answer");
+    assert!(
+        held.is_some_and(|s| s.fields.contains_key("title")),
+        "a live schema is held"
+    );
+
+    let mut dropped = live.clone();
+    dropped.state = storage::SchemaState::Dropped;
+    dropped.fields.clear();
+    assert!(matches!(held_schema(as_answer(&dropped)), Ok(None)));
+
+    let mut dropped_with_fields = live.clone();
+    dropped_with_fields.state = storage::SchemaState::Dropped;
+    assert!(
+        matches!(held_schema(as_answer(&dropped_with_fields)), Ok(None)),
+        "the state decides, not whether fields happen to be present"
+    );
+
+    assert!(matches!(
+        held_schema(as_answer(&IndexSchema::default())),
+        Ok(None)
+    ));
+    assert!(matches!(held_schema(JsonValue::Null), Ok(None)));
+    assert!(
+        held_schema(json!({"fields": "not a map"})).is_err(),
+        "an unreadable answer is not \"none\": it must not license sampling"
+    );
 }
