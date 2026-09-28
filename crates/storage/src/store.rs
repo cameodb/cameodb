@@ -130,9 +130,11 @@ pub(crate) fn tantivy_checkpoint_seq(tantivy_index: &Index) -> Option<u64> {
 /// How long startup warmup may spend faulting in segment structures before it gives up on
 /// the indices it has not reached. Indices are warmed smallest-first, so the budget buys the
 /// largest number of warm indices it can and leaves the rest to warm on demand.
-/// How many times a write reopens an index that eviction closed under it before it gives up
-/// with [`StoreError::WriterClosed`]. Each attempt needs a fresh eviction of this very index
-/// inside the few microseconds between opening it and locking its writer.
+/// How many times a write reopens an index whose writer was detached under it before it
+/// gives up with [`StoreError::WriterClosed`]. Eviction cannot cause the detach any more —
+/// the write holds the index's init lock from open to writer lock, and `close_index` needs
+/// the same lock — so what is left is a dead writer's retirement or a forced removal, both
+/// rarer than the race the bound was sized for.
 const LIVE_WRITER_ATTEMPTS: usize = 3;
 
 /// Open an index's writer, waiting out a close that is still letting go of the previous one.
@@ -896,6 +898,19 @@ impl HybridStore {
     /// finds the writer gone, see `lock_live_writer`). Returns `false`, closing nothing, when a
     /// write holds the writer — the caller picks another victim rather than wait on it.
     pub fn close_index(&self, index: &str) -> bool {
+        // The init lock first, and only ever by trying. A write holds it from before the index
+        // is opened until its writer is locked, so a lock that is not free means the index is
+        // mid-open — and a close landing in that span would drop caches the opener is about to
+        // fill, then have the opener's writer removed under it. Reported like a busy writer:
+        // nothing closed, the caller picks another victim. Getting it makes the rest of this
+        // atomic against an open, the commit included.
+        let init_lock = self.index_init_lock(index);
+        let _init_guard = match init_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+
         let writer_arc = self
             .writers
             .get(index)
@@ -1673,18 +1688,35 @@ impl HybridStore {
         // warmup threads. Without this guard two of them can both miss the fast path and
         // both call `writer_with_options`, where tantivy's non-blocking `.tantivy-writer.lock`
         // makes the loser fail with `LockError::LockBusy`.
-        let init_lock = {
-            let entry = self
-                .index_init_locks
-                .entry(index.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(())));
-            Arc::clone(entry.value())
-        };
+        let init_lock = self.index_init_lock(index);
         let _init_guard = init_lock.lock().unwrap_or_else(|poisoned| {
             tracing::error!(index = %index, "Index init mutex was poisoned, recovering");
             poisoned.into_inner()
         });
+        self.get_or_create_index_locked(index)
+    }
 
+    /// This index's init lock: the mutex that serializes opening it, and — held into the write
+    /// that follows the open — its close as well. Never removed from the map it lives in
+    /// (see `drop_index_caches`): the lock is not a cache, and dropping it would unserialize
+    /// what it serializes.
+    fn index_init_lock(&self, index: &str) -> Arc<Mutex<()>> {
+        let entry = self
+            .index_init_locks
+            .entry(index.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())));
+        Arc::clone(entry.value())
+    }
+
+    /// `get_or_create_index` with the index's init lock already held.
+    ///
+    /// The write paths call this rather than the public wrapper, because they keep the lock
+    /// until they hold the writer lock — `close_index` takes the same lock, so the index
+    /// cannot be closed out from between being opened and its writer being taken.
+    fn get_or_create_index_locked(
+        &self,
+        index: &str,
+    ) -> Result<(Arc<Mutex<IndexWriter>>, SchemaFields), StoreError> {
         // Re-check under the init lock: another thread may have finished initialization
         // while we were waiting for it.
         if let Some(writer) = self.writers.get(index)
@@ -2388,9 +2420,11 @@ impl HybridStore {
     ///
     /// Held for the whole write, the mutex makes a close either finish before the write starts
     /// or wait for it to end (`close_index` only ever `try_lock`s, so it skips a busy index
-    /// rather than waiting). What is left is a close landing between `get_or_create_index`
-    /// handing this writer out and the lock here, which leaves it locked but detached; `None`
-    /// says so, and the caller reopens before it has touched anything.
+    /// rather than waiting — and now `try_lock`s the index's init lock first, which the
+    /// caller holds across this call, so a close cannot interpose at all). What can still
+    /// detach a writer between hand-out and lock is `retire_dead_writer` and the last-resort
+    /// `force_remove_writer`, which take no init lock; `None` says so, and the caller reopens
+    /// before it has touched anything.
     fn lock_live_writer<'w>(
         &self,
         index: &str,
@@ -2481,9 +2515,18 @@ impl HybridStore {
             return Err(StoreError::IndexNotFound(index.to_string()));
         }
 
-        // Get or create the index, and hold its writer for the rest of the write.
-        let (writer_arc, fields) = self.get_or_create_index(index)?;
+        // Get or create the index, and hold its writer for the rest of the write. The init
+        // lock is held from the open through the writer lock — `close_index` takes the same
+        // lock before it detaches anything, so a close can no longer land between the two.
+        // What is left for the live check is a dead writer being retired or a forced removal;
+        // those keep the retry.
+        let init_lock = self.index_init_lock(index);
+        let init_guard = init_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (writer_arc, fields) = self.get_or_create_index_locked(index)?;
         let Some(writer) = self.lock_live_writer(index, &writer_arc) else {
+            drop(init_guard);
             if attempt >= LIVE_WRITER_ATTEMPTS {
                 return Err(StoreError::WriterClosed(index.to_string()));
             }
@@ -2494,6 +2537,7 @@ impl HybridStore {
             drop(writer_arc);
             return self.apply_write_attempt(index, op, attempt + 1);
         };
+        drop(init_guard);
 
         // Get sequence ID for this index
         let seq_id = {
@@ -3441,9 +3485,17 @@ impl HybridStore {
         }
 
         // Get or create the index, and hold its writer for the rest of the batch — see
-        // `lock_live_writer` for what a close landing mid-batch used to do.
-        let (writer_arc, fields) = self.get_or_create_index(index)?;
+        // `lock_live_writer` for what a close landing mid-batch used to do. The init lock is
+        // held from the open through the writer lock, as in `apply_write_attempt`, so a close
+        // cannot land between them; the retry is for a dead writer's retirement and the
+        // last-resort forced removal.
+        let init_lock = self.index_init_lock(index);
+        let init_guard = init_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (writer_arc, fields) = self.get_or_create_index_locked(index)?;
         let Some(writer) = self.lock_live_writer(index, &writer_arc) else {
+            drop(init_guard);
             if attempt >= LIVE_WRITER_ATTEMPTS {
                 return Err(StoreError::WriterClosed(index.to_string()));
             }
@@ -3454,6 +3506,7 @@ impl HybridStore {
             drop(writer_arc);
             return self.apply_batch_attempt(index, ops, attempt + 1);
         };
+        drop(init_guard);
 
         // Get schema for shadow field filtering
         let schema = if let Some(schema) = self.get_schema_cached(index)? {
@@ -3894,7 +3947,7 @@ impl HybridStore {
                             let outcome = self.get_or_create_index(index_name);
                             results
                                 .lock()
-                                .unwrap()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .push((index_name.clone(), outcome.is_ok()));
                             if let Err(e) = outcome {
                                 tracing::warn!(
@@ -3912,7 +3965,7 @@ impl HybridStore {
                 }
             });
 
-            for (index_name, ok) in results.into_inner().unwrap() {
+            for (index_name, ok) in results.into_inner().unwrap_or_else(|p| p.into_inner()) {
                 if ok {
                     // Recovered, but the reader is still cold — phase 2 warms it.
                     self.warmup_states
