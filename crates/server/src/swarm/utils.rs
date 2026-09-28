@@ -65,7 +65,7 @@ pub fn resolve_listen_address(
         .cloned();
 
     if let Some(addr) = pick {
-        info!("🎧 Using configured cluster listen address: {}", addr);
+        info!("Using configured cluster listen address: {}", addr);
         return Ok(addr);
     }
 
@@ -74,7 +74,7 @@ pub fn resolve_listen_address(
         && let Some(addr) = resolve_hostname_to_ip(bind_address, port)
     {
         info!(
-            "🎧 Resolved DNS bind address {} -> {} for cluster listen",
+            "Resolved DNS bind address {} -> {} for cluster listen",
             bind_address, addr
         );
         return Ok(addr);
@@ -82,10 +82,7 @@ pub fn resolve_listen_address(
 
     // Fallback to 0.0.0.0
     let addr = get_preferred_listen_address(port)?;
-    warn!(
-        "⚠️  No valid listen address provided; falling back to {}",
-        addr
-    );
+    warn!("No valid listen address provided; falling back to {}", addr);
     Ok(addr)
 }
 
@@ -139,7 +136,7 @@ fn resolve_hostname_to_ip(host: &str, port: u16) -> Option<Multiaddr> {
             None
         }
         Err(e) => {
-            warn!("⚠️  Failed to resolve bind hostname '{}': {}", host, e);
+            warn!("Failed to resolve bind hostname '{}': {}", host, e);
             None
         }
     }
@@ -160,7 +157,7 @@ fn parse_listen_entry(entry: &str, port: u16) -> Vec<Multiaddr> {
                 return out;
             }
             Err(e) => {
-                warn!("⚠️  Ignoring invalid listen multiaddr '{}': {}", trimmed, e);
+                warn!("Ignoring invalid listen multiaddr '{}': {}", trimmed, e);
                 return out;
             }
         }
@@ -172,7 +169,7 @@ fn parse_listen_entry(entry: &str, port: u16) -> Vec<Multiaddr> {
             Ok(pn) => (h, pn),
             Err(e) => {
                 warn!(
-                    "⚠️  Ignoring listen address '{}': invalid port '{}': {}",
+                    "Ignoring listen address '{}': invalid port '{}': {}",
                     trimmed, p, e
                 );
                 return out;
@@ -216,13 +213,13 @@ fn parse_listen_entry(entry: &str, port: u16) -> Vec<Multiaddr> {
                 return out;
             }
             warn!(
-                "⚠️  Ignoring listen address '{}': DNS resolved to no usable IP",
+                "Ignoring listen address '{}': DNS resolved to no usable IP",
                 trimmed
             );
         }
         Err(e) => {
             warn!(
-                "⚠️  Ignoring listen address '{}': DNS resolution failed: {}",
+                "Ignoring listen address '{}': DNS resolution failed: {}",
                 trimmed, e
             );
         }
@@ -240,8 +237,8 @@ pub fn get_preferred_listen_address(port: u16) -> Result<Multiaddr> {
     let addr = Ipv4Addr::UNSPECIFIED; // 0.0.0.0 - bind to all interfaces
     let multiaddr = format!("/ip4/{}/tcp/{}", addr, port).parse::<Multiaddr>()?;
 
-    info!("🎧 Swarm listening on all interfaces: {}", multiaddr);
-    info!("   📡 Ready for Kademlia DHT peer discovery");
+    info!("Swarm listening on all interfaces: {}", multiaddr);
+    info!("   Ready for Kademlia DHT peer discovery");
 
     Ok(multiaddr)
 }

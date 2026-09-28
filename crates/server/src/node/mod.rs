@@ -296,7 +296,9 @@ pub struct NodeConfig {
     pub commit_interval_ms: u64,
     /// Pin per-shard writer threads to the core given by the shard's dense ordinal.
     /// Improves cache locality and reduces cross-core wakeups under heavy write load.
-    /// Default: false (no pinning, OS scheduler decides).
+    /// Default: true — measured neutral on throughput and latency, and a no-op where
+    /// pinning is unsupported (macOS). The measured regressions were the *dispatch*
+    /// flags below, which stay off.
     pub writer_core_affinity: bool,
     /// Enable shard-affine worker dispatch (default: false).
     /// When enabled, operations targeting the same shard are routed to the same

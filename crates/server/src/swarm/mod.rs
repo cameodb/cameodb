@@ -220,7 +220,7 @@ impl SwarmRuntimeMetrics {
             kademlia_updates = self.kademlia_updates,
             connections_established = self.connections_established,
             connections_closed = self.connections_closed,
-            "📊 Swarm runtime summary"
+            "Swarm runtime summary"
         );
     }
 }
@@ -247,33 +247,33 @@ fn resolves_to_local(
                 if let Ok(addrs) = (hostname, port).to_socket_addrs() {
                     let addrs_vec: Vec<_> = addrs.collect();
                     debug!(
-                        "🔍 Checking DNS4 {}:{} resolves to {:?} (local IP: {:?})",
+                        "Checking DNS4 {}:{} resolves to {:?} (local IP: {:?})",
                         hostname, port, addrs_vec, listen_ip4
                     );
                     for sa in addrs_vec {
                         match sa.ip() {
                             IpAddr::V4(ip) => {
                                 if Some(ip) == listen_ip4 {
-                                    info!("🎯 DNS4 {} resolves to local IP {}", hostname, ip);
+                                    info!("DNS4 {} resolves to local IP {}", hostname, ip);
                                     return true;
                                 }
                             }
                             IpAddr::V6(ip) => {
                                 if Some(ip) == listen_ip6 {
-                                    info!("🎯 DNS4 {} resolves to local IP {}", hostname, ip);
+                                    info!("DNS4 {} resolves to local IP {}", hostname, ip);
                                     return true;
                                 }
                             }
                         }
                     }
                 } else {
-                    debug!("⚠️  Failed to resolve DNS4 {}:{}", hostname, port);
+                    debug!("Failed to resolve DNS4 {}:{}", hostname, port);
                 }
             } else {
-                debug!("⚠️  Invalid port in DNS4 address: {}", port_str);
+                debug!("Invalid port in DNS4 address: {}", port_str);
             }
         } else {
-            debug!("⚠️  Invalid DNS4 format: {}", dns_part);
+            debug!("Invalid DNS4 format: {}", dns_part);
         }
     } else if let Some(dns_part) = addr_str.strip_prefix("/dns6/") {
         // Parse /dns6/hostname/tcp/port format
@@ -282,36 +282,36 @@ fn resolves_to_local(
                 if let Ok(addrs) = (hostname, port).to_socket_addrs() {
                     let addrs_vec: Vec<_> = addrs.collect();
                     debug!(
-                        "🔍 Checking DNS6 {}:{} resolves to {:?} (local IP: {:?})",
+                        "Checking DNS6 {}:{} resolves to {:?} (local IP: {:?})",
                         hostname, port, addrs_vec, listen_ip6
                     );
                     for sa in addrs_vec {
                         match sa.ip() {
                             IpAddr::V4(ip) => {
                                 if Some(ip) == listen_ip4 {
-                                    info!("🎯 DNS6 {} resolves to local IP {}", hostname, ip);
+                                    info!("DNS6 {} resolves to local IP {}", hostname, ip);
                                     return true;
                                 }
                             }
                             IpAddr::V6(ip) => {
                                 if Some(ip) == listen_ip6 {
-                                    info!("🎯 DNS6 {} resolves to local IP {}", hostname, ip);
+                                    info!("DNS6 {} resolves to local IP {}", hostname, ip);
                                     return true;
                                 }
                             }
                         }
                     }
                 } else {
-                    debug!("⚠️  Failed to resolve DNS6 {}:{}", hostname, port);
+                    debug!("Failed to resolve DNS6 {}:{}", hostname, port);
                 }
             } else {
-                debug!("⚠️  Invalid port in DNS6 address: {}", port_str);
+                debug!("Invalid port in DNS6 address: {}", port_str);
             }
         } else {
-            debug!("⚠️  Invalid DNS6 format: {}", dns_part);
+            debug!("Invalid DNS6 format: {}", dns_part);
         }
     } else if addr_str.starts_with("/dns4/") || addr_str.starts_with("/dns6/") {
-        debug!("⚠️  DNS resolution failed for address: {}", addr_str);
+        debug!("DNS resolution failed for address: {}", addr_str);
     }
 
     false
@@ -370,7 +370,7 @@ pub async fn init_distributed_swarm(
         });
     }
 
-    info!("🚀 Initializing distributed libp2p swarm");
+    info!("Initializing distributed libp2p swarm");
 
     // Create production-ready swarm with Kademlia DHT
     let startup = create_production_swarm(
@@ -383,16 +383,12 @@ pub async fn init_distributed_swarm(
     )
     .await?;
 
-    info!("✅ Production swarm initialized successfully");
-    info!("   📡 Peer ID: {}", startup.peer_id);
-    info!("   🎧 Listen Address: {}", startup.listen_addr);
-    info!("   🚀 Cluster Port: {} (from config)", config.cluster_port);
-    info!("   🌐 Discovery: Kademlia DHT");
-    info!("   📊 Bootstrap Peers: {}", startup.bootstrap_peer_count);
-
-    // TODO: Future enhancements:
-    // - Cluster state actor integration for peer management
-    // - Enhanced event loop with distributed state synchronization
+    info!("Production swarm initialized successfully");
+    info!("   Peer ID: {}", startup.peer_id);
+    info!("   Listen Address: {}", startup.listen_addr);
+    info!("   Cluster Port: {} (from config)", config.cluster_port);
+    info!("   Discovery: Kademlia DHT");
+    info!("   Bootstrap Peers: {}", startup.bootstrap_peer_count);
 
     Ok(startup)
 }
@@ -410,7 +406,7 @@ async fn create_production_swarm(
     let (keypair, _identity) = load_or_generate_keypair(storage_path)?;
     let peer_id = PeerId::from(keypair.public());
 
-    info!("🔐 Node identity: {}", peer_id);
+    info!("Node identity: {}", peer_id);
 
     // Get optimized listen address using configured bind + interfaces (fallback handled inside)
     let listen_addr = resolve_listen_address(
@@ -442,7 +438,7 @@ async fn create_production_swarm(
     )?
     .with_ping(ping_config(config));
 
-    info!("🏗️  Created Kademlia DHT behaviour for peer discovery");
+    info!("Created Kademlia DHT behaviour for peer discovery");
 
     // Load pre-shared key for private network encryption, if configured.
     // When PSK is set, we wrap TCP with PnetConfig (XSalsa20) and skip QUIC
@@ -452,7 +448,7 @@ async fn create_production_swarm(
     let mut swarm = if let Some(cluster_psk) = cluster_psk {
         let psk = PreSharedKey::new(cluster_psk.bytes());
         info!(
-            "🔐 Cluster PSK enabled — fingerprint: {} (QUIC disabled, TCP wrapped with XSalsa20)",
+            "Cluster PSK enabled — fingerprint: {} (QUIC disabled, TCP wrapped with XSalsa20)",
             psk.fingerprint()
         );
         let pnet_config = PnetConfig::new(psk);
@@ -502,19 +498,19 @@ async fn create_production_swarm(
 
     // Initialize Kameo remote registry so remote actors can be registered/looked up.
     swarm.behaviour_mut().kameo.init_global();
-    info!("🎭 Kameo remote actor registry initialized");
+    info!("Kameo remote actor registry initialized");
 
     // Publish node UUID to DHT for peer discovery
     if let Err(e) = swarm.behaviour_mut().publish_node_uuid(&peer_id, node_uuid) {
-        warn!("⚠️  Failed to publish node UUID to DHT: {}", e);
+        warn!("Failed to publish node UUID to DHT: {}", e);
     }
 
     // Start listening on the optimized address
     swarm.listen_on(listen_addr.clone())?;
-    info!("🎧 Swarm listening on: {}", listen_addr);
+    info!("Swarm listening on: {}", listen_addr);
     // Log all active listeners to show OS-resolved interfaces/ports (after potential port rebinding)
     for addr in swarm.listeners() {
-        info!("   📡 Active listener: {}", addr);
+        info!("   Active listener: {}", addr);
     }
 
     // Connect to seed nodes for DHT initialization
@@ -523,7 +519,7 @@ async fn create_production_swarm(
     let mut dialable_seeds = Vec::new();
 
     info!(
-        "🔍 Seed node configuration: {} nodes configured",
+        "Seed node configuration: {} nodes configured",
         config.seed_nodes.len()
     );
     for node in &config.seed_nodes {
@@ -532,14 +528,14 @@ async fn create_production_swarm(
 
     for addr in seed_addrs {
         debug!(
-            "🔍 Checking seed address: {} (local IPs: {:?}, {:?})",
+            "Checking seed address: {} (local IPs: {:?}, {:?})",
             addr, listen_ip4, listen_ip6
         );
 
         // Skip self-dialing by checking against our listeners and resolved listen IPs
         if swarm.listeners().any(|l| l == &addr) {
             info!(
-                "⏭️  Skipping self-dial to local seed node (listener match): {}",
+                "Skipping self-dial to local seed node (listener match): {}",
                 addr
             );
             continue;
@@ -548,7 +544,7 @@ async fn create_production_swarm(
             && addr.to_string().starts_with(&format!("/ip4/{}/tcp/", ip4))
         {
             info!(
-                "⏭️  Skipping self-dial to local seed node (ip4 match): {}",
+                "Skipping self-dial to local seed node (ip4 match): {}",
                 addr
             );
             continue;
@@ -557,44 +553,44 @@ async fn create_production_swarm(
             && addr.to_string().starts_with(&format!("/ip6/{}/tcp/", ip6))
         {
             info!(
-                "⏭️  Skipping self-dial to local seed node (ip6 match): {}",
+                "Skipping self-dial to local seed node (ip6 match): {}",
                 addr
             );
             continue;
         }
 
         // Check if DNS address resolves to local
-        debug!("🔍 About to check DNS resolution for: {}", addr);
+        debug!("About to check DNS resolution for: {}", addr);
         if resolves_to_local(&addr, listen_ip4, listen_ip6) {
             info!(
-                "⏭️  Skipping self-dial to local seed node (DNS resolves to local): {}",
+                "Skipping self-dial to local seed node (DNS resolves to local): {}",
                 addr
             );
             continue;
         }
 
         dialable_seeds.push(addr.clone());
-        info!("📞 Attempting to dial seed node: {}", addr);
+        info!("Attempting to dial seed node: {}", addr);
         match swarm.dial(addr.clone()) {
             Ok(_) => {
                 connected_peers += 1;
-                info!("✅ Successfully initiated dial to: {}", addr);
+                info!("Successfully initiated dial to: {}", addr);
             }
             Err(e) => {
-                warn!("⚠️  Failed to dial seed node {}: {:?}", addr, e);
+                warn!("Failed to dial seed node {}: {:?}", addr, e);
             }
         }
     }
 
     info!(
-        "📊 Seed node dial summary: {} successful, {} total",
+        "Seed node dial summary: {} successful, {} total",
         connected_peers,
         config.seed_nodes.len()
     );
 
     // Bootstrap is deferred to the swarm runtime and will trigger on first non-self peer connect.
     if connected_peers == 0 {
-        info!("📋 No seed nodes available - running in standalone mode");
+        info!("No seed nodes available - running in standalone mode");
     }
 
     // Start the swarm runtime task to process events
@@ -636,10 +632,7 @@ pub fn load_or_generate_keypair(storage_path: &Path) -> Result<(Keypair, NodeIde
         match NodeIdentity::load(identity_path.clone()) {
             Ok(id) => Some(id),
             Err(e) => {
-                warn!(
-                    "⚠️  Failed to load existing identity: {}. Will recreate.",
-                    e
-                );
+                warn!("Failed to load existing identity: {}. Will recreate.", e);
                 None
             }
         }
@@ -650,23 +643,23 @@ pub fn load_or_generate_keypair(storage_path: &Path) -> Result<(Keypair, NodeIde
     // 2. Get or generate the keypair
     let keypair = if let Some(ref identity) = existing_identity {
         if let Some(key_bytes) = &identity.keypair {
-            info!("🔑 Loading existing libp2p keypair from node_identity.json");
+            info!("Loading existing libp2p keypair from node_identity.json");
             match Keypair::from_protobuf_encoding(key_bytes) {
                 Ok(kp) => kp,
                 Err(e) => {
                     warn!(
-                        "⚠️  Failed to decode existing keypair: {}. Generating new one.",
+                        "Failed to decode existing keypair: {}. Generating new one.",
                         e
                     );
                     Keypair::generate_ed25519()
                 }
             }
         } else {
-            info!("🔑 Generating new Ed25519 keypair (no keypair in identity)");
+            info!("Generating new Ed25519 keypair (no keypair in identity)");
             Keypair::generate_ed25519()
         }
     } else {
-        info!("🔑 Generating new Ed25519 keypair for libp2p");
+        info!("Generating new Ed25519 keypair for libp2p");
         Keypair::generate_ed25519()
     };
 
@@ -690,16 +683,16 @@ pub fn load_or_generate_keypair(storage_path: &Path) -> Result<(Keypair, NodeIde
     //    `0644`, and skipping on content alone would leave it that way for good. One rewrite
     //    settles it and later boots skip.
     if identity.matches_stored(&identity_path) && identity_file_is_owner_only(&identity_path) {
-        info!("🔑 Node identity unchanged on disk, leaving it alone");
-        info!("✨ Node UUID (deterministic): {}", identity.uuid);
+        info!("Node identity unchanged on disk, leaving it alone");
+        info!("Node UUID (deterministic): {}", identity.uuid);
     } else if let Err(e) = identity.save(&identity_path) {
         warn!(
-            "⚠️  Failed to save consolidated identity to node_identity.json: {}",
+            "Failed to save consolidated identity to node_identity.json: {}",
             e
         );
     } else {
-        info!("💾 Consolidated node identity saved to {:?}", identity_path);
-        info!("✨ Node UUID (deterministic): {}", identity.uuid);
+        info!("Consolidated node identity saved to {:?}", identity_path);
+        info!("Node UUID (deterministic): {}", identity.uuid);
     }
 
     Ok((keypair, identity))
@@ -731,14 +724,14 @@ fn convert_seed_nodes_to_multiaddrs(seed_nodes: &[String]) -> Vec<Multiaddr> {
                     Ok(IpAddr::V4(_)) => {
                         let addr = format!("/ip4/{}/tcp/{}", clean_host, port_num);
                         if let Ok(ma) = addr.parse::<Multiaddr>() {
-                            info!("✅ Converted bootstrap node {} to {}", node, ma);
+                            info!("Converted bootstrap node {} to {}", node, ma);
                             multiaddrs.push(ma);
                         }
                     }
                     Ok(IpAddr::V6(_)) => {
                         let addr = format!("/ip6/{}/tcp/{}", clean_host, port_num);
                         if let Ok(ma) = addr.parse::<Multiaddr>() {
-                            info!("✅ Converted bootstrap node {} to {}", node, ma);
+                            info!("Converted bootstrap node {} to {}", node, ma);
                             multiaddrs.push(ma);
                         }
                     }
@@ -747,35 +740,32 @@ fn convert_seed_nodes_to_multiaddrs(seed_nodes: &[String]) -> Vec<Multiaddr> {
                         // Try dns4 first (priority 1)
                         let addr4 = format!("/dns4/{}/tcp/{}", clean_host, port_num);
                         if let Ok(ma) = addr4.parse::<Multiaddr>() {
-                            info!("✅ Bootstrap node {} as dns4: {}", node, ma);
+                            info!("Bootstrap node {} as dns4: {}", node, ma);
                             multiaddrs.push(ma);
                         } else {
                             // Fallback to dns6 (priority 3)
                             let addr6 = format!("/dns6/{}/tcp/{}", clean_host, port_num);
                             if let Ok(ma) = addr6.parse::<Multiaddr>() {
-                                info!("✅ Bootstrap node {} as dns6: {}", node, ma);
+                                info!("Bootstrap node {} as dns6: {}", node, ma);
                                 multiaddrs.push(ma);
                             } else {
-                                warn!(
-                                    "⚠️  Failed to create multiaddr for bootstrap node '{}'",
-                                    node
-                                );
+                                warn!("Failed to create multiaddr for bootstrap node '{}'", node);
                             }
                         }
                     }
                 }
             } else {
-                warn!("⚠️  Invalid port in bootstrap node '{}': {}", node, port);
+                warn!("Invalid port in bootstrap node '{}': {}", node, port);
             }
         } else {
             // Try to parse as full multiaddr (backward compatibility)
             match node.parse::<Multiaddr>() {
                 Ok(addr) => {
-                    info!("✅ Using full multiaddr bootstrap node: {}", addr);
+                    info!("Using full multiaddr bootstrap node: {}", addr);
                     multiaddrs.push(addr);
                 }
                 Err(e) => {
-                    warn!("⚠️  Invalid bootstrap node format '{}': {}", node, e);
+                    warn!("Invalid bootstrap node format '{}': {}", node, e);
                 }
             }
         }
@@ -794,7 +784,7 @@ fn launch_swarm_runtime(
     let (shutdown_signal_tx, mut shutdown_signal_rx) = watch::channel(SwarmControl::Run);
 
     let runtime_handle = tokio::spawn(async move {
-        info!("🔄 Swarm runtime task started");
+        info!("Swarm runtime task started");
         let mut metrics = SwarmRuntimeMetrics::default();
         let mut peer_book = PeerBook::default();
         let mut redial = SeedRedial::new(seeds);
@@ -804,7 +794,7 @@ fn launch_swarm_runtime(
             select! {
                 _ = shutdown_signal_rx.changed() => {
                     if matches!(*shutdown_signal_rx.borrow(), SwarmControl::Shutdown) {
-                        info!("🛑 Swarm shutdown signal received");
+                        info!("Swarm shutdown signal received");
                         break;
                     }
                 }
@@ -827,7 +817,7 @@ fn launch_swarm_runtime(
         }
 
         metrics.log_summary();
-        info!("✅ Swarm runtime task completed");
+        info!("Swarm runtime task completed");
     });
 
     SwarmRuntimeHandle::new(shutdown_signal_tx, cmd_tx, runtime_handle)
@@ -901,11 +891,11 @@ impl SeedRedial {
         info!(
             seeds = self.seeds.len(),
             next_in_secs = self.backoff.as_secs(),
-            "📞 No connected peers; redialing seed nodes"
+            "No connected peers; redialing seed nodes"
         );
         for addr in &self.seeds {
             if let Err(e) = swarm.dial(addr.clone()) {
-                debug!("⚠️  Seed redial to {} not started: {}", addr, e);
+                debug!("Seed redial to {} not started: {}", addr, e);
             }
         }
         // Kademlia bootstraps on the first peer connection; let the next one do it again, since
@@ -978,8 +968,8 @@ impl LostPeerRedial {
                 .condition(PeerCondition::DisconnectedAndNotDialing)
                 .build();
             match swarm.dial(opts) {
-                Ok(()) => debug!(%peer, next_in_secs = backoff.as_secs(), "📞 Redialing lost peer"),
-                Err(e) => debug!(%peer, error = %e, "📞 Lost-peer redial not started"),
+                Ok(()) => debug!(%peer, next_in_secs = backoff.as_secs(), "Redialing lost peer"),
+                Err(e) => debug!(%peer, error = %e, "Lost-peer redial not started"),
             }
             *due = now + *backoff;
             *backoff = (*backoff * 2).min(SEED_REDIAL_MAX);
@@ -1000,7 +990,7 @@ fn handle_swarm_command(cmd: SwarmCommand, swarm: &mut libp2p::Swarm<DhtBehaviou
                 .behaviour_mut()
                 .publish_shards(node_uuid, node_name, &shards, generation, checksum)
             {
-                warn!("⚠️  Failed to publish shards to DHT: {}", e);
+                warn!("Failed to publish shards to DHT: {}", e);
             }
         }
         SwarmCommand::QueryNodeMetadata { node_uuid } => {
@@ -1024,10 +1014,10 @@ fn handle_swarm_event(
             handle_behaviour_event(behaviour_event, metrics, event_tx, swarm, peer_book);
         }
         SwarmEvent::NewListenAddr { address, .. } => {
-            info!("🎧 Swarm listening on: {}", address);
+            info!("Swarm listening on: {}", address);
         }
         SwarmEvent::ExpiredListenAddr { address, .. } => {
-            warn!("⚠️ Listen address expired: {}", address);
+            warn!("Listen address expired: {}", address);
         }
         SwarmEvent::ConnectionEstablished {
             peer_id,
@@ -1038,7 +1028,7 @@ fn handle_swarm_event(
         } => {
             metrics.connections_established += 1;
             info!(
-                "🔗 Connection established with {} ({} ms, {} open)",
+                "Connection established with {} ({} ms, {} open)",
                 peer_id,
                 established_in.as_millis(),
                 num_established
@@ -1069,19 +1059,19 @@ fn handle_swarm_event(
                         Ok(_) => {
                             metrics.bootstrapped = true;
                             info!(
-                                "🚀 Kademlia DHT bootstrap triggered on first peer connect ({})",
+                                "Kademlia DHT bootstrap triggered on first peer connect ({})",
                                 peer_id
                             );
                         }
                         Err(e) => {
                             warn!(
-                                "⚠️  Deferred bootstrap failed on peer connect {}: {}",
+                                "Deferred bootstrap failed on peer connect {}: {}",
                                 peer_id, e
                             );
                         }
                     }
                 } else {
-                    info!("⌛ Deferring bootstrap: Kademlia has no known peers yet");
+                    info!("Deferring bootstrap: Kademlia has no known peers yet");
                 }
             }
         }
@@ -1093,7 +1083,7 @@ fn handle_swarm_event(
         } => {
             metrics.connections_closed += 1;
             info!(
-                "🔒 Connection closed with {} ({:?}, {} still open)",
+                "Connection closed with {} ({:?}, {} still open)",
                 peer_id, cause, num_established
             );
             // The peer is lost when its last connection goes, not its first. Closing one of
@@ -1114,8 +1104,8 @@ fn handle_swarm_event(
             peer_id,
             connection_id,
         } => match peer_id {
-            Some(peer) => debug!("📞 Dialing peer: {} (conn {:?})", peer, connection_id),
-            None => debug!("📞 Dialing new peer address (conn {:?})", connection_id),
+            Some(peer) => debug!("Dialing peer: {} (conn {:?})", peer, connection_id),
+            None => debug!("Dialing new peer address (conn {:?})", connection_id),
         },
         SwarmEvent::IncomingConnection {
             local_addr,
@@ -1123,7 +1113,7 @@ fn handle_swarm_event(
             connection_id,
         } => {
             info!(
-                "📥 Incoming connection on {} from {} (conn {:?})",
+                "Incoming connection on {} from {} (conn {:?})",
                 local_addr, send_back_addr, connection_id
             );
         }
@@ -1135,7 +1125,7 @@ fn handle_swarm_event(
             peer_id,
         } => {
             warn!(
-                "⚠️ Incoming connection error on {} from {:?} (conn {:?}, peer {:?}): {}",
+                "Incoming connection error on {} from {:?} (conn {:?}, peer {:?}): {}",
                 local_addr, send_back_addr, connection_id, peer_id, error
             );
         }
@@ -1145,7 +1135,7 @@ fn handle_swarm_event(
             error,
         } => {
             warn!(
-                "⚠️ Outgoing connection error to {:?} (conn {:?}): {}",
+                "Outgoing connection error to {:?} (conn {:?}): {}",
                 peer_id, connection_id, error
             );
             let _ = event_tx.send(CoordinatorEvent::DialFailed {
@@ -1160,15 +1150,15 @@ fn handle_swarm_event(
             ..
         } => {
             warn!(
-                "⚠️ Listener {:?} closed: {:?} (addresses: {:?})",
+                "Listener {:?} closed: {:?} (addresses: {:?})",
                 listener_id, reason, addresses
             );
         }
         SwarmEvent::ListenerError { listener_id, error } => {
-            warn!("⚠️ Listener {:?} error: {}", listener_id, error);
+            warn!("Listener {:?} error: {}", listener_id, error);
         }
         other => {
-            debug!("📡 Swarm event: {:?}", other);
+            debug!("Swarm event: {:?}", other);
         }
     }
 }
@@ -1199,7 +1189,7 @@ fn handle_behaviour_event(
 /// The ping settings for this node, or `None` when pinging is turned off.
 fn ping_config(config: &ClusterConfig) -> Option<libp2p::ping::Config> {
     if config.ping_interval_secs == 0 {
-        info!("💓 Peer liveness pings disabled (ping_interval_secs = 0)");
+        info!("Peer liveness pings disabled (ping_interval_secs = 0)");
         return None;
     }
     let interval = Duration::from_secs(config.ping_interval_secs);
@@ -1207,7 +1197,7 @@ fn ping_config(config: &ClusterConfig) -> Option<libp2p::ping::Config> {
     info!(
         interval_secs = interval.as_secs(),
         timeout_secs = timeout.as_secs(),
-        "💓 Peer liveness pings enabled"
+        "Peer liveness pings enabled"
     );
     Some(
         libp2p::ping::Config::new()
@@ -1233,16 +1223,16 @@ fn handle_ping_event(
 ) {
     use libp2p::ping::Failure;
     match event.result {
-        Ok(rtt) => debug!(peer = %event.peer, rtt_ms = rtt.as_millis(), "💓 ping"),
+        Ok(rtt) => debug!(peer = %event.peer, rtt_ms = rtt.as_millis(), "ping"),
         Err(Failure::Unsupported) => {
-            debug!(peer = %event.peer, "💓 peer does not support ping; not monitoring it")
+            debug!(peer = %event.peer, "peer does not support ping; not monitoring it")
         }
         Err(failure) => {
             warn!(
                 peer = %event.peer,
                 connection = ?event.connection,
                 error = %failure,
-                "💔 Peer failed a liveness ping; closing the connection"
+                "Peer failed a liveness ping; closing the connection"
             );
             swarm.close_connection(event.connection);
             let _ = event_tx.send(CoordinatorEvent::PeerUnresponsive {
@@ -1268,7 +1258,7 @@ fn handle_kademlia_event(
             let addr_vec: Vec<_> = addresses.iter().cloned().collect();
             let addr_count = addr_vec.len();
             info!(
-                "🛰️  Routing table updated for {} ({} addresses)",
+                "Routing table updated for {} ({} addresses)",
                 peer, addr_count
             );
 
@@ -1296,15 +1286,15 @@ fn handle_kademlia_event(
                             peer_book
                                 .addr_by_peer
                                 .insert(peer.to_string(), addr.to_string());
-                            info!("📞 Dialing Kademlia-discovered peer: {} at {}", peer, addr);
+                            info!("Dialing Kademlia-discovered peer: {} at {}", peer, addr);
                         }
                         Err(e) => {
-                            debug!("⚠️  Failed to dial peer {}: {}", peer, e);
+                            debug!("Failed to dial peer {}: {}", peer, e);
                         }
                     }
                 }
             } else {
-                debug!("⏭️  Skipping self-dial to local peer: {}", peer);
+                debug!("Skipping self-dial to local peer: {}", peer);
             }
 
             let _ = event_tx.send(CoordinatorEvent::RoutingUpdated {
@@ -1329,7 +1319,7 @@ fn handle_kademlia_event(
                         .insert(peer_id_str.to_string(), uuid_str.to_string());
 
                     info!(
-                        "🎯 DHT Record Found: Peer {} -> UUID {}",
+                        "DHT Record Found: Peer {} -> UUID {}",
                         peer_id_str, uuid_str
                     );
 
@@ -1344,7 +1334,7 @@ fn handle_kademlia_event(
                     ) {
                         Ok(metadata) => {
                             info!(
-                                "🎯 DHT Node Metadata Found: Node {} -> {} shards, gen={}, storage={} docs={}",
+                                "DHT Node Metadata Found: Node {} -> {} shards, gen={}, storage={} docs={}",
                                 metadata.node_uuid,
                                 metadata.shard_count,
                                 metadata.generation,
@@ -1377,7 +1367,7 @@ fn handle_kademlia_event(
                         ) {
                             Ok(shard) => {
                                 info!(
-                                    "🎯 DHT Shard Found: Node {} -> Shard {} ({})",
+                                    "DHT Shard Found: Node {} -> Shard {} ({})",
                                     shard.node_id, shard.shard_id, shard.document_count
                                 );
 
@@ -1395,16 +1385,16 @@ fn handle_kademlia_event(
             }
             _ => {
                 debug!(
-                    "📊 Kademlia query {:?} progressed: result={:?}, stats={:?}",
+                    "Kademlia query {:?} progressed: result={:?}, stats={:?}",
                     id, result, stats
                 );
             }
         },
         kad::Event::InboundRequest { request } => {
-            debug!("📨 Kademlia inbound request: {:?}", request);
+            debug!("Kademlia inbound request: {:?}", request);
         }
         other => {
-            debug!("📡 Kademlia event: {:?}", other);
+            debug!("Kademlia event: {:?}", other);
         }
     }
 }
@@ -1414,10 +1404,10 @@ fn handle_kameo_event(event: kameo::remote::Event, _swarm: &mut libp2p::Swarm<Dh
 
     match event {
         Event::Registry(registry_event) => {
-            debug!("📡 Kameo registry event: {:?}", registry_event);
+            debug!("Kameo registry event: {:?}", registry_event);
         }
         Event::Messaging(msg_event) => {
-            debug!("📬 Kameo messaging event: {:?}", msg_event);
+            debug!("Kameo messaging event: {:?}", msg_event);
         }
     }
 }
@@ -1436,7 +1426,7 @@ fn handle_identify_event(
     } = event
     {
         info!(
-            "🆔 Identify: Received info from peer {} ({} addrs, agent: {})",
+            "Identify: Received info from peer {} ({} addrs, agent: {})",
             peer_id,
             info.listen_addrs.len(),
             info.agent_version
@@ -1467,7 +1457,7 @@ fn handle_identify_event(
                 }
 
                 info!(
-                    "✨ Discovered Node identity from Identify protocol: {} ({})",
+                    "Discovered Node identity from Identify protocol: {} ({})",
                     node_name, uuid
                 );
 
@@ -1478,7 +1468,7 @@ fn handle_identify_event(
                     address: select_preferred_address(&info.listen_addrs).map(|a| a.to_string()),
                 });
             } else {
-                warn!("⚠️  Invalid UUID in agent version: {}", uuid_str);
+                warn!("Invalid UUID in agent version: {}", uuid_str);
             }
         } else if parts.len() >= 3 {
             // Fallback for old format without node name: "cameodb/1.0.0/{UUID}"
@@ -1494,7 +1484,7 @@ fn handle_identify_event(
                 }
 
                 info!(
-                    "✨ Discovered Node UUID from Identify protocol (legacy format): {}",
+                    "Discovered Node UUID from Identify protocol (legacy format): {}",
                     uuid
                 );
 
@@ -1504,7 +1494,7 @@ fn handle_identify_event(
                     address: select_preferred_address(&info.listen_addrs).map(|a| a.to_string()),
                 });
             } else {
-                warn!("⚠️  Invalid UUID in agent version: {}", uuid_str);
+                warn!("Invalid UUID in agent version: {}", uuid_str);
             }
         }
 
@@ -1553,7 +1543,7 @@ mod tests {
     ///
     /// `wait_for_shutdown` takes the runtime's join handle out of its mutex; a
     /// `.lock().unwrap()` there would turn one contained panic into a panic on every later
-    /// shutdown, contradicting the `panic = "unwind"` posture the release chose. The slot
+    /// shutdown, contradicting the `panic = "unwind"posture the release chose. The slot
     /// holds only ownership of a handle, so recovering the guard is safe and matches what the
     /// rest of the process does.
     #[tokio::test]

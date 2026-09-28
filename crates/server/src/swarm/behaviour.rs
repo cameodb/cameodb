@@ -83,19 +83,19 @@ impl DhtBehaviour {
         remote_message_size_bytes: usize,
         remote_timeout_secs: u64,
     ) -> Result<Self, anyhow::Error> {
-        info!("🌐 Initializing Kademlia DHT for distributed peer discovery");
+        info!("Initializing Kademlia DHT for distributed peer discovery");
         let store = MemoryStore::new(local_peer_id);
         let mut kademlia = kad::Behaviour::new(local_peer_id, store);
 
         if let Some(mode) = kad_mode {
             kademlia.set_mode(Some(mode));
-            info!("⚙️  Kademlia mode set to: {:?}", mode);
+            info!("Kademlia mode set to: {:?}", mode);
         }
 
         // Configure Kameo remote messaging with size limits derived from max_record_size_mb.
         // Bulk batches can contain many records, so the envelope must be generously sized.
         info!(
-            "⚙️  Kameo remote messaging: max_size={}MB, timeout={}s",
+            "Kameo remote messaging: max_size={}MB, timeout={}s",
             remote_message_size_bytes / (1024 * 1024),
             remote_timeout_secs
         );
@@ -149,13 +149,13 @@ impl DhtBehaviour {
         match self.kademlia.put_record(record, kad::Quorum::One) {
             Ok(_) => {
                 info!(
-                    "📝 Published node UUID {} to DHT with key {}",
+                    "Published node UUID {} to DHT with key {}",
                     node_uuid, key_str
                 );
                 Ok(())
             }
             Err(e) => {
-                warn!("⚠️  Failed to publish node UUID to DHT: {:?}", e);
+                warn!("Failed to publish node UUID to DHT: {:?}", e);
                 Err(anyhow::anyhow!("Failed to publish node UUID: {:?}", e))
             }
         }
@@ -166,7 +166,7 @@ impl DhtBehaviour {
         let key_str = format!("cameodb-peer-{}", peer_id);
         let key = kad::RecordKey::new(&key_str);
         info!(
-            "🔍 Querying DHT for peer {} node UUID with key {}",
+            "Querying DHT for peer {} node UUID with key {}",
             peer_id, key_str
         );
         self.kademlia.get_record(key)
@@ -203,19 +203,23 @@ impl DhtBehaviour {
             key: key.clone(),
             value: metadata_bytes,
             publisher: None,
-            expires: None, // TODO: Set expiration
+            // No expiry on purpose: the record is this node's anchor in the DHT, so a node
+            // that drops off and comes back finds itself still registered under its UUID.
+            // Peer loss is handled through connection events and the coordinator's lost-peer
+            // set, not through the record aging out.
+            expires: None,
         };
 
         match self.kademlia.put_record(record, kad::Quorum::One) {
             Ok(_) => {
                 info!(
-                    "📝 Published node metadata to DHT with key {} ({} shards, gen={})",
+                    "Published node metadata to DHT with key {} ({} shards, gen={})",
                     key_str, metadata.shard_count, metadata.generation
                 );
                 Ok(())
             }
             Err(e) => {
-                warn!("⚠️  Failed to publish node metadata to DHT: {:?}", e);
+                warn!("Failed to publish node metadata to DHT: {:?}", e);
                 Err(anyhow::anyhow!("Failed to publish node metadata: {:?}", e))
             }
         }
@@ -240,22 +244,21 @@ impl DhtBehaviour {
             key: key.clone(),
             value: shard_bytes,
             publisher: None,
-            expires: None, // TODO: Set expiration
+            // As with the node record above: persistent by intent, refreshed by republish
+            // on change, and a returning node's own anchor.
+            expires: None,
         };
 
         match self.kademlia.put_record(record, kad::Quorum::One) {
             Ok(_) => {
                 info!(
-                    "📝 Published shard {} to DHT with key {}",
+                    "Published shard {} to DHT with key {}",
                     shard.shard_id, key_str
                 );
                 Ok(())
             }
             Err(e) => {
-                warn!(
-                    "⚠️  Failed to publish shard {} to DHT: {:?}",
-                    e, shard.shard_id
-                );
+                warn!("Failed to publish shard {} to DHT: {:?}", e, shard.shard_id);
                 Err(anyhow::anyhow!(
                     "Failed to publish shard {}: {:?}",
                     shard.shard_id,
@@ -309,12 +312,12 @@ impl DhtBehaviour {
         }
 
         info!(
-            "📊 Shard publishing complete: {} published, {} failed",
+            "Shard publishing complete: {} published, {} failed",
             published, failed
         );
 
         if failed > 0 {
-            warn!("⚠️  Some shards failed to publish to DHT");
+            warn!("Some shards failed to publish to DHT");
         }
 
         Ok(())
@@ -325,7 +328,7 @@ impl DhtBehaviour {
         let key_str = format!("cameodb-node-{}", node_uuid);
         let key = kad::RecordKey::new(&key_str);
         info!(
-            "🔍 Querying DHT for node metadata of {} with key {}",
+            "Querying DHT for node metadata of {} with key {}",
             node_uuid, key_str
         );
         self.kademlia.get_record(key)
@@ -336,15 +339,15 @@ impl DhtBehaviour {
         // Skip bootstrap if we have no peers; prevents noisy "No known peers" warnings in standalone mode
         let has_peer = self.kademlia.kbuckets().any(|b| !b.is_empty());
         if !has_peer {
-            info!("⌛ Skipping Kademlia bootstrap: no known peers");
+            info!("Skipping Kademlia bootstrap: no known peers");
             return Ok(());
         }
 
-        info!("🚀 Bootstrapping Kademlia DHT");
+        info!("Bootstrapping Kademlia DHT");
         match self.kademlia.bootstrap() {
             Ok(_id) => Ok(()),
             Err(e) => {
-                warn!("⚠️  Kademlia bootstrap failed: {}", e);
+                warn!("Kademlia bootstrap failed: {}", e);
                 Err(anyhow::anyhow!("Bootstrap failed: {}", e))
             }
         }

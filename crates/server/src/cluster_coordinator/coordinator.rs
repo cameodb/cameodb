@@ -1610,24 +1610,16 @@ impl Message<PeerNodeMetadataDiscovered> for ClusterCoordinator {
             .map(|s| s.shard_id)
             .collect();
 
-        // For now, we don't know which specific shard IDs to query
-        // In a full implementation, we would:
-        // 1. Maintain a list of known shard IDs for each node
-        // 2. Query only the missing/changed shards
-        // 3. Use the query_shard method for granular updates
-
-        // TODO: Implement individual shard queries based on shard count
-        // For now, we'll trigger a full shard query if we have no shards for this node
+        // We don't know which specific shard IDs to query, and we don't need to:
+        // the periodic `SyncShardMaps` pull fetches the peer's whole map and merges it,
+        // which covers a node whose shards we hold none of. A per-shard pull would only
+        // narrow the fetch, not reach anything the pull misses.
         if existing_shard_ids.is_empty() && msg.shard_count > 0 {
-            info!(
+            debug!(
                 peer = %node_identity,
                 shard_count = %msg.shard_count,
-                "ClusterCoordinator: no local shards for peer, will query all shards"
+                "ClusterCoordinator: no local shards for peer; the shard-map sync will pull them"
             );
-            // Fall back to querying all shards (legacy behavior)
-            // We can't query individual shards without knowing their IDs
-            // So we'll need to wait for the peer to push shard metadata via Kameo
-            debug!(peer = %node_identity, "Waiting for shard metadata via Kameo push");
         }
 
         self.last_seen_state
