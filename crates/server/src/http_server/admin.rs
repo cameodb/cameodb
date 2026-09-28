@@ -49,6 +49,24 @@ pub(super) async fn admin_workers_handler(
     Ok(Json(state.router.admin_worker_stats()?))
 }
 
+/// `POST /_admin/keys/reload` — re-resolve the `[security]` key material from the
+/// configuration this node booted from and swap the live key ring.
+///
+/// The endpoint half of key rotation: a new `[[security.api_keys]]` stanza takes effect
+/// without a restart, and a removed one stops authenticating on the next request — a
+/// request already past the gate finishes on the entry it authenticated as. A config the
+/// node would refuse to boot with is refused here too: a `400` carrying the reason, with
+/// the previous ring still deciding requests.
+pub(super) async fn admin_keys_reload_handler(
+    State(state): State<AppState>,
+) -> Result<Json<crate::auth::KeyReloadReport>, AppError> {
+    state
+        .keyring
+        .reload()
+        .map(Json)
+        .map_err(|err| AppError::bad_request(format!("{err:#}")))
+}
+
 /// `GET /_admin/audit?limit=N` — the most recent audit records, newest first.
 ///
 /// The point of a live view rather than only a file: the question "who has been reading the

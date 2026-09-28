@@ -20,6 +20,11 @@ Environment=MALLOC_CONF=background_thread:true,percpu_arena:percpu,oversize_thre
 # a no-op rather than something to remember to remove.
 ExecStartPre=/usr/local/bin/cameodb check-config --config /etc/cameodb/cameodb.toml --allow-unauthenticated
 ExecStart=/usr/local/bin/cameodb --config /etc/cameodb/cameodb.toml
+# `systemctl reload` sends SIGHUP, which re-resolves [[security.api_keys]] — and any
+# key_hash_file they name — and swaps the live key ring: key rotation without a restart.
+# A config the node would refuse to boot with is refused instead; the ring already in
+# effect keeps deciding requests.
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 User=cameodb
 Group=cameodb

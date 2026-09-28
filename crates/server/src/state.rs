@@ -66,6 +66,11 @@ pub struct AppState {
     pub max_response_bytes: usize,
     /// Where the audit trail goes. Inert unless `[security.audit]` turned it on.
     pub audit: Arc<crate::audit::AuditSink>,
+    /// The keys requests are decided against, shared with the auth middleware's
+    /// `GateState`, plus the means to re-resolve them: `POST /_admin/keys/reload` and
+    /// SIGHUP both land on its `reload`, which swaps the ring underneath every
+    /// in-flight reader.
+    pub keyring: Arc<crate::auth::KeyReloader>,
     /// This node's writer-thread liveness. The health endpoint reads it with one atomic load so
     /// a shard whose writer thread has died stops the node reporting green.
     pub writer_liveness: Arc<WriterLiveness>,

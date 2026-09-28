@@ -309,17 +309,24 @@ async fn main() -> Result<()> {
     let cli_overrides = config::CliOverrides::parse(args.into_iter().skip(1))?;
     let cameodb_config = CameoDbConfig::load_with_cli(&cli_overrides)?;
 
+    // The live key ring, behind the handle `/_admin/keys/reload` and SIGHUP swap. The
+    // overrides move into it — they are re-applied on every reload, which is how an
+    // `--api-key-hash` key survives the file being re-read.
+    let keyring = Arc::new(auth::KeyReloader::new(
+        cli_overrides,
+        cameodb_config.security.clone(),
+    )?);
+
     // Name every configured key once at startup. The point is the `key_id`: an audit line or
     // a rejection carrying one has to be traceable back to a team without the key itself ever
     // appearing in a log. `validate()` already resolved these, so this cannot fail.
-    let keyring = Arc::new(cameodb_config.security.load_keyring()?);
-    for entry in keyring.entries() {
+    for entry in keyring.current().entries() {
         tracing::info!(
             key_id = %entry.key_id(),
             label = %entry.label(),
             role = %entry.role(),
             indexes = %entry.scope_summary(),
-            auth_enabled = keyring.enabled(),
+            auth_enabled = keyring.current().enabled(),
             "🔑 API key loaded"
         );
     }
@@ -656,6 +663,7 @@ async fn main() -> Result<()> {
         max_federated_indexes: cameodb_config.security.limits.max_federated_indexes,
         max_response_bytes: cameodb_config.effective_max_response_bytes(),
         audit: Arc::clone(&audit_sink),
+        keyring: Arc::clone(&keyring),
         writer_liveness,
         read_pool_health,
         queue_load,
@@ -665,7 +673,6 @@ async fn main() -> Result<()> {
     // Create the HTTP router with shared state and body limit derived from max_record_size_mb
     let (app, mcp_handle) = create_router(
         app_state,
-        keyring.clone(),
         &http_server::RouterConfig {
             max_body_size_mb: cameodb_config.effective_max_body_size_mb(),
             cors_allowed_origins: &cameodb_config.network.http.cors_allowed_origins,
@@ -675,6 +682,32 @@ async fn main() -> Result<()> {
             mcp: &cameodb_config.mcp,
         },
     );
+
+    // SIGHUP — `systemctl reload`, an operator's `kill -HUP` — runs the same reload the
+    // `POST /_admin/keys/reload` endpoint drives. A refused reload is a log line, never
+    // fatal: the ring that was already deciding requests keeps deciding them.
+    #[cfg(unix)]
+    {
+        let keys = Arc::clone(&keyring);
+        tokio::spawn(async move {
+            use tokio::signal::unix;
+            let mut sighup = match unix::signal(unix::SignalKind::hangup()) {
+                Ok(sighup) => sighup,
+                Err(err) => {
+                    tracing::warn!(error = %err, "could not subscribe to SIGHUP; key reload is HTTP-only");
+                    return;
+                }
+            };
+            while sighup.recv().await.is_some() {
+                match keys.reload() {
+                    Ok(report) => {
+                        tracing::info!(keys = %report.summary, "SIGHUP: key ring reloaded")
+                    }
+                    Err(err) => tracing::warn!("SIGHUP key reload refused: {err:#}"),
+                }
+            }
+        });
+    }
 
     // Extract HTTP configuration
     let http_config = &cameodb_config.network.http;
@@ -717,8 +750,10 @@ async fn main() -> Result<()> {
         println!(
             "  POST /_admin/memory/purge - Trigger jemalloc memory purge (?force=true for aggressive)"
         );
-        println!("  POST /_admin/index/{{index}}/commit - Force index writer commit");
         println!("  GET  /_admin/workers - Worker pool statistics");
+        println!("  GET  /_admin/audit - Read the audit trail");
+        println!("  POST /_admin/keys/reload - Reload API keys from config (also on SIGHUP)");
+        println!("  POST /_admin/index/{{index}}/commit - Force index writer commit");
         println!("  POST /_admin/index/{{index}}/evict-writer - Evict index writer from cache");
     } else {
         println!("  (Admin endpoints are disabled)");

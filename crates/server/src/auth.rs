@@ -30,8 +30,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-#[cfg(unix)]
-use tracing::warn;
+use tracing::{info, warn};
 use zeroize::Zeroize;
 
 /// One thing a caller is allowed to do.
@@ -853,6 +852,187 @@ impl KeyRing {
     }
 }
 
+/// The live key ring, and what re-resolving it takes.
+///
+/// One type rather than a swap cell for the gate plus reload inputs somewhere else, because
+/// neither half is useful alone: the cell is what a reload swaps, and the inputs are what it
+/// swaps in. `POST /_admin/keys/reload` and SIGHUP both land on [`Self::reload`].
+pub struct KeyReloader {
+    /// Read per request by the gate; written only by [`Self::reload`]. `ArcSwap` rather than
+    /// a `RwLock` because the read side is the hot one: a request takes a snapshot and never
+    /// waits on a reload in progress, and a reload never waits on a request.
+    ring: arc_swap::ArcSwap<KeyRing>,
+    /// The overrides startup parsed, re-applied on every reload — which is how an
+    /// `--api-key-hash`/`CAMEODB_API_KEY_HASH` key survives the file being re-read.
+    cli: crate::config::CliOverrides,
+    /// The file startup read, resolved once at boot and pinned. See
+    /// [`crate::config::CameoDbConfig::resolve_config_path`] for why the implicit search
+    /// list is never re-walked.
+    source: Option<PathBuf>,
+    /// The `[security]` section as it stood at startup, so a reload can report the fields it
+    /// cannot move — `tenants`, `limits`, `audit` and `implicit_index_creation` are bound
+    /// into the node, the rate limiter and the audit sink before any request is served.
+    startup: SecurityConfig,
+}
+
+impl KeyReloader {
+    /// Build the handle startup authenticates against.
+    ///
+    /// `security` is the already-resolved `[security]` section; `load_keyring` cannot fail
+    /// for a node that passed `validate()`, and a failure here propagates the same way
+    /// startup's does.
+    pub fn new(cli: crate::config::CliOverrides, security: SecurityConfig) -> Result<Self> {
+        let source = crate::config::CameoDbConfig::resolve_config_path(cli.config_path.as_deref());
+        let ring = security.load_keyring()?;
+        Ok(Self {
+            ring: arc_swap::ArcSwap::from_pointee(ring),
+            cli,
+            source,
+            startup: security,
+        })
+    }
+
+    /// The ring to decide a request against: a consistent snapshot, cheap to take.
+    pub fn current(&self) -> Arc<KeyRing> {
+        self.ring.load_full()
+    }
+
+    /// Re-resolve the configuration and swap the ring.
+    ///
+    /// Everything startup validates is re-validated — the same file, the same overrides, the
+    /// same [`crate::config::CameoDbConfig::validate`] — so a config this node would refuse
+    /// to boot with is refused here, with the previous ring still deciding requests. The one
+    /// refusal startup cannot know about: a new ring that is `enabled` but grants
+    /// `node-admin` to nobody. This endpoint and SIGHUP are the only ways back, and both
+    /// need that capability — a reload that removed the last admin key could never be undone
+    /// short of a restart.
+    pub fn reload(&self) -> Result<KeyReloadReport> {
+        let security = crate::config::CameoDbConfig::reload(&self.cli, self.source.as_deref())
+            .context("key reload refused — the previous key ring is still in effect")?
+            .security;
+        let ring = security
+            .load_keyring()
+            .context("key reload refused — the previous key ring is still in effect")?;
+
+        if ring.enabled() && !ring.holds(Capability::NodeAdmin) {
+            bail!(
+                "key reload refused: the new configuration grants node-admin to no key, which \
+                 would leave /_admin/* unreachable until a restart. Add an admin key and \
+                 reload again; the previous key ring is still in effect"
+            );
+        }
+
+        // What the swap does not move. These are bound into the node, the rate limiter and
+        // the audit sink at startup, so a changed value in the file changes nothing until a
+        // restart — reported rather than left to surprise whoever changed it.
+        let mut not_applied = Vec::new();
+        if security.implicit_index_creation != self.startup.implicit_index_creation {
+            not_applied.push("security.implicit_index_creation");
+        }
+        if security.tenants != self.startup.tenants {
+            not_applied.push("security.tenants");
+        }
+        if security.limits != self.startup.limits {
+            not_applied.push("security.limits");
+        }
+        if security.audit != self.startup.audit {
+            not_applied.push("security.audit");
+        }
+
+        let was_enabled = self.ring.load().enabled();
+        self.ring.store(Arc::new(ring));
+        let ring = self.ring.load_full();
+
+        // The same per-key line startup logs, so a reload is as auditable in the log as a
+        // boot is.
+        for entry in ring.entries() {
+            info!(
+                key_id = %entry.key_id(),
+                label = %entry.label(),
+                role = %entry.role(),
+                indexes = %entry.scope_summary(),
+                "🔑 API key loaded by reload"
+            );
+        }
+        if ring.enabled() != was_enabled {
+            warn!(
+                enabled = ring.enabled(),
+                "key reload changed whether requests are authenticated"
+            );
+        }
+        if !not_applied.is_empty() {
+            warn!(
+                fields = ?not_applied,
+                "key reload: [security] settings bound at startup changed on disk; they still \
+                 run with their old values until a restart"
+            );
+        }
+
+        Ok(KeyReloadReport {
+            enabled: ring.enabled(),
+            source: self.source.clone(),
+            keys: ring
+                .entries()
+                .iter()
+                .map(|entry| ReloadedKey {
+                    key_id: entry.key_id(),
+                    label: entry.label().to_string(),
+                    role: entry.role().as_str(),
+                    indexes: entry.scope_summary(),
+                })
+                .collect(),
+            summary: ring.summary(),
+            not_applied,
+        })
+    }
+
+    /// A handle over a ready-made ring, for tests that have no config file to reload from.
+    /// Calling `reload` on it resolves environment and flags over defaults — what a node
+    /// that booted without a file would adopt.
+    #[cfg(test)]
+    pub fn for_test(ring: KeyRing) -> Arc<Self> {
+        Arc::new(Self {
+            ring: arc_swap::ArcSwap::from_pointee(ring),
+            cli: crate::config::CliOverrides::default(),
+            source: None,
+            startup: SecurityConfig::default(),
+        })
+    }
+
+    /// Swap the ring without re-resolving anything — the test hook `for_test` answers to.
+    #[cfg(test)]
+    pub fn swap_for_test(&self, ring: KeyRing) {
+        self.ring.store(Arc::new(ring));
+    }
+}
+
+/// What a key reload did — the body `POST /_admin/keys/reload` answers with.
+#[derive(Debug, Serialize)]
+pub struct KeyReloadReport {
+    /// `security.enabled` as now enforced.
+    pub enabled: bool,
+    /// The file the ring was re-resolved from; `null` on a node configured by environment
+    /// and flags alone.
+    pub source: Option<PathBuf>,
+    /// Every key now accepted — the same facts the startup banner logs.
+    pub keys: Vec<ReloadedKey>,
+    /// `3 keys (1 admin, 2 reader)`.
+    pub summary: String,
+    /// `[security]` fields the file changed but the running node did not adopt: they are
+    /// bound at startup and take effect on restart.
+    pub not_applied: Vec<&'static str>,
+}
+
+/// One accepted key, as the reload report renders it.
+#[derive(Debug, Serialize)]
+pub struct ReloadedKey {
+    pub key_id: String,
+    pub label: String,
+    pub role: &'static str,
+    /// `all indexes` or the allow-list, exactly as the startup banner renders it.
+    pub indexes: String,
+}
+
 /// `cameodb keygen` — mint a key, print it once, print the configuration that accepts it.
 ///
 /// The key goes to stdout and everything else to stderr, so `cameodb keygen --role reader >
@@ -1416,6 +1596,190 @@ mod tests {
         .expect_err("a blank tenant must not load")
         .to_string();
         assert!(err.contains("tenant"), "{err}");
+    }
+
+    // ---- Live reload -------------------------------------------------------
+
+    /// A config file with `[security] enabled` set and one `[[security.api_keys]]` stanza
+    /// per (key, role). `profile = "local"` declares what the loopback bind would have
+    /// inferred anyway, so a posture rule can never make the test about something else.
+    fn security_toml(enabled: bool, keys: &[(&ApiKey, &str)]) -> String {
+        let mut toml = format!("[node]\nprofile = \"local\"\n\n[security]\nenabled = {enabled}\n");
+        for (key, role) in keys {
+            toml.push_str(&format!(
+                "\n[[security.api_keys]]\nkey_hash = \"{}\"\nrole = \"{role}\"\n",
+                key.digest().to_config_value()
+            ));
+        }
+        toml
+    }
+
+    /// Write `toml` as `cameodb.toml` in a fresh tempdir and return it with the overrides
+    /// `--config` would have parsed into. The dir must outlive the reloader — the file is
+    /// re-read on every reload.
+    fn config_file(toml: &str) -> (tempfile::TempDir, crate::config::CliOverrides) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cameodb.toml");
+        std::fs::write(&path, toml).unwrap();
+        (dir, cli_for(&path, &[]))
+    }
+
+    fn rewrite_config(dir: &tempfile::TempDir, toml: &str) {
+        std::fs::write(dir.path().join("cameodb.toml"), toml).unwrap();
+    }
+
+    fn cli_for(path: &std::path::Path, extra: &[&str]) -> crate::config::CliOverrides {
+        let mut args = vec!["--config".to_string(), path.to_string_lossy().to_string()];
+        args.extend(extra.iter().map(|arg| arg.to_string()));
+        crate::config::CliOverrides::parse(args).unwrap()
+    }
+
+    /// Build the reloader the way `main` does: load through the overrides, then hand the
+    /// resolved `[security]` section over.
+    fn reloader_for(cli: &crate::config::CliOverrides) -> KeyReloader {
+        let config = crate::config::CameoDbConfig::load_with_cli(cli).unwrap();
+        KeyReloader::new(cli.clone(), config.security).unwrap()
+    }
+
+    /// The whole point of the endpoint: keys can be added and revoked while the node runs.
+    #[test]
+    fn a_reload_adopts_added_and_removed_keys() {
+        let key_a = ApiKey::generate().unwrap();
+        let key_b = ApiKey::generate().unwrap();
+        let (dir, cli) = config_file(&security_toml(true, &[(&key_a, "admin")]));
+        let keys = reloader_for(&cli);
+
+        assert!(keys.current().authenticate(key_a.expose()).is_some());
+        assert!(keys.current().authenticate(key_b.expose()).is_none());
+
+        // A second key joins without a restart...
+        rewrite_config(
+            &dir,
+            &security_toml(true, &[(&key_a, "admin"), (&key_b, "admin")]),
+        );
+        let report = keys.reload().unwrap();
+        assert_eq!(report.keys.len(), 2);
+        assert!(keys.current().authenticate(key_b.expose()).is_some());
+
+        // ...and removing one revokes it: the next request it makes is refused.
+        rewrite_config(&dir, &security_toml(true, &[(&key_b, "admin")]));
+        let report = keys.reload().unwrap();
+        assert_eq!(report.summary, "1 key (1 admin)");
+        assert!(keys.current().authenticate(key_a.expose()).is_none());
+        assert!(keys.current().authenticate(key_b.expose()).is_some());
+    }
+
+    /// A bad edit must not take the working ring down with it.
+    #[test]
+    fn a_reload_the_node_would_not_boot_is_refused_and_the_old_ring_stays() {
+        let key_a = ApiKey::generate().unwrap();
+        let (dir, cli) = config_file(&security_toml(true, &[(&key_a, "admin")]));
+        let keys = reloader_for(&cli);
+
+        // An entry without a role is a config `load_keyring` refuses — the same refusal a
+        // boot would hit, surfaced at reload instead.
+        rewrite_config(
+            &dir,
+            "[node]\nprofile = \"local\"\n\n[security]\nenabled = true\n\n\
+             [[security.api_keys]]\nkey_hash = \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
+        );
+        let err = keys.reload().unwrap_err().to_string();
+        assert!(err.contains("key reload refused"), "{err}");
+        assert!(keys.current().authenticate(key_a.expose()).is_some());
+
+        // And the file being gone entirely is an error, not a slide onto defaults — that
+        // would be a silent disabling of authentication.
+        std::fs::remove_file(dir.path().join("cameodb.toml")).unwrap();
+        let err = keys.reload().unwrap_err().to_string();
+        assert!(err.contains("key reload refused"), "{err}");
+        assert!(keys.current().authenticate(key_a.expose()).is_some());
+    }
+
+    /// The one refusal startup cannot make: `/_admin/keys/reload` needs a node-admin key to
+    /// call, so a ring with none could never be fixed from the API — only a restart could.
+    #[test]
+    fn a_reload_that_drops_the_last_admin_key_is_refused() {
+        let key_a = ApiKey::generate().unwrap();
+        let key_b = ApiKey::generate().unwrap();
+        let (dir, cli) = config_file(&security_toml(true, &[(&key_a, "admin")]));
+        let keys = reloader_for(&cli);
+
+        rewrite_config(&dir, &security_toml(true, &[(&key_b, "reader")]));
+        let err = keys.reload().unwrap_err().to_string();
+        assert!(err.contains("node-admin"), "{err}");
+        assert!(keys.current().authenticate(key_a.expose()).is_some());
+        assert!(keys.current().authenticate(key_b.expose()).is_none());
+    }
+
+    /// `--api-key-hash`/`CAMEODB_API_KEY_HASH` did not come from the file, so re-reading the
+    /// file must not lose it.
+    #[test]
+    fn an_override_key_survives_a_reload() {
+        let file_key = ApiKey::generate().unwrap();
+        let override_key = ApiKey::generate().unwrap();
+        let (dir, _cli) = config_file(&security_toml(true, &[(&file_key, "admin")]));
+        let cli = cli_for(
+            &dir.path().join("cameodb.toml"),
+            &[
+                "--api-key-hash",
+                &override_key.digest().to_config_value(),
+                "--api-key-role",
+                "admin",
+            ],
+        );
+        let keys = reloader_for(&cli);
+        assert!(
+            keys.current().authenticate(override_key.expose()).is_some(),
+            "the override key authenticates at boot"
+        );
+
+        // Rewrite the file without it — nothing about the file can carry an override.
+        rewrite_config(&dir, &security_toml(true, &[(&file_key, "admin")]));
+        keys.reload().unwrap();
+        assert!(
+            keys.current().authenticate(override_key.expose()).is_some(),
+            "the override key must survive a reload of the file"
+        );
+    }
+
+    /// Sections the swap cannot move are named in the report rather than left to surprise
+    /// the operator who changed them.
+    #[test]
+    fn startup_bound_security_fields_changed_on_disk_are_reported() {
+        let key_a = ApiKey::generate().unwrap();
+        let (dir, cli) = config_file(&security_toml(true, &[(&key_a, "admin")]));
+        let keys = reloader_for(&cli);
+
+        let mut toml = String::from(
+            "[node]\nprofile = \"local\"\n\n[security]\nenabled = true\n\n\
+             [security.limits]\nmax_search_limit = 500\n",
+        );
+        toml.push_str(&format!(
+            "\n[[security.api_keys]]\nkey_hash = \"{}\"\nrole = \"admin\"\n",
+            key_a.digest().to_config_value()
+        ));
+        rewrite_config(&dir, &toml);
+
+        let report = keys.reload().unwrap();
+        assert_eq!(report.not_applied, vec!["security.limits"]);
+        // ...and the key material itself still moved.
+        assert!(keys.current().authenticate(key_a.expose()).is_some());
+    }
+
+    /// `enabled` lives inside the ring, so flipping it is part of what a reload can do —
+    /// including turning authentication on for a node that booted without it.
+    #[test]
+    fn enabled_moves_with_the_ring() {
+        let key_a = ApiKey::generate().unwrap();
+        let (dir, cli) = config_file(&security_toml(false, &[]));
+        let keys = reloader_for(&cli);
+        assert!(!keys.current().enabled());
+
+        rewrite_config(&dir, &security_toml(true, &[(&key_a, "admin")]));
+        let report = keys.reload().unwrap();
+        assert!(report.enabled);
+        assert!(keys.current().enabled());
+        assert!(keys.current().authenticate(key_a.expose()).is_some());
     }
 
     /// Every optional field unset, so a test names only what it is about.
