@@ -2655,3 +2655,96 @@ mod date_shape_tests {
         }
     }
 }
+
+/// The startup recovery fan-out and its single retry pass.
+#[cfg(test)]
+mod recovery_fanout_tests {
+    use super::*;
+
+    /// A thread that panics must still answer for its index: recorded failed, and
+    /// no index comes back unrecorded — an unrecorded index used to sit in
+    /// `Recovering` forever, absent from both outcome lists.
+    #[test]
+    fn a_panicking_recovery_thread_is_recorded_as_failed() {
+        let indices = vec![
+            "good".to_string(),
+            "boom".to_string(),
+            "also_good".to_string(),
+        ];
+        let results = HybridStore::recovery_fanout(&indices, &|name| {
+            if name == "boom" {
+                panic!("injected recovery panic");
+            }
+            Ok(())
+        });
+
+        assert_eq!(results.len(), 3, "every index is answered for exactly once");
+        for name in ["good", "also_good"] {
+            assert!(
+                results.iter().any(|(n, ok)| n == name && *ok),
+                "{name} should be recovered"
+            );
+        }
+        assert!(
+            results.iter().any(|(n, ok)| n == "boom" && !*ok),
+            "a panicking thread counts as failed recovery"
+        );
+    }
+
+    /// Pass-one failures are retried exactly once, pass-one recoveries not at all,
+    /// and an index whose failure was an accident of boot pressure comes back
+    /// without a write having to touch it.
+    #[test]
+    fn the_retry_pass_revisits_only_the_first_pass_failures() {
+        let calls: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let indices = vec![
+            "stable".to_string(),
+            "flaky".to_string(),
+            "broken".to_string(),
+        ];
+        let (recovered, failed) = HybridStore::recover_with_a_retry(&indices, &|name| {
+            let mut seen = calls.lock().unwrap();
+            seen.push(name.to_string());
+            let attempts = seen.iter().filter(|n| n.as_str() == name).count();
+            drop(seen);
+            match name {
+                "flaky" if attempts == 1 => Err(StoreError::IndexNotFound(name.to_string())),
+                "broken" => Err(StoreError::IndexNotFound(name.to_string())),
+                _ => Ok(()),
+            }
+        });
+
+        assert_eq!(
+            failed,
+            ["broken"],
+            "only the permanent failure stays failed"
+        );
+        assert!(
+            recovered.contains(&"stable".to_string()) && recovered.contains(&"flaky".to_string()),
+            "retry brings the boot-pressure failure back: {recovered:?}"
+        );
+
+        let calls = calls.into_inner().unwrap();
+        let count = |name: &str| calls.iter().filter(|n| n.as_str() == name).count();
+        assert_eq!(count("stable"), 1, "a first-pass recovery is not retried");
+        assert_eq!(count("flaky"), 2, "a first-pass failure gets its one retry");
+        assert_eq!(count("broken"), 2);
+    }
+
+    #[test]
+    fn no_failures_means_no_second_pass() {
+        let calls = std::sync::Mutex::new(0usize);
+        let (recovered, failed) =
+            HybridStore::recover_with_a_retry(&["a".to_string(), "b".to_string()], &|_| {
+                *calls.lock().unwrap() += 1;
+                Ok(())
+            });
+        assert_eq!(recovered.len(), 2);
+        assert!(failed.is_empty());
+        assert_eq!(
+            *calls.lock().unwrap(),
+            2,
+            "each index recovered exactly once, nothing retried"
+        );
+    }
+}
