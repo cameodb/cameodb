@@ -7,7 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-09-28
+
 ### Fixed
+
+- **A write no longer loses its freshly opened index to a concurrent close.** The per-index
+  init lock was released as soon as the index was opened, so a close — under an eviction storm,
+  as many as three — could land between the write getting its writer and locking it, exhaust
+  the live-writer retries and fail the write. Write paths now hold the init lock from open
+  through the writer lock, and a close that finds an index mid-open reports it busy, the same
+  answer as for a busy writer.
+
+- **A recovery thread that panics at startup is counted, and a failed replay is retried once.**
+  The startup fan-out discarded each thread's join result, so an index whose recovery panicked
+  stayed `Recovering` forever — in neither the recovered nor the failed list, with nothing
+  logged. And a recovery that returned an error was marked failed for good: the warning promised
+  a retry on first access, but reads never open a writer, so queries served the last committed
+  state until something wrote. A panic is now recorded as a failure, and every first-pass failure
+  is rerun once after the startup gate drains, so a failure caused by boot pressure is transient;
+  one that fails twice stays failed, and the log says what that means for reads.
+
+- **Reopening an index after its writer died is retried, bounded.** The reopen ran once, and its
+  likeliest failure is one of our own: another write queued on the dead writer can still hold a
+  clone of it, and Tantivy's lockfile stays held until the last one drops — longer than the
+  100 ms the open waits, so the write failed although its documents were already durable in
+  redb. The reopen now gets three attempts 10 ms apart; each resumes from the last checkpoint,
+  and a failure that outlasts them is still reported.
 
 - **Recreating an index after `delete --delete-schema` no longer loses most of what is written
   to it.** The drop leaves a record in place of the schema, so a write already in flight cannot
@@ -382,6 +407,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `500`: it round-trips as the `400` it was raised as.
 
 ### Changed
+
+- **Built with Rust 1.98.1, the toolchain every 0.3.5 test ran on.** The release image and the
+  musl builds used 1.95, so the shipped binary came from a compiler no test had seen. The
+  Dockerfile pins the exact release rather than a channel, and `RUST_VERSION` is now declared
+  inside the builder stage — before `FROM` it was invisible there, and the rust-std fallback
+  download had 1.95.0 hard-coded.
+
+- **Dependencies: 67 compatible updates and serde-saphyr 1.3.** tantivy 0.26.2 fixes a buffered
+  union seek on OR queries; redb 4.3.0 fixes a recovery that could roll back a commit, iterators
+  that skipped data after an error, and pages leaked by a panic. serde-saphyr moves from 0.0.28
+  to its stable 1.3 line; `check-config` output is byte-identical. kameo, libp2p and yamux are
+  unchanged — libp2p 0.57 waits on kameo.
 
 - **A node serves its peers' writes and searches concurrently: bulk writes through every node
   2.0–2.9× faster.** A share of a bulk write forwarded from a peer, a single write the router
