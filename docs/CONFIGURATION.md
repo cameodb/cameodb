@@ -1192,12 +1192,29 @@ secret, but a writable one lets anyone mint themselves a role.
 
 ### Rotation
 
-Keys are read once at startup; there is no hot reload. Rotating is therefore:
+Keys are read at startup, and re-read on demand: `POST /_admin/keys/reload` (a `node-admin`
+route, mounted with the rest of `/_admin/*`) re-resolves `[[security.api_keys]]` — and any
+`key_hash_file` they name — and swaps the live key ring. SIGHUP does the same, for
+`kill -HUP` and for a unit carrying `ExecReload=/bin/kill -HUP $MAINPID`.
+
+Rotating is therefore:
 
 1. `cameodb keygen` a replacement and add it as a second `[[security.api_keys]]` entry
-2. Restart, so the node accepts both
+2. Reload — the node now accepts both keys
 3. Move clients across
-4. Remove the old entry and restart again
+4. Remove the old entry and reload again
+
+A reload runs the same validation a boot does, so a file the node would refuse to start on
+is refused, and the ring already in place keeps deciding requests — the reload reports the
+error rather than adopting it. One state is refused outright: a reload that leaves no key
+holding `node-admin`, which would make `/_admin/*` unreachable until a restart. A request
+already past the gate finishes on the entry it authenticated as; a revoked key fails its
+next request.
+
+What moves with a reload is `enabled` and the key list, plus the `--api-key-hash` override,
+which is re-applied rather than read from the file. `tenants`, `limits`, `audit` and
+`implicit_index_creation` do not — they are bound at startup, and the reload response names
+them under `not_applied` when the file changed them.
 
 ## Environment Variables
 

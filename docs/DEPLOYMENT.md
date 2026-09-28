@@ -284,16 +284,20 @@ clear. That variable belongs to the client.
 
 ### Rotation
 
-Keys are read once at startup — there is no hot reload, and no way to revoke a key without a
-restart. Plan for two restarts:
+Keys are read at startup and re-read on demand: `POST /_admin/keys/reload` (a `node-admin`
+route) or SIGHUP — `kill -HUP`, or `systemctl reload` on a unit carrying
+`ExecReload=/bin/kill -HUP $MAINPID`, which the shipped unit has. Rotating without a
+restart:
 
 1. `keygen` the replacement and add it as a second `[[security.api_keys]]` entry
-2. Restart — the node now accepts both keys
+2. Reload — the node now accepts both keys
 3. Move clients across
-4. Remove the old entry and restart again
+4. Remove the old entry and reload again
 
-Rolling this across a cluster is a rolling restart, one node at a time; a node with the new
-key configured still accepts the old one until step 4.
+Rolling this across a cluster is a rolling reload, one node at a time; a node with the new
+key configured still accepts the old one until step 4. A reload that would leave no key
+holding `node-admin` is refused, as is any configuration the node could not boot with —
+the ring already in effect keeps deciding requests in both cases.
 
 ### The audit trail
 

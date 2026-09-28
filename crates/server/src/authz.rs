@@ -31,7 +31,7 @@ use tracing::{debug, warn};
 use cameodb_mcp::{McpAuthz, McpAuthzRef, McpCapability};
 
 use crate::audit::{AuditRecord, AuditSink};
-use crate::auth::{Capability, KeyEntry, KeyRing};
+use crate::auth::{Capability, KeyEntry, KeyReloader, KeyRing};
 use crate::http_server::validate_index_name;
 use crate::ratelimit::Caller;
 
@@ -42,7 +42,10 @@ use crate::ratelimit::Caller;
 /// key ring decided.
 #[derive(Clone)]
 pub struct GateState {
-    pub keyring: Arc<KeyRing>,
+    /// The keys requests are decided against, behind a handle that
+    /// `POST /_admin/keys/reload` and SIGHUP can swap — so what is read here is the ring as
+    /// of *this* request, not the ring as of boot.
+    pub keyring: Arc<KeyReloader>,
     pub audit: Arc<AuditSink>,
 }
 
@@ -126,6 +129,10 @@ const ROUTES: &[RouteRule] = &[
     // Reading the audit trail is itself an audited, node-admin action: the log of who read
     // what is exactly the thing a compromised key would want to read, and then edit.
     rule("GET",    "/_admin/audit",                     Access::Needs(Capability::NodeAdmin)),
+    // The key ring this table is enforced by, swapped from disk. Node-admin not because it
+    // changes keys — it cannot, the config file stays the source of truth — but because it
+    // decides when revocation takes effect.
+    rule("POST",   "/_admin/keys/reload",               Access::Needs(Capability::NodeAdmin)),
     rule("POST",   "/_admin/index/{index}/commit",      Access::Needs(Capability::NodeAdmin)),
     rule("POST",   "/_admin/index/{index}/evict-writer",Access::Needs(Capability::NodeAdmin)),
 
@@ -692,7 +699,7 @@ pub async fn authorize(State(gate): State<GateState>, mut req: Request, next: Ne
         .audit
         .is_enabled()
         .then(|| peer_ip.map(|ip| ip.to_string()));
-    match decide(&gate.keyring, &method, &path, req.headers()) {
+    match decide(&gate.keyring.current(), &method, &path, req.headers()) {
         Ok(authz) => {
             // Off at the default level, and the first thing worth turning on when an
             // operator asks who called what. The `key_id` is the whole point of minting one:
@@ -1795,12 +1802,44 @@ mod tests {
             .key_id();
 
         let subject = subject_through_gate(
-            Arc::new(ring),
+            ring,
             headers_with(Some(&key)),
             Some("198.51.100.7:4242".parse().unwrap()),
         )
         .await;
         assert_eq!(subject, Some(Caller::Key(expected)));
+    }
+
+    /// A reload swaps the ring underneath the gate; the very next request is decided by the
+    /// new one. This is the property `/_admin/keys/reload` relies on — tested here through
+    /// the real middleware rather than asserted of `current()` in isolation.
+    #[tokio::test]
+    async fn a_swapped_ring_decides_the_next_request() {
+        let (key_a, config_a) = key_for(Role::Reader, None);
+        let (key_b, config_b) = key_for(Role::Reader, None);
+        let keys = KeyReloader::for_test(ring(vec![config_a]));
+
+        assert_eq!(
+            status_through_gate(&keys, headers_with(Some(&key_a))).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status_through_gate(&keys, headers_with(Some(&key_b))).await,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // What `reload` does once the new ring has been validated.
+        keys.swap_for_test(ring(vec![config_b]));
+
+        assert_eq!(
+            status_through_gate(&keys, headers_with(Some(&key_b))).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status_through_gate(&keys, headers_with(Some(&key_a))).await,
+            StatusCode::UNAUTHORIZED,
+            "the removed key must stop authenticating on its next request"
+        );
     }
 
     /// Run a request through the real gate on a node that identifies nobody, and report the
@@ -1809,14 +1848,14 @@ mod tests {
         key: Option<&ApiKey>,
         peer: Option<std::net::SocketAddr>,
     ) -> Option<Caller> {
-        let ring = Arc::new(SecurityConfig::default().load_keyring().unwrap());
+        let ring = SecurityConfig::default().load_keyring().unwrap();
         subject_through_gate(ring, headers_with(key), peer).await
     }
 
     /// The same, against a given key ring: mount the gate over a handler that reports what
     /// reached it, and answer with the `Caller` extension the middleware inserted.
     async fn subject_through_gate(
-        keyring: Arc<KeyRing>,
+        keyring: KeyRing,
         headers: HeaderMap,
         peer: Option<std::net::SocketAddr>,
     ) -> Option<Caller> {
@@ -1842,7 +1881,7 @@ mod tests {
             .layer(axum::Extension(Arc::clone(&seen)))
             .layer(axum::middleware::from_fn_with_state(
                 GateState {
-                    keyring,
+                    keyring: KeyReloader::for_test(keyring),
                     audit: crate::audit::AuditSink::disabled(),
                 },
                 authorize,
@@ -1867,5 +1906,30 @@ mod tests {
             "the gate should have admitted this request"
         );
         seen.lock().expect("the test's own lock").clone()
+    }
+
+    /// The same mounting as `subject_through_gate`, answering with the status the gate gave —
+    /// for a test that needs a refusal rather than the subject.
+    async fn status_through_gate(keyring: &Arc<KeyReloader>, headers: HeaderMap) -> StatusCode {
+        use tower::ServiceExt as _;
+
+        let app = axum::Router::new()
+            // A route `ROUTES` classifies, so the gate can admit it when the key checks out.
+            .route("/_indexes", axum::routing::get(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn_with_state(
+                GateState {
+                    keyring: Arc::clone(keyring),
+                    audit: crate::audit::AuditSink::disabled(),
+                },
+                authorize,
+            ));
+
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/_indexes")
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        *request.headers_mut() = headers;
+        app.oneshot(request).await.expect("gate ran").status()
     }
 }

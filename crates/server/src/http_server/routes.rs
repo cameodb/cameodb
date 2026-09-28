@@ -30,7 +30,8 @@ use tracing::{info, warn};
 use crate::http_server::HEALTH_PATH;
 use crate::http_server::admin::{
     admin_audit_handler, admin_index_commit_handler, admin_index_evict_writer_handler,
-    admin_memory_handler, admin_memory_purge_handler, admin_workers_handler,
+    admin_keys_reload_handler, admin_memory_handler, admin_memory_purge_handler,
+    admin_workers_handler,
 };
 use crate::http_server::catalogue::{
     create_config_handler, delete_index_handler, get_config_handler, list_cluster_indexes_handler,
@@ -71,14 +72,10 @@ pub struct RouterConfig<'a> {
 /// Creates the main HTTP router with all endpoints and middleware
 ///
 /// # Arguments
-/// * `state` - Application state with actor references
-/// * `keyring` - The keys the authorization gate decides against
+/// * `state` - Application state with actor references; `state.keyring` is the live ring
+///   the authorization gate decides against and `/_admin/keys/reload` swaps
 /// * `config` - See [`RouterConfig`]
-pub fn create_router(
-    state: AppState,
-    keyring: Arc<crate::auth::KeyRing>,
-    config: &RouterConfig<'_>,
-) -> (Router, McpShutdownHandle) {
+pub fn create_router(state: AppState, config: &RouterConfig<'_>) -> (Router, McpShutdownHandle) {
     let &RouterConfig {
         max_body_size_mb,
         cors_allowed_origins,
@@ -91,8 +88,10 @@ pub fn create_router(
     let body_limit_bytes = max_body_size_mb * 1024 * 1024;
     let (mcp_routes, mcp_handle) = mcp_router::<AppState>(mcp.transport());
     // The gate writes to the same sink the handlers do, so a request produces one record
-    // whichever layer had the last word about it.
+    // whichever layer had the last word about it. The keyring is shared the same way: the
+    // handle the gate reads is the one `/_admin/keys/reload` swaps.
     let audit = Arc::clone(&state.audit);
+    let keyring = Arc::clone(&state.keyring);
 
     // Concurrency limiter: rejects with 503 when too many requests are in flight.
     //
@@ -236,6 +235,7 @@ pub fn create_router(
             .route("/_admin/memory/purge", post(admin_memory_purge_handler))
             .route("/_admin/workers", get(admin_workers_handler))
             .route("/_admin/audit", get(admin_audit_handler))
+            .route("/_admin/keys/reload", post(admin_keys_reload_handler))
             .route(
                 "/_admin/index/{index}/commit",
                 post(admin_index_commit_handler),

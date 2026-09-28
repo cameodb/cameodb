@@ -6284,8 +6284,9 @@ HTTP search. Nothing has shipped with the old names.
 
 - **Non-goals, recorded so they are not re-litigated**: no lockout or throttle on failed auth
   (against a 256-bit key it buys nothing and is itself a DoS lever — count and log for C2);
-  no hot config reload (rotation is add-key → migrate → remove-key → restart, already better
-  than the PSK's "stop every node" gap).
+  no general hot config reload — the key ring alone is hot-swappable since
+  `POST /_admin/keys/reload` and SIGHUP landed; tenants, limits and audit still bind at
+  startup and a reload reports changes to them as not applied.
 
 - **Order of work**:
   1. ✅ **Landed 2026-08-08.** `[security]` config + key types + `keygen` + posture rules +

@@ -45,6 +45,7 @@ Both return `{"error": …, "message": …}`. An unknown path answers `401` with
 | `POST` | `/_admin/memory/purge` | `node-admin` |
 | `GET` | `/_admin/workers` | `node-admin` |
 | `GET` | `/_admin/audit` | `node-admin` |
+| `POST` | `/_admin/keys/reload` | `node-admin` |
 | `POST` | `/_admin/index/{index}/commit` | `node-admin` |
 | `POST` | `/_admin/index/{index}/evict-writer` | `node-admin` |
 | `POST` `GET` `DELETE` | `/mcp` | `read` at the endpoint, then per tool |
@@ -1205,3 +1206,46 @@ a non-zero value means the window shown is incomplete. Reads, MCP tool calls, ad
 and refusals of a valid key are recorded individually; writes, health checks and
 unauthenticated refusals arrive as counted `*_stats` records. Reading this endpoint is itself
 recorded. Field-by-field detail is in [CONFIGURATION.md](CONFIGURATION.md).
+
+#### Key Ring Reload
+Re-resolve `[[security.api_keys]]` — and any `key_hash_file` they name — from the
+configuration file this node booted from, and swap the live key ring without a restart.
+SIGHUP drives the same reload.
+
+```bash
+POST /_admin/keys/reload
+```
+
+**Example:**
+```bash
+curl -s -X POST -H "Authorization: Bearer $ADMIN_KEY" \
+  http://localhost:9480/_admin/keys/reload
+```
+
+**Response:**
+```json
+{
+  "enabled": true,
+  "source": "/etc/cameodb/cameodb.toml",
+  "keys": [
+    {
+      "key_id": "a1b2c3d4",
+      "label": "ops",
+      "role": "admin",
+      "indexes": "all indexes"
+    }
+  ],
+  "summary": "1 key (1 admin)",
+  "not_applied": []
+}
+```
+
+`not_applied` names `[security]` fields the file changed that a running node cannot adopt —
+`tenants`, `limits`, `audit` and `implicit_index_creation` are bound at startup and take
+effect on restart. `enabled` and the key list are the ones that move; an
+`--api-key-hash`/`CAMEODB_API_KEY_HASH` override survives the reload, since it never came
+from the file.
+
+A `400` means the reload was refused — `details` carries the reason (a file the node would
+refuse to boot with, or a result that leaves no key holding `node-admin`) — and the previous
+ring is still in effect.

@@ -31,6 +31,18 @@ use tracing::{info, warn};
 
 mod overrides;
 
+/// Where [`CameoDbConfig::resolve_config_path`] looks when neither `--config` nor
+/// `CAMEODB_CONFIG` names a file, in the order they are tried.
+const IMPLICIT_CONFIG_PATHS: &[&str] = &[
+    "cameodb.toml",
+    "cameodb.yaml",
+    "cameodb.yml",
+    "config/cameodb.toml",
+    "config/cameodb.yaml",
+    "/etc/cameodb/cameodb.toml",
+    "/etc/cameodb/config.toml",
+];
+
 #[cfg(test)]
 mod tests;
 
@@ -882,6 +894,39 @@ impl CameoDbConfig {
         Ok(config)
     }
 
+    /// The one place "which file does this invocation read" is answered.
+    ///
+    /// An explicit `--config`/`CAMEODB_CONFIG` wins and is returned even if unreadable — a
+    /// named file that cannot be read is an error the caller raises, never a reason to try a
+    /// different one. Otherwise the first readable entry of [`IMPLICIT_CONFIG_PATHS`], or
+    /// `None` for a node configured by environment and flags alone.
+    ///
+    /// Key reload pins the answer this returns at startup: the file this node booted on is
+    /// the file it reloads, and the implicit list is never re-walked — a `cameodb.toml`
+    /// dropped into the working directory after boot must not become this node's
+    /// configuration.
+    pub fn resolve_config_path(cli_path: Option<&str>) -> Option<PathBuf> {
+        let env_path = std::env::var("CAMEODB_CONFIG").ok();
+        if let Some(path) = cli_path.or(env_path.as_deref()) {
+            return Some(PathBuf::from(path));
+        }
+        IMPLICIT_CONFIG_PATHS
+            .iter()
+            .find(|path| fs::read_to_string(path).is_ok())
+            .map(PathBuf::from)
+    }
+
+    /// Read and parse one config file. The "📄 Loading" line sits between the read and the
+    /// parse, as startup has always done, so which file was picked is logged before any
+    /// complaint about its contents.
+    fn load_config_file(path: &PathBuf) -> Result<Self> {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+        info!("📄 Loading configuration from: {}", path.display());
+        Self::parse_config_content(&content, &path.to_string_lossy())
+            .with_context(|| format!("Failed to parse config file: {}", path.display()))
+    }
+
     /// Load configuration from a YAML or TOML file.
     ///
     /// `cli_path` is the `--config` argument; it takes precedence over `CAMEODB_CONFIG`, per
@@ -901,36 +946,38 @@ impl CameoDbConfig {
             );
         }
 
-        if let Some(path) = cli_path.or(env_path.as_deref()) {
-            let content = fs::read_to_string(path)
-                .with_context(|| format!("Failed to read config file: {path}"))?;
-            info!("📄 Loading configuration from: {}", path);
-            return Self::parse_config_content(&content, path)
-                .with_context(|| format!("Failed to parse config file: {path}"));
-        }
-
-        let config_paths = [
-            "cameodb.toml",
-            "cameodb.yaml",
-            "cameodb.yml",
-            "config/cameodb.toml",
-            "config/cameodb.yaml",
-            "/etc/cameodb/cameodb.toml",
-            "/etc/cameodb/config.toml",
-        ];
-
-        for path in &config_paths {
-            if let Ok(content) = fs::read_to_string(path) {
-                info!("📄 Loading configuration from: {}", path);
-                return Self::parse_config_content(&content, path)
-                    .with_context(|| format!("Failed to parse config file: {path}"));
+        let Some(path) = Self::resolve_config_path(cli_path) else {
+            return Err(ConfigError::FileNotFound {
+                path: IMPLICIT_CONFIG_PATHS.join(", "),
             }
-        }
+            .into());
+        };
+        Self::load_config_file(&path)
+    }
 
-        Err(ConfigError::FileNotFound {
-            path: config_paths.join(", "),
-        }
-        .into())
+    /// Re-resolve the configuration for a live reload, against the file this node booted
+    /// from.
+    ///
+    /// `source` is what [`Self::resolve_config_path`] settled on at startup, pinned: the
+    /// implicit search list is not re-walked, so a file appearing in it after boot cannot
+    /// become this node's configuration, and a deleted `source` is an error rather than a
+    /// silent slide onto defaults. `None` means no file was ever in play — the reload is
+    /// then environment and flags over defaults, which is still worth running: it is the
+    /// path an `CAMEODB_API_KEY_HASH`-only deployment reloads through.
+    ///
+    /// Everything startup did, redone — file, then environment, then command line (which is
+    /// how an `--api-key-hash` override survives the file being re-read), then the full
+    /// [`Self::validate`]. A config this node would refuse to boot with is a config it
+    /// refuses to adopt.
+    pub fn reload(cli: &CliOverrides, source: Option<&std::path::Path>) -> Result<Self> {
+        let mut config = match source {
+            Some(path) => Self::load_config_file(&path.to_path_buf())?,
+            None => Self::default(),
+        };
+        config = Self::apply_overrides(config, cli)?;
+        config.storage.normalize_paths();
+        config.validate()?;
+        Ok(config)
     }
 
     /// Parse configuration content based on file extension.
