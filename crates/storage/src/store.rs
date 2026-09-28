@@ -2471,6 +2471,55 @@ impl HybridStore {
         }
     }
 
+    /// Retire a writer that just died under a write (`cause`), and reopen the index now rather
+    /// than leaving the cost to the next use: the write's documents are already durable in
+    /// redb, and the open replays them along with everything else the dead writer held.
+    ///
+    /// The reopen is retried, because its likeliest transient failure is of this method's own
+    /// making: another thread queued on this write's writer may still hold a clone of `writer_arc`,
+    /// and until the last clone drops the lockfile is still held. `open_writer_past_a_close`
+    /// waits that out, but only for a short window; a brief pause here covers the slow tail.
+    /// Every retry is idempotent — an interrupted replay resumes from the last stamped
+    /// checkpoint. A failure that outlives the attempts keeps surfacing as the error it is,
+    /// with the data still durable for the next successful open.
+    fn reopen_after_dead_writer(
+        &self,
+        index: &str,
+        writer_arc: Arc<Mutex<IndexWriter>>,
+        cause: &dyn std::fmt::Display,
+    ) -> Result<(), StoreError> {
+        const ATTEMPTS: u32 = 3;
+        const PAUSE: Duration = Duration::from_millis(10);
+
+        self.retire_dead_writer(index, &writer_arc, cause);
+        // Held through the first reopen, this clone made it fail with LockBusy — the same
+        // wait the write path's retry documents.
+        drop(writer_arc);
+
+        let mut attempt = 1;
+        loop {
+            match self.get_or_create_index(index) {
+                Ok(_) => {
+                    self.invalidate_size_cache(index);
+                    return Ok(());
+                }
+                Err(e) => {
+                    if attempt == ATTEMPTS {
+                        return Err(e);
+                    }
+                    tracing::warn!(
+                        index = %index,
+                        error = %e,
+                        attempt,
+                        "Reopen after a dead writer failed; retrying"
+                    );
+                    attempt += 1;
+                    std::thread::sleep(PAUSE);
+                }
+            }
+        }
+    }
+
     /// This index's schema lock, which every read-modify-write of its schema row holds from
     /// the read to the cache update.
     ///
@@ -2731,10 +2780,7 @@ impl HybridStore {
                     // The document is durable above, so it is written: reopening the index
                     // replays it along with everything else the dead writer held.
                     drop(writer);
-                    self.retire_dead_writer(index, &writer_arc, &died);
-                    drop(writer_arc);
-                    self.get_or_create_index(index)?;
-                    self.invalidate_size_cache(index);
+                    self.reopen_after_dead_writer(index, writer_arc, &died)?;
                     return Ok(seq_id);
                 }
 
@@ -3819,10 +3865,7 @@ impl HybridStore {
                 // The batch is durable in redb, so it is written: reopening the index replays
                 // it along with everything else the dead writer held since its last commit.
                 drop(writer);
-                self.retire_dead_writer(index, &writer_arc, &died);
-                drop(writer_arc);
-                self.get_or_create_index(index)?;
-                self.invalidate_size_cache(index);
+                self.reopen_after_dead_writer(index, writer_arc, &died)?;
                 return Ok((seq_ids, new_documents_count));
             }
 
