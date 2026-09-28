@@ -1,6 +1,6 @@
 # Distributed Hybrid-Search Database: Architecture Design Document
 
-**Version:** 0.3.4
+**Version:** 0.3.5
 **Stack:** Rust, Kameo (Actors), Tokio, Redb, Tantivy, Axum, Libp2p
 **Crates:** `server`, `storage`, `cluster`, `client`, `mcp` (+ `bench`, a latency harness that
 doubles as a worked SDK example; not shipped)
