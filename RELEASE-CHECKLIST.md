@@ -130,6 +130,95 @@ Signed off by:
 
 <!-- Newest first. Append a filled-in template per release. -->
 
+## v0.3.5 — 2026-09-28
+
+Commit: f348371 (`release: 0.3.5`), the last commit to touch `crates/` or `Cargo.*`.
+
+Built targets: macOS arm64 (24M), x86_64-unknown-linux-musl (32M binary, 8/8 hardening checks,
++ `cameodb_0.3.5_amd64.deb` 9.3M + `cameodb-0.3.5-1.x86_64.rpm` 10M), Windows x86_64
+(`cameodb.exe`, 33M, sidecar reads `cameodb 0.3.5`), both SBOMs (SPDX 582 packages, CycloneDX 581
+components against 581 in `Cargo.lock`). Linux built with Rust 1.98.1 in the container. All seven
+artifacts signed.
+
+Validation suite, 2026-09-28 20:27:55 → 20:46:16:
+
+```
+binary: /Users/gc/Code/cameodb/target/release/cameodb
+
+  PASS deps
+  PASS unit
+  PASS posture
+  PASS auth
+  PASS tls
+  PASS remote-sources
+  PASS artifact
+```
+
+That binary is byte-identical to the staged `dist/0.3.5/mac/cameodb`
+(sha256 `c6021b573f8a661276e212d1f839432e40475f081f14aac3809be6035e0537e7`) and reports
+`cameodb 0.3.5` with no `+fault-injection` marker. The suite warned that `target/debug/cameodb` was
+newer than the release build; that is the `unit` suite's own `cargo test` build, and the release
+binary is the one tested.
+
+| Suite | Host build | musl | windows | notes |
+|-------|-----------|------|---------|-------|
+| deps           | PASS | —    | —    | three transitive advisories ignored, all review-by 2026-11-01 — not yet due, none renewed |
+| unit           | PASS | —    | —    | `cargo test --workspace` |
+| posture        | PASS | —    | —    | |
+| auth           | PASS | —    | —    | |
+| tls            | PASS | —    | —    | |
+| remote-sources | PASS | PASS | PASS | musl: staged `dist/0.3.5/linux/cameodb` in clean amd64 `alpine:latest` and `debian:bookworm-slim`, 4/4 each — see below. Windows: run on the Windows machine against the release build, PASS as reported by goranc (output not attached) |
+| artifact       | —    | PASS | —    | read the musl binary through a container probe |
+
+`remote-sources` on musl ran the staged artifact, not `target/`, in stock images with only
+`bash`, `curl` and `ca-certificates` added and no `SSL_CERT_FILE` set — not in the builder image,
+whose `SSL_CERT_FILE` and corporate CA would have tested the build host's trust store instead of a
+user's. On a Debian image with no `ca-certificates` the fetch fails closed: "No CA certificates were
+loaded from the system".
+
+The Windows build warned `LNK4044: unrecognized option '/SDL'; ignored`. `/SDL` is a cl.exe
+option that `.cargo/config.toml` passed to link.exe, where it never had an effect; it is removed.
+The shipped `cameodb.exe` was checked directly: its PE header sets DYNAMIC_BASE, HIGH_ENTROPY_VA,
+NX_COMPAT and GUARD_CF, and its load config reports CF instrumentation.
+
+Shipped configs: `check-config --allow-unauthenticated` returns OK on both `cameodb.example.toml`
+and `crates/server/cameodb.toml`, each with the four `internal`-profile warnings expected
+(tls, admin_api, auth, rate).
+
+Signed and staged: `dist/0.3.5/` holds all seven artifacts with a `.bundle` and `.sha256` each, plus
+`SHA256SUMS`, `MANIFEST.txt` and both SBOMs. `shasum -c SHA256SUMS` verifies all seven. Every
+signature was checked against the key `dl.cameodb.com` serves (byte-identical to the
+`cameodb-web` copy) rather than taken from the manifest's "signed" column — `cosign verify-blob`
+returns `Verified OK` for all seven.
+
+`MANIFEST.txt` records `f3483710a84b7a1f90ba94a4ec9a36bf8eba05ae` with no dirty flag. The first
+dry run marked it "(dirty at build time)": `publish.sh` reads `git status` when it runs, not when
+the build ran, and this record was uncommitted then. The build itself logged no dirty-tree warning;
+the manifest was regenerated with this file stashed.
+
+`publish.sh --commit` copied everything into the `cameodb-web` checkout (run with this record stashed,
+so the manifest stays clean): 17 files replaced and the six 0.3.5 `.deb`/`.rpm` files added. The
+copy verifies there too, `shasum -c` and `cosign verify-blob` for all seven. The six 0.3.4 `.deb`/`.rpm`
+files were left in place because `archive/v0.3.4/` still links them. The site's pages, `data/release.json`
+and `llms.txt` now show 0.3.5, with the new commit, date, sizes and hashes; every hash on the site
+appears in `SHA256SUMS`.
+
+Advisory exceptions reviewed: RUSTSEC-2026-0118, RUSTSEC-2026-0119 (hickory-proto 0.25.x via
+libp2p 0.56.0) and RUSTSEC-2024-0436 (unmaintained `paste`, via libp2p → if-watch). All three
+review-by 2026-11-01; none came due, none renewed.
+
+Skipped checks and why: none of the suites.
+
+Docker Hub: `goranc/cameodb:0.3.5` and `latest` are the same index
+(`sha256:dd1edd6dbd704c35ed7163c1ff00a6252c96e5f85cd91abc62c63e799c93681b`), amd64 and arm64, pushed
+2026-09-28T19:39Z from an image built at 19:31Z, after f348371. Both architectures pulled report
+`cameodb 0.3.5` with no `+fault-injection` marker and run as `nonroot`; the arm64 image started and
+`/_cluster/health` answered `green` with no panic logged. The site's Docker section names 0.3.5.
+
+Known gaps acknowledged: yes — the standing list above is unchanged.
+
+Signed off by: goranc
+
 ## v0.3.4 — 2026-09-07
 
 Commit: 433f8b9 — `MANIFEST.txt` records `433f8b94b6067ef2005b9ad4bdacb4f7add468ed`, and that is
