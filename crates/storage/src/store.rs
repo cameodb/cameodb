@@ -3865,6 +3865,97 @@ impl HybridStore {
         Ok((seq_ids, new_documents_count))
     }
 
+    /// Run `recover` for every index, each on its own scoped thread. A thread per index is
+    /// cheap; the writer arenas they can hold are not, and the gate inside `recover` rations
+    /// those.
+    ///
+    /// Every index is answered for exactly once, whatever its thread's fate: the push that
+    /// records the outcome is the thread's last act, so a thread that panics reaches no push
+    /// at all, and the join loop answers `false` in its place. An index whose thread vanished
+    /// without a record used to sit in `Recovering` forever, absent from both outcome lists.
+    pub(crate) fn recovery_fanout<F>(indices: &[String], recover: &F) -> Vec<(String, bool)>
+    where
+        F: Fn(&str) -> Result<(), StoreError> + Sync,
+    {
+        let results = std::sync::Mutex::new(Vec::<(String, bool)>::new());
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = indices
+                .iter()
+                .map(|index_name| {
+                    let results = &results;
+                    scope.spawn(move || {
+                        let ok = recover(index_name).is_ok();
+                        results
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push((index_name.clone(), ok));
+                    })
+                })
+                .collect();
+
+            for (index_name, handle) in indices.iter().zip(handles) {
+                if handle.join().is_err() {
+                    tracing::error!(
+                        index = %index_name,
+                        "Recovery thread panicked; treated as failed recovery"
+                    );
+                    results
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push((index_name.clone(), false));
+                }
+            }
+        });
+        results.into_inner().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// `recover` every index once, and the failures once more after the first pass has
+    /// drained: a boot-time failure can be an accident of startup pressure, and the retry
+    /// turns a permanently stale read state into a transient one. What fails twice stays
+    /// failed — reads answer from the last committed state, and the tail replays on the
+    /// index's next write. Queries do not open a writer, so claiming retry "on first
+    /// access" would promise a write that only a write ever made.
+    pub(crate) fn recover_with_a_retry<F>(
+        indices: &[String],
+        recover: &F,
+    ) -> (Vec<String>, Vec<String>)
+    where
+        F: Fn(&str) -> Result<(), StoreError> + Sync,
+    {
+        let mut recovered = Vec::new();
+        let mut first_failed = Vec::new();
+        for (index_name, ok) in Self::recovery_fanout(indices, recover) {
+            if ok {
+                recovered.push(index_name);
+            } else {
+                first_failed.push(index_name);
+            }
+        }
+
+        let mut failed = Vec::new();
+        if !first_failed.is_empty() {
+            tracing::warn!(
+                count = first_failed.len(),
+                "Phase 1: retrying the failed recoveries once, with the gate drained"
+            );
+            for (index_name, ok) in Self::recovery_fanout(&first_failed, recover) {
+                if ok {
+                    tracing::info!(index = %index_name, "Recovery succeeded on the retry pass");
+                    recovered.push(index_name);
+                } else {
+                    tracing::error!(
+                        index = %index_name,
+                        "Recovery failed twice; reads serve the last committed state until \
+                         the next write replays the WAL tail"
+                    );
+                    failed.push(index_name);
+                }
+            }
+        }
+
+        (recovered, failed)
+    }
+
     /// Phase 1 of startup: replay the WAL tail of every index that has one.
     ///
     /// redb and Tantivy have each finished their own recovery before this runs — redb by
@@ -3926,57 +4017,29 @@ impl HybridStore {
             "Phase 1: replaying the WAL tail of indices redb committed past Tantivy"
         );
 
-        let mut recovered = Vec::new();
-        let mut failed = Vec::new();
+        // Every index that needs replay gets a thread, and `RECOVERY_GATE` decides how many
+        // of them hold an `IndexWriter` at once. The threads are the cheap part; the arenas
+        // are what has to be rationed, and rationing them by gate rather than by chunking
+        // means a slow replay does not hold back the rest of its chunk.
+        // `get_or_create_index` runs `recover_index` as a side effect.
+        let attempt = |index_name: &str| -> Result<(), StoreError> {
+            let _permit = RECOVERY_GATE.acquire();
+            self.get_or_create_index(index_name)
+                .map(|_| ())
+                .inspect_err(|e| {
+                    tracing::warn!(index = %index_name, error = %e, "WAL replay failed");
+                })
+        };
+        let (recovered, failed) = Self::recover_with_a_retry(&needs_recovery, &attempt);
 
-        if !needs_recovery.is_empty() {
-            let results = std::sync::Mutex::new(Vec::new());
-
-            // Every index that needs replay gets a thread, and `RECOVERY_GATE` decides how
-            // many of them hold an `IndexWriter` at once. The threads are the cheap part; the
-            // arenas are what has to be rationed, and rationing them here rather than by
-            // chunking means a slow replay does not hold back the rest of its chunk.
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = needs_recovery
-                    .iter()
-                    .map(|index_name| {
-                        let results = &results;
-                        scope.spawn(move || {
-                            let _permit = RECOVERY_GATE.acquire();
-                            // get_or_create_index runs recover_index as a side effect.
-                            let outcome = self.get_or_create_index(index_name);
-                            results
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .push((index_name.clone(), outcome.is_ok()));
-                            if let Err(e) = outcome {
-                                tracing::warn!(
-                                    index = %index_name,
-                                    error = %e,
-                                    "Recovery failed, index will retry on first access"
-                                );
-                            }
-                        })
-                    })
-                    .collect();
-
-                for handle in handles {
-                    let _ = handle.join();
-                }
-            });
-
-            for (index_name, ok) in results.into_inner().unwrap_or_else(|p| p.into_inner()) {
-                if ok {
-                    // Recovered, but the reader is still cold — phase 2 warms it.
-                    self.warmup_states
-                        .insert(index_name.clone(), IndexWarmupState::Cold);
-                    recovered.push(index_name);
-                } else {
-                    self.warmup_states
-                        .insert(index_name.clone(), IndexWarmupState::Failed);
-                    failed.push(index_name);
-                }
-            }
+        for index_name in &recovered {
+            // Recovered, but the reader is still cold — phase 2 warms it.
+            self.warmup_states
+                .insert(index_name.clone(), IndexWarmupState::Cold);
+        }
+        for index_name in &failed {
+            self.warmup_states
+                .insert(index_name.clone(), IndexWarmupState::Failed);
         }
 
         // Phase 2 covers every index, recovered or not: recovery populates the *writer*
