@@ -43,11 +43,13 @@ rustflags = [
 [env]
 JEMALLOC_SYS_WITH_LG_PAGE = "12"
 
+# No `/SDL`: it is a cl.exe (C/C++ compiler) option, not a link.exe one — as a link-arg it was
+# ignored with LNK4044 and never had an effect. The PE bits these set (DYNAMIC_BASE,
+# HIGH_ENTROPY_VA, NX_COMPAT, GUARD_CF) were checked on the 0.3.5 cameodb.exe.
 [target.'cfg(windows)']
 rustflags = [
-    "-C", "link-arg=/SDL",
     "-C", "link-arg=/DYNAMICBASE",
-    "-C", "link-arg=/HIGHENTROPYVA", 
+    "-C", "link-arg=/HIGHENTROPYVA",
     "-C", "link-arg=/NXCOMPAT",
     "-C", "link-arg=/GUARD:CF",
     "-C", "control-flow-guard"
