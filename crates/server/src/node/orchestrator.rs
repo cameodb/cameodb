@@ -5730,6 +5730,12 @@ impl NodeOrchestrator {
         schema
             .validate_default_fields()
             .map_err(OrchestratorError::Validation)?;
+        // A tokenizer this node cannot build would store, take writes, and then fail every
+        // commit. Refused here so the caller hears it as a 400 naming the field; the store
+        // refuses it too, for schemas that arrive by other routes.
+        schema
+            .validate_tokenizers()
+            .map_err(OrchestratorError::Validation)?;
 
         // Ensure 'id' field is explicitly in the schema for visibility
         if !schema.fields.contains_key("id") {

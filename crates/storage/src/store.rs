@@ -3092,6 +3092,13 @@ impl HybridStore {
         index: &str,
         schema: &IndexSchema,
     ) -> Result<(), StoreError> {
+        // The declaration path refuses an unknown tokenizer with a message for the caller; this
+        // is the backstop for the paths that never pass through it — a schema adopted from a
+        // peer, or re-stored by evolution. Storing one would leave an index no commit can reach.
+        schema
+            .validate_tokenizers()
+            .map_err(StoreError::Serialization)?;
+
         let schema_lock = self.lock_schema(index);
         let _schema_guard = schema_lock.lock().unwrap_or_else(|p| p.into_inner());
 

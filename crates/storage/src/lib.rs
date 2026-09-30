@@ -32,6 +32,7 @@ use tantivy::doc;
 use tantivy::query::QueryParserError;
 use thiserror::Error;
 
+mod analysis;
 mod query;
 mod schema;
 mod search;
@@ -58,6 +59,7 @@ pub use store::HybridStore;
 
 // Inside the crate every module reaches its siblings through `crate::*`, so these stay globs —
 // scoped to the crate and no wider, which is what makes the lists above the whole public surface.
+pub(crate) use analysis::*;
 pub(crate) use query::*;
 pub(crate) use schema::*;
 pub(crate) use search::*;

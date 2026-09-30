@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Language analyzers for text fields: `hr_stem`, `hr_stem_fold`, `it_stem`, `de_stem`,
+  `fr_stem` and `es_stem`.** A text field names one as its `tokenizer`, and index-time and
+  query-time analysis both use it, so a query for one form of a word finds the others. Italian,
+  German, French and Spanish use tantivy's Snowball stemmers.
+- **Croatian analysis of our own.** No Croatian stemmer exists in tantivy or Snowball, so
+  `hr_stem` maps each word to its dictionary form (`člancima` → `članak`, `Umagu` → `umag`) from
+  data built in `tools/hr-lexicon`: 1.7 million word forms learned from CLASSLA-web.hr, a CC0
+  corpus of 3 billion words annotated with lemmas, suffix rules for the words it lacks, and
+  corrections for Istrian place names. `hr_stem_fold` does the same with diacritics removed
+  first, so `fazana` finds `Fažana`. Against hand-checked Croatian (hr500k), a base-form query
+  scores 97.1% F1 under `hr_stem`, and one typed without diacritics reaches 97.6% of the accented
+  occurrences under `hr_stem_fold`. The data adds 5.5 MB to the binary, maps straight from it,
+  and costs about 40 ns per token for common words.
+
+### Fixed
+
+- **A schema naming a tokenizer the node does not have is refused.** It used to be stored, and
+  its writes were accepted into the WAL, and then every commit of the index failed with "Error
+  getting tokenizer for field" while searches found nothing. `PUT /api/{index}/_config` now
+  answers `400` naming the field and listing the tokenizers available, and the store refuses
+  such a schema by any other route, including one adopted from a peer.
+
 ## [0.3.5] - 2026-09-28
 
 ### Fixed

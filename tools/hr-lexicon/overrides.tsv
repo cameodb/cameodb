@@ -1,0 +1,60 @@
+# Overrides for hr_stem / hr_stem_fold, applied at build time before exceptions are computed.
+# Columns (tab-separated): kind, from, to, note
+#   lemma  every form whose corpus lemma is `from` gets lemma `to` (fixes a whole family in one line)
+#   form   this one word form gets lemma `to`
+# Lowercase, with diacritics; the folded analyzer's entries are derived by folding both sides.
+# Write entries from our own evidence (the gazette text, general knowledge), never copied from
+# hrLex or CLASSLA model output (CC BY-SA, evaluation only).
+lemma	umago	umag	Umaga, Umagu: the Italian name leaks in as lemma
+lemma	marčan	marčana	every form of Marčana lemmatized as marčan
+form	žminja	žminj	genitive of Žminj, corpus lemma žminjo
+form	žminjci	žminjac	inhabitants of Žminj, corpus lemma is noise (žminjkk)
+form	vodnjana	vodnjan	genitive of Vodnjan; also gen. pl. of Vodnjanin, the town dominates in the gazette
+form	grožnjana	grožnjan	genitive of Grožnjan (gen. pl. of Grožnjanin)
+form	grožnjanu	grožnjan	dative/locative of Grožnjan, left unlemmatized
+form	ližnjana	ližnjan	genitive of Ližnjan (gen. pl. of Ližnjanin)
+form	ližnjanci	ližnjanac	inhabitants of Ližnjan, corpus lemma is noise (ližnjanc)
+form	kršana	kršan	genitive of Kršan (gen. pl. of Kršanin)
+form	brtoniglu	brtonigla	accusative of Brtonigla, corpus lemma brtonigl
+# --- gazette review 2026-09-30 (whole HR corpus, 692 files; only forms seen repeatedly) ---
+form	buja	buje	genitive of Buje ("Grada Buja"), corpus lemma bujati
+form	bala	bale	genitive of Bale ("Općina Bala"), corpus lemma bal
+form	balama	bale	locative of Bale ("u Balama")
+form	vrsara	vrsar	genitive of Vrsar, corpus lemma vršar
+form	peroja	peroj	genitive of Peroj, corpus lemma is noise (peroo)
+form	peroju	peroj	locative of Peroj, corpus lemma pero
+form	kršete	kršete	village Kršete (Buje), corpus lemma kršeti
+form	kršeta	kršete	genitive of Kršete
+form	šuridi	šurida	locative of Šurida (Fažana)
+form	šikutima	šikuti	locative of Šikuti (Novigrad)
+form	šumbera	šumber	genitive of Šumber
+form	šumberu	šumber	locative of Šumber
+form	valture	valtura	genitive of Valtura
+form	vodicama	vodica	locative of Vodice (Ćićarija); vodice -> vodica already
+form	koromačna	koromačno	genitive of Koromačno, corpus lemma koromačni
+form	koromačnom	koromačno	locative of Koromačno, corpus lemma koromačan
+form	stoja	stoja	Stoja, Pula ("OŠ Stoja"), corpus lemma stoj
+form	sveta	svet	Sveta Nedelja / Marina / Marija; corpus lemma svijet (ekavian genitive)
+form	nedelje	nedelja	Sveta Nedelja ("Sv. Nedelje"); Sunday is nedjelja
+form	nedelji	nedelja	Sveta Nedelja ("u Sv. Nedelji")
+form	nedelju	nedelja	Sveta Nedelja
+form	tita	tito	"Maršala Tita" (streets, squares), corpus lemma tit
+form	gorana	goran	"Ivana Gorana Kovačića", corpus lemma goranin
+form	elektroistre	elektroistra	company Elektroistra Pula
+form	elektroistrom	elektroistra	company Elektroistra Pula
+lemma	butonig	butoniga	Butoniga reservoir, corpus lemma butonig
+lemma	banjol	banjole	Banjole (Medulin)
+form	banjolama	banjole	locative of Banjole
+lemma	puntižel	puntižela	Puntižela (Pula)
+lemma	hidrobaz	hidrobaza	Hidrobaza (Pula)
+lemma	brijun	brijuni	Brijuni islands (plural name)
+lemma	prapoća	prapoće	Prapoće (plural name, "u Prapoćama")
+lemma	podgać	podgaće	Podgaće (plural name)
+lemma	podgaća	podgaće	Podgaće ("u Podgaćama")
+lemma	limska	limski	Limski kanal / Limska draga: one adjective family
+lemma	tarska	tarski	Tarska uvala: one adjective family
+lemma	valturska	valturski	Valturska (street, Pula): one adjective family
+# recurring typos in budget tables (copied issue to issue), mapped to the correct word's lemma
+form	nemataerijalna	nematerijalan	typo of nematerijalna (220 times)
+form	investijskog	investicijski	typo of investicijskog (96 times)
+form	materijalini	materijalan	typo of materijalni (74 times)

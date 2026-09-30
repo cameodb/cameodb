@@ -1,0 +1,13 @@
+[package]
+name = "hr-lexicon-fstbuild"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+# Its own workspace: a build tool for the storage crate's data, not a member of the product's.
+[workspace]
+
+[dependencies]
+# The version the storage crate reads these files with (through tantivy); keep them equal.
+tantivy-fst = "=0.5.0"
