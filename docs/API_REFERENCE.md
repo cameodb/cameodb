@@ -612,6 +612,7 @@ exactly as the documents were. Omitted, it is `default`.
 | `raw` | The whole value as one term; exact match only |
 | `whitespace` | Splits on whitespace only; no lowercasing |
 | `en_stem` · `de_stem` · `fr_stem` · `es_stem` · `it_stem` | `default`, then the language's Snowball stemmer, so `regolamenti` finds `regolamento` |
+| `it_stem_fold` | `default` with accents removed, then the Italian stemmer, so `citta` finds `città` and `attivita` finds `attività`. Words whose accent carries grammar stem shorter than under `it_stem` (`sanità` → `san`) |
 | `hr_stem` | `default`, then each word to its dictionary form: `članka`, `člancima` → `članak`; `odlučila` → `odlučiti`; `Umagu` → `umag`. Terms keep their diacritics |
 | `hr_stem_fold` | The same with diacritics removed first, so `zupanija` finds `županije` and `fazana` finds `Fažana`. The usual choice for Croatian text people search |
 

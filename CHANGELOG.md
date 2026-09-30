@@ -9,10 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Language analyzers for text fields: `hr_stem`, `hr_stem_fold`, `it_stem`, `de_stem`,
-  `fr_stem` and `es_stem`.** A text field names one as its `tokenizer`, and index-time and
+- **Language analyzers for text fields: `hr_stem`, `hr_stem_fold`, `it_stem`, `it_stem_fold`,
+  `de_stem`, `fr_stem` and `es_stem`.** A text field names one as its `tokenizer`, and index-time and
   query-time analysis both use it, so a query for one form of a word finds the others. Italian,
-  German, French and Spanish use tantivy's Snowball stemmers.
+  German, French and Spanish use tantivy's Snowball stemmers. `it_stem_fold` removes accents
+  before stemming, so a query typed `attivita` finds `attività`; stemming first and folding
+  after missed 10% of the accented words in the Italian gazette (`-ità` nouns, `-erà` futures).
 - **Croatian analysis of our own.** No Croatian stemmer exists in tantivy or Snowball, so
   `hr_stem` maps each word to its dictionary form (`člancima` → `članak`, `Umagu` → `umag`) from
   data built in `tools/hr-lexicon`: 1.7 million word forms learned from CLASSLA-web.hr, a CC0

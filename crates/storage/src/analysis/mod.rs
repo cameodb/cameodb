@@ -48,6 +48,7 @@ pub(crate) const TOKENIZERS: &[&str] = &[
     "hr_stem",
     "hr_stem_fold",
     "it_stem",
+    "it_stem_fold",
 ];
 
 /// The languages tantivy stems itself, by tokenizer name. Croatian is not among them — see
@@ -92,6 +93,19 @@ pub(crate) fn register_tokenizers(index: &Index) {
     for &(name, language) in TANTIVY_STEMMED {
         manager.register(name, lowercased().filter(Stemmer::new(language)).build());
     }
+
+    // Folded before stemming for the reason `hr_stem_fold` is: `citta` and `città` then take one
+    // path to one term. Measured on the Italian gazette, stemming first and folding after lets an
+    // accent-free query miss 10% of accented tokens — exactly the `-ità` nouns and `-erà` futures
+    // (`sanita`, `attivita`). The price: those stem shorter (`sanità` → `san`) and a future
+    // singular no longer meets its other forms. `it_stem` keeps the accent-exact stems.
+    manager.register(
+        "it_stem_fold",
+        lowercased()
+            .filter(AsciiFoldingFilter)
+            .filter(Stemmer::new(Language::Italian))
+            .build(),
+    );
 
     manager.register(
         "hr_stem",
@@ -202,6 +216,30 @@ mod tests {
             analyze("hr_stem_fold", "Člancima"),
             vec!["clanak".to_string()]
         );
+    }
+
+    #[test]
+    fn it_stem_fold_matches_queries_written_without_accents() {
+        for (plain, accented) in [
+            ("citta", "Città"),
+            ("attivita", "attività"),
+            ("sanita", "SANITÀ"),
+            ("perche", "perché"),
+            ("procedera", "procederà"),
+        ] {
+            assert_eq!(
+                analyze("it_stem_fold", plain),
+                analyze("it_stem_fold", accented),
+                "{plain} must find {accented}"
+            );
+        }
+        // Still a stemmer: plurals meet their singular.
+        assert_eq!(
+            analyze("it_stem_fold", "regolamenti"),
+            analyze("it_stem_fold", "regolamento")
+        );
+        // `it_stem` keeps accents, so there the plain spelling can be another term.
+        assert_ne!(analyze("it_stem", "sanita"), analyze("it_stem", "sanità"));
     }
 
     #[test]

@@ -16,6 +16,13 @@ CameoDB's storage engine combines two complementary storage systems:
 - **Strengths**: Inverted indexes, relevance scoring, complex queries
 - **Use Cases**: Full-text search, filtering, analytics
 - **Storage Strategy**: Index-only (except `id` field) - complete data retrieved from redb
+- **Text analysis**: a text field names its tokenizer; `src/analysis` holds the list a schema may
+  name (anything else is refused where it is declared) and registers them on every index:
+  `default`, `raw`, `whitespace`, the Snowball stemmers `en_stem` · `it_stem` · `de_stem` ·
+  `fr_stem` · `es_stem`, `it_stem_fold` (accents folded first), and `hr_stem` / `hr_stem_fold`, a Croatian lemmatizer whose data
+  (`src/analysis/croatian/data`, 5.45 MB, embedded) is built by
+  [`tools/hr-lexicon`](../../tools/hr-lexicon/README.md). The tokenizer decides the terms written,
+  so a change to what a name produces means reindexing the fields that use it.
 
 ### Multi-Tenant Architecture
 
