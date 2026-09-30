@@ -1192,6 +1192,122 @@ mod tests {
         );
     }
 
+    fn single_shard_store(dir: &TempDir) -> HybridStore {
+        let config = StorageConfig {
+            max_open_indexes: 0,
+            shard_path: dir.path().to_path_buf(),
+            indexer_memory_budget: 32 * 1024 * 1024,
+            indexer_memory_min_mb: 16,
+            indexer_memory_max_mb: 256,
+            total_memory_limit_bytes: 2048 * 1024 * 1024,
+            memory_pressure_threshold_percent: 80,
+            indexer_num_threads: 1,
+            merge_num_threads: 1,
+            default_batch_size: 100_000,
+            wal_sync: true,
+            commit_interval_ms: 0,
+            query: Default::default(),
+        };
+        HybridStore::new(config, 1).unwrap()
+    }
+
+    /// An unknown tokenizer is refused when the schema is stored, not discovered at commit.
+    ///
+    /// Before the check, `hr_stem` — a name this engine did not have — stored, took a write into
+    /// the WAL and answered success, and then every commit failed with "Error getting tokenizer
+    /// for field" while searches quietly found nothing. The index could not recover without a
+    /// new schema.
+    #[test]
+    fn an_unknown_tokenizer_is_refused_before_the_index_takes_writes() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = single_shard_store(&temp_dir);
+        let mut schema: IndexSchema = serde_json::from_value(serde_json::json!({
+            "fields": {
+                "title": {"field_type": "text", "indexed": true, "tokenizer": "hr_stemm"},
+                "body": {"field_type": "text", "indexed": false, "tokenizer": "croatian"},
+                "tag": {"field_type": "string", "indexed": true}
+            }
+        }))
+        .unwrap();
+        schema.normalize_after_deserialization();
+
+        let reason = schema.validate_tokenizers().expect_err("must be refused");
+        // Sorted, so the first offender named is stable; the unindexed field counts, since it
+        // can be switched on later without its tokenizer being looked at again.
+        assert!(
+            reason.starts_with("field 'body' names tokenizer 'croatian'"),
+            "{reason}"
+        );
+        assert!(reason.contains("(and 1 other field)"), "{reason}");
+        assert!(
+            reason.contains("hr_stem_fold"),
+            "must list what is available: {reason}"
+        );
+
+        let err = store
+            .store_schema_and_cache("wedged", &schema)
+            .expect_err("the store must refuse it too");
+        assert!(matches!(err, StoreError::Serialization(_)), "{err:?}");
+        assert!(
+            store.get_schema_cached("wedged").unwrap().is_none(),
+            "nothing may be stored"
+        );
+    }
+
+    /// The language analyzers, end to end: declared in a schema, written, committed, and found
+    /// by an inflected form the document does not contain.
+    #[test]
+    fn language_tokenizers_find_inflected_forms() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = single_shard_store(&temp_dir);
+        let index = "sluzbene_novine";
+        let mut schema: IndexSchema = serde_json::from_value(serde_json::json!({
+            "fields": {
+                "text_hr": {"field_type": "text", "indexed": true, "tokenizer": "hr_stem_fold"},
+                "text_it": {"field_type": "text", "indexed": true, "tokenizer": "it_stem"},
+                "text_plain": {"field_type": "text", "indexed": true}
+            }
+        }))
+        .unwrap();
+        schema.normalize_after_deserialization();
+        schema.validate_tokenizers().unwrap();
+        store.store_schema_and_cache(index, &schema).unwrap();
+
+        let text_hr = "Županijska skupština Istarske županije donosi Odluku o proračunu";
+        let text_it = "L'Assemblea della Regione Istriana emana i regolamenti";
+        store
+            .apply_write(
+                index,
+                WalOp::Put {
+                    id: "akt-1".to_string(),
+                    json_blob: Some(serde_json::json!({
+                        "text_hr": text_hr,
+                        "text_it": text_it,
+                        "text_plain": text_hr,
+                    })),
+                },
+            )
+            .unwrap();
+        store.commit_index(index).unwrap();
+
+        let hits = |query: &str| {
+            store
+                .search_documents(index, query, 10, None)
+                .unwrap()
+                .total_hits
+        };
+        // Other cases of the same words, and written without diacritics.
+        assert_eq!(hits("text_hr:županija"), 1);
+        assert_eq!(hits("text_hr:zupanija"), 1);
+        assert_eq!(hits("text_hr:proracun"), 1);
+        assert_eq!(hits("text_hr:odluka"), 1);
+        assert_eq!(hits(r#"text_hr:"istarska županija""#), 1);
+        assert_eq!(hits("text_it:regolamento"), 1);
+        // The same text under `default` matches only the forms written.
+        assert_eq!(hits("text_plain:županija"), 0);
+        assert_eq!(hits("text_plain:županije"), 1);
+    }
+
     /// A traversal index name must not create or remove anything outside the
     /// shard. This exercises the real write and delete paths rather than the
     /// validator in isolation, because the earlier canonicalize-based guard

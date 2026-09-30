@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize, de::Error as DeserializeError};
 use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
 use tantivy::schema::{Facet, Field};
-use tantivy::{DateTime, Index, doc};
+use tantivy::{DateTime, doc};
 use xxhash_rust::xxh3::xxh3_64;
 
 /// Tantivy DateTime safe range limits (to avoid i64 overflow during nanosecond conversion)
@@ -87,55 +87,6 @@ pub(crate) fn parse_naive_datetime(s: &str) -> Option<NaiveDateTime> {
         .chain(YEAR_LAST_FORMATS)
         .filter_map(parse)
         .find(year_written_out)
-}
-
-/// Longest token, in bytes, that `default` and `en_stem` keep.
-///
-/// Tantivy's own `default` and `en_stem` cap tokens at 40 bytes, which silently drops the long
-/// atoms this engine is routinely asked to match on — hex digests, base64 blobs, opaque keys.
-/// A dropped token is invisible: the document indexes, the field reports itself as indexed, and
-/// the term simply does not exist to be searched. Both are re-registered under their original
-/// names with this cap.
-///
-/// Deliberately a constant rather than a [`StorageConfig`] knob. The cap decides which terms
-/// exist on disk, so two shards holding the same data under different caps would answer the
-/// same query differently, and nothing in a response would say why.
-pub(crate) const MAX_INDEXED_TOKEN_LEN: usize = 128;
-
-/// Registers this engine's tokenizer overrides on an index.
-///
-/// A `TokenizerManager` is per-[`Index`]-instance and in-memory — nothing about it is persisted
-/// with the index — so every instance handed out must pass through here. Both constructors
-/// ([`open_tantivy_index`] and [`create_tantivy_index`]) do, and they are the only two in the
-/// workspace; an `Index` built any other way silently falls back to the 40-byte builtins and
-/// writes terms that disagree with the rest of the shard.
-pub(crate) fn register_tokenizers(index: &Index) {
-    use tantivy::tokenizer::{
-        Language, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, TextAnalyzer,
-    };
-
-    // `RemoveLongFilter` keeps tokens strictly shorter than its limit, so the limit is one past
-    // the longest token to keep. Off by one here and a digest of exactly the cap disappears.
-    let remove_long = || RemoveLongFilter::limit(MAX_INDEXED_TOKEN_LEN + 1);
-
-    // Filter order matches tantivy's own construction of these two analyzers. Term bytes are
-    // whatever the last filter emits, so a reordering here would not raise anything — it would
-    // just stop matching the terms already on disk.
-    index.tokenizers().register(
-        "default",
-        TextAnalyzer::builder(SimpleTokenizer::default())
-            .filter(remove_long())
-            .filter(LowerCaser)
-            .build(),
-    );
-    index.tokenizers().register(
-        "en_stem",
-        TextAnalyzer::builder(SimpleTokenizer::default())
-            .filter(remove_long())
-            .filter(LowerCaser) // The stemmer does not lowercase.
-            .filter(Stemmer::new(Language::English))
-            .build(),
-    );
 }
 
 /// Native Tantivy field types with proper enum for type safety.
@@ -1289,6 +1240,47 @@ impl IndexSchema {
             }
         }
         Ok(())
+    }
+
+    /// Check that every text field names a tokenizer this engine registers.
+    ///
+    /// Refused where it is declared, because nothing later would say so: an unknown name stores,
+    /// its writes land in the WAL and answer success, and then every commit of the index fails
+    /// because the writer cannot find the analyzer — the index is stuck, and a search finds
+    /// nothing rather than erroring. A typo does this, and so does a name a newer build
+    /// introduced, arriving at a node that predates it.
+    ///
+    /// Only `text` fields are checked, indexed or not: they are the only type the builder hands a
+    /// tokenizer to, and a field declared unindexed can be switched on later without its
+    /// tokenizer being looked at again.
+    pub fn validate_tokenizers(&self) -> Result<(), String> {
+        let mut unknown: Vec<(&str, &str)> = self
+            .fields
+            .iter()
+            .filter(|(_, def)| def.field_type == TantivyFieldType::Text)
+            .filter_map(|(name, def)| {
+                def.tokenizer
+                    .as_deref()
+                    .filter(|tokenizer| !is_known_tokenizer(tokenizer))
+                    .map(|tokenizer| (name.as_str(), tokenizer))
+            })
+            .collect();
+        // Sorted for the same reason as descriptions: an error naming a different field on each
+        // attempt is one an operator cannot work through.
+        unknown.sort();
+        let Some((name, tokenizer)) = unknown.first() else {
+            return Ok(());
+        };
+        let and_others = match unknown.len() - 1 {
+            0 => String::new(),
+            1 => " (and 1 other field)".to_string(),
+            n => format!(" (and {n} other fields)"),
+        };
+        Err(format!(
+            "field '{name}' names tokenizer '{tokenizer}', which this node does not have{and_others}; \
+             available: {}",
+            TOKENIZERS.join(", ")
+        ))
     }
 
     /// Check operator-supplied descriptions against their limits.

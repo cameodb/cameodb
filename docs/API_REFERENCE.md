@@ -602,6 +602,30 @@ Only `text`, `string`, `i64`, `u64`, `f64` and `date` can carry a column. On a `
 column is built for those types and reporting `true` would describe an index that does not exist. A
 sort naming one of them is refused with `400` saying so.
 
+**Tokenizers.** `tokenizer` is optional on a `text` field and decides how its text becomes
+searchable terms. Index-time and query-time analysis use the same one, so a query is analysed
+exactly as the documents were. Omitted, it is `default`.
+
+| Tokenizer | What it does |
+|---|---|
+| `default` | Splits on anything not a letter or digit, lowercases. Matches the forms written |
+| `raw` | The whole value as one term; exact match only |
+| `whitespace` | Splits on whitespace only; no lowercasing |
+| `en_stem` · `de_stem` · `fr_stem` · `es_stem` · `it_stem` | `default`, then the language's Snowball stemmer, so `regolamenti` finds `regolamento` |
+| `hr_stem` | `default`, then each word to its dictionary form: `članka`, `člancima` → `članak`; `odlučila` → `odlučiti`; `Umagu` → `umag`. Terms keep their diacritics |
+| `hr_stem_fold` | The same with diacritics removed first, so `zupanija` finds `županije` and `fazana` finds `Fažana`. The usual choice for Croatian text people search |
+
+Tokens longer than 128 bytes are dropped by every tokenizer but `raw` and `whitespace`. A name
+not in this table is refused with `400` naming the field: the node could not build the index.
+The tokenizer decides which terms are written, so changing a field's tokenizer means rebuilding
+the index. The Snowball stemmers are rules and cut words to stems (`regolament`), with the usual
+misses. The Croatian analyzers are dictionary-based: 1.7 million word forms learned from a
+3-billion-word corpus, plus suffix rules for words the dictionary lacks, so terms are real words
+and irregular forms meet (`ljudi` → `čovjek`). Where a form belongs to two words, the more common
+one wins: `mora` is read as *must* (`morati`), not *of the sea*. A passive participle reaches its
+verb (`određeni` → `odrediti`). A text in two languages is best split into a field per language,
+each with its own tokenizer.
+
 **Date values.** A `date` field takes a string in any of the shapes listed in the
 [date handling reference](../crates/server/README.md#71-write-path-date-normalization) — ISO 8601 /
 RFC 3339, RFC 2822, `YYYY-MM-DD` with `-`, `/` or `.`, `YYYYMMDD`, American `MM/DD/YYYY`, European

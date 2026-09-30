@@ -1294,6 +1294,49 @@ async fn creating_an_index_does_not_report_the_internal_seq_field() {
     );
 }
 
+/// A declaration naming a tokenizer the node does not have is a 400 naming the field, and one
+/// naming a language tokenizer is accepted and reported back.
+///
+/// Accepted, the unknown name would have stored, taken writes, and then failed every commit —
+/// the caller's only sign a search that never found anything.
+#[tokio::test]
+async fn a_declared_tokenizer_must_be_one_the_node_has() {
+    let node = TestNode::start("").await;
+
+    let (status, body) = put_config(
+        &node,
+        "akti",
+        &json!({"fields": {"tekst": {"field_type": "text", "indexed": true, "tokenizer": "croatian"}}}),
+    )
+    .await;
+    assert_eq!(status, 400, "an unknown tokenizer must be refused: {body}");
+    let message = body.to_string();
+    assert!(
+        message.contains("tekst") && message.contains("croatian"),
+        "the refusal must name the field and the tokenizer: {message}"
+    );
+
+    let (status, body) = put_config(
+        &node,
+        "akti",
+        &json!({"fields": {
+            "tekst": {"field_type": "text", "indexed": true, "tokenizer": "hr_stem_fold"},
+            "testo": {"field_type": "text", "indexed": true, "tokenizer": "it_stem"}
+        }}),
+    )
+    .await;
+    assert_eq!(status, 200, "language tokenizers must be accepted: {body}");
+    let config = get_json(&node, "/api/akti/_config").await;
+    let tokenizer = |name: &str| {
+        config["fields"]
+            .as_array()
+            .and_then(|fields| fields.iter().find(|field| field["name"] == name))
+            .map(|field| field["tokenizer"].clone())
+    };
+    assert_eq!(tokenizer("tekst"), Some(json!("hr_stem_fold")), "{config}");
+    assert_eq!(tokenizer("testo"), Some(json!("it_stem")), "{config}");
+}
+
 async fn put_config(
     node: &TestNode,
     index: &str,
