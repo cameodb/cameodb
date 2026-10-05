@@ -101,14 +101,32 @@ fn cap_response_bytes(response: &mut JsonValue, max_bytes: usize) {
     }
 }
 
+/// The MCP sort request's spelling of a sort as the storage one.
+///
+/// The two `SortSpec`s are the same record declared in two crates — the MCP one is what the
+/// tool schema advertises, the storage one is what the engine runs — and this is the only
+/// place the spelling is translated. A `From` impl cannot carry it: both types are foreign to
+/// the one crate that sees both, and the `mcp` crate deliberately holds no dependency on
+/// `storage`.
+fn to_storage_sort(sort: cameodb_mcp::SortSpec) -> storage::SortSpec {
+    storage::SortSpec {
+        field: sort.field,
+        order: match sort.order {
+            cameodb_mcp::SortOrder::Desc => storage::SortOrder::Desc,
+            cameodb_mcp::SortOrder::Asc => storage::SortOrder::Asc,
+        },
+    }
+}
+
 /// Resolve the window this search will run with, or refuse it.
 ///
 /// Checked on the values the search will actually run with rather than on the arguments, because
 /// the query string is a second door into the same numbers: `limit 5000000 offset 900000` written
 /// inline reaches this after the arguments have already been validated and found absent.
 ///
-/// The rule itself lives on [`SearchWindow::checked`], with the HTTP surface, so that a caller
-/// cannot get a different answer by asking a different way.
+/// The rule itself is [`SearchWindow::checked`], which shares it with the schema-side check
+/// through [`cameodb_mcp::checked_search_window`], so a caller cannot get a different answer
+/// by asking a different way.
 fn effective_window(
     state: &AppState,
     limit: Option<usize>,
@@ -221,16 +239,7 @@ pub(super) fn search_index(
         // The argument wins over an inline `sort` clause, as `limit` and `fields` do: a caller
         // that passed a structured sort chose it deliberately, where the clause may be part of
         // a query string it copied.
-        let final_sort = index
-            .sort
-            .map(|requested| storage::SortSpec {
-                field: requested.field,
-                order: match requested.order {
-                    cameodb_mcp::SortOrder::Desc => storage::SortOrder::Desc,
-                    cameodb_mcp::SortOrder::Asc => storage::SortOrder::Asc,
-                },
-            })
-            .or(inline.sort);
+        let final_sort = index.sort.map(to_storage_sort).or(inline.sort);
 
         let result = state
             .router
@@ -323,20 +332,9 @@ pub(super) fn search_across_indexes(
         // Per-index sort takes precedence; fall back to query-parsed sort.
         let global_sort: Option<storage::SortSpec> = indexes
             .iter()
-            .find_map(|req| req.sort.as_ref())
-            .map(|mcp_sort| storage::SortSpec {
-                field: mcp_sort.field.clone(),
-                order: match mcp_sort.order {
-                    cameodb_mcp::SortOrder::Desc => storage::SortOrder::Desc,
-                    cameodb_mcp::SortOrder::Asc => storage::SortOrder::Asc,
-                },
-            })
-            .or_else(|| {
-                parsed_sort.as_ref().map(|storage_sort| storage::SortSpec {
-                    field: storage_sort.field.clone(),
-                    order: storage_sort.order,
-                })
-            });
+            .find_map(|req| req.sort.clone())
+            .map(to_storage_sort)
+            .or_else(|| parsed_sort.clone());
 
         // Read before the requests move into the futures below, for the "did anything at
         // all answer" test after the merge.
@@ -362,24 +360,7 @@ pub(super) fn search_across_indexes(
                 async move {
                     // Merge MCP-provided fields/sort with parsed values
                     let final_fields = fields.or(parsed_fields);
-                    let final_sort = sort.or_else(|| {
-                        parsed_sort.map(|storage_sort| cameodb_mcp::SortSpec {
-                            field: storage_sort.field,
-                            order: match storage_sort.order {
-                                storage::SortOrder::Desc => cameodb_mcp::SortOrder::Desc,
-                                storage::SortOrder::Asc => cameodb_mcp::SortOrder::Asc,
-                            },
-                        })
-                    });
-
-                    // Convert MCP SortSpec to storage SortSpec
-                    let storage_sort = final_sort.map(|mcp_sort| storage::SortSpec {
-                        field: mcp_sort.field,
-                        order: match mcp_sort.order {
-                            cameodb_mcp::SortOrder::Desc => storage::SortOrder::Desc,
-                            cameodb_mcp::SortOrder::Asc => storage::SortOrder::Asc,
-                        },
-                    });
+                    let storage_sort = sort.map(to_storage_sort).or(parsed_sort);
 
                     // The merge below orders by `_sort_key`, so this is the one caller that
                     // needs it to survive the routing path. The strip after the merge is what

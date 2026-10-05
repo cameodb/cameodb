@@ -33,8 +33,10 @@ pub use backend::{
 };
 pub use protocol::MCP_SESSION_ID_HEADER;
 pub use session::McpShutdownHandle;
-// The bounds the tool schemas advertise. Public because the host enforces the same numbers on
-// the value a search runs with, which is not always the argument a client sent — importing
-// them is what keeps the advertised bound and the enforced one from becoming two numbers.
+// The bounds the tool schemas advertise, and the check that enforces them. Public because the
+// host applies the same rule to the window a search runs with, which is not always the
+// argument a client sent — importing both is what keeps the advertised bound and the enforced
+// one from becoming two spellings.
+pub use tools::limits::checked_search_window;
 pub use tools::schema::{DEFAULT_MAX_FEDERATED_INDEXES, DEFAULT_MAX_SEARCH_LIMIT};
 pub use transport::{McpTransportConfig, mcp_router};

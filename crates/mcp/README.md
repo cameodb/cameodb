@@ -6,6 +6,8 @@ Model Context Protocol (MCP) server implementation for CameoDB, enabling AI agen
 
 The `cameodb_mcp` crate provides a standards-compliant MCP server that exposes CameoDB's search capabilities as tools for AI agents. It implements the [Model Context Protocol](https://modelcontextprotocol.io) specification, negotiating `2025-06-18` by default and accepting `2025-03-26` and `2024-11-05` from clients that ask for them, over Streamable HTTP and the legacy HTTP+SSE transport.
 
+This is the caller-facing reference — the tools, the paging rules and the query syntax an agent composes. For the operator's side — enabling and securing the endpoint, and shaping an index for agent use — see [docs/MCP.md](../../docs/MCP.md).
+
 ### Architecture
 
 - **Shared-Port Design**: MCP endpoints are nested under `/mcp` in the main CameoDB HTTP server
@@ -796,32 +798,6 @@ cargo test -p cameodb_mcp
 ```bash
 cargo clippy -p cameodb_mcp -- -D warnings
 ```
-
-### Recent Changes
-
-#### v0.2.3 — Federated Search Overhaul & Sort Improvements
-
-- **Concurrent Multi-Index Search**: `search_across_indexes` now executes all index searches concurrently using `FuturesUnordered`, reducing latency from sum-of-all-searches to max-of-all-searches
-- **Fixed Merge Sort**: Relevance merge now reads `_score` (the actual field name) instead of `score`, which was a no-op causing arbitrary truncation order
-- **Removed `results_by_index`**: Response no longer includes per-index result duplicates — only the merged `hits` array is returned, cutting token usage by 2-4x for LLM consumers
-- **Sort-Aware Merge**: When a per-index sort spec is provided, the federated merge orders hits by `_sort_key` (internal metadata) instead of score, preserving sort order across indexes
-- **Default Sort Order**: Changed from `desc` to `asc` across MCP, storage, and HTTP server layers
-- **Expanded Sortable Types**: Text/string fields now supported for alphabetic post-fetch sort in addition to FAST fields (u64, i64, f64, date)
-- **Field Projection Order**: `apply_field_projection` now inserts user-specified fields first in projection order, then metadata fields after, ensuring consistent response field ordering regardless of sort
-
-#### v0.1.0 — MCP Specification Compliance
-- **Fixed SSE Handshake**: Now emits proper `endpoint` event per MCP spec
-- **Asynchronous POST Processing**: Returns `202 Accepted` immediately, processes in background
-- **Structured Events**: Uses Axum SSE `Event` objects instead of raw strings
-- **Session Cleanup**: 5-minute timeout with automatic cleanup
-- **Error Handling**: Graceful handling of dropped receivers in async tasks
-
-#### Technical Improvements
-- Removed unused `MessageAck` struct
-- Updated channel types from `String` to `Event`
-- Added proper event type mapping (`endpoint`, `message`)
-- Non-blocking message processing with `tokio::spawn`
-- Improved logging for debug scenarios
 
 ### Integration with Main Server
 

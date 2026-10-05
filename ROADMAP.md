@@ -223,20 +223,24 @@ is larger than a page", and building either changes how the other should work.
 
 **What is actually left:**
 
-- **Nothing in `docs/` mentions MCP setup.** `API_REFERENCE.md`, `CONFIGURATION.md`,
-  `DEPLOYMENT.md`, `ARCHITECTURE.md` and `DEVELOPMENT.md` name MCP only in passing. An
-  operator reading the documentation tree never reaches the crate README.
-- **Index-design guidance for agent context** — how to shape an index so an agent can use it,
-  including the cheap mitigation for [D1](#d1--reindex): declare the fields up front with
-  `PUT /api/{index}/_config`, or let the first write carry them.
 - **The syntax reference's home.** `validate_query` called with no arguments still returns the
   static reference, and the tool's own description tells agents to do exactly that. Moving it
   to `instructions` and a `cameodb://syntax` resource is a change to the tool's contract
   rather than a fix to it, which is why it was held for this item — the description, the
   instructions and the README have to change together.
-- **`crates/mcp/README.md`'s "Recent Changes" section is stale**, describing v0.2.3 and v0.1.0
-  while the crate is at 0.3.2. It duplicates what `CHANGELOG.md` records properly; delete it
-  rather than maintain two histories.
+
+**Done 2026-10-05**, on top of the earlier list:
+
+- **`docs/MCP.md`** now carries the operator's side of the surface — what is mounted,
+  enabling and securing it, connecting clients — and links the crate README as the
+  authoritative caller reference rather than duplicating it. The root README's documentation
+  list reaches it.
+- **Index-design guidance for agent context** is the back half of that page: descriptions,
+  fields declared up front with `PUT /api/{index}/_config` or carried by the first write
+  (the cheap mitigation for [D1](#d1--reindex)), and types chosen for the operators
+  `describe_index` will advertise.
+- The stale **"Recent Changes"** section in `crates/mcp/README.md` is deleted; `CHANGELOG.md`
+  holds the one history.
 
 ### A3 — Protocol-compliance tests and agent-query benchmarks
 
@@ -1876,18 +1880,25 @@ a page", and building either changes how the other should work.
 
 ### CH4 — The window bound is spelled twice
 
-📋 `SearchWindow::checked` (server) and `check_limit` + `check_offset_window` (the `mcp` crate)
-enforce the same rule with independently maintained arithmetic and error text. The double check
-is deliberate — the schema is the `mcp` crate's promise, and a promise nothing enforces
-describes nothing — but two spellings of one rule drift, and the refusal text already differs
-between them. Keep both checks; share the arithmetic and the test vectors, so a change to the
-rule cannot land in one crate only.
+✅ **Done 2026-10-05.** `SearchWindow::checked` (server) and `check_limit` +
+`check_offset_window` (the `mcp` crate) enforced the same rule with independently maintained
+arithmetic and error text, and the refusal text had already drifted between them. Both checks
+remain — the schema is the `mcp` crate's promise, and a promise nothing enforces describes
+nothing — but the arithmetic and its test vectors now live once in
+`cameodb_mcp::checked_search_window` (`tools/limits.rs`), exported beside the
+`DEFAULT_MAX_*` bounds so the advertised ceiling and the enforced one cannot drift. The
+dispatcher resolves the window once per call rather than running a limit check and a window
+check in sequence; the refusal text unified on the server's wording.
 
 ### CH5 — Sort type conversion, four times inline
 
-📋 `crates/server/src/mcp/search.rs` converts `cameodb_mcp::SortSpec` ↔ `storage::SortSpec` with
-the same written-out match in four places. One pair of `From` impls, next to the type that owns
-the shape.
+✅ **Done 2026-10-05.** `crates/server/src/mcp/search.rs` converted `cameodb_mcp::SortSpec` ↔
+`storage::SortSpec` with the same written-out match in four places — including a
+storage→MCP→storage round trip that existed only to merge an argument sort with an inline
+one. The `From` impls this item pictured cannot be written: both types are foreign to the
+only crate that sees both, and the `mcp` crate deliberately holds no dependency on
+`storage`. One `to_storage_sort` beside the call sites carries the translation instead, and
+the round trip collapsed into `sort.map(to_storage_sort).or(parsed_sort)`.
 
 ### CH6 — The federated merge clones every hit
 

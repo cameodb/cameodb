@@ -230,7 +230,8 @@ Dive deeper into CameoDB's architecture and APIs:
 - 📦 **[Building & Packaging](docs/BUILDING.md)**: Instructions for compiling cross-platform binaries and generating RPM/DEB packages.
 - 💻 **[Development Setup](docs/DEVELOPMENT.md)**: Getting a clean macOS or Linux machine ready to build, test and validate CameoDB.
 - 🚢 **[Deployment](docs/DEPLOYMENT.md)**: Running CameoDB as a service, in containers, and as a cluster.
-- 🧭 **[Architecture Decisions](docs/ADR.md)**: Why the system is shaped the way it is.
+- � **[MCP Server](docs/MCP.md)**: Enabling, securing and feeding the Model Context Protocol surface an agent searches through.
+- �🧭 **[Architecture Decisions](docs/ADR.md)**: Why the system is shaped the way it is.
 - 🧪 **[Scripts](scripts/README.md)**: Build, setup, validation and testing scripts, and what each one checks.
 - 📊 **[Data Ingestion Examples](examples/README.md)**: Sample python scripts and datasets (TED Talks, Book Summaries) to try out right away.
 
