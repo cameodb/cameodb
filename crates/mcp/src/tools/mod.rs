@@ -1,5 +1,6 @@
 //! The tool catalogue and the dispatcher that runs a call against the backend.
 
+pub mod limits;
 pub(crate) mod schema;
 
 use serde::{Deserialize, de::DeserializeOwned};
@@ -8,6 +9,7 @@ use serde_json::{Value as JsonValue, json};
 use crate::{
     authz::{McpAuthzRef, McpCapability, tool_capability},
     backend::{McpBackend, McpIndexSearchRequest, ToolError},
+    tools::limits::checked_search_window,
     tools::schema::{
         DescribeIndexArgs, GetCatalogStatsArgs, ListIndexesArgs, SearchAcrossIndexesArgs,
         SearchIndexArgs, ToolLimits, ValidateQueryArgs, describe_index_input_schema,
@@ -38,50 +40,24 @@ fn decode_args<T: DeserializeOwned>(tool: &str, arguments: JsonValue) -> Result<
         .map_err(|err| ToolError::caller(format!("Invalid {tool} arguments: {err}")))
 }
 
-/// Refuse a `limit` past what the schema advertises.
+/// Refuse a window — `offset + limit`, counted against the host's default where `limit` is
+/// absent — past what the schema advertises.
 ///
 /// Both numbers come from the same place — the host, through
 /// [`McpBackend::max_search_limit`] — so a caller cannot be refused for exceeding a bound the
 /// catalogue did not show it. Checked here as well as by the host because the schema is this
 /// crate's promise about what a call may carry, and a promise nothing enforces describes
-/// nothing.
-fn check_limit(limit: Option<usize>, max_search_limit: usize) -> Result<(), ToolError> {
-    match limit {
-        Some(limit) if limit > max_search_limit => Err(ToolError::caller(format!(
-            "limit {limit} is above the maximum of {max_search_limit}; ask for at most that many \
-             and narrow the query to reach the rest"
-        ))),
-        _ => Ok(()),
-    }
-}
-
-/// Refuse an offset whose window — `offset + limit` — exceeds the advertised maximum.
-///
-/// The engine fetches `offset + limit` hits to apply the skip after merging, so the sum is
-/// what the bound applies to. Checked here for the same reason [`check_limit`] is: the schema
-/// advertises the bound, and a promise nothing enforces describes nothing.
-///
-/// An absent `limit` is the host's default, not zero. Reading it as zero would let
-/// `offset = max_search_limit` past this check and leave the node fetching
-/// `max_search_limit + default` — the advertised ceiling exceeded by exactly the number the
-/// schema tells callers an omitted `limit` means.
-fn check_offset_window(
+/// nothing. The rule itself lives in [`checked_search_window`], shared with the host's own
+/// surfaces, so a caller cannot get a different answer by asking a different way.
+fn check_window(
     limit: Option<usize>,
     offset: Option<usize>,
     default_search_limit: usize,
     max_search_limit: usize,
 ) -> Result<(), ToolError> {
-    let limit = limit.unwrap_or(default_search_limit);
-    let offset = offset.unwrap_or(0);
-    let window = offset.saturating_add(limit);
-    if window > max_search_limit {
-        return Err(ToolError::caller(format!(
-            "offset {offset} + limit {limit} = {window} is above the maximum of \
-             {max_search_limit}; the engine fetches offset + limit hits, so a page this deep \
-             costs what a limit that large costs. Narrow the query, or reduce the offset."
-        )));
-    }
-    Ok(())
+    checked_search_window(limit, offset, default_search_limit, max_search_limit)
+        .map(|_| ())
+        .map_err(ToolError::caller)
 }
 
 /// Refuse an index list that is empty, too long, or names an index twice.
@@ -149,8 +125,7 @@ where
     match params.name.as_str() {
         "search_index" => {
             let args: SearchIndexArgs = decode_args("search_index", params.arguments)?;
-            check_limit(args.limit, backend.max_search_limit())?;
-            check_offset_window(
+            check_window(
                 args.limit,
                 args.offset,
                 backend.default_search_limit(),
@@ -173,8 +148,7 @@ where
         "search_across_indexes" => {
             let args: SearchAcrossIndexesArgs =
                 decode_args("search_across_indexes", params.arguments)?;
-            check_limit(args.limit, backend.max_search_limit())?;
-            check_offset_window(
+            check_window(
                 args.limit,
                 args.offset,
                 backend.default_search_limit(),
@@ -937,54 +911,5 @@ mod tests {
         // invites an agent to plan around it and fail mid-task.
         let nobody: McpAuthzRef = Arc::new(NoCapabilities);
         assert!(visible_tools(&nobody, ToolLimits::default()).is_empty());
-    }
-
-    #[test]
-    fn check_limit_refuses_past_the_maximum() {
-        assert!(check_limit(Some(101), 100).is_err());
-        assert!(check_limit(Some(100), 100).is_ok());
-        assert!(check_limit(None, 100).is_ok());
-    }
-
-    #[test]
-    fn check_offset_window_refuses_when_offset_plus_limit_exceeds_the_maximum() {
-        // offset + limit within the bound is accepted.
-        assert!(check_offset_window(Some(50), Some(50), 10, 100).is_ok());
-        assert!(check_offset_window(Some(100), Some(0), 10, 100).is_ok());
-
-        // offset + limit past the bound is refused.
-        assert!(check_offset_window(Some(50), Some(51), 10, 100).is_err());
-        assert!(check_offset_window(Some(1), Some(100), 10, 100).is_err());
-
-        // Neither named: the default limit from offset 0, which is within any usable bound.
-        assert!(check_offset_window(None, None, 10, 100).is_ok());
-    }
-
-    /// An omitted `limit` is the node's default, and the bound is applied to that.
-    ///
-    /// The window this rejects — `offset` at the ceiling with no `limit` — is the one an earlier
-    /// version accepted by reading the omission as zero, leaving the node to fetch
-    /// `max + default` hits for a request the check had already approved.
-    #[test]
-    fn check_offset_window_counts_the_default_limit_when_none_is_given() {
-        assert!(check_offset_window(None, Some(100), 10, 100).is_err());
-        assert!(check_offset_window(None, Some(90), 10, 100).is_ok());
-        assert!(check_offset_window(None, Some(91), 10, 100).is_err());
-
-        // The host's default is what counts, not this crate's: a node configured with a larger
-        // one has less room for the offset, and says so at the same ceiling.
-        assert!(check_offset_window(None, Some(90), 50, 100).is_err());
-        assert!(check_offset_window(None, Some(50), 50, 100).is_ok());
-    }
-
-    /// A refusal has to name the numbers a caller can act on: what it asked for, what that
-    /// summed to, and what the ceiling is.
-    #[test]
-    fn check_offset_window_error_names_the_window_and_the_bound() {
-        let err = check_offset_window(Some(20), Some(9_990), 10, 10_000).unwrap_err();
-        assert!(err.detail().contains("9990"), "{err}");
-        assert!(err.detail().contains("20"), "{err}");
-        assert!(err.detail().contains("10010"), "{err}");
-        assert!(err.detail().contains("10000"), "{err}");
     }
 }

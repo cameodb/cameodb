@@ -1234,51 +1234,20 @@ impl SearchWindow {
 
     /// Resolve a request's `limit` and `offset` into a window, or say why it cannot be served.
     ///
-    /// Every request surface goes through here, so that all of them apply the node's default and
-    /// its ceiling the same way. Two things it settles that a per-surface check kept getting
-    /// wrong:
-    ///
-    /// An absent `limit` means the node's default, not zero. Bounding `offset + 0` lets
-    /// `offset = max_search_limit` past a check the engine then exceeds by the default, so the
-    /// advertised ceiling was not the real one.
-    ///
-    /// The ceiling applies to `offset + limit` rather than to `limit`, because that sum is what
-    /// gets fetched: every source is asked for the whole window from the front (see
-    /// [`Self::fetch_count`]), and Tantivy's collector allocates against the number it is given
-    /// before it has matched anything. So a deep page is exactly as expensive as a large limit,
-    /// and `max_search_limit` has to bound both or it bounds neither.
+    /// The rule itself — an absent `limit` is the default rather than zero, and the ceiling
+    /// applies to `offset + limit` — is [`cameodb_mcp::checked_search_window`], spelled next to
+    /// the bounds the tool schemas advertise, so the schema-side check and this one cannot
+    /// drift apart. Every request surface still goes through here, so that all of them apply
+    /// the node's default and its ceiling the same way.
     pub(crate) fn checked(
         limit: Option<usize>,
         offset: Option<usize>,
         default_limit: usize,
         max_search_limit: usize,
     ) -> Result<Self, String> {
-        let window = SearchWindow {
-            offset: offset.unwrap_or(0),
-            limit: limit.unwrap_or(default_limit),
-        };
-
-        if window.limit > max_search_limit {
-            return Err(format!(
-                "limit {} is above the maximum of {max_search_limit}; ask for at most that many \
-                 hits, or narrow the query",
-                window.limit
-            ));
-        }
-
-        if window.fetch_count() > max_search_limit {
-            return Err(format!(
-                "offset {} + limit {} = {} is above the maximum of {max_search_limit}; the \
-                 engine fetches offset + limit hits, so a page this deep costs what a limit that \
-                 large costs. Narrow the query, or sort on a field that lets you resume from the \
-                 last hit instead of paging.",
-                window.offset,
-                window.limit,
-                window.fetch_count()
-            ));
-        }
-
-        Ok(window)
+        let (offset, limit) =
+            cameodb_mcp::checked_search_window(limit, offset, default_limit, max_search_limit)?;
+        Ok(SearchWindow { offset, limit })
     }
 
     /// How many hits each source must return for this window to be servable from them.

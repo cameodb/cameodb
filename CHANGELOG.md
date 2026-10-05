@@ -41,6 +41,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answers `400` naming the field and listing the tokenizers available, and the store refuses
   such a schema by any other route, including one adopted from a peer.
 
+### Changed
+
+- **The search-window bound is spelled once.** The MCP dispatcher and the node's own
+  `SearchWindow::checked` enforced `offset + limit ≤ max_search_limit` with two copies of the
+  arithmetic whose refusal text had already drifted; both now call
+  `cameodb_mcp::checked_search_window`, beside the bounds the tool schemas advertise, so a
+  change to the rule cannot land on one surface only. The two MCP refusals now read like the
+  HTTP ones.
+- **MCP↔storage sort translation happens in one function.** The four written-out matches —
+  one of them a storage→MCP→storage round trip that existed only to merge an argument sort
+  with an inline one — are a single `to_storage_sort` beside the call sites.
+
+### Documentation
+
+- **`docs/MCP.md` is the operator's entry point to the MCP surface** — what is mounted, the
+  `[mcp]` configuration and securing the endpoint, and how to shape an index for agent use:
+  descriptions, fields declared up front with `PUT /api/{index}/_config`, and types picked
+  for the operators `describe_index` advertises. The stale "Recent Changes" section in
+  `crates/mcp/README.md` is removed; this file holds the one history.
+
 ## [0.3.5] - 2026-09-28
 
 ### Fixed
