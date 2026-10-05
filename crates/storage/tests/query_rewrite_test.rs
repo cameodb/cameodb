@@ -284,7 +284,8 @@ fn a_shadow_reference_is_rewritten_wherever_a_field_name_can_appear() {
             "(sha1:d1 OR sha1:d2) AND title:rust",
             "(id:d1 OR id:d2) AND title:rust",
         ),
-        ("title:rust NOT sha1:d2", "title:rust NOT id:d2"),
+        // `a NOT b` normalizes to `a -b` before the shadow pass runs.
+        ("title:rust NOT sha1:d2", "title:rust -id:d2"),
         ("sha1: IN [d1 d2]", "id: IN [d1 d2]"),
         // An escaped colon inside the value is the value's; the name span still rewrites.
         (

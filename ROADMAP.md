@@ -182,6 +182,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [OB21](#ob21--a-peer-that-stops-answering-detected-refused-at-once-and-bounded-while-it-lasts) | **A peer that stops answering** — orchestrator forwards now share one deadline, stale peer references go on the first failure, and topology can no longer drop the newest ring. Also fixed: a kameo panic at shutdown (5.5), and a frozen peer is detected by ping within ~40 s, after which requests for it are answered at once (5.4) | — | 2026-09-26 | ✅ |
 | [OB22](#ob22--an-orchestrator-waited-on-peers-while-holding-its-mailbox) | **An orchestrator waited on peers while holding its mailbox** — schema canvasses and forwards ran inside it, so two nodes doing either at once waited on each other until a 5 s or 60 s timeout: bulk writes through every node all timed out, and new indexes created through every node ran at 0.1/s, most refused. Fixed; now 510 batches/s and 134 new indexes/s, none failed; several nodes minting one index at once settle it by node id, where 88 of 120 such writes were refused. Found by the cluster suite's new cross-node phase | — | 2026-09-26 | ✅ |
 | [OB23](#ob23--recreating-an-index-after-dropping-its-schema-lost-most-of-what-was-written) | **Recreating an index after dropping its schema lost most of what was written** — the drop's record read as a schema, the node re-minted the index from every batch, and a retyped column killed the Tantivy writer, which stayed dead until restart. 1,030 of 16,559 documents landed; now all do, a dying writer is retired and replayed, and the loader counts every failure by its file line | — | 2026-09-27 | ✅ |
+| [OB24](#ob24--a-and-not-b-and-a-or-not-b-parsed-cleanly-and-answered-wrongly) | **`a AND NOT b` and `a OR NOT b` parsed cleanly and answered wrongly** — a `NOT` arm under `Must`/`Should` matched nothing and nothing reported it; rewritten to `a AND -b` / `a OR (* -b)` before the parser runs | — | 2026-10-05 | ✅ |
 | [F9](#f9--commit-on-a-clock-not-a-count) | **Commit on a clock, not a count** — bulk ingest 1.8–6.6×, a trickle searchable within 2 s, single writes unchanged | — | 2026-09-26 | ✅ |
 | [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
@@ -3244,6 +3245,34 @@ schema with no fields as none.
 Each test fails against the code it pins: `a_dropped_index_is_minted_once_by_the_writes_that_recreate_it`
 (0 of 60 searchable on the old caching rule), `a_value_is_added_by_the_column_the_index_built`,
 and the two dead-writer tests, which fail with retirement disabled.
+
+### OB24 — `a AND NOT b` and `a OR NOT b` parsed cleanly and answered wrongly
+
+✅ **Done 2026-10-05**, observed while scoping 0.3.6. Tantivy's grammar accepts `NOT leaf` in
+every position a leaf can sit, but repairs an all-negative clause only at the top level —
+`make_non_negative` appends a `?*` there and nowhere else. A `NOT` arm nested under `Must` or
+`Should` therefore matched no documents, and the failure was silent: `title:rust AND NOT
+tag:draft` answered 0 hits instead of the rust-but-not-draft set, `title:rust OR NOT tag:nosuch`
+answered exactly `title:rust` with the `NOT` arm contributing nothing, and a bare `NOT
+tag:draft` matched the right set while reporting `clause was dropped: Only excluding terms
+given` — the correct answer wearing a false report. Verified on a store rather than read off the
+grammar: rust/systems, go/systems, rust/draft, through `validate_query` and
+`search_documents` alike.
+
+**What landed.** `normalize_not_clauses` in `storage/src/query.rs`, first of the normalization
+passes in `prepare_query_parser`, rewrites the text while it still says what the caller wrote:
+`a AND NOT b` to `a AND -b`, `a OR NOT b` and a leading, grouped or signed `NOT` to `(* -b)` —
+a `-b` appended to the disjunction instead would drop documents matching both arms — and
+`a NOT b` to the `a -b` it already evaluated as. A run of `NOT`s collapses by parity, so
+`NOT NOT a` is `a`. `NOT` counts only in uppercase at a leaf boundary, outside quotes and
+outside `[]`/`{}` ranges and sets: `notes:x`, `a-NOT b`, `title:"a NOT b"` and `tag: IN [a NOT]`
+are all untouched. The rewrite stays visible — `normalized_query` reports the engine's form,
+which is the property [A6](#a6--the-syntax-reference-has-drifted-from-the-engine) established.
+
+**The boundary kept.** Inside `field:( ... )` only the `-` rewrites apply: the `*` in `(* -x)`
+would take the field's scope and `field:*` is refused, so `title:(NOT a)` is left for the parser
+to report rather than rewritten into a form that means something else.
+`not_query_forms_test.rs` pins the hits, the rewrites and the non-operators.
 
 ### F9 — Commit on a clock, not a count
 

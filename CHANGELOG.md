@@ -27,6 +27,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`NOT` beside `AND`/`OR` or at the head of a query now answers the boolean it reads as.** The
+  parser accepted every one of these forms, and evaluated none of them: `a AND NOT b` matched
+  nothing, `a OR NOT b` silently dropped the `NOT` arm, and a bare `NOT b` matched correctly while
+  reporting a discarded clause. The query is rewritten before it reaches the parser — `a AND NOT b`
+  to `a AND -b`, `a OR NOT b` and a leading or grouped `NOT` to `(* -b)` — and `validate_query`
+  shows the rewritten form. `a NOT b` keeps its exclusion meaning. The one form left alone is a
+  `NOT` needing the `(* -x)` shape inside `field:( ... )`, where the `*` would take the field's
+  scope and `field:*` is refused.
 - **A schema naming a tokenizer the node does not have is refused.** It used to be stored, and
   its writes were accepted into the WAL, and then every commit of the index failed with "Error
   getting tokenizer for field" while searches found nothing. `PUT /api/{index}/_config` now

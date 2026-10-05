@@ -285,6 +285,9 @@ curl -s -X POST http://localhost:9480/api/books/search \
 > is query text. `to` and `in` break the clause around them, so they surface as dropped clauses
 > above. `and`, `or` and `not` do not: they are searched for as ordinary words, which widens a query
 > silently — `a not b` matches everything rather than excluding `b`.
+>
+> `NOT` composes with the other two: `a AND NOT b` keeps what matches `a` and not `b`, `a OR NOT b`
+> adds everything not matching `b`, and `a NOT b` or a leading `NOT b` are the exclusion forms.
 
 #### Streaming Search
 Get search results as a real-time stream for large result sets.

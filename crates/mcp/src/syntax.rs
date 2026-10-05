@@ -127,11 +127,17 @@ pub const OPERATORS: &[Operator] = &[
     Operator {
         syntax: "AND / OR / NOT",
         summary: "Combine clauses. Uppercase only.",
-        examples: &["title:rust AND year:2024", "title:rust NOT tag:draft"],
+        examples: &[
+            "title:rust AND year:2024",
+            "title:rust AND NOT tag:draft",
+            "title:rust OR NOT tag:draft",
+            "NOT tag:draft",
+        ],
         types: &[],
         caveat: Some(
-            "Lowercase is not reported: `a and b` is three terms, which widens the query, and \
-             `a not b` matches everything.",
+            "`a AND NOT b` keeps what matches a and not b, `a OR NOT b` adds everything not \
+             matching b, `a NOT b` and `NOT b` alone are exclusions. Lowercase is not reported: \
+             `a and b` is three terms, which widens the query, and `a not b` matches everything.",
         ),
     },
     Operator {
