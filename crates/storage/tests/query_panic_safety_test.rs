@@ -24,7 +24,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use storage::{
-    FieldDef, HybridStore, IndexSchema, StorageConfig, TantivyFieldType, WalOp, field_references,
+    FieldDef, HybridStore, IndexSchema, StorageConfig, StoreError, TantivyFieldType, WalOp,
+    field_references,
 };
 use tempfile::TempDir;
 
@@ -304,4 +305,39 @@ fn no_hand_written_edge_case_panics_any_parser() {
         let _ = store.search_documents(INDEX, &long, 10, None);
         progress.fetch_add(1, Ordering::Relaxed);
     });
+}
+
+/// Nesting is the axis the parser recurses on, one stack frame per level, and a stack overflow
+/// aborts the node. A query nested past the limit is refused as the request's fault before
+/// anything parses it — validation calls it invalid and says why — and one at the limit runs.
+/// Both sit far inside what the stack holds.
+#[test]
+fn a_query_nested_past_the_limit_is_refused_before_parsing() {
+    let dir = TempDir::new().expect("temp dir");
+    let store = store(&dir);
+
+    let groups = |d: usize| format!("{}title:seed{}", "(".repeat(d), ")".repeat(d));
+    // `NOT (` counts twice: the `NOT`, and the group it negates.
+    let negated = |d: usize| format!("{}title:seed{}", "NOT (".repeat(d), ")".repeat(d));
+
+    for query in [groups(64), negated(32)] {
+        store.validate_query(INDEX, &query).expect("at the limit");
+        store
+            .search_documents(INDEX, &query, 10, None)
+            .expect("at the limit");
+    }
+    for query in [groups(65), negated(33)] {
+        let verdict = store.validate_query(INDEX, &query).unwrap().unwrap();
+        assert!(!verdict.is_valid());
+        assert!(verdict.syntax_errors[0].contains("past the limit of 64"));
+        let refused = store.search_documents(INDEX, &query, 10, None);
+        assert!(
+            matches!(&refused, Err(StoreError::QueryParser(e)) if e.to_string().contains("past the limit of 64")),
+            "{refused:?}"
+        );
+        assert!(matches!(
+            store.search_documents(INDEX, &query, 0, None),
+            Err(StoreError::QueryParser(_))
+        ));
+    }
 }

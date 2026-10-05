@@ -602,12 +602,103 @@ pub(crate) fn normalize_not_clauses(query: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// How deep a query may nest before it is refused. Each `(` — a group or a `field:( ... )` —
+/// is a level until its `)`, and each `NOT` a level until the leaf it negates ends.
+///
+/// Tantivy's grammar, its AST rewrite and the query built from it all recurse once per level,
+/// on a read-pool thread's 2 MiB stack, and running out of it aborts the node rather than
+/// panicking. Through validate, search and count the stack ran out at 186 levels in a debug
+/// build and 468 in release, `field:(` groups and `NOT (` nests reaching it first. 64 keeps a
+/// wide margin under both and is far deeper than any query written by hand.
+pub(crate) const MAX_QUERY_DEPTH: usize = 64;
+
+/// The deepest nesting in `query`, counted as [`MAX_QUERY_DEPTH`] describes.
+///
+/// A `NOT` stays open until the term after it ends or, when it negates a group, until the
+/// group closes: `a AND NOT b AND NOT c` is one level deep and `NOT (NOT (a))` four. Brackets
+/// and `NOT` inside quotes, ranges and `IN` sets are text, not nesting.
+pub(crate) fn query_depth(query: &str) -> usize {
+    let bytes = query.as_bytes();
+    let n = bytes.len();
+    // Per open group, the levels it added: its own and those of the `NOT`s in front of it.
+    let mut groups: Vec<usize> = Vec::new();
+    let mut depth = 0usize;
+    // `NOT`s still waiting on the leaf they negate.
+    let mut pending = 0usize;
+    let mut in_term = false;
+    let mut in_quote = false;
+    let mut value_depth = 0usize;
+    let mut deepest = 0usize;
+    let mut i = 0usize;
+    while i < n {
+        let c = bytes[i];
+        if c == b'\\' {
+            in_term = true;
+            i += 2;
+            continue;
+        }
+        if in_quote {
+            in_quote = c != b'"';
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' => {
+                in_quote = true;
+                in_term = true;
+            }
+            b'[' | b'{' => {
+                value_depth += 1;
+                in_term = true;
+            }
+            b']' | b'}' => value_depth = value_depth.saturating_sub(1),
+            _ if value_depth > 0 => {}
+            b'(' => {
+                let added = 1 + pending;
+                groups.push(added);
+                depth += added;
+                deepest = deepest.max(depth);
+                pending = 0;
+                in_term = false;
+            }
+            b')' => {
+                depth -= groups.pop().unwrap_or(0);
+                pending = 0;
+                in_term = false;
+            }
+            c if c.is_ascii_whitespace() => {
+                if in_term {
+                    pending = 0;
+                    in_term = false;
+                }
+            }
+            // A sign belongs to the leaf after it, which may be a `NOT`.
+            b'+' | b'-' if !in_term => {}
+            b'N' if !in_term
+                && bytes[i..].starts_with(b"NOT")
+                && i + 3 < n
+                && bytes[i + 3].is_ascii_whitespace() =>
+            {
+                pending += 1;
+                deepest = deepest.max(depth + pending);
+                i += 3;
+                continue;
+            }
+            _ => in_term = true,
+        }
+        i += 1;
+    }
+    deepest
+}
+
 /// Normalize a query the way a search does, and build the parser a search would use.
 ///
 /// Shared by the search path, the count-only path and validation, so that what validation
 /// reports is what a search would actually do. A validator that built its parser differently —
 /// a different default field set, a different normalization — would be worse than none: it would
 /// disagree with the search it exists to predict.
+///
+/// Refuses a query nested past [`MAX_QUERY_DEPTH`] before any pass parses it.
 pub(crate) fn prepare_query_parser(
     tantivy_index: &Index,
     fields: &SchemaFields,
@@ -615,17 +706,31 @@ pub(crate) fn prepare_query_parser(
     query: &str,
     // `StorageConfig::query`; see `normalize_prefix_query`.
     policy: &QueryPolicy,
-) -> (
-    String,
-    Vec<String>,
-    tantivy::query::QueryParser,
-    Option<NarrowedDefaultFields>,
-) {
+) -> Result<
+    (
+        String,
+        Vec<String>,
+        tantivy::query::QueryParser,
+        Option<NarrowedDefaultFields>,
+    ),
+    StoreError,
+> {
     // Fold whitespace the grammar's set parser cannot skip down to an ASCII space first, so no
     // later pass — and above all `parse_query_lenient` — is handed a character that makes its
     // element loop spin without consuming input.
     let query = fold_untokenizable_whitespace(query);
     let query = query.as_ref();
+
+    // Every pass below that parses — and the parser itself — recurses once per level.
+    let depth = query_depth(query);
+    if depth > MAX_QUERY_DEPTH {
+        return Err(StoreError::QueryParser(
+            tantivy::query::QueryParserError::SyntaxError(format!(
+                "query nests {depth} levels deep, past the limit of {MAX_QUERY_DEPTH}; each \
+                 parenthesised group and each NOT is a level"
+            )),
+        ));
+    }
 
     // `AND NOT`, `OR NOT` and a leading `NOT` all parse and all evaluate wrongly — a negated
     // clause under `Must` or `Should` matches nothing. Rewrite them into the `-` and `(* -x)`
@@ -687,7 +792,7 @@ pub(crate) fn prepare_query_parser(
     );
 
     let parser = tantivy::query::QueryParser::for_index(tantivy_index, default_query_fields);
-    (normalized_query, prefix_notes, parser, narrowed)
+    Ok((normalized_query, prefix_notes, parser, narrowed))
 }
 
 /// Whether any clause of `query` names no field, and so goes to the default fields.
@@ -1869,6 +1974,36 @@ mod bare_prefix_tests {
             parsed.sort();
             assert_eq!(scanned, parsed, "{query:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod query_depth_tests {
+    use super::*;
+
+    /// Groups nest by their parentheses, a `field:( ... )` group like any other.
+    #[test]
+    fn a_group_is_a_level_until_it_closes() {
+        assert_eq!(query_depth("a b"), 0);
+        assert_eq!(query_depth("(a) (b)"), 1);
+        assert_eq!(query_depth("((a) OR title:(b c))"), 2);
+    }
+
+    /// A `NOT` lasts as long as its leaf: a term ends it, a group carries it to its `)`.
+    #[test]
+    fn a_not_is_a_level_until_its_leaf_ends() {
+        assert_eq!(query_depth("a AND NOT b AND NOT c"), 1);
+        assert_eq!(query_depth("NOT NOT a"), 2);
+        assert_eq!(query_depth("NOT (NOT (a))"), 4);
+        assert_eq!(query_depth("x -NOT title:(a)"), 2);
+    }
+
+    /// Inside a phrase, a range or a set, brackets and `NOT` are text.
+    #[test]
+    fn quoted_and_bracketed_text_does_not_nest() {
+        assert_eq!(query_depth("title:\"((NOT a\""), 0);
+        assert_eq!(query_depth("f:[( TO (] g: IN [NOT (]"), 0);
+        assert_eq!(query_depth("a\\(b"), 0);
     }
 }
 

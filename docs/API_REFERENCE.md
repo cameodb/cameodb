@@ -288,6 +288,11 @@ curl -s -X POST http://localhost:9480/api/books/search \
 >
 > `NOT` composes with the other two: `a AND NOT b` keeps what matches `a` and not `b`, `a OR NOT b`
 > adds everything not matching `b`, and `a NOT b` or a leading `NOT b` are the exclusion forms.
+>
+> **Nesting:** a query may nest 64 levels deep. Each parenthesised group, including
+> `field:( ... )`, is a level until it closes, and each `NOT` a level until the term or group it
+> negates ends — `NOT (NOT (a))` is four. A deeper query is refused with `400`, and
+> `validate_query` reports it as a syntax error naming the limit.
 
 #### Streaming Search
 Get search results as a real-time stream for large result sets.
