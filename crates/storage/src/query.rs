@@ -262,6 +262,279 @@ pub(crate) fn normalize_date_literals(input: &str, field: &str) -> String {
     out
 }
 
+/// The clause context a `NOT` keyword sits in, which decides the rewrite.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NotContext {
+    /// Nothing a leaf follows precedes it: the start of the query, `(`, or a `+`/`-` sign that
+    /// is itself at a leaf boundary — the sign is copied through, so `+NOT b` rewrites like a
+    /// bare `NOT b`.
+    Bare,
+    /// After `AND`.
+    And,
+    /// After `OR`.
+    Or,
+    /// After another leaf — `a NOT b`.
+    AfterLeaf,
+}
+
+/// The context of the `NOT` starting at `not_pos`, or `None` when `NOT` is not an operator
+/// there — mid-term (`aNOT b`) or behind a sign that is part of a term (`a-NOT b`).
+fn not_context(bytes: &[u8], not_pos: usize) -> Option<NotContext> {
+    /// Whether a `+`/`-` at `sign` begins a leaf rather than sitting inside one.
+    fn sign_is_occur(bytes: &[u8], sign: usize) -> bool {
+        sign == 0 || bytes[sign - 1].is_ascii_whitespace() || matches!(bytes[sign - 1], b'(' | b')')
+    }
+
+    if not_pos > 0 {
+        match bytes[not_pos - 1] {
+            c if c.is_ascii_whitespace() || c == b'(' => {}
+            b'+' | b'-' => {
+                return sign_is_occur(bytes, not_pos - 1).then_some(NotContext::Bare);
+            }
+            _ => return None,
+        }
+    }
+    let mut end = not_pos;
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    if end == 0 {
+        return Some(NotContext::Bare);
+    }
+    match bytes[end - 1] {
+        b'(' => Some(NotContext::Bare),
+        b'+' | b'-' => Some(if sign_is_occur(bytes, end - 1) {
+            NotContext::Bare
+        } else {
+            // `x- NOT b` — the sign belongs to the leaf before it.
+            NotContext::AfterLeaf
+        }),
+        b')' => Some(NotContext::AfterLeaf),
+        _ => {
+            let mut start = end;
+            while start > 0
+                && !bytes[start - 1].is_ascii_whitespace()
+                && !matches!(bytes[start - 1], b'(' | b')')
+            {
+                start -= 1;
+            }
+            Some(match &bytes[start..end] {
+                b"AND" => NotContext::And,
+                b"OR" => NotContext::Or,
+                _ => NotContext::AfterLeaf,
+            })
+        }
+    }
+}
+
+/// Byte offset one past the leaf a `NOT` negates, `start` pointing at its first byte.
+///
+/// A leaf is a parenthesised group, a quoted phrase, a `field:value` — where the value may
+/// itself be quoted, a bracketed range or `field:( ... )` group, all of which can contain
+/// spaces — a `field: IN [ ... ]` set, which whitespace alone would otherwise split after the
+/// colon, or a bare term. It ends at the first space or `)` outside all of those.
+fn not_leaf_end(query: &str, start: usize) -> usize {
+    let bytes = query.as_bytes();
+    let n = bytes.len();
+    let mut i = start;
+    let mut in_quote = false;
+    // `(`, `[` and `{` inside the leaf keep it open across spaces.
+    let mut depth = 0usize;
+    while i < n {
+        let c = bytes[i];
+        if c == b'\\' {
+            i += 2;
+            continue;
+        }
+        if in_quote {
+            in_quote = c != b'"';
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' => in_quote = true,
+            b'(' | b'[' | b'{' => depth += 1,
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            b')' => {
+                if depth == 0 {
+                    return i;
+                }
+                depth -= 1;
+            }
+            c if c.is_ascii_whitespace() && depth == 0 => break,
+            _ => {}
+        }
+        i += 1;
+    }
+
+    // `field: IN [a b]` — the set sits behind the whitespace after the colon.
+    if i > start && bytes[i - 1] == b':' {
+        let mut p = i;
+        while p < n && bytes[p].is_ascii_whitespace() {
+            p += 1;
+        }
+        if bytes[p..].starts_with(b"IN") {
+            let mut q = p + 2;
+            while q < n && bytes[q].is_ascii_whitespace() {
+                q += 1;
+            }
+            if q < n && bytes[q] == b'[' {
+                let mut set_quote = false;
+                while q < n {
+                    match bytes[q] {
+                        b'\\' => q += 1,
+                        b'"' => set_quote = !set_quote,
+                        b']' if !set_quote => return q + 1,
+                        _ => {}
+                    }
+                    q += 1;
+                }
+                return n;
+            }
+        }
+    }
+    i
+}
+
+/// Rewrite `NOT` clauses into the boolean shapes Tantivy actually evaluates.
+///
+/// Tantivy parses `NOT leaf` as a negated clause, but repairs an all-negative clause only at
+/// the top level: nested under `Must` or `Should` it matches no documents. So `a AND NOT b`
+/// parses cleanly and answers zero documents, `a OR NOT b` silently drops the `NOT` arm, and a
+/// bare `NOT b` runs correctly yet reports a discarded clause. The rewrite puts a positive
+/// clause beside every negation, which is the only shape the evaluator honours:
+///
+/// - `a AND NOT b` → `a AND -b`: the `-` binds the leaf that follows.
+/// - `a OR NOT b` → `a OR (* -b)`: the `*` is the positive the `OR` needs. Writing `-b`
+///   directly would make it an exclusion on the whole disjunction — `a OR -b` drops a document
+///   matching both.
+/// - `NOT b` at the start of the query, after `(`, or after a `+`/`-` sign → `(* -b)`.
+/// - `a NOT b` → `a -b`: the exclusion it already evaluates as.
+///
+/// A run of `NOT`s collapses by parity: `NOT NOT a` is `a`. Inside a `field:( ... )` group the
+/// positive form cannot be written — the `*` would take the field's scope, and `field:*` is
+/// refused — so only the `-` rewrites apply there, and a `NOT` needing `(* -x)` is left for
+/// the parser to report.
+///
+/// `NOT` is the operator only in uppercase at a leaf boundary, outside quotes and outside
+/// `[]`/`{}` ranges and sets, matching where the grammar reads it as one: `notes:x`,
+/// `a-NOT b` and `title:"a NOT b"` are all left alone.
+pub(crate) fn normalize_not_clauses(query: &str) -> Cow<'_, str> {
+    if !query.contains("NOT") {
+        return Cow::Borrowed(query);
+    }
+
+    let bytes = query.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(query.len() + 8);
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    let mut in_quote = false;
+    // Depth of `[` and `{` — inside a range or an `IN` set a `NOT` is a literal element.
+    let mut value_depth = 0usize;
+    // Per open `(`, whether it opened a `field:(` group.
+    let mut groups: Vec<bool> = Vec::new();
+
+    while i < n {
+        let c = bytes[i];
+        if c == b'\\' {
+            i += 2;
+            continue;
+        }
+        if in_quote {
+            in_quote = c != b'"';
+            i += 1;
+            continue;
+        }
+        let mut advanced = false;
+        match c {
+            b'"' => in_quote = true,
+            b'[' | b'{' => value_depth += 1,
+            b']' | b'}' => value_depth = value_depth.saturating_sub(1),
+            b'(' if value_depth == 0 => groups.push(i > 0 && bytes[i - 1] == b':'),
+            b')' if value_depth == 0 => {
+                groups.pop();
+            }
+            b'N' if value_depth == 0
+                && bytes[i..].starts_with(b"NOT")
+                && i + 3 < n
+                && bytes[i + 3].is_ascii_whitespace() =>
+            {
+                if let Some(ctx) = not_context(bytes, i) {
+                    // A run of `NOT`s negates by parity; each one must be followed by
+                    // whitespace to be the keyword at all.
+                    let mut count = 1usize;
+                    let mut p = i + 3;
+                    while p < n && bytes[p].is_ascii_whitespace() {
+                        p += 1;
+                    }
+                    while bytes[p..].starts_with(b"NOT")
+                        && p + 3 < n
+                        && bytes[p + 3].is_ascii_whitespace()
+                    {
+                        count += 1;
+                        p += 3;
+                        while p < n && bytes[p].is_ascii_whitespace() {
+                            p += 1;
+                        }
+                    }
+                    let leaf_end = not_leaf_end(query, p);
+                    let leaf = &query[p..leaf_end];
+                    let needs_positive = matches!(ctx, NotContext::Bare | NotContext::Or);
+                    let in_field_group = groups.iter().any(|group| *group);
+                    if !leaf.is_empty()
+                        && !matches!(leaf, "AND" | "OR" | "NOT" | "IN")
+                        && !leaf.starts_with(['+', '-'])
+                        && !(needs_positive && in_field_group && count % 2 == 1)
+                    {
+                        out.push_str(&query[copied..i]);
+                        // A leaf can hold a group — `NOT (a AND NOT b)` — whose own `NOT`s
+                        // rewrite by the same rules.
+                        let leaf = if leaf.contains("NOT") {
+                            normalize_not_clauses(leaf)
+                        } else {
+                            Cow::Borrowed(leaf)
+                        };
+                        if count.is_multiple_of(2) {
+                            // `NOT NOT` is the clause alone — after a leaf it needs an
+                            // operator to keep its conjunction.
+                            if ctx == NotContext::AfterLeaf {
+                                out.push_str("AND ");
+                            }
+                            out.push_str(&leaf);
+                        } else {
+                            match ctx {
+                                NotContext::And | NotContext::AfterLeaf => {
+                                    out.push('-');
+                                    out.push_str(&leaf);
+                                }
+                                _ => {
+                                    out.push_str("(* -");
+                                    out.push_str(&leaf);
+                                    out.push(')');
+                                }
+                            }
+                        }
+                        copied = leaf_end;
+                        i = leaf_end;
+                        advanced = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        if !advanced {
+            i += 1;
+        }
+    }
+
+    if copied == 0 {
+        return Cow::Borrowed(query);
+    }
+    out.push_str(&query[copied..]);
+    Cow::Owned(out)
+}
+
 /// Normalize a query the way a search does, and build the parser a search would use.
 ///
 /// Shared by the search path, the count-only path and validation, so that what validation
@@ -285,6 +558,12 @@ pub(crate) fn prepare_query_parser(
     // later pass — and above all `parse_query_lenient` — is handed a character that makes its
     // element loop spin without consuming input.
     let query = fold_untokenizable_whitespace(query);
+    let query = query.as_ref();
+
+    // `AND NOT`, `OR NOT` and a leading `NOT` all parse and all evaluate wrongly — a negated
+    // clause under `Must` or `Should` matches nothing. Rewrite them into the `-` and `(* -x)`
+    // forms the evaluator honours while the text still says what the caller wrote.
+    let query = normalize_not_clauses(query);
     let query = query.as_ref();
 
     // Shadow names first, so every later rewriter — and the parser — sees only fields the
