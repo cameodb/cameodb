@@ -35,6 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shows the rewritten form. `a NOT b` keeps its exclusion meaning. The one form left alone is a
   `NOT` needing the `(* -x)` shape inside `field:( ... )`, where the `*` would take the field's
   scope and `field:*` is refused.
+- **A query nested more than 64 levels deep is refused with `400`, not run.** Tantivy's
+  parser recurses once per level, and on a read thread's 2 MiB stack a few hundred levels — a
+  query under 2 KB — ran it out, which aborts the node. Each parenthesised group and each `NOT`
+  is a level, so `NOT (NOT (a))` is four deep and `a AND NOT b AND NOT c` one. `validate_query`
+  reports such a query as invalid and names the limit.
 - **A schema naming a tokenizer the node does not have is refused.** It used to be stored, and
   its writes were accepted into the WAL, and then every commit of the index failed with "Error
   getting tokenizer for field" while searches found nothing. `PUT /api/{index}/_config` now

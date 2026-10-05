@@ -330,8 +330,25 @@ impl HybridStore {
             }));
         }
 
-        let (normalized_query, prefix_notes, query_parser, _) =
-            prepare_query_parser(tantivy_index, &fields, &schema, query, &self.config.query);
+        // A query refused before parsing — nested too deep — is a verdict here, not a failure:
+        // the search it predicts would refuse it for the reason given.
+        let (normalized_query, prefix_notes, query_parser, _) = match prepare_query_parser(
+            tantivy_index,
+            &fields,
+            &schema,
+            query,
+            &self.config.query,
+        ) {
+            Ok(prepared) => prepared,
+            Err(StoreError::QueryParser(tantivy::query::QueryParserError::SyntaxError(detail))) => {
+                return Ok(Some(QueryValidation {
+                    normalized_query: query.to_string(),
+                    syntax_errors: vec![detail],
+                    discarded: Vec::new(),
+                }));
+            }
+            Err(e) => return Err(e),
+        };
 
         // The query itself is discarded: what is wanted is the error list, which is the half a
         // search throws away after deciding it can still run.
@@ -404,7 +421,7 @@ impl HybridStore {
             }
 
             let (normalized_query, prefix_notes, query_parser, narrowed_default_fields) =
-                prepare_query_parser(tantivy_index, &fields, &schema, query, &self.config.query);
+                prepare_query_parser(tantivy_index, &fields, &schema, query, &self.config.query)?;
             let (parsed_query, parse_errors) = query_parser.parse_query_lenient(&normalized_query);
             let mut discarded = describe_discarded_all(&parse_errors, query, &schema);
             discarded.extend(prefix_notes);
@@ -519,7 +536,7 @@ impl HybridStore {
         }
 
         let (normalized_query, prefix_notes, query_parser, narrowed_default_fields) =
-            prepare_query_parser(tantivy_index, &fields, &schema, query, &self.config.query);
+            prepare_query_parser(tantivy_index, &fields, &schema, query, &self.config.query)?;
 
         // Lenient, so one bad clause does not fail the whole query; what it drops is reported
         // through `SearchOutcome::discarded` rather than swallowed.
