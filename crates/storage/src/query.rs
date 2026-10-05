@@ -327,19 +327,20 @@ fn not_context(bytes: &[u8], not_pos: usize) -> Option<NotContext> {
     }
 }
 
-/// Byte offset one past the leaf a `NOT` negates, `start` pointing at its first byte.
+/// Every bracket of the query that opens a leaf's span — `(`, `[` or `{` outside quotes — paired
+/// with the bracket that closes it, or with the query's length when none does. Ordered by the
+/// opening offset.
 ///
-/// A leaf is a parenthesised group, a quoted phrase, a `field:value` — where the value may
-/// itself be quoted, a bracketed range or `field:( ... )` group, all of which can contain
-/// spaces — a `field: IN [ ... ]` set, which whitespace alone would otherwise split after the
-/// colon, or a bare term. It ends at the first space or `)` outside all of those.
-fn not_leaf_end(query: &str, start: usize) -> usize {
-    let bytes = query.as_bytes();
+/// Brackets pair by nesting alone, whatever their kind, which is how [`not_leaf_end`] counts
+/// them. Found in one pass, so that a leaf scan steps over a group instead of walking it again:
+/// without it `NOT (NOT (NOT ...` scans the rest of the query once per level.
+fn bracket_pairs(bytes: &[u8]) -> Vec<(usize, usize)> {
     let n = bytes.len();
-    let mut i = start;
+    let mut pairs = Vec::new();
+    // Indexes into `pairs` of the brackets still open.
+    let mut open = Vec::new();
     let mut in_quote = false;
-    // `(`, `[` and `{` inside the leaf keep it open across spaces.
-    let mut depth = 0usize;
+    let mut i = 0usize;
     while i < n {
         let c = bytes[i];
         if c == b'\\' {
@@ -353,19 +354,64 @@ fn not_leaf_end(query: &str, start: usize) -> usize {
         }
         match c {
             b'"' => in_quote = true,
-            b'(' | b'[' | b'{' => depth += 1,
-            b']' | b'}' => depth = depth.saturating_sub(1),
-            b')' => {
-                if depth == 0 {
-                    return i;
-                }
-                depth -= 1;
+            b'(' | b'[' | b'{' => {
+                open.push(pairs.len());
+                pairs.push((i, n));
             }
-            c if c.is_ascii_whitespace() && depth == 0 => break,
+            b')' | b']' | b'}' => {
+                if let Some(k) = open.pop() {
+                    pairs[k].1 = i;
+                }
+            }
             _ => {}
         }
         i += 1;
     }
+    pairs
+}
+
+/// Byte offset one past the leaf a `NOT` negates, `start` pointing at its first byte.
+///
+/// A leaf is a parenthesised group, a quoted phrase, a `field:value` — where the value may
+/// itself be quoted, a bracketed range or `field:( ... )` group, all of which can contain
+/// spaces — a `field: IN [ ... ]` set, which whitespace alone would otherwise split after the
+/// colon, or a bare term. It ends at the first space or `)` outside all of those. `pairs` is
+/// [`bracket_pairs`] of the same query, so a bracket inside the leaf is stepped over in one jump.
+fn not_leaf_end(query: &str, start: usize, pairs: &[(usize, usize)]) -> usize {
+    let bytes = query.as_bytes();
+    let n = bytes.len();
+    let mut i = start;
+    let mut in_quote = false;
+    while i < n {
+        let c = bytes[i];
+        if c == b'\\' {
+            i += 2;
+            continue;
+        }
+        if in_quote {
+            in_quote = c != b'"';
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' => in_quote = true,
+            // Past the bracket that closes it — or to the end, which is where an unclosed one
+            // keeps the leaf open to.
+            b'(' | b'[' | b'{' => {
+                let close = pairs
+                    .binary_search_by_key(&i, |&(open, _)| open)
+                    .map_or(n, |k| pairs[k].1);
+                i = close.saturating_add(1);
+                continue;
+            }
+            b')' => return i,
+            c if c.is_ascii_whitespace() => break,
+            _ => {}
+        }
+        i += 1;
+    }
+    // A trailing `\` steps past the end.
+    let i = i.min(n);
 
     // `field: IN [a b]` — the set sits behind the whitespace after the colon.
     if i > start && bytes[i - 1] == b':' {
@@ -432,10 +478,24 @@ pub(crate) fn normalize_not_clauses(query: &str) -> Cow<'_, str> {
     let mut in_quote = false;
     // Depth of `[` and `{` — inside a range or an `IN` set a `NOT` is a literal element.
     let mut value_depth = 0usize;
-    // Per open `(`, whether it opened a `field:(` group.
+    // Per open `(`, whether it opened a `field:(` group, and how many of those are open.
     let mut groups: Vec<bool> = Vec::new();
+    let mut field_groups = 0usize;
+    // Where each open `(* -` rewrite's `)` belongs. Its leaf is scanned in place, and leaves
+    // nest, so the innermost — the nearest end — is on top.
+    let mut closes: Vec<usize> = Vec::new();
+    // Built at the first `NOT` that needs a leaf's extent.
+    let mut pairs: Option<Vec<(usize, usize)>> = None;
 
     while i < n {
+        while let Some(&end) = closes.last()
+            && end <= i
+        {
+            closes.pop();
+            out.push_str(&query[copied..end]);
+            out.push(')');
+            copied = end;
+        }
         let c = bytes[i];
         if c == b'\\' {
             i += 2;
@@ -451,9 +511,15 @@ pub(crate) fn normalize_not_clauses(query: &str) -> Cow<'_, str> {
             b'"' => in_quote = true,
             b'[' | b'{' => value_depth += 1,
             b']' | b'}' => value_depth = value_depth.saturating_sub(1),
-            b'(' if value_depth == 0 => groups.push(i > 0 && bytes[i - 1] == b':'),
+            b'(' if value_depth == 0 => {
+                let field_group = i > 0 && bytes[i - 1] == b':';
+                field_groups += usize::from(field_group);
+                groups.push(field_group);
+            }
             b')' if value_depth == 0 => {
-                groups.pop();
+                if groups.pop() == Some(true) {
+                    field_groups -= 1;
+                }
             }
             b'N' if value_depth == 0
                 && bytes[i..].starts_with(b"NOT")
@@ -478,45 +544,40 @@ pub(crate) fn normalize_not_clauses(query: &str) -> Cow<'_, str> {
                             p += 1;
                         }
                     }
-                    let leaf_end = not_leaf_end(query, p);
+                    let pairs = pairs.get_or_insert_with(|| bracket_pairs(bytes));
+                    let leaf_end = not_leaf_end(query, p, pairs);
                     let leaf = &query[p..leaf_end];
                     let needs_positive = matches!(ctx, NotContext::Bare | NotContext::Or);
-                    let in_field_group = groups.iter().any(|group| *group);
-                    if !leaf.is_empty()
-                        && !matches!(leaf, "AND" | "OR" | "NOT" | "IN")
-                        && !leaf.starts_with(['+', '-'])
-                        && !(needs_positive && in_field_group && count % 2 == 1)
+                    if leaf.is_empty()
+                        || matches!(leaf, "AND" | "OR" | "NOT" | "IN")
+                        || leaf.starts_with(['+', '-'])
                     {
+                        // Every `NOT` of the run negates this same leaf and is refused for the
+                        // same reason, so none is worth recounting the run from.
+                        i = p;
+                        advanced = true;
+                    } else if !(needs_positive && field_groups > 0 && count % 2 == 1) {
                         out.push_str(&query[copied..i]);
-                        // A leaf can hold a group — `NOT (a AND NOT b)` — whose own `NOT`s
-                        // rewrite by the same rules.
-                        let leaf = if leaf.contains("NOT") {
-                            normalize_not_clauses(leaf)
-                        } else {
-                            Cow::Borrowed(leaf)
-                        };
                         if count.is_multiple_of(2) {
                             // `NOT NOT` is the clause alone — after a leaf it needs an
                             // operator to keep its conjunction.
                             if ctx == NotContext::AfterLeaf {
                                 out.push_str("AND ");
                             }
-                            out.push_str(&leaf);
                         } else {
                             match ctx {
-                                NotContext::And | NotContext::AfterLeaf => {
-                                    out.push('-');
-                                    out.push_str(&leaf);
-                                }
+                                NotContext::And | NotContext::AfterLeaf => out.push('-'),
                                 _ => {
                                     out.push_str("(* -");
-                                    out.push_str(&leaf);
-                                    out.push(')');
+                                    closes.push(leaf_end);
                                 }
                             }
                         }
-                        copied = leaf_end;
-                        i = leaf_end;
+                        // The leaf is scanned where it stands rather than rewritten on its own,
+                        // so a group's `NOT`s — `NOT (a AND NOT b)` — rewrite by the same rules
+                        // in the scope they sit in, and nesting costs neither stack nor a rescan.
+                        copied = p;
+                        i = p;
                         advanced = true;
                     }
                 }
@@ -526,6 +587,12 @@ pub(crate) fn normalize_not_clauses(query: &str) -> Cow<'_, str> {
         if !advanced {
             i += 1;
         }
+    }
+
+    while let Some(end) = closes.pop() {
+        out.push_str(&query[copied..end]);
+        out.push(')');
+        copied = end;
     }
 
     if copied == 0 {
@@ -1802,5 +1869,61 @@ mod bare_prefix_tests {
             parsed.sort();
             assert_eq!(scanned, parsed, "{query:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod not_clause_tests {
+    use super::*;
+
+    /// A negated group's own `NOT`s rewrite in place, closed or not, each level getting its
+    /// `)` where its group ends.
+    #[test]
+    fn nested_negated_groups_rewrite_in_place() {
+        assert_eq!(
+            normalize_not_clauses("NOT (NOT (NOT (a)))"),
+            "(* -((* -((* -(a))))))"
+        );
+        assert_eq!(normalize_not_clauses("NOT (NOT (a"), "(* -((* -(a))");
+        assert_eq!(
+            normalize_not_clauses("NOT (a OR (b AND NOT c)) d"),
+            "(* -(a OR (b AND -c))) d"
+        );
+    }
+
+    /// A run of `NOT`s whose leaf is refused is left as written, and scanning resumes after the
+    /// run rather than recounting it from each `NOT` in it.
+    #[test]
+    fn a_refused_not_run_is_left_as_written() {
+        for query in ["NOT NOT NOT", "NOT NOT NOT -x", "a AND NOT NOT AND b"] {
+            assert_eq!(normalize_not_clauses(query), query);
+        }
+        assert_eq!(
+            normalize_not_clauses("NOT NOT -x AND NOT b"),
+            "NOT NOT -x AND -b"
+        );
+    }
+
+    /// A trailing `\` escapes past the end of the query, which the leaf scan once indexed
+    /// beyond. The query is malformed whatever the rewrite makes of it; what matters is that it
+    /// reaches the parser to be reported rather than panicking the search.
+    #[test]
+    fn a_trailing_escape_ends_the_leaf_at_the_query_end() {
+        assert!(normalize_not_clauses("NOT a\\").starts_with("(* -a\\"));
+        assert_eq!(normalize_not_clauses("x AND NOT a\\"), "x AND -a\\");
+    }
+
+    /// A group negated by a rewrite keeps the scope it sits in: inside `field:( ... )` its own
+    /// `NOT` cannot take the `(* -x)` form, and is left for the parser to report.
+    #[test]
+    fn a_negated_group_keeps_its_field_scope() {
+        assert_eq!(
+            normalize_not_clauses("title:(x AND NOT (a OR NOT b))"),
+            "title:(x AND -(a OR NOT b))"
+        );
+        assert_eq!(
+            normalize_not_clauses("x AND NOT (a OR NOT (c AND NOT d))"),
+            "x AND -(a OR (* -(c AND -d)))"
+        );
     }
 }
