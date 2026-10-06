@@ -1,14 +1,21 @@
 //! The non-interactive command surface: the clap grammar, top-level dispatch, and
 //! the list/output helpers shared with the interactive shell in `shell.rs`. The ingest
-//! pipeline lives in `ingest.rs`.
+//! pipeline lives in `ingest.rs`, and what a source's sample says about its fields in
+//! `detect.rs`.
 
+mod detect;
 mod ingest;
+mod profile;
+mod scan;
 mod shell;
 
 #[cfg(test)]
 mod tests;
 
+pub(crate) use detect::*;
 pub(crate) use ingest::*;
+pub(crate) use profile::*;
+pub(crate) use scan::*;
 pub(crate) use shell::*;
 
 use crate::sdk::{CameoClient, ClientAuth, Credential, IndexInfo, ListIndexesResponse, TlsTrust};
@@ -479,14 +486,25 @@ pub enum ClientCommand {
         /// Operation to perform
         #[arg(value_enum)]
         operation: SchemaOperation,
-        /// Path or HTTP(S) URL to schema/data source
-        file: String,
-        /// Target index name (required for `load`, optional for `detect`)
+        /// `detect <FILE>`, or `load <INDEX> <FILE>` — the index first, as `data load` takes it.
+        /// FILE is a path or HTTP(S) URL to a schema or data source
+        #[arg(value_name = "[INDEX] FILE", num_args = 1..=2, required = true)]
+        args: Vec<String>,
+        /// Target index name for `load`, when it is not given before the file
         #[arg(long, short = 'n')]
         index: Option<String>,
         /// Delimiter override (default: auto-detect first line)
         #[arg(long, value_enum, default_value_t = Delimiter::Detect)]
         delimiter: Delimiter,
+        /// The column that identifies each row, or several comma-separated whose values joined
+        /// with `|` make the id. Several stay fields of their own; one not named `id` becomes a
+        /// shadow field. Default: detected from the scanned rows.
+        #[arg(long = "id", value_name = "COLUMN[,COLUMN...]")]
+        id: Option<String>,
+        /// Print how the source was scanned and why each column became the field it did,
+        /// instead of the schema (`detect` only)
+        #[arg(long, default_value_t = false)]
+        report: bool,
     },
 
     /// Data ingestion
@@ -504,6 +522,15 @@ pub enum ClientCommand {
         /// Maximum documents per batch
         #[arg(long, default_value_t = DEFAULT_BATCH_SIZE)]
         batch_size: usize,
+        /// The column that identifies each row, or several comma-separated whose values joined
+        /// with `|` make the id. Default: the id the index records, else detected from the
+        /// scanned rows. Another id than the index records needs the index empty, or --recreate.
+        #[arg(long = "id", value_name = "COLUMN[,COLUMN...]")]
+        id: Option<String>,
+        /// Delete the index's documents first, keeping its schema, then load. What a change of
+        /// --id, or of a field's type or tokenizer, needs on an index that holds documents.
+        #[arg(long, default_value_t = false)]
+        recreate: bool,
     },
 
     /// Delete documents from an index, or the whole index
@@ -777,35 +804,66 @@ pub async fn run_cli() -> Result<()> {
         }
         ClientCommand::Schema {
             operation,
+            args,
             index,
-            file,
             delimiter,
-        } => match operation {
-            SchemaOperation::Detect => {
-                let schema_json = detect_schema_from_source(&client, &file, delimiter).await?;
-                print_json(&schema_json)?;
-            }
-            SchemaOperation::Load => {
-                let index_name = index
+            id,
+            report,
+        } => {
+            let id = id.as_deref().map(IdSpec::parse).transpose()?;
+            let (index, file) = schema_targets(operation, args, index)?;
+            match operation {
+                SchemaOperation::Detect if report => {
+                    print!(
+                        "{}",
+                        report_source(&client, &file, delimiter, id.as_ref()).await?
+                    );
+                }
+                SchemaOperation::Detect => {
+                    let schema_json =
+                        detect_schema_from_source(&client, &file, delimiter, id.as_ref()).await?;
+                    print_json(&schema_json)?;
+                }
+                SchemaOperation::Load => {
+                    let index_name = index
                         .as_deref()
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
-                        .ok_or_else(|| anyhow!("Index name is required for schema load. Usage: schema load <index> <file>"))?;
+                        .ok_or_else(|| {
+                            anyhow!("Index name is required. Usage: schema load <index> <file>")
+                        })?;
 
-                let schema_json = load_schema_from_source(&client, &file, delimiter).await?;
-                client.put_index_config(index_name, &schema_json).await?;
-                println!("Schema applied to index '{}'", index_name);
+                    if report {
+                        return Err(anyhow!("--report applies to schema detect"));
+                    }
+                    let schema_json =
+                        load_schema_from_source(&client, &file, delimiter, id.as_ref()).await?;
+                    client.put_index_config(index_name, &schema_json).await?;
+                    println!("Schema applied to index '{}'", index_name);
+                }
             }
-        },
+        }
         ClientCommand::Data {
             operation,
             index,
             file,
             delimiter,
             batch_size,
+            id,
+            recreate,
         } => match operation {
             DataOperation::Load => {
-                load_data_from_source(&client, &index, &file, delimiter, batch_size).await?;
+                let id = id.as_deref().map(IdSpec::parse).transpose()?;
+                load_data_from_source(
+                    &client,
+                    &index,
+                    &file,
+                    delimiter,
+                    batch_size,
+                    id.as_ref(),
+                    recreate,
+                )
+                .await?;
             }
         },
         ClientCommand::Delete {
@@ -878,4 +936,27 @@ fn print_json<T: Serialize>(val: &T) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The index and file `schema` names: `detect <file>`, `load <index> <file>`, or — as it was
+/// first written — `load <file> --index <index>`.
+fn schema_targets(
+    operation: SchemaOperation,
+    args: Vec<String>,
+    index: Option<String>,
+) -> Result<(Option<String>, String)> {
+    let mut args = args.into_iter();
+    let (first, second) = (args.next(), args.next());
+    match (operation, first, second) {
+        (SchemaOperation::Detect, Some(file), None) => Ok((index, file)),
+        (SchemaOperation::Detect, _, _) => Err(anyhow!("Usage: schema detect <file>")),
+        (SchemaOperation::Load, Some(named), Some(file)) => match index {
+            Some(flag) if flag != named => Err(anyhow!(
+                "schema load names two indexes, '{named}' and --index '{flag}'"
+            )),
+            _ => Ok((Some(named), file)),
+        },
+        (SchemaOperation::Load, Some(file), None) => Ok((index, file)),
+        (SchemaOperation::Load, None, _) => Err(anyhow!("Usage: schema load <index> <file>")),
+    }
 }

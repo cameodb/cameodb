@@ -490,17 +490,26 @@ impl IndexCompleter {
 
     /// Flags for `schema detect|load`, offered once its positional arguments are in.
     pub(crate) fn schema_flag_suggestions(&self, current: &str, tokens: &[&str]) -> Vec<Pair> {
-        if preceding_token(tokens) == Some("--delimiter") {
-            return self.delimiter_value_suggestions(current);
+        match preceding_token(tokens) {
+            Some("--delimiter") => return self.delimiter_value_suggestions(current),
+            // Column names: nothing to complete.
+            Some("--id") => return Vec::new(),
+            _ => {}
         }
-        self.flag_suggestion(
-            "--delimiter",
-            "--delimiter <detect|comma|tab|semicolon>",
-            current,
-            tokens,
-        )
-        .into_iter()
-        .collect()
+        let mut suggestions: Vec<Pair> = self
+            .flag_suggestion(
+                "--delimiter",
+                "--delimiter <detect|comma|tab|semicolon>",
+                current,
+                tokens,
+            )
+            .into_iter()
+            .collect();
+        suggestions.extend(id_flag_suggestion(current, tokens));
+        if tokens.get(1) == Some(&"detect") {
+            suggestions.extend(self.flag_suggestion("--report", "--report", current, tokens));
+        }
+        suggestions
     }
 
     /// Flags for `data load`, offered once its positional arguments are in.
@@ -508,7 +517,7 @@ impl IndexCompleter {
         match preceding_token(tokens) {
             Some("--delimiter") => return self.delimiter_value_suggestions(current),
             // A document count: nothing to complete.
-            Some("--batch-size") => return Vec::new(),
+            Some("--batch-size") | Some("--id") => return Vec::new(),
             _ => {}
         }
 
@@ -530,6 +539,8 @@ impl IndexCompleter {
                 replacement: "--batch-size ".to_string(),
             });
         }
+        suggestions.extend(id_flag_suggestion(current, tokens));
+        suggestions.extend(self.flag_suggestion("--recreate", "--recreate", current, tokens));
 
         suggestions
     }
@@ -1154,10 +1165,11 @@ mod usage {
     pub(super) const LIST_INDEX: &str = "list index <name> [--extended] [--data-size]";
     pub(super) const SEARCH: &str = "search <index> <query> [limit N]";
     pub(super) const SCHEMA: &str = "schema <detect|load> ...";
-    pub(super) const SCHEMA_DETECT: &str = "schema detect <file> [--delimiter <delim>]";
-    pub(super) const SCHEMA_LOAD: &str = "schema load <index> <file> [--delimiter <delim>]";
-    pub(super) const DATA_LOAD: &str =
-        "data load <index> <file> [--delimiter <delim>] [--batch-size <n>]";
+    pub(super) const SCHEMA_DETECT: &str =
+        "schema detect <file> [--delimiter <delim>] [--id <col[,col...]>] [--report]";
+    pub(super) const SCHEMA_LOAD: &str =
+        "schema load <index> <file> [--delimiter <delim>] [--id <col[,col...]>]";
+    pub(super) const DATA_LOAD: &str = "data load <index> <file> [--delimiter <delim>] [--batch-size <n>] [--id <col[,col...]>] [--recreate]";
     pub(super) const DELETE_INDEX: &str = "delete <index> [--delete-schema]";
     pub(super) const DELETE_DOCS: &str =
         "delete <index> (--id <ID[,ID...]> | --ids-file <path>) [--routing-key <KEY>]";
@@ -1391,18 +1403,32 @@ pub(crate) async fn dispatch_interactive_command(
             match sub {
                 "detect" => {
                     let remaining: Vec<&str> = parts.collect();
+                    let (report, remaining) = take_flag(&remaining, "--report");
+                    let (id, remaining) = parse_id_arg(&remaining)?;
                     let (delimiter, positional) = parse_delimiter_arg(&remaining)?;
                     let file = positional
                         .first()
                         .copied()
                         .ok_or_else(|| anyhow!("Usage: {}", usage::SCHEMA_DETECT))?;
 
-                    let schema_json =
-                        detect_schema_from_source(session.client(), file, delimiter).await?;
-                    print_json(&schema_json)?;
+                    if report {
+                        let report =
+                            report_source(session.client(), file, delimiter, id.as_ref()).await?;
+                        print!("{report}");
+                    } else {
+                        let schema_json = detect_schema_from_source(
+                            session.client(),
+                            file,
+                            delimiter,
+                            id.as_ref(),
+                        )
+                        .await?;
+                        print_json(&schema_json)?;
+                    }
                 }
                 "load" => {
                     let remaining: Vec<&str> = parts.collect();
+                    let (id, remaining) = parse_id_arg(&remaining)?;
                     let (delimiter, positional) = parse_delimiter_arg(&remaining)?;
                     let index = positional
                         .first()
@@ -1414,7 +1440,8 @@ pub(crate) async fn dispatch_interactive_command(
                         .ok_or_else(|| anyhow!("Usage: {}", usage::SCHEMA_LOAD))?;
 
                     let schema_json =
-                        load_schema_from_source(session.client(), file, delimiter).await?;
+                        load_schema_from_source(session.client(), file, delimiter, id.as_ref())
+                            .await?;
                     session
                         .client()
                         .put_index_config(index, &schema_json)
@@ -1438,6 +1465,8 @@ pub(crate) async fn dispatch_interactive_command(
             match sub {
                 "load" => {
                     let remaining: Vec<&str> = parts.collect();
+                    let (recreate, remaining) = take_flag(&remaining, "--recreate");
+                    let (id, remaining) = parse_id_arg(&remaining)?;
                     let (delimiter, positional_after_delim) = parse_delimiter_arg(&remaining)?;
                     let (batch_size, positional) =
                         parse_batch_size_arg(&positional_after_delim, DEFAULT_BATCH_SIZE)?;
@@ -1451,8 +1480,16 @@ pub(crate) async fn dispatch_interactive_command(
                         .copied()
                         .ok_or_else(|| anyhow!("Usage: {}", usage::DATA_LOAD))?;
 
-                    load_data_from_source(session.client(), index, file, delimiter, batch_size)
-                        .await?;
+                    load_data_from_source(
+                        session.client(),
+                        index,
+                        file,
+                        delimiter,
+                        batch_size,
+                        id.as_ref(),
+                        recreate,
+                    )
+                    .await?;
                 }
                 other => {
                     return Err(anyhow!(
@@ -1657,4 +1694,13 @@ pub(crate) async fn dispatch_interactive_command(
     }
 
     Ok(())
+}
+
+/// `--id`, which a column list follows: the completion carries its own space, since the list
+/// completes to nothing.
+fn id_flag_suggestion(current: &str, tokens: &[&str]) -> Option<Pair> {
+    (!tokens.contains(&"--id") && "--id".starts_with(current)).then(|| Pair {
+        display: "--id <col[,col...]>".to_string(),
+        replacement: "--id ".to_string(),
+    })
 }

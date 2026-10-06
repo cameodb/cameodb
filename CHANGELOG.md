@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`schema detect --report`: what a source holds, and why each column became its field.**
+  Prints how the source was scanned, its row count (counted, or estimated from bytes per row),
+  which column identifies a row — or which ones repeat, where, and which pairs are unique together
+  — and for every column the kinds of value seen, with the line each kind first appears on.
+- **`--id COLUMN[,COLUMN...]` on `schema detect`, `schema load` and `data load`.** One column names
+  the id; several make it from their values joined with `|` in the order given
+  (`--id Hr,cmMacAddress` → `2026-10-05 06:00:00|00:7A:A4:E5:90:28`). A composite id's columns stay
+  ordinary fields, returned apart; only a single column not named `id` becomes a shadow field.
+- **An index records how its ids are made, and every load keys documents the same way.** The
+  schema gains `id_fields` — `["Hr", "cmMacAddress"]` — written by `schema detect` and the first
+  load, and reported by `GET /_config`. A load without `--id` uses it: one that forgot the first
+  load's `--id` fell back to another column and overwrote every row sharing that column's value,
+  56% of a 300,000-row test file. A load naming another id than the index records updates the
+  schema when the index is empty, and is refused before a row is sent when it is not.
+- **`data load --recreate`** deletes the index's documents, keeps its schema, and loads again —
+  the way to change the id, or a field's type or tokenizer, on an index that holds documents.
+- **A load reports the ids it could not keep.** Rows repeating an id already sent each replace the
+  document before it; a load now counts them and names the first, and counts the rows skipped for
+  having no id, instead of finishing with fewer documents and nothing said.
 - **Language analyzers for text fields: `hr_stem`, `hr_stem_fold`, `it_stem`, `it_stem_fold`,
   `de_stem`, `fr_stem` and `es_stem`.** A text field names one as its `tokenizer`, and index-time and
   query-time analysis both use it, so a query for one form of a word finds the others. Italian,
@@ -35,6 +54,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tokenizer, an index record option, another id — is refused with `409`, naming each change and
   the document count. A column declared ahead of the index is still accepted, and reported not
   searchable or sortable until a rebuild.
+- **`schema detect data.csv > schema.json` saves valid JSON.** The progress spinner wrote its
+  frames to stdout ahead of the schema; it now writes to stderr, and only to a terminal.
+- **Detecting a CSV delimiter no longer reads the whole file into memory.** `schema detect` and
+  `data load` held all 5.2 GB of a 5.2 GB file to look at its first line. The delimiter is read
+  from the first 64 KB, and the file is streamed.
 - **A `string` field takes every string.** The write path asked what type a string's spelling
   inferred, so a version `284.08.25` or a code `10.0.0.1` — a date and an address to the
   inference — was refused from a `string` field the writer stores any string in.
@@ -59,6 +83,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Schema detection reads a source across its length, and types a column by every value it
+  saw.** It used to type each column from the first 200 rows, one value at a time: a file sorted
+  by hour showed one hour, and `no data` then `true` made a boolean column whose `no data` rows
+  were all refused. A local file up to 1 GB is now read whole; a larger one from the head until
+  two batches teach nothing new about any column (at least 50,000 rows), then in 64 blocks spread
+  over the rest, enough rows to show a repeated key; compressed and remote sources from the head
+  only. On a 5.2 GB, 5.2-million-row file the scan takes about 3 s and estimates the row count
+  within 0.01%. A column takes a type only if every value fits it, else it is text: `abc` beside
+  `5` is text whatever order they come in; a leading zero keeps `007` a code; in a column named as
+  an identifier, a number too long for a double or written with an exponent stays text.
+- **Detected fields are shaped for how they are searched.** A short set of repeated values — a
+  status, a vendor — becomes a `string` with a fast column. A column of codes (no spaces, about
+  one per row: a MAC address, a serial) is `text` with the `raw` tokenizer, matched whole rather
+  than split at its punctuation. A cell holding a list, `['a', 'b']`, is loaded as several values
+  of the field.
+- **The id is chosen by its values, not only its name.** A column must be filled and distinct in
+  every scanned row; among those, names rank a digest (longest first), a hash, a uuid, an `…id`,
+  a key, then a sequence or serial number. A load into an index keeps the index's own shadow
+  field. With no unique column the best name is used as before, with a warning that suggests the
+  pair of columns that is unique.
+- **A blank is no value in every field, a boolean one included,** and a JSON source's values are
+  fitted to their fields as a CSV's are: `"12"` in a count is 12, `"NA"` or `""` no value, `"TRUE"`
+  in a flag `true`.
 - **A list in a `text` field is several values, not one.** It was indexed as its JSON spelling,
   so a phrase matched across two elements and, under the `raw` tokenizer, no element matched at
   all. Each element is now a value of its own, as numeric and `string` fields already took them.
