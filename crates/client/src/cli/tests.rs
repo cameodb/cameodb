@@ -1207,6 +1207,42 @@ mod detect_tests {
         assert!(whole.summary.whole);
         assert_eq!(whole.summary.rows, Some(40_000));
     }
+
+    /// Loading into an index that has a schema reads only the first batch of rows ahead, where a
+    /// new index's scan reads the same file whole; a typed index without a recorded id samples it.
+    #[test]
+    fn a_load_into_a_typed_index_reads_only_its_first_batch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("steady.csv");
+        let mut text = String::from("seq,reading\n");
+        for n in 0..150_000 {
+            text.push_str(&format!("{n:06},{}.5\n", n % 97));
+        }
+        std::fs::write(&path, &text).expect("write");
+        let data = SourceData::File {
+            path,
+            compression: Compression::None,
+        };
+
+        let limits = ScanLimits::first_batch();
+        let first = scan_csv(&data, b',', &limits, None).expect("scan");
+        assert!(!first.summary.whole);
+        assert_eq!(first.summary.head_rows, limits.batch_rows);
+        assert_eq!(first.summary.spread_blocks, 0);
+
+        let sampled = scan_csv(&data, b',', &ScanLimits::sampled(), None).expect("scan");
+        assert!(!sampled.summary.whole);
+        assert_eq!(sampled.summary.stopped_by, "column types stable");
+        assert!(
+            sampled.summary.head_rows < 100_000,
+            "{}",
+            sampled.summary.head_rows
+        );
+
+        let whole = scan_csv(&data, b',', &ScanLimits::default(), None).expect("scan");
+        assert!(whole.summary.whole);
+        assert_eq!(whole.summary.rows, Some(150_000));
+    }
 }
 
 #[cfg(test)]

@@ -101,6 +101,13 @@ becomes several values of one field, and a column with few distinct values repea
 a `string` category; other identifier-like columns become `text` with the `raw` tokenizer.
 `schema detect --report` shows all of it.
 
+A load into an index that already has a schema is not scanned: its fields are typed and its id is
+recorded, so the loader reads only the first batch of rows ahead, for what a schema does not hold
+— the order a column writes its numeric dates in, and whether it holds lists. An index that
+records no id, loaded from a source without an `id` column, is still sampled from the head and in
+spread blocks, since its id is chosen by its values. `--id` naming another id than the index
+records means a new schema, and a full scan.
+
 ### How CSV/TSV cells are read
 
 A delimited file has no types, so each cell is read by the type of the field it lands in — the

@@ -4,8 +4,9 @@
 //! which is how exports are written — shows only its first hour there. Here the head is read in
 //! batches until the columns stop teaching anything new; a local file is then also read in short
 //! blocks spread over the rest, visited coarse to fine, so even a scan cut short has seen every
-//! part of the file. A file up to [`ScanLimits::whole_file_bytes`] is read whole. Compressed and
-//! remote sources cannot be read out of order, so they are read from the head only.
+//! part of the file. A file up to [`ScanLimits::whole_file_bytes`] is read whole, unless its
+//! fields are typed already ([`ScanLimits::sampled`]). Compressed and remote sources cannot be read
+//! out of order, so they are read from the head only.
 
 use super::*;
 use anyhow::{Context, Result};
@@ -21,8 +22,10 @@ use storage::TantivyFieldType;
 /// How far a scan reads.
 #[derive(Debug, Clone)]
 pub(crate) struct ScanLimits {
-    /// A local file up to this size is read whole.
+    /// A local file up to this size is read whole, when `read_whole` allows it.
     pub(crate) whole_file_bytes: u64,
+    /// Whether a file under `whole_file_bytes` is read whole, or sampled like a larger one.
+    pub(crate) read_whole: bool,
     /// Past it, the scan reads at most the larger of this and a third of the file.
     pub(crate) budget_fraction: u64,
     /// The head is read for at most this long.
@@ -41,6 +44,7 @@ impl Default for ScanLimits {
     fn default() -> Self {
         Self {
             whole_file_bytes: 1 << 30,
+            read_whole: true,
             budget_fraction: 3,
             time: Duration::from_secs(10),
             min_rows: 50_000,
@@ -52,6 +56,35 @@ impl Default for ScanLimits {
 }
 
 impl ScanLimits {
+    /// Limits for a source whose fields are already typed — loading into an index with a schema.
+    /// The scan settles only the value shapes and the id there, so no file is read whole: the head
+    /// until it stops teaching anything new, and the spread blocks.
+    pub(crate) fn sampled() -> Self {
+        Self {
+            read_whole: false,
+            ..Self::default()
+        }
+    }
+
+    /// Limits that read only the first batch of rows — the rows a load starts with anyway. Enough
+    /// for what a schema does not record, a column's date order and whether it holds lists, when
+    /// the schema and the index's id settle everything else.
+    pub(crate) fn first_batch() -> Self {
+        let defaults = Self::default();
+        Self {
+            read_whole: false,
+            min_rows: defaults.batch_rows,
+            stable_batches: 0,
+            blocks: 0,
+            ..defaults
+        }
+    }
+
+    /// Whether a local file this long is read whole.
+    fn reads_whole(&self, len: u64) -> bool {
+        self.read_whole && len <= self.whole_file_bytes
+    }
+
     /// The bytes a scan may read of a source this size.
     fn budget(&self, size: Option<u64>) -> u64 {
         size.map_or(self.whole_file_bytes, |size| {
@@ -283,7 +316,7 @@ pub(crate) fn scan_csv(
     }
 
     let seekable = data.seekable();
-    let whole = seekable.is_some_and(|(_, len)| len <= limits.whole_file_bytes);
+    let whole = seekable.is_some_and(|(_, len)| limits.reads_whole(len));
     let byte_limit = match seekable {
         Some(_) if whole => None,
         // Half the budget goes to the head, the other half to the blocks after it.
@@ -320,7 +353,10 @@ pub(crate) fn scan_csv(
     let head_bytes = reader.position().byte();
     summary.bytes_read = head_bytes;
 
-    if !at_end && let Some((path, len)) = seekable {
+    if !at_end
+        && limits.blocks > 0
+        && let Some((path, len)) = seekable
+    {
         let per_row = (head_bytes - header_bytes) as f64 / summary.head_rows.max(1) as f64;
         let estimated = ((len - header_bytes) as f64 / per_row.max(1.0)) as u64;
         let block_rows = limits.block_rows(estimated);
@@ -551,7 +587,7 @@ pub(crate) fn scan_json(
     named_id: Option<&IdSpec>,
 ) -> Result<JsonScan> {
     let seekable = data.seekable();
-    let whole = seekable.is_some_and(|(_, len)| len <= limits.whole_file_bytes);
+    let whole = seekable.is_some_and(|(_, len)| limits.reads_whole(len));
     let byte_limit = if whole {
         None
     } else {
