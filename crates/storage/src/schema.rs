@@ -550,11 +550,14 @@ pub(crate) enum BadValue {
 /// carrying more than one value, with nothing said and no error to see — the write succeeded
 /// and a range query over the field simply never matched.
 ///
-/// Text and json are deliberately not treated that way: both take the whole value serialized,
-/// so a list under them is already indexed as its own JSON text and splitting it would change
-/// what those fields have always held. Bytes is a list by definition. One level is flattened
-/// and no more, so a list inside a list is a value the inner type has to accept on its own —
-/// which mirrors what this function then does with it.
+/// Text is treated that way too: each element of a list is a value of its own, a string as it
+/// is and anything else as its JSON. Serializing the whole list into one value, as text once did,
+/// indexed `["ok", "warning"]` as the text `["ok","warning"]` — so a phrase matched across two
+/// elements, and under the raw tokenizer no element could be matched at all, only the whole
+/// list's spelling. Json alone takes the whole value serialized: a json field holds a document,
+/// not several values. Bytes is a list by definition. One level is flattened and no more, so a
+/// list inside a list is a value the inner type has to accept on its own — which mirrors what
+/// this function then does with it.
 ///
 /// Sorting is the one place where several values are not simply more: `order_by_fast_field`
 /// reads one value per document, and for a multivalued column that is the first one written —
@@ -568,15 +571,24 @@ pub(crate) fn add_json_value_to_doc(
     field_value: &JsonValue,
     bad_value: BadValue,
 ) -> Result<(), StoreError> {
-    // The types that take the value whole, whatever shape it arrived in.
+    // Text, which takes any value as text and a list as several; json and bytes, which take the
+    // value whole.
     match field_type {
         TantivyFieldType::Text => {
-            if let Some(s) = field_value.as_str() {
-                tantivy_doc.add_text(tantivy_field, s);
-            } else {
-                let field_str = serde_json::to_string(field_value)
-                    .map_err(|e| StoreError::Serialization(e.to_string()))?;
-                tantivy_doc.add_text(tantivy_field, &field_str);
+            let values: &[JsonValue] = match field_value.as_array() {
+                Some(items) => items.as_slice(),
+                None => std::slice::from_ref(field_value),
+            };
+            for value in values {
+                match value {
+                    JsonValue::String(s) => tantivy_doc.add_text(tantivy_field, s),
+                    JsonValue::Null => {}
+                    other => {
+                        let text = serde_json::to_string(other)
+                            .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                        tantivy_doc.add_text(tantivy_field, &text);
+                    }
+                }
             }
             return Ok(());
         }
