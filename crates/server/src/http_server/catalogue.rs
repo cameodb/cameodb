@@ -139,6 +139,20 @@ pub(super) async fn create_config_handler(
         .route_and_handle(client_op, None, OperationType::Write)
         .await
         .map_err(AppError::from_route)?;
+    // A change the built index cannot take while it holds documents: refused, nothing written.
+    if result.get("acknowledged").and_then(|v| v.as_bool()) == Some(false) {
+        let reason = result
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Schema change refused");
+        return Err(AppError {
+            error: anyhow::anyhow!("{}", reason),
+            status: Some(StatusCode::CONFLICT),
+            retry_after_secs: None,
+            shed: false,
+            quiet: false,
+        });
+    }
     Ok(Json(result))
 }
 

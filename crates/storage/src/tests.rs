@@ -2864,3 +2864,78 @@ mod recovery_fanout_tests {
         );
     }
 }
+
+/// What a schema change asks of an index already built: every column it changes, and a
+/// different id — and nothing for what the built index serves as it is.
+#[cfg(test)]
+mod rebuild_changes_tests {
+    use crate::{FieldDef, IndexSchema, TantivyFieldType};
+
+    fn schema(fields: &[(&str, TantivyFieldType)]) -> IndexSchema {
+        let mut schema = IndexSchema::default();
+        for (name, field_type) in fields {
+            schema.fields.insert(
+                name.to_string(),
+                FieldDef::new(name.to_string(), field_type.clone()),
+            );
+        }
+        schema
+    }
+
+    fn listed(current: &IndexSchema, next: &IndexSchema) -> Vec<(String, bool)> {
+        current
+            .rebuild_changes(next)
+            .into_iter()
+            .map(|c| (c.what, c.conflicts))
+            .collect()
+    }
+
+    #[test]
+    fn a_change_to_a_built_column_is_listed() {
+        let current = schema(&[
+            ("score", TantivyFieldType::I64),
+            ("mac", TantivyFieldType::Text),
+            ("note", TantivyFieldType::Text),
+        ]);
+        let mut next = current.clone();
+        next.fields.get_mut("score").unwrap().field_type = TantivyFieldType::F64;
+        next.fields.get_mut("mac").unwrap().tokenizer = Some("raw".to_string());
+        next.fields.remove("note");
+        next.fields.insert(
+            "added".to_string(),
+            FieldDef::new("added".to_string(), TantivyFieldType::I64),
+        );
+        let changes = listed(&current, &next);
+        let has = |what: &str, conflicts: bool| {
+            changes
+                .iter()
+                .any(|(w, c)| w.starts_with(what) && *c == conflicts)
+        };
+        // The index would act against these until rebuilt…
+        assert!(has("score: i64 → f64", true), "{changes:?}");
+        assert!(has("mac: tokenizer default → raw", true), "{changes:?}");
+        // …and merely lacks, or keeps, a column for these.
+        assert!(has("note: no longer indexed", false), "{changes:?}");
+        assert!(has("added: indexed as i64", false), "{changes:?}");
+    }
+
+    #[test]
+    fn what_the_built_index_serves_as_it_is_is_not_listed() {
+        let current = schema(&[("mac", TantivyFieldType::Text)]);
+        let mut next = current.clone();
+        next.description = Some("devices".to_string());
+        next.fields.get_mut("mac").unwrap().description = Some("modem".to_string());
+        // `None` and the default it resolves to are one declaration.
+        next.fields.get_mut("mac").unwrap().tokenizer = Some("default".to_string());
+        // Recording an id where none was is not a change of key.
+        next.id_fields = vec!["mac".to_string()];
+        assert!(listed(&current, &next).is_empty());
+
+        let mut keyed = next.clone();
+        keyed.id_fields = vec!["Hr".to_string(), "mac".to_string()];
+        assert_eq!(
+            listed(&next, &keyed),
+            vec![("id: mac → Hr,mac".to_string(), true)]
+        );
+    }
+}

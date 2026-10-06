@@ -3980,6 +3980,13 @@ impl NodeOrchestrator {
                 JsonValue::String(description.clone()),
             );
         }
+        // How the loader made this index's ids, so a later load makes them the same way.
+        if !schema.id_fields.is_empty() {
+            map.insert(
+                "id_fields".to_string(),
+                JsonValue::from(schema.id_fields.clone()),
+            );
+        }
         let (searched, truncated) =
             Self::searched_by_default(schema, searchable, max_default_fields);
         Self::insert_default_search(&mut map, schema, &searched, truncated);
@@ -5757,6 +5764,57 @@ impl NodeOrchestrator {
             ));
         }
 
+        // A built index keeps the columns it was built with; storing a schema that says otherwise
+        // only made the two disagree. A change the index must be rebuilt for is applied by
+        // rebuilding it — which costs nothing while the index holds no documents. Holding some,
+        // a change the index would act against — a retype, a tokenizer, another id — is refused,
+        // naming each and the way through: delete the documents (the schema stays), apply this,
+        // load again. A column declared ahead of the index is accepted, as it always was: the
+        // listing reports it unsearchable or unsortable until a rebuild.
+        let changes = current
+            .as_ref()
+            .filter(|_| !minting)
+            .map(|current| current.rebuild_changes(&schema))
+            .unwrap_or_default();
+        let mut rebuild = !changes.is_empty();
+        if rebuild {
+            let mut documents = 0u64;
+            for store in &stores {
+                let store = Arc::clone(store);
+                let idx = index.to_string();
+                documents += tokio::task::spawn_blocking(move || store.document_count(&idx))
+                    .await
+                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))??;
+            }
+            let conflicts: Vec<&str> = changes
+                .iter()
+                .filter(|c| c.conflicts)
+                .map(|c| c.what.as_str())
+                .collect();
+            if documents > 0 && !conflicts.is_empty() {
+                return Ok(serde_json::json!({
+                    "acknowledged": false,
+                    "index": index,
+                    "documents": documents,
+                    "changes": conflicts,
+                    "reason": format!(
+                        "index '{index}' holds {documents} documents, and its built index cannot \
+                         change under them: {}. Delete its documents (DELETE /api/{index} without \
+                         delete_schema keeps the schema), apply this schema, then load again",
+                        conflicts.join("; ")
+                    ),
+                }));
+            }
+            rebuild = documents == 0;
+            if rebuild {
+                tracing::info!(
+                    index = %index,
+                    changes = ?changes,
+                    "Schema changes a built column of an empty index; rebuilding it"
+                );
+            }
+        }
+
         let index_name = index.to_string();
         let schema_clone = schema.clone();
 
@@ -5775,6 +5833,10 @@ impl NodeOrchestrator {
                 let idx = index_name.clone();
                 let sch = schema_clone.clone();
                 tokio::task::spawn_blocking(move || {
+                    // An empty index whose columns change is built again from nothing.
+                    if rebuild {
+                        store.delete_index_data(&idx, false)?;
+                    }
                     // First store the schema
                     store.store_schema_and_cache(&idx, &sch)?;
                     tracing::debug!(index = %idx, "Schema stored and cached");

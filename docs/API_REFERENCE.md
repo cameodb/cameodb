@@ -646,6 +646,20 @@ is refused with `400` rather than guessed. A year must be written as four digits
 stored exactly as sent; only the indexed value is normalized. The same shapes are accepted in
 query literals.
 
+**Changing a schema.** A `PUT` over an index that already has a schema replaces it, and a
+change to a built column — a field's type, tokenizer, index record option, a column added or
+dropped, a fast column — or to `id_fields` needs the index built again. An index with no documents
+is rebuilt from the new schema as part of the `PUT`. An index holding documents is refused with
+`409` for a change it would act against — a retype, a tokenizer, a record option, another
+`id_fields` — naming each change and the document count; delete its documents
+(`DELETE /api/{index}`, which keeps the schema), apply the schema, and load again. A column
+declared ahead of the index is accepted, and `GET /_config` reports it `searchable` or `sortable`
+`false` until a rebuild. Counted per node: on a cluster, `PUT /_config` applies on the node that
+receives it.
+
+**`id_fields`** records the fields whose values, joined with `|` in order, make each document's
+id — `["Hr", "cmMacAddress"]`. The CLI loader writes it and keys every later load the same way.
+
 **Response:**
 ```json
 {
@@ -695,6 +709,7 @@ has one description. `fields` is ordered with `id` first, then alphabetically.
 |-----|---------|
 | `version` | Advances on every change to this schema, starting at 1 — a `PUT /_config`, a field added by a write, a flag flipped by `PATCH /_schema`. **Monotonic, not a count of requests:** one request touching three fields may advance it three times, so compare versions for order and never for how much happened. Adopting a schema that already exists elsewhere keeps the version it came with, which is the point of an agreed version. Two nodes reporting different versions for one index have not converged yet |
 | `default_fields` | Present only when declared: the fields an unqualified term searches, in priority order. Under the name `PUT /_config` accepts, so reading a schema and writing it back keeps the declaration |
+| `id_fields` | Present only when recorded: the fields whose values, joined in this order with a vertical bar, make each document's id |
 | `searched_by_default` | What an unqualified term actually searches: the declared list, or every indexed text, string and JSON field by name — either way cut to the node's `[security.limits] max_default_fields` (default 64) |
 | `default_fields_truncated` | Present, and `true`, when the cap cut `searched_by_default` short. A bare term then misses the fields left out; a query naming a field reaches it at any width |
 | `thumbprint` | 16 hex digits over the **resolved** schema, so two nodes agree whenever they would build the same index. A declaration and the index built from it therefore match: it hashes what a field resolves to, not what was written, so an omitted tokenizer and the default it fills in are the same schema. Different thumbprints at the same `version` mean the two have genuinely diverged and no retry will settle it |

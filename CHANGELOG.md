@@ -27,6 +27,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A schema change now reaches the built index, or is refused.** `PUT /_config` stored the new
+  schema and left the Tantivy index as first built, empty or not: a field retyped `i64` to `f64`
+  refused range queries with decimals and silently skipped every decimal written, and a changed
+  tokenizer was ignored. A change to a built column, or to `id_fields`, now rebuilds an index
+  that holds no documents; on one that does, a change the index would act against — a retype, a
+  tokenizer, an index record option, another id — is refused with `409`, naming each change and
+  the document count. A column declared ahead of the index is still accepted, and reported not
+  searchable or sortable until a rebuild.
 - **A `string` field takes every string.** The write path asked what type a string's spelling
   inferred, so a version `284.08.25` or a code `10.0.0.1` — a date and an address to the
   inference — was refused from a `string` field the writer stores any string in.
