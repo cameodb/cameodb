@@ -121,6 +121,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A load into an index that has a schema reads only its first batch ahead, not the file.** The
+  scan typed columns the schema had already typed: a file up to 1 GB was read whole before its
+  first row was sent, about 10 s of a 600,000-row, 600 MB load. The schema types the fields and
+  the index records the id, so the loader now reads one batch of rows ahead, for the date order
+  and lists a schema does not hold, and the same load finishes about 23% sooner. An index
+  recording no id, loaded from a source without an `id` column, is sampled instead, since its id
+  is chosen by its values; a new index, or `--id` naming another id, is scanned as before.
 - **Schema detection reads a source across its length, and types a column by every value it
   saw.** It used to type each column from the first 200 rows, one value at a time: a file sorted
   by hour showed one hour, and `no data` then `true` made a boolean column whose `no data` rows

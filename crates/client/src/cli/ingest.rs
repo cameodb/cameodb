@@ -366,14 +366,15 @@ impl IdOptions<'_> {
     }
 }
 
-/// Scan a source and settle what it holds. See [`scan`](super::scan) for how much is read.
+/// Scan a source within `limits` and settle what it holds. See [`scan`](super::scan) for how much
+/// is read.
 pub(crate) async fn analyze_source(
     client: &CameoClient,
     source: &str,
     delimiter: Delimiter,
     ids: IdOptions<'_>,
+    limits: ScanLimits,
 ) -> Result<SourceAnalysis> {
-    let limits = ScanLimits::default();
     let format = detect_source_format_for_source(client, source).await?;
     match format {
         SourceFormat::CsvLike => {
@@ -2104,7 +2105,7 @@ pub(crate) async fn detect_schema_from_source(
             explicit: id,
             recorded: None,
         };
-        let analysis = analyze_source(client, source, delimiter, ids).await?;
+        let analysis = analyze_source(client, source, delimiter, ids, ScanLimits::default()).await?;
         analysis.profiler.warn_about_id(&analysis.id);
         schema_from_analysis(&analysis)
     }
@@ -2135,7 +2136,7 @@ pub(crate) async fn report_source(
         explicit: id,
         recorded: None,
     };
-    let analysis = analyze_source(client, source, delimiter, ids).await;
+    let analysis = analyze_source(client, source, delimiter, ids, ScanLimits::default()).await;
     spinner.stop();
     Ok(analysis?.report(source))
 }
@@ -2168,21 +2169,35 @@ pub(crate) async fn load_data_from_source(
         println!("Deleted the documents of index '{index}'; its schema is kept");
     }
     let recorded = existing.as_ref().and_then(ExistingSchema::recorded_id);
+    let new_id = id.is_some_and(|id| recorded.as_ref().is_none_or(|r| !same_id(id, r)));
+    // An index with a schema has its fields typed and, usually, its id recorded: the load reads
+    // only its first batch ahead, for the date orders and lists a schema does not record. A schema
+    // still to be written from the scan — a new index, or a new id — is scanned in full.
+    let typed = existing.is_some() && !new_id;
+    let limits = if typed {
+        ScanLimits::first_batch()
+    } else {
+        ScanLimits::default()
+    };
     let mut spinner = ProgressSpinner::new();
     let result = async {
         let ids = IdOptions {
             explicit: id,
             recorded: recorded.as_ref(),
         };
-        let analysis = analyze_source(client, source, delimiter, ids).await?;
+        let mut analysis = analyze_source(client, source, delimiter, ids, limits).await?;
+        if typed && matches!(analysis.id.reason, IdReason::Unique | IdReason::NameOnly) {
+            // An index that records no id, loaded from a source with no `id` column: the id is
+            // chosen by its values, and one batch is too few to judge them by.
+            analysis =
+                analyze_source(client, source, delimiter, ids, ScanLimits::sampled()).await?;
+        }
         analysis.profiler.warn_about_id(&analysis.id);
         let field_types = match &existing {
             // Another id than the index records: its schema has to say so before a row is sent.
             // The node rebuilds an index with no documents for it, and refuses one with some —
             // two keys in one index cannot be told apart.
-            Some(existing)
-                if id.is_some_and(|id| recorded.as_ref().is_none_or(|r| !same_id(id, r))) =>
-            {
+            Some(existing) if new_id => {
                 let schema = schema_for_new_id(&analysis, existing)?;
                 client
                     .put_index_config(index, &schema)
