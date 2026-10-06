@@ -926,6 +926,33 @@ pub enum SchemaState {
     Dropped,
 }
 
+/// One way a schema change differs from the index already built. See
+/// [`IndexSchema::rebuild_changes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaChange {
+    /// The change, as a person reads it: `score: i64 → f64`.
+    pub what: String,
+    /// The built index would act against the schema until rebuilt, rather than merely lack a
+    /// column the schema declares.
+    pub conflicts: bool,
+}
+
+impl SchemaChange {
+    fn conflicting(what: String) -> Self {
+        Self {
+            what,
+            conflicts: true,
+        }
+    }
+
+    fn pending(what: String) -> Self {
+        Self {
+            what,
+            conflicts: false,
+        }
+    }
+}
+
 /// Index schema definition for validation and evolution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexSchema {
@@ -972,6 +999,14 @@ pub struct IndexSchema {
     /// Field name to use for routing/sharding (default: "id")
     #[serde(default = "default_routing_field")]
     pub routing_field_name: String,
+    /// The source fields whose values, joined with `|` in this order, make a document's id.
+    ///
+    /// Recorded by the loader so that every load into the index keys its documents the same way:
+    /// a load that forgot how the first one did keyed the rest by another field, and each of its
+    /// rows overwrote whichever document happened to share that field's value. Empty on a schema
+    /// that does not say, which is every schema written before this field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub id_fields: Vec<String>,
     /// Pre-computed set of shadow field names for O(1) lookup.
     /// Rebuilt from fields on deserialization via rebuild_shadow_fields_cache().
     #[serde(skip)]
@@ -991,6 +1026,7 @@ impl Default for IndexSchema {
             tenant: None,
             default_fields: None,
             routing_field_name: "id".to_string(),
+            id_fields: Vec::new(),
             shadow_fields: HashSet::new(),
         }
     }
@@ -1213,8 +1249,108 @@ impl IndexSchema {
                 push_str(&mut combined, name);
             }
         }
+        // Likewise only when recorded: two nodes keying the same index differently would write
+        // one record under two ids.
+        if !self.id_fields.is_empty() {
+            combined.push(0x1D);
+            combined.extend_from_slice(&(self.id_fields.len() as u64).to_le_bytes());
+            for name in &self.id_fields {
+                push_str(&mut combined, name);
+            }
+        }
 
         xxh3_64(&combined)
+    }
+
+    /// What changing to `next` would ask of a Tantivy index already built from this schema: each
+    /// column added, dropped, retyped, re-tokenized, or made fast or not, and a different id.
+    ///
+    /// A built index keeps the columns it was built with, so every change listed here needs a
+    /// rebuild to take effect — free while the index holds no documents. They differ in what the
+    /// index does meanwhile. A [conflicting](SchemaChange::conflicts) one makes it act against
+    /// the schema: a field retyped `i64` to `f64` refused every range query with a decimal in it
+    /// and silently skipped every decimal written, a re-tokenized field analysed queries one way
+    /// and documents another, a new id sat each record beside its old copy. The rest declare a
+    /// column the index does not have yet, which the schema listing already reports as not
+    /// searchable or sortable until a rebuild. Empty when the built index serves `next` as it is:
+    /// a description, the default search fields. Both schemas are compared as they resolve, so
+    /// `tokenizer: None` and `"default"` on a text field are the same declaration.
+    pub fn rebuild_changes(&self, next: &IndexSchema) -> Vec<SchemaChange> {
+        let mut current = self.clone();
+        current.normalize_after_deserialization();
+        let mut next = next.clone();
+        next.normalize_after_deserialization();
+
+        let built = |schema: &IndexSchema, name: &str| -> Option<FieldDef> {
+            schema
+                .fields
+                .get(name)
+                .filter(|f| f.indexed && !f.is_shadow)
+                .cloned()
+        };
+        let mut names: Vec<&String> = current.fields.keys().chain(next.fields.keys()).collect();
+        names.sort();
+        names.dedup();
+
+        let mut changes = Vec::new();
+        let mut conflict = |what: String| changes.push(SchemaChange::conflicting(what));
+        let mut pending = Vec::new();
+        for name in names.into_iter().filter(|n| *n != "id") {
+            match (built(&current, name), built(&next, name)) {
+                (None, None) => {}
+                (Some(_), None) => pending.push(format!("{name}: no longer indexed")),
+                (None, Some(field)) => pending.push(format!(
+                    "{name}: indexed as {}",
+                    field.field_type.to_string()
+                )),
+                (Some(was), Some(now)) => {
+                    if was.field_type != now.field_type {
+                        conflict(format!(
+                            "{name}: {} → {}",
+                            was.field_type.to_string(),
+                            now.field_type.to_string()
+                        ));
+                    }
+                    if was.tokenizer != now.tokenizer {
+                        conflict(format!(
+                            "{name}: tokenizer {} → {}",
+                            was.tokenizer.as_deref().unwrap_or("none"),
+                            now.tokenizer.as_deref().unwrap_or("none")
+                        ));
+                    }
+                    if was.index_record_option != now.index_record_option {
+                        conflict(format!(
+                            "{name}: index record option {} → {}",
+                            was.index_record_option.as_deref().unwrap_or("none"),
+                            now.index_record_option.as_deref().unwrap_or("none")
+                        ));
+                    }
+                    if was.is_fast() != now.is_fast() {
+                        pending.push(format!(
+                            "{name}: fast {} → {}",
+                            was.is_fast(),
+                            now.is_fast()
+                        ));
+                    }
+                }
+            }
+        }
+        // An id recorded once and recorded differently now: documents already in the index are
+        // keyed the old way, and a record loaded the new way would sit beside its old copy rather
+        // than replace it. Recording an id where none was is not a change of key.
+        if !current.id_fields.is_empty() && current.id_fields != next.id_fields {
+            conflict(format!(
+                "id: {} → {}",
+                current.id_fields.join(","),
+                if next.id_fields.is_empty() {
+                    "none".to_string()
+                } else {
+                    next.id_fields.join(",")
+                }
+            ));
+        }
+        changes.extend(pending.into_iter().map(SchemaChange::pending));
+        changes
     }
 
     /// Check a declared `default_fields` list against this schema.

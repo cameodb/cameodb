@@ -1650,6 +1650,8 @@ impl HybridStore {
             // Query-time only, and never in tantivy; recovered from the stored schema the same
             // way `tenant` is.
             default_fields: None,
+            // Nothing in tantivy says how ids were made; the stored schema does.
+            id_fields: Vec::new(),
             routing_field_name: "id".to_string(),
             shadow_fields: HashSet::new(),
         }
@@ -2822,6 +2824,19 @@ impl HybridStore {
 
     /// Delete all data for an index using redb's efficient delete_table() function
     /// If delete_schema is true, also removes schema metadata from TABLE_SCHEMA
+    /// Documents the index holds on this store, read from its data table: exact, and as cheap as
+    /// one table's length. Zero when the index has never held one.
+    pub fn document_count(&self, index: &str) -> Result<u64, StoreError> {
+        let read_txn = self.kv.begin_read()?;
+        let data_table_name = format!("data_{}", index);
+        let data_table_def = TableDefinition::<&str, &[u8]>::new(&data_table_name);
+        match read_txn.open_table(data_table_def) {
+            Ok(table) => Ok(table.len()?),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(0),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     pub fn delete_index_data(&self, index: &str, delete_schema: bool) -> Result<(), StoreError> {
         // Resolve (and validate) the directory before mutating any state, so an
         // invalid name cannot drop caches or redb tables on its way to failing.
