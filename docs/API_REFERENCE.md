@@ -654,8 +654,10 @@ is rebuilt from the new schema as part of the `PUT`. An index holding documents 
 `id_fields` — naming each change and the document count; delete its documents
 (`DELETE /api/{index}`, which keeps the schema), apply the schema, and load again. A column
 declared ahead of the index is accepted, and `GET /_config` reports it `searchable` or `sortable`
-`false` until a rebuild. Counted per node: on a cluster, `PUT /_config` applies on the node that
-receives it.
+`false` until a rebuild. Fields are compared as they build: `string` is a `text` field with
+tokenizer `raw` and `index_record_option` `Basic`, so changing one to the other changes no column
+and is accepted on an index holding documents. Counted per node: on a cluster, `PUT /_config`
+applies on the node that receives it.
 
 **`id_fields`** records the fields whose values, joined with `|` in order, make each document's
 id — `["Hr", "cmMacAddress"]`. The CLI loader writes it and keys every later load the same way.

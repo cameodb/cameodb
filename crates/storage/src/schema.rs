@@ -7,7 +7,7 @@ use chrono::{Datelike, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize, de::Error as DeserializeError};
 use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
-use tantivy::schema::{Facet, Field};
+use tantivy::schema::{Facet, Field, IndexRecordOption};
 use tantivy::{DateTime, doc};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -953,6 +953,31 @@ impl SchemaChange {
     }
 }
 
+/// The postings a text column keeps, by the name a schema declares: `Basic`, `WithFreqs`, and
+/// anything else — absent or misspelled — the full `WithFreqsAndPositions`.
+pub(crate) fn index_record_option(declared: Option<&str>) -> IndexRecordOption {
+    match declared {
+        Some("Basic") => IndexRecordOption::Basic,
+        Some("WithFreqs") => IndexRecordOption::WithFreqs,
+        _ => IndexRecordOption::WithFreqsAndPositions,
+    }
+}
+
+/// How a text-like field's column analyses its values: the tokenizer and the postings it keeps.
+/// A `string` field builds Tantivy's `STRING` — the raw tokenizer with `Basic` postings — whatever
+/// it declares, so a `text` field declaring those two builds the same column. `None` for a field
+/// that builds no text column.
+fn text_analysis(field: &FieldDef) -> Option<(&str, IndexRecordOption)> {
+    match field.field_type {
+        TantivyFieldType::String => Some(("raw", IndexRecordOption::Basic)),
+        TantivyFieldType::Text => Some((
+            field.tokenizer.as_deref().unwrap_or("default"),
+            index_record_option(field.index_record_option.as_deref()),
+        )),
+        _ => None,
+    }
+}
+
 /// Index schema definition for validation and evolution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexSchema {
@@ -1273,8 +1298,10 @@ impl IndexSchema {
     /// and documents another, a new id sat each record beside its old copy. The rest declare a
     /// column the index does not have yet, which the schema listing already reports as not
     /// searchable or sortable until a rebuild. Empty when the built index serves `next` as it is:
-    /// a description, the default search fields. Both schemas are compared as they resolve, so
-    /// `tokenizer: None` and `"default"` on a text field are the same declaration.
+    /// a description, the default search fields, a type renamed over the same column. Both
+    /// schemas are compared as they build, not as they are spelled: `tokenizer: None` and
+    /// `"default"` on a text field are one declaration, and so are `string` and a `text` field
+    /// with the raw tokenizer and `Basic` postings.
     pub fn rebuild_changes(&self, next: &IndexSchema) -> Vec<SchemaChange> {
         let mut current = self.clone();
         current.normalize_after_deserialization();
@@ -1304,26 +1331,33 @@ impl IndexSchema {
                     field.field_type.to_string()
                 )),
                 (Some(was), Some(now)) => {
-                    if was.field_type != now.field_type {
-                        conflict(format!(
+                    let retyped = || {
+                        format!(
                             "{name}: {} → {}",
                             was.field_type.to_string(),
                             now.field_type.to_string()
-                        ));
-                    }
-                    if was.tokenizer != now.tokenizer {
-                        conflict(format!(
-                            "{name}: tokenizer {} → {}",
-                            was.tokenizer.as_deref().unwrap_or("none"),
-                            now.tokenizer.as_deref().unwrap_or("none")
-                        ));
-                    }
-                    if was.index_record_option != now.index_record_option {
-                        conflict(format!(
-                            "{name}: index record option {} → {}",
-                            was.index_record_option.as_deref().unwrap_or("none"),
-                            now.index_record_option.as_deref().unwrap_or("none")
-                        ));
+                        )
+                    };
+                    match (text_analysis(&was), text_analysis(&now)) {
+                        // Both build a text column, and the column is the analysis: `string` and a
+                        // raw, `Basic` `text` are one column under two names, so renaming it
+                        // changes nothing the index holds.
+                        (Some(a), Some(b)) if a == b => {}
+                        (Some(_), Some(_)) if was.field_type != now.field_type => {
+                            conflict(retyped())
+                        }
+                        (Some((was_tok, was_rec)), Some((now_tok, now_rec))) => {
+                            if was_tok != now_tok {
+                                conflict(format!("{name}: tokenizer {was_tok} → {now_tok}"));
+                            }
+                            if was_rec != now_rec {
+                                conflict(format!(
+                                    "{name}: index record option {was_rec:?} → {now_rec:?}"
+                                ));
+                            }
+                        }
+                        _ if was.field_type != now.field_type => conflict(retyped()),
+                        _ => {}
                     }
                     if was.is_fast() != now.is_fast() {
                         pending.push(format!(
