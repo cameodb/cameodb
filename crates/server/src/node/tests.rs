@@ -3143,6 +3143,27 @@ fn a_numeric_field_still_refuses_what_the_writer_would_skip() {
     assert!(refused(TantivyFieldType::U64, json!([1, -2])));
 }
 
+/// A string field holds any string, as the writer stores it, whatever type its spelling would
+/// infer: a version that reads as a date, a code that reads as an address. It still refuses
+/// what the writer would skip.
+#[test]
+fn a_string_field_takes_every_string() {
+    let storable = |value| unstorable_value("s", &TantivyFieldType::String, &value).is_none();
+    for value in [
+        "no data",
+        "284.08.25",
+        "2026-10-05",
+        "10.0.0.1",
+        "true",
+        "12",
+    ] {
+        assert!(storable(json!(value)), "{value}");
+    }
+    assert!(storable(json!(["ok", "2026-10-05"])));
+    assert!(!storable(json!(12)));
+    assert!(!storable(json!(true)));
+}
+
 /// A declaration cannot make a column exist, and the refusal says which case it is.
 ///
 /// The guard reads the declaration, and for these five types the index builder never reads it
