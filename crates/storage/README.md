@@ -342,27 +342,28 @@ Beyond raw storage, the engine tracks per-index metadata and stats:
 CameoDB tracks schema changes through versioning and deterministic fingerprinting:
 
 **Schema Version (`version: u64`)**
-- Incremented when fields are added, removed, or modified
-- Default: `1` for new schemas
-- Used for schema evolution tracking and compatibility checks
+- Advances on every change to the schema: a `PUT /_config`, a field added by a write, a flag flipped
+  by `PATCH /_schema`. Monotonic, not a count of changes.
+- On a cluster, a `PUT /_config` sets one version for every node — one past the highest any node
+  holds — and two schemas for the same index are settled by it: the newer version wins, a tie goes
+  to the lower fingerprint.
+- Default: `1` for new schemas.
 
-**Schema Fingerprint (`fingerprint: u64`)**
-- Deterministic hash calculated from sorted field names using XXH3
-- Automatically updated when schema changes via `calculate_fingerprint()`
-- Algorithm:
-  ```rust
-  // Sort field names alphabetically
-  let mut sorted_names: Vec<&String> = fields.keys().collect();
-  sorted_names.sort();
-  
-  // Concatenate and hash
-  let combined = sorted_names.join("");
-  let fingerprint = xxh3_64(combined.as_bytes());
-  ```
-- Use cases:
-  - Quick schema change detection (O(1) comparison vs full field-by-field diff)
-  - Cache invalidation triggers
-  - Distributed schema synchronization
+**Schema Fingerprint (`calculate_fingerprint()`, shown as `thumbprint`)**
+- XXH3 over the *resolved* schema, not the declaration as written: every field with its type,
+  `indexed`, `stored`, `fast`, shadow flag, description, tokenizer and index record option, then
+  the routing field, the index description, the default search fields and the recorded
+  `id_fields`. A declaration and the index built from it therefore hash alike (an
+  omitted tokenizer and the `default` it resolves to are one schema).
+- Two nodes with the same version and different fingerprints have genuinely diverged.
+
+**Schema changes against a built index (`rebuild_changes`)**
+- Lists what moving to a new schema asks of an index already built: a column added, dropped,
+  retyped, re-tokenized or made fast, and a different id. Columns are compared as they build, so
+  `string` and a `text` field with the `raw` tokenizer and `Basic` record option are one column.
+- A *conflicting* change (retype, tokenizer, record option, id) needs the index built again: free
+  while it holds no documents, refused with `409` while it holds some. The rest only declare a
+  column the built index lacks.
 
 **Timestamps**
 - `created_at: i64` - Unix timestamp when schema was first created

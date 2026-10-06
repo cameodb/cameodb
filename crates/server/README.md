@@ -37,7 +37,7 @@ The `RouterActor` is the primary ingress for database operations on a node.
   - `Stream { index, query, limit, fields, sort }` - Streaming search with optional field projection and sorting
   - `Write { index, id, routing_key, doc }` - Single document write
   - `BulkWrite { index, docs }` - Batch document write
-  - `CreateConfig { index, schema }`, `GetConfig { index }` (Schema management)
+  - `GetConfig { index }`, and `PrepareSchema` / `ApplySchema` / `ReleaseSchemaChange` (the two phases of a cluster-wide `PUT /_config`, sent node to node) (Schema management)
   - `ListIndexes { include_data_size }`, `ListClusterIndexes { include_data_size }` (Metadata)
   - `GetIdentity` (Node identity information)
   - `DeleteIndex { index, delete_schema }` (Index Management)
@@ -222,11 +222,13 @@ This gives you single-owner semantics for keyed **writes** across the cluster wh
 providing a deterministic, evenly distributed fallback when clients do not specify a
 routing key explicitly.
 
-**Metadata operations** (`GetConfig`, `CreateConfig`, `ListIndexes`) always execute locally on the node handling the HTTP request. They do not broadcast or remote, since schema/config data is available via the local `HybridStore`.
+**Metadata operations** (`GetConfig`, `ListIndexes`) execute on the node handling the HTTP request, from its local `HybridStore`. `GetConfig` for an index this node holds no schema for asks its peers (on the worker lane, never the mailbox) and answers with theirs, marked `held_here: false`.
+
+**Schema changes** (`PUT /_config`) are decided once for the cluster: the receiving node's HTTP task asks every node `PrepareSchema` (what it holds, its documents, the built columns the change touches), decides one version, owner and verdict, then sends every node `ApplySchema`. Each node reserves the index for the change between the two steps, so concurrent changes are applied one after the other. See `cluster_coordinator/schema_change.rs` and the API reference.
 
 **Cluster-wide Metadata** (`ListClusterIndexes`) is an exception: it broadcasts to all nodes to aggregate index statistics and shard counts across the cluster.
 
-Schema metadata is cached per node inside `NodeOrchestrator` to avoid repeated redb reads on every request. The cache is populated on first read (`_config`), updated on schema evolution or `CreateConfig`, and returned on subsequent requests with fields sorted (`id` first, others alphabetical).
+Schema metadata is cached per node inside `NodeOrchestrator` to avoid repeated redb reads on every request. The cache is populated on first read (`_config`), updated on schema evolution or `ApplySchema`, and returned on subsequent requests with fields sorted (`id` first, others alphabetical).
 
 ### 4.2 Broadcast / Scatter–Gather
 
