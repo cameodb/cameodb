@@ -1124,9 +1124,22 @@ async fn changing_a_flag_leaves_the_rest_of_the_schema_alone() {
         .await
         .expect("config after");
 
+    // `id` aside: a schema inferred from writes lists it only on a shard that has built its
+    // index, and the edit stores the declared form, which lists it on every shard.
+    let names = |config: &client::sdk::IndexConfigResponse| {
+        let mut names: Vec<String> = config
+            .fields
+            .iter()
+            .filter_map(|f| f["name"].as_str())
+            .filter(|name| *name != "id")
+            .map(str::to_string)
+            .collect();
+        names.sort();
+        names
+    };
     assert_eq!(
-        before.fields.len(),
-        after.fields.len(),
+        names(&before),
+        names(&after),
         "the field set should be unchanged by a flag edit"
     );
 
@@ -1335,6 +1348,70 @@ async fn a_declared_tokenizer_must_be_one_the_node_has() {
     };
     assert_eq!(tokenizer("tekst"), Some(json!("hr_stem_fold")), "{config}");
     assert_eq!(tokenizer("testo"), Some(json!("it_stem")), "{config}");
+}
+
+/// A flag edit is one schema change: every field it touches moves the version once, a field it
+/// marks indexed on an index with no documents is searchable at once — the index is built again
+/// with its column — and sending the same edit again changes nothing, the version included.
+#[tokio::test]
+async fn a_flag_edit_on_an_empty_index_is_searchable_at_once_and_moves_the_version_once() {
+    let node = TestNode::start("").await;
+    let (status, body) = put_config(
+        &node,
+        "notes",
+        &json!({"fields": {
+            "title": {"field_type": "text", "indexed": true},
+            "body": {"field_type": "text", "indexed": false}
+        }}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let declared = body["version"].as_u64().expect("a version");
+
+    let edit = json!({"body": true, "title": false});
+    let (status, body) = patch_schema(&node, "notes", &edit).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["updated_fields"], json!(["body", "title"]), "{body}");
+    assert!(
+        body.get("pending_reindex_fields").is_none(),
+        "an empty index is built again with the column: {body}"
+    );
+    assert_eq!(
+        body["version"],
+        json!(declared + 1),
+        "one edit, one version: {body}"
+    );
+
+    let (status, body) = put_document(&node, "notes", "n1", &json!({"body": "lighthouse"})).await;
+    assert_eq!(status, 200, "{body}");
+    // Searchable once committed: a lone write waits for the idle commit, a few seconds.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let hits = loop {
+        let hits = node
+            .client()
+            .search("notes", "body:lighthouse", Some(10), None, None, None)
+            .await
+            .expect("search");
+        if hits["total_hits"] == json!(1) || Instant::now() > deadline {
+            break hits;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(
+        hits["total_hits"],
+        json!(1),
+        "the promoted field is searchable without a reindex: {hits}"
+    );
+
+    let (status, body) = patch_schema(&node, "notes", &edit).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["updated_fields"], json!([]), "{body}");
+    assert_eq!(body["unchanged_fields"], json!(["body", "title"]), "{body}");
+    assert_eq!(
+        body["version"],
+        json!(declared + 1),
+        "nothing changed: {body}"
+    );
 }
 
 /// A change to a built column rebuilds an index that holds no documents, and is refused with

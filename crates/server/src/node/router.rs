@@ -616,7 +616,6 @@ impl RouterActor {
                 | ClientOp::PrepareSchema { .. }
                 | ClientOp::ApplySchema { .. }
                 | ClientOp::ReleaseSchemaChange { .. }
-                | ClientOp::UpdateSchema { .. }
         ) {
             return self.handle_client_op(op).await;
         }
