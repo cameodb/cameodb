@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 // Re-export SortSpec and SortOrder from storage crate
 use serde_json::Value as JsonValue;
-use storage::{HybridStore, StorageConfig, StoreError, WalOp};
+use storage::{HybridStore, IndexSchema, StorageConfig, StoreError, WalOp};
 
 /// Type alias for single write commands enqueued in the writer thread
 pub(super) type WriteCommand = (WalOp, tokio::sync::oneshot::Sender<Result<u64, StoreError>>);
@@ -66,6 +66,13 @@ pub(super) type DeleteCommand = (
     String,
     bool,
     tokio::sync::oneshot::Sender<Result<(), StoreError>>,
+);
+
+/// Type alias for rebuilds enqueued in the writer thread: (index, schema, reply)
+pub(super) type RebuildCommand = (
+    String,
+    Box<IndexSchema>,
+    tokio::sync::oneshot::Sender<Result<u64, StoreError>>,
 );
 
 /// Type alias for tracking reply slices when coalescing batch writes
@@ -742,6 +749,7 @@ pub(super) fn spawn_writer_thread(
                     let mut commits: Vec<(String, tokio::sync::oneshot::Sender<Result<(), StoreError>>)> = Vec::new();
                     let mut evictions: Vec<(String, tokio::sync::oneshot::Sender<bool>)> = Vec::new();
                     let mut deletions: Vec<DeleteCommand> = Vec::new();
+                    let mut rebuilds: Vec<RebuildCommand> = Vec::new();
                     let mut committed_indices: HashSet<String> = HashSet::new();
                     let mut written_indices: HashSet<String> = HashSet::new();
                     let mut mixed: Vec<String> = Vec::new();
@@ -776,6 +784,7 @@ pub(super) fn spawn_writer_thread(
                     commits.clear();
                     evictions.clear();
                     deletions.clear();
+                    rebuilds.clear();
                     let mut should_shutdown = false;
                     // Indices whose Tantivy commit published a new segment this iteration.
                     // Collected rather than posted inline so a burst that commits the same
@@ -801,6 +810,9 @@ pub(super) fn spawn_writer_thread(
                             }
                             StorageCommand::DeleteIndex { index, delete_schema, reply } => {
                                 deletions.push((index, delete_schema, reply));
+                            }
+                            StorageCommand::RebuildIfEmpty { index, schema, reply } => {
+                                rebuilds.push((index, schema, reply));
                             }
                             StorageCommand::Shutdown => {
                                 should_shutdown = true;
@@ -1109,6 +1121,31 @@ pub(super) fn spawn_writer_thread(
                         match &res {
                             Ok(()) => info!(index = %index, delete_schema, "Index data deleted"),
                             Err(e) => warn!(index = %index, error = %e, "Index deletion failed"),
+                        }
+                        let _ = reply.send(res);
+                    }
+
+                    // Phase 5c': Rebuilds after deletions, for the same reason — a write
+                    // batched alongside is applied first, and is then counted.
+                    for (index, schema, reply) in rebuilds.drain(..) {
+                        let res = guard_writer_op(&writer_store, &index, || {
+                            let documents = writer_store.document_count(&index)?;
+                            if documents > 0 {
+                                return Ok(documents);
+                            }
+                            writer_store.delete_index_data(&index, false)?;
+                            writer_store.store_schema_and_cache(&index, &schema)?;
+                            drop(writer_store.get_or_create_index(&index)?);
+                            Ok(0)
+                        });
+                        match &res {
+                            Ok(0) => info!(index = %index, "Index rebuilt under a new schema"),
+                            Ok(documents) => info!(
+                                index = %index,
+                                documents,
+                                "Index not rebuilt: it holds documents"
+                            ),
+                            Err(e) => warn!(index = %index, error = %e, "Index rebuild failed"),
                         }
                         let _ = reply.send(res);
                     }
@@ -1997,6 +2034,31 @@ impl MicroshardActor {
         self.send_write_command(StorageCommand::DeleteIndex {
             index: index.to_string(),
             delete_schema,
+            reply: reply_tx,
+        })
+        .await?;
+
+        reply_rx
+            .await
+            .map_err(|_| OrchestratorError::Io(std::io::Error::other("Writer dropped reply")))?
+            .map_err(|e: StoreError| match e {
+                StoreError::Io(io_err) => OrchestratorError::Io(io_err),
+                _ => OrchestratorError::Io(std::io::Error::other(e.to_string())),
+            })
+    }
+
+    /// Rebuild an index under `schema` if this shard holds none of its documents, on the
+    /// writer thread. The documents found: `0` when it rebuilt. See
+    /// [`StorageCommand::RebuildIfEmpty`].
+    pub(super) async fn rebuild_if_empty(
+        &self,
+        index: &str,
+        schema: &IndexSchema,
+    ) -> Result<u64, OrchestratorError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.send_write_command(StorageCommand::RebuildIfEmpty {
+            index: index.to_string(),
+            schema: Box::new(schema.clone()),
             reply: reply_tx,
         })
         .await?;

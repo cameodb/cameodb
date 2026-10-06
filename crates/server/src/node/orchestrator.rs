@@ -195,7 +195,7 @@ impl BulkCtx<'_> {
                         "document {}: forwarded here, but shard {target_shard} is not local \
                          either. This node and the one that forwarded disagree about who owns \
                          it; retry once the cluster has settled",
-                        placed.doc.id
+                        placed.position
                     )
                 },
             ));
@@ -1648,6 +1648,62 @@ pub(super) async fn find_schema_in_cluster(
     }
 }
 
+/// `GET /_config` for an index this node holds no schema for: the schema its peers hold, marked
+/// `held_here: false`. Its fields are reported as declared — searchable when indexed, sortable
+/// when fast — since this node has built nothing to read that from. Not found only when every
+/// peer answered and none holds one.
+pub(super) async fn peer_config_response(
+    shards: &HashMap<Uuid, MicroshardActor>,
+    canvass: &SchemaCanvass,
+    index: String,
+) -> Result<JsonValue, OrchestratorError> {
+    let schema = match canvass.peer_schema_for(&index, None).await {
+        PeerSchemaLookup::Found(schema) => schema,
+        PeerSchemaLookup::NoneHeld => {
+            return Err(OrchestratorError::Storage(StoreError::IndexNotFound(index)));
+        }
+        PeerSchemaLookup::Contested { rivals } => {
+            return Err(OrchestratorError::SchemaUnconfirmed {
+                index,
+                reason: format!("node(s) {rivals:?} are creating this index right now"),
+            });
+        }
+        PeerSchemaLookup::Unreachable { reason } => {
+            return Err(OrchestratorError::SchemaUnconfirmed { index, reason });
+        }
+    };
+    let searchable: HashSet<String> = schema
+        .fields
+        .iter()
+        .filter(|(_, field)| field.indexed && !field.is_shadow)
+        .map(|(name, _)| name.clone())
+        .collect();
+    let sortable: HashSet<String> = schema
+        .fields
+        .iter()
+        .filter(|(_, field)| field.indexed && !field.is_shadow && field.is_fast())
+        .map(|(name, _)| name.clone())
+        .collect();
+    let max_default_fields = shards
+        .values()
+        .find_map(|shard| shard.store.as_ref())
+        .map_or_else(
+            || storage::QueryPolicy::default().max_default_fields,
+            |store| store.query_policy().max_default_fields,
+        );
+    let mut response = NodeOrchestrator::schema_response(
+        &index,
+        &schema,
+        &searchable,
+        &sortable,
+        max_default_fields,
+    );
+    if let Some(map) = response.as_object_mut() {
+        map.insert("held_here".to_string(), JsonValue::Bool(false));
+    }
+    Ok(response)
+}
+
 /// What a mailbox op produced: its answer, or the rest of the work, to finish off the mailbox.
 ///
 /// `Later` is how an op that must wait on a peer gives the mailbox back first. The actor does
@@ -1732,6 +1788,9 @@ pub(crate) fn worker_eligible(op: &ClientOp) -> bool {
             // Waits on peers, so it must not wait on this node's mailbox: see the engine's arm
             // for it in `execute`.
             | ClientOp::FindSchemaInCluster { .. }
+            // Asks the peers when this node holds no schema, for the same reason; one it holds
+            // goes on to the actor as before.
+            | ClientOp::GetConfig { .. }
     )
 }
 
@@ -2838,6 +2897,22 @@ impl OrchestratorEngine {
                     Err(err) => return WorkerOutcome::Done(Err(err)),
                 };
                 WorkerOutcome::Done(find_schema_in_cluster(held, &self.canvass, index).await)
+            }
+            // A node holds an index's schema only once a document of it has reached one of its
+            // shards, or a declaration was sent to it. Answered from this node alone, a load
+            // through a node that held none heard "no schema" and declared its own, at version
+            // 1, beside the one its peers hold.
+            ClientOp::GetConfig { index } => {
+                let shards = self.shards.load();
+                match self.schema_cache.durable(&shards, &index).await {
+                    Ok(Some(held)) if held.state != storage::SchemaState::Dropped => {
+                        WorkerOutcome::UseActor(Box::new(ClientOp::GetConfig { index }))
+                    }
+                    Ok(_) => WorkerOutcome::Done(
+                        peer_config_response(&shards, &self.canvass, index).await,
+                    ),
+                    Err(err) => WorkerOutcome::Done(Err(err)),
+                }
             }
             other => WorkerOutcome::UseActor(Box::new(other)),
         }
@@ -5776,8 +5851,7 @@ impl NodeOrchestrator {
             .filter(|_| !minting)
             .map(|current| current.rebuild_changes(&schema))
             .unwrap_or_default();
-        let mut rebuild = !changes.is_empty();
-        if rebuild {
+        if !changes.is_empty() {
             let mut documents = 0u64;
             for store in &stores {
                 let store = Arc::clone(store);
@@ -5805,13 +5879,55 @@ impl NodeOrchestrator {
                     ),
                 }));
             }
-            rebuild = documents == 0;
-            if rebuild {
+            if documents == 0 {
                 tracing::info!(
                     index = %index,
                     changes = ?changes,
                     "Schema changes a built column of an empty index; rebuilding it"
                 );
+                // Each shard checks again and rebuilds in one step on its writer thread, so a
+                // write landing after the count above is counted there rather than dropped
+                // with the data. Shards are not locked against one another, so documents can
+                // reach one shard while another is being rebuilt; then a conflicting change is
+                // undone on the shards it reached — empty a moment ago, so rebuilding them back
+                // is as free — and refused, as it would have been had they arrived first.
+                let found = self.rebuild_shards_if_empty(index, &schema).await?;
+                let arrived: u64 = found.iter().map(|(_, documents)| documents).sum();
+                if arrived == 0 {
+                    self.schema_cache.put(index, &schema);
+                    return Ok(serde_json::json!({
+                        "acknowledged": true,
+                        "index": index,
+                        "field_names": Self::sorted_field_names(&schema)
+                    }));
+                }
+                if !conflicts.is_empty() {
+                    let rebuilt: Vec<Uuid> = found
+                        .iter()
+                        .filter(|(_, documents)| *documents == 0)
+                        .map(|(shard_id, _)| *shard_id)
+                        .collect();
+                    if let Some(previous) = current.as_deref() {
+                        self.rebuild_shards_back(index, previous, &rebuilt).await;
+                    }
+                    return Ok(serde_json::json!({
+                        "acknowledged": false,
+                        "index": index,
+                        "documents": arrived,
+                        "changes": conflicts,
+                        "reason": format!(
+                            "{arrived} documents reached index '{index}' while its schema was \
+                             changing, and its built index cannot change under them: {}. The \
+                             schema is unchanged; delete its documents (DELETE /api/{index} \
+                             without delete_schema keeps the schema), apply this schema, then \
+                             load again",
+                            conflicts.join("; ")
+                        ),
+                    }));
+                }
+                // Only columns declared ahead of the index: the shards holding documents take
+                // the schema as a populated index does, below, and the rebuilt ones take it
+                // again unchanged.
             }
         }
 
@@ -5833,10 +5949,6 @@ impl NodeOrchestrator {
                 let idx = index_name.clone();
                 let sch = schema_clone.clone();
                 tokio::task::spawn_blocking(move || {
-                    // An empty index whose columns change is built again from nothing.
-                    if rebuild {
-                        store.delete_index_data(&idx, false)?;
-                    }
                     // First store the schema
                     store.store_schema_and_cache(&idx, &sch)?;
                     tracing::debug!(index = %idx, "Schema stored and cached");
@@ -5870,6 +5982,60 @@ impl NodeOrchestrator {
             "index": index,
             "field_names": Self::sorted_field_names(&schema)
         }))
+    }
+
+    /// [`MicroshardActor::rebuild_if_empty`] on every local shard at once: each shard's id and
+    /// the documents it found, `0` where it rebuilt.
+    async fn rebuild_shards_if_empty(
+        &self,
+        index: &str,
+        schema: &IndexSchema,
+    ) -> Result<Vec<(Uuid, u64)>, OrchestratorError> {
+        let rebuilds = self
+            .shards
+            .iter()
+            .filter(|(_, shard)| shard.store.is_some())
+            .map(|(shard_id, shard)| async move {
+                shard
+                    .rebuild_if_empty(index, schema)
+                    .await
+                    .map(|documents| (*shard_id, documents))
+            });
+        futures::future::join_all(rebuilds)
+            .await
+            .into_iter()
+            .collect()
+    }
+
+    /// Put `previous` back on the shards a refused change already rebuilt. A shard that has
+    /// taken documents since holds them under the refused schema's columns, which nothing here
+    /// can undo, so it is logged for an operator to rebuild.
+    async fn rebuild_shards_back(&self, index: &str, previous: &IndexSchema, shard_ids: &[Uuid]) {
+        let rollbacks = shard_ids
+            .iter()
+            .filter_map(|shard_id| self.shards.get(shard_id).map(|shard| (shard_id, shard)))
+            .map(|(shard_id, shard)| async move {
+                (*shard_id, shard.rebuild_if_empty(index, previous).await)
+            });
+        for (shard_id, result) in futures::future::join_all(rollbacks).await {
+            match result {
+                Ok(0) => {}
+                Ok(documents) => tracing::error!(
+                    index = %index,
+                    shard_id = %shard_id,
+                    documents,
+                    "A refused schema change could not be undone on this shard: documents \
+                     reached it under the new columns. Delete the index's documents and load \
+                     again"
+                ),
+                Err(e) => tracing::error!(
+                    index = %index,
+                    shard_id = %shard_id,
+                    error = %e,
+                    "A refused schema change could not be undone on this shard"
+                ),
+            }
+        }
     }
 
     /// Set `indexed` flags on an existing schema, across every shard that holds it.

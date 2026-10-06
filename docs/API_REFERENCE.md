@@ -654,10 +654,17 @@ is rebuilt from the new schema as part of the `PUT`. An index holding documents 
 `id_fields` — naming each change and the document count; delete its documents
 (`DELETE /api/{index}`, which keeps the schema), apply the schema, and load again. A column
 declared ahead of the index is accepted, and `GET /_config` reports it `searchable` or `sortable`
-`false` until a rebuild. Fields are compared as they build: `string` is a `text` field with
+`false` until a rebuild. The rebuild runs on each shard's writer, which counts the index's
+documents again in the same step: documents reaching it after the first count stop it there, and a
+conflicting change is then undone on the shards it reached and refused with `409` as above. Fields
+are compared as they build: `string` is a `text` field with
 tokenizer `raw` and `index_record_option` `Basic`, so changing one to the other changes no column
-and is accepted on an index holding documents. Counted per node: on a cluster, `PUT /_config`
-applies on the node that receives it.
+and is accepted on an index holding documents. **On a cluster, a change to an existing schema is per node.** `PUT /_config`
+counts the documents and applies the schema on the node that receives it; peers already holding
+the index keep their schema and built columns, and nothing reconciles the two later. A node that
+holds no schema for the index yet takes the cluster's on its first write, so a change made before
+the index has spread reaches every node; after that, send the same `PUT` to every node, or delete
+the index (`DELETE /api/{index}` reaches every node) and declare it again.
 
 **`id_fields`** records the fields whose values, joined with `|` in order, make each document's
 id — `["Hr", "cmMacAddress"]`. The CLI loader writes it and keys every later load the same way.
@@ -712,6 +719,7 @@ has one description. `fields` is ordered with `id` first, then alphabetically.
 | `version` | Advances on every change to this schema, starting at 1 — a `PUT /_config`, a field added by a write, a flag flipped by `PATCH /_schema`. **Monotonic, not a count of requests:** one request touching three fields may advance it three times, so compare versions for order and never for how much happened. Adopting a schema that already exists elsewhere keeps the version it came with, which is the point of an agreed version. Two nodes reporting different versions for one index have not converged yet |
 | `default_fields` | Present only when declared: the fields an unqualified term searches, in priority order. Under the name `PUT /_config` accepts, so reading a schema and writing it back keeps the declaration |
 | `id_fields` | Present only when recorded: the fields whose values, joined in this order with a vertical bar, make each document's id |
+| `held_here` | Present, and `false`, when this node holds no copy of the schema and answered with the one its peers hold. A node takes an index's schema once one of its documents reaches it, so on a cluster a new index is held by some nodes before others. Its fields are then reported as declared: `searchable` when indexed, `sortable` when fast. Not found (`404`) only when every peer answered and none holds one; a peer that could not be asked is `503` |
 | `searched_by_default` | What an unqualified term actually searches: the declared list, or every indexed text, string and JSON field by name — either way cut to the node's `[security.limits] max_default_fields` (default 64) |
 | `default_fields_truncated` | Present, and `true`, when the cap cut `searched_by_default` short. A bare term then misses the fields left out; a query naming a field reaches it at any width |
 | `thumbprint` | 16 hex digits over the **resolved** schema, so two nodes agree whenever they would build the same index. A declaration and the index built from it therefore match: it hashes what a field resolves to, not what was written, so an omitted tokenizer and the default it fills in are the same schema. Different thumbprints at the same `version` mean the two have genuinely diverged and no retry will settle it |

@@ -449,6 +449,34 @@ impl CameoClient {
             .context("Failed to parse index config response")
     }
 
+    /// The index's schema, or `None` when the node answers that it has none (`404`). Any other
+    /// failure is an error: a node that could not be asked, or could not canvass its peers, has
+    /// not said the index is absent.
+    pub async fn find_index_config(&self, index: &str) -> Result<Option<IndexConfigResponse>> {
+        let url = self
+            .base_url
+            .join(&format!("api/{}/_config", index))
+            .context("Invalid config URL")?;
+        let resp = self.http.get(url).send().await?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Failed to fetch index config: {} - {}{}",
+                status,
+                refusal_text(&text),
+                self.refusal_hint(status)
+            );
+        }
+        resp.json()
+            .await
+            .map(Some)
+            .context("Failed to parse index config response")
+    }
+
     pub async fn put_index_config(&self, index: &str, config: &JsonValue) -> Result<()> {
         let url = self
             .base_url

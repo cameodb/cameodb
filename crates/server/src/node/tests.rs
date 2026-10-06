@@ -767,6 +767,51 @@ async fn an_op_the_engine_declines_comes_back_whole() {
     }
 }
 
+/// `GET /_config` for an index this node holds goes on to the actor, which reads its built
+/// columns; for one it does not hold, the worker asks the peers — and a node with none says
+/// not found, rather than the answer a loader once took as leave to declare its own schema.
+#[tokio::test]
+async fn a_config_this_node_does_not_hold_is_asked_of_its_peers() {
+    let engine = bare_engine();
+    let mut held = IndexSchema::default();
+    held.fields.insert(
+        "title".to_string(),
+        FieldDef::new("title".to_string(), TantivyFieldType::Text),
+    );
+    engine.schema_cache.put("books", &held);
+
+    match engine
+        .execute(ClientOp::GetConfig {
+            index: "books".to_string(),
+        })
+        .await
+    {
+        WorkerOutcome::UseActor(op) => {
+            assert!(matches!(*op, ClientOp::GetConfig { ref index } if index == "books"));
+        }
+        WorkerOutcome::Done(result) => panic!("a held schema is the actor's, got {result:?}"),
+    }
+
+    let mut dropped = held.clone();
+    dropped.state = storage::SchemaState::Dropped;
+    dropped.version = held.version + 1;
+    engine.schema_cache.put("gone", &dropped);
+    for index in ["films", "gone"] {
+        match engine
+            .execute(ClientOp::GetConfig {
+                index: index.to_string(),
+            })
+            .await
+        {
+            WorkerOutcome::Done(Err(OrchestratorError::Storage(StoreError::IndexNotFound(
+                name,
+            )))) => assert_eq!(name, index),
+            WorkerOutcome::Done(other) => panic!("{index}: expected not found, got {other:?}"),
+            WorkerOutcome::UseActor(op) => panic!("{index}: went to the actor: {op:?}"),
+        }
+    }
+}
+
 /// A worker operation whose future is boxed so the runner closures below can be named in
 /// a return type. The loop never inspects the op, only how many are running.
 type TestOp = std::pin::Pin<Box<dyn std::future::Future<Output = WorkerOutcome> + Send>>;
@@ -2033,19 +2078,21 @@ fn normalize_projection_fields_rewrites_id_to_the_shadow_name() {
 
 /// A metadata op the pool has no answer for must be handed to the actor rather than
 /// answered with an error — the same contract. `GetIdentity` and the index listing are
-/// metadata the pool *does* answer; the rest still defer.
+/// metadata the pool *does* answer, and so is a schema this node holds no copy of; the rest
+/// still defer.
 #[tokio::test]
 async fn a_metadata_op_defers_rather_than_failing() {
     let engine = bare_engine();
 
     let outcome = engine
-        .execute(ClientOp::GetConfig {
+        .execute(ClientOp::GetRawSchema {
             index: "books".to_string(),
+            minting_by: None,
         })
         .await;
 
     assert!(
-        matches!(outcome, WorkerOutcome::UseActor(op) if matches!(*op, ClientOp::GetConfig { .. })),
+        matches!(outcome, WorkerOutcome::UseActor(op) if matches!(*op, ClientOp::GetRawSchema { .. })),
         "a metadata op must be deferred to the actor, carrying its own op"
     );
 }
@@ -3844,6 +3891,9 @@ fn only_what_a_worker_can_serve_leaves_the_mailbox() {
             fields: None,
             sort: None,
         },
+        // Asks the peers when the schema is not held here; see
+        // `a_config_this_node_does_not_hold_is_asked_of_its_peers`.
+        ClientOp::GetConfig { index: index() },
     ] {
         assert!(worker_eligible(&op), "a worker must serve {op:?}");
     }
@@ -3852,7 +3902,6 @@ fn only_what_a_worker_can_serve_leaves_the_mailbox() {
             index: index(),
             delete_schema: false,
         },
-        ClientOp::GetConfig { index: index() },
         ClientOp::GetRawSchema {
             index: index(),
             minting_by: None,
