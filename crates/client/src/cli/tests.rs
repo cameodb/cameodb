@@ -1032,7 +1032,9 @@ mod detect_tests {
                     .map(str::to_string)
             }));
             match id {
-                Some(id) => ingest.ledger.admit(&id, Location::Line(line)),
+                Some(id) => {
+                    ingest.ledger.admit(&id, Location::Line(line));
+                }
                 None => ingest.ledger.skip(Location::Line(line)),
             }
         };
@@ -1204,5 +1206,27 @@ mod detect_tests {
         let whole = scan_csv(&data, b',', &ScanLimits::default(), None).expect("scan");
         assert!(whole.summary.whole);
         assert_eq!(whole.summary.rows, Some(40_000));
+    }
+}
+
+#[cfg(test)]
+mod parallel_tests {
+    use super::super::ingest::{MAX_PARALLEL, check_parallel, parse_parallel_arg};
+
+    #[test]
+    fn parallel_is_one_unless_given_and_bounded_by_half_a_nodes_requests() {
+        let (parallel, rest) = parse_parallel_arg(&["wifi", "kpi.csv"]).unwrap();
+        assert_eq!((parallel, rest), (1, vec!["wifi", "kpi.csv"]));
+
+        let (parallel, rest) = parse_parallel_arg(&["wifi", "--parallel", "4", "kpi.csv"]).unwrap();
+        assert_eq!((parallel, rest), (4, vec!["wifi", "kpi.csv"]));
+
+        assert_eq!(check_parallel(MAX_PARALLEL).unwrap(), 16);
+        for refused in [0, MAX_PARALLEL + 1] {
+            let err = check_parallel(refused).unwrap_err().to_string();
+            assert!(err.contains("1 to 16"), "{err}");
+        }
+        assert!(parse_parallel_arg(&["--parallel", "many"]).is_err());
+        assert!(parse_parallel_arg(&["--parallel"]).is_err());
     }
 }

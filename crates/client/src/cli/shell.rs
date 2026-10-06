@@ -517,7 +517,7 @@ impl IndexCompleter {
         match preceding_token(tokens) {
             Some("--delimiter") => return self.delimiter_value_suggestions(current),
             // A document count: nothing to complete.
-            Some("--batch-size") | Some("--id") => return Vec::new(),
+            Some("--batch-size") | Some("--parallel") | Some("--id") => return Vec::new(),
             _ => {}
         }
 
@@ -537,6 +537,12 @@ impl IndexCompleter {
             suggestions.push(Pair {
                 display: "--batch-size <n>".to_string(),
                 replacement: "--batch-size ".to_string(),
+            });
+        }
+        if !tokens.contains(&"--parallel") && "--parallel".starts_with(current) {
+            suggestions.push(Pair {
+                display: "--parallel <1-16>".to_string(),
+                replacement: "--parallel ".to_string(),
             });
         }
         suggestions.extend(id_flag_suggestion(current, tokens));
@@ -1169,7 +1175,7 @@ mod usage {
         "schema detect <file> [--delimiter <delim>] [--id <col[,col...]>] [--report]";
     pub(super) const SCHEMA_LOAD: &str =
         "schema load <index> <file> [--delimiter <delim>] [--id <col[,col...]>]";
-    pub(super) const DATA_LOAD: &str = "data load <index> <file> [--delimiter <delim>] [--batch-size <n>] [--id <col[,col...]>] [--recreate]";
+    pub(super) const DATA_LOAD: &str = "data load <index> <file> [--delimiter <delim>] [--batch-size <n>] [--parallel <n>] [--id <col[,col...]>] [--recreate]";
     pub(super) const DELETE_INDEX: &str = "delete <index> [--delete-schema]";
     pub(super) const DELETE_DOCS: &str =
         "delete <index> (--id <ID[,ID...]> | --ids-file <path>) [--routing-key <KEY>]";
@@ -1466,6 +1472,7 @@ pub(crate) async fn dispatch_interactive_command(
                 "load" => {
                     let remaining: Vec<&str> = parts.collect();
                     let (recreate, remaining) = take_flag(&remaining, "--recreate");
+                    let (parallel, remaining) = parse_parallel_arg(&remaining)?;
                     let (id, remaining) = parse_id_arg(&remaining)?;
                     let (delimiter, positional_after_delim) = parse_delimiter_arg(&remaining)?;
                     let (batch_size, positional) =
@@ -1485,7 +1492,10 @@ pub(crate) async fn dispatch_interactive_command(
                         index,
                         file,
                         delimiter,
-                        batch_size,
+                        LoadPace {
+                            batch_size,
+                            parallel,
+                        },
                         id.as_ref(),
                         recreate,
                     )

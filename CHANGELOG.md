@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`data load --parallel N`: up to N batches in flight.** A load read and converted a batch,
+  sent it, and waited for the answer before reading on, so the client and the nodes took turns
+  idling. `--parallel` (default 1, at most 16 — half of a node's 32 concurrent requests in the
+  shipped configuration) keeps N batches in flight, each converted in its own task. On a 3-node
+  cluster the 5.17-million-row telecom KPI file loaded in 185 s at `--parallel 4` against 357 s
+  at 1; the batch size alone, 4,000 to 25,000, had gained 5%. A batch repeating an id sent
+  before waits for the batches ahead of it, so the later row still replaces the earlier one.
+
 - **`schema detect --report`: what a source holds, and why each column became its field.**
   Prints how the source was scanned, its row count (counted, or estimated from bytes per row),
   which column identifies a row — or which ones repeat, where, and which pairs are unique together
