@@ -68,9 +68,9 @@ cameodb client data load myindex https://external.com/data.csv --insecure-source
 | `list indexes` | List all indexes with stats + cached field names |
 | `list index <name>` | Show detailed stats and schema for one index |
 | `search <index> <query>` | Run hybrid search. The query may end in a run of `return`/`limit`/`sort` clauses; the subcommand also takes `--limit N` |
-| `schema detect <file> [--delimiter ...]` | Detect schema from CSV/TSV/JSON/JSONL/NDJSON (auto or forced delimiter, supports compression & HTTP(S)) |
-| `schema load <index> <file> [--delimiter ...]` | Detect schema from CSV/TSV/JSON/JSONL/NDJSON and apply to an index (supports compression & HTTP(S)) |
-| `data load <index> <file> [--delimiter ...] [--batch-size N]` | Ingest CSV/TSV/JSON/JSONL/NDJSON data in batches (supports compression & HTTP(S)) |
+| `schema detect <file> [--delimiter ...] [--id COL[,COL...]] [--report]` | Detect schema from CSV/TSV/JSON/JSONL/NDJSON (auto or forced delimiter, supports compression & HTTP(S)); `--report` explains each column and the keys found |
+| `schema load <index> <file> [--delimiter ...] [--id COL[,COL...]]` | Detect schema from CSV/TSV/JSON/JSONL/NDJSON, or read a schema file, and apply it to an index (supports compression & HTTP(S)) |
+| `data load <index> <file> [--delimiter ...] [--batch-size N] [--parallel N] [--id COL[,COL...]] [--recreate]` | Ingest CSV/TSV/JSON/JSONL/NDJSON data in batches, up to N at once (supports compression & HTTP(S)) |
 | `delete <index> --id <ID[,ID…]> [--routing-key K]` | Delete documents by id (comma-separated, or `--ids-file <PATH>` for one id per line) |
 | `delete <index> [--delete-schema]` | Delete an index; prompts `Delete index "<name>"? [yes/NO]:` and only proceeds on `yes` |
 | `admin memory stats` / `admin memory purge [--force]` | Read memory statistics / trigger a jemalloc purge |
@@ -83,22 +83,37 @@ cameodb client data load myindex https://external.com/data.csv --insecure-source
 
 ### Data & Schema helpers
 
-- `schema detect <file> [--delimiter detect|comma|tab|semicolon]` – auto-detect schema from CSV, TSV, JSON, JSONL, or NDJSON. Supports local files and HTTP(S) URLs. Automatically decompresses Gzip (.gz/.gzip) and Zip archives.
-- `schema load <index> <file> [--delimiter ...]` – detect schema from CSV, TSV, JSON, JSONL, or NDJSON and apply it to an index. Supports local files and HTTP(S) URLs. Automatically decompresses Gzip (.gz/.gzip) and Zip archives.
-- `data load <index> <file> [--delimiter ...] [--batch-size N]` – ingest CSV, TSV, JSON, JSONL, or NDJSON data in batches. Supports local files and HTTP(S) URLs. Automatically decompresses Gzip (.gz/.gzip) and Zip archives. Default batch size is 4000 documents.
+- `schema detect <file> [--delimiter detect|comma|tab|semicolon] [--id COL[,COL...]] [--report]` – auto-detect schema from CSV, TSV, JSON, JSONL, or NDJSON. Supports local files and HTTP(S) URLs. Automatically decompresses Gzip (.gz/.gzip) and Zip archives. `--report` prints what was scanned, the keys found unique, and why each column got its type, instead of the schema.
+- `schema load <index> <file> [--delimiter ...] [--id ...]` – detect schema from CSV, TSV, JSON, JSONL, or NDJSON, or read a schema file, and apply it to an index. Supports local files and HTTP(S) URLs. Automatically decompresses Gzip (.gz/.gzip) and Zip archives.
+- `data load <index> <file> [--delimiter ...] [--batch-size N] [--parallel N] [--id ...] [--recreate]` – ingest CSV, TSV, JSON, JSONL, or NDJSON data in batches. Supports local files and HTTP(S) URLs. Automatically decompresses Gzip (.gz/.gzip) and Zip archives. Default batch size is 4000 documents.
+  - `--parallel N` (1 to 16, default 1) keeps up to N batches in flight; 4 halved the load of a 5.2 GB file on a 3-node cluster. A batch repeating an id sent before waits for the batches ahead of it, so the later row still replaces the earlier one.
+  - `--id COL[,COL...]` names the column, or the columns joined with `|` in order, whose values make each document's id; the index records it and later loads use it without the flag. Rows repeating an id replace the earlier document.
+  - `--recreate` deletes the index's documents first, keeping its schema — what a change of id, or of a field's type or tokenizer, needs on an index that holds documents.
+
+### How a source is scanned
+
+Before anything is sent, the loader scans the source to type its columns. A local file up to 1 GB
+is read whole; a larger one from the head, until the column types stop changing, then in blocks
+spread over the rest — within a 10-second budget. A compressed or remote source is read from the
+head only. Every value is classified strictly, so a column holding one non-number among its
+numbers is text, a code with leading zeros stays text, a list written into a cell (`['a', 'b']`)
+becomes several values of one field, and a column with few distinct values repeated often becomes
+a `string` category; other identifier-like columns become `text` with the `raw` tokenizer.
+`schema detect --report` shows all of it.
 
 ### How CSV/TSV cells are read
 
 A delimited file has no types, so each cell is read by the type of the field it lands in — the
-index's schema when it has one, or the schema detected from the first 200 rows when it does not.
-Nothing is sent until those rows have settled how every column is read.
+index's schema when it has one, or the schema the scan detects when it does not. Nothing is sent
+until the scan has settled how every column is read.
 
 | Field type | Cell handling |
 |---|---|
 | `text`, `string` | Sent as written (trimmed): `007` stays `007`, `NA` stays `NA` |
 | `i64`, `u64`, `f64`, `date`, `boolean`, `ip` | `NA`, `N/A`, `#N/A`, `NaN`, `null`, `None`, `nil` and `-` (any case) mean *no value*: the row loads without that field |
 | `date` | Sent as text whenever the text is a date, so `20240315` and `2024` are dates, not seconds since 1970; a number the node does not read as a date string (seconds before 2000, or negative) is sent as epoch seconds. The accepted shapes are listed in the [date handling reference](../server/README.md#71-write-path-date-normalization) |
-| `boolean` | `true`/`false`, `yes`/`no`, `y`/`n`, `1`/`0`, in any case |
+| `boolean` | `true`/`false`, `yes`/`no`, `y`/`n`, `1`/`0`, in any case; a blank cell is *no value*, never `false` |
+| a list column (`text[]`) | `['a', 'b']` or `["a", "b"]` sent as an array: each element is a value of the field, matched on its own |
 | a column no field describes | Read by its look: numbers, booleans, else text |
 
 **Date order.** The node reads a slash date month first (`03/04/2024` is March 4th) and a dotted

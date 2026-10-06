@@ -659,7 +659,9 @@ documents again in the same step: documents reaching it after the first count st
 conflicting change is then undone on the shards it reached and refused with `409` as above. Fields
 are compared as they build: `string` is a `text` field with
 tokenizer `raw` and `index_record_option` `Basic`, so changing one to the other changes no column
-and is accepted on an index holding documents. **On a cluster, a schema is decided once and stored on every node.** The node receiving the
+and is accepted on an index holding documents.
+
+**On a cluster, a schema is decided once and stored on every node.** The node receiving the
 `PUT` asks every node first what the change would ask of it — the version it holds, its documents
 of the index, the built columns the change touches — and decides from all of them: the new
 `version` is one past the highest any node holds, the index keeps the owner it was created with,
@@ -682,10 +684,17 @@ id — `["Hr", "cmMacAddress"]`. The CLI loader writes it and keys every later l
 {
   "acknowledged": true,
   "index": "books",
-  "shard_count": 256,
-  "field_names": ["id", "author", "title", "publication_year"]
+  "version": 1,
+  "nodes": 3,
+  "field_names": ["id", "author", "publication_year", "title"]
 }
 ```
+
+`version` is the schema's new version and `nodes` how many nodes stored it — `1` on a standalone
+node. A change refused while the index holds documents answers `409` naming each change and the
+documents in the way; one that could not reach every node answers `503` and says whether anything
+was stored. `shard_count` in a body is accepted and ignored: a node's shard count is its own
+configuration.
 
 #### Get Index Schema
 Retrieve the current schema for an index.

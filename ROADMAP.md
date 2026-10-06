@@ -706,6 +706,15 @@ cheap mitigation that already exists — declare the fields up front with
 `PUT /api/{index}/_config`, or let the first write carry them — belongs in
 [A2](#a2--the-documentation-pass)'s index-design guidance.
 
+**A second use, added 2026-10-06: a schema change on an index that holds documents.** `PUT
+/_config` now compares the built columns (`rebuild_changes`) and decides once for the whole
+cluster. A change the built index would act against — a retype such as `i64` to `f64`, another
+tokenizer, another `id_fields` — rebuilds an empty index on every node, but on a populated one it
+is refused with `409`, and the way through is to delete the documents and load the source again.
+Reindex would apply it in place: rebuild each shard from the documents redb holds under the new
+schema, reporting the documents whose values the new types cannot hold, driven through the same
+two-phase `PrepareSchema`/`ApplySchema` round so every node rebuilds together.
+
 Until it exists, "the index knows about this field" and "you can search on it" stay permanently
 different states for anything discovered after creation. The engine already reports the gap
 honestly (`pending_reindex`, discarded-clause refusals), so this stage turns an explained gap
