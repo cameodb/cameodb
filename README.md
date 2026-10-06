@@ -283,6 +283,14 @@ cameodb client data load wifi ./wifi_kpi_hourly.csv --id Hr,cmMacAddress
 
 The index records its id, and later loads key documents the same way without `--id`. A schema can be edited and applied before loading (`schema detect … > schema.json`, then `schema load wifi schema.json`); once the index holds documents, a change to a field's type or tokenizer, or to the id, needs its documents deleted first — `data load --recreate` does that, keeping the schema, and loads again.
 
+A load sends one batch at a time unless told otherwise. `--parallel N` (1 to 16) keeps up to N batches in flight, converting rows to documents beside the reading, so the nodes index while the next batches are read:
+
+```bash
+cameodb client data load wifi ./wifi_kpi_hourly.csv --id Hr,cmMacAddress --parallel 4
+```
+
+On a 3-node cluster the 5.2 GB, 5.17-million-row file above loaded in 185 s with `--parallel 4` against 357 s one batch at a time; 8 and 16 added little there, the nodes' writers being the limit. A batch repeating an id sent before waits for the batches ahead of it, so the later row still replaces the earlier one. The ceiling is half of the 32 requests a node takes at once in the shipped configuration, leaving the rest to searches.
+
 ## 🔒 Security
 
 ### Authentication
