@@ -54,6 +54,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`PATCH /api/{index}/_schema` changes the schema on every node of a cluster.** It set the
+  `indexed` flags and default fields on the node that received it alone, so its peers kept the
+  old flags and an unqualified term searched different fields depending on the node asked. The
+  edit is now made to the schema the cluster holds and applied through the same two steps as
+  `PUT /_config`: one version for the whole request (it advanced once per field), `503` with
+  nothing changed while a node is missing, and a change landing in between is built on rather
+  than overwritten. A field marked indexed on an index with no documents is searchable at once,
+  and an edit that changes nothing writes nothing. Fields only some nodes learned from writes are
+  kept on every node. The response adds `version` and `nodes`.
 - **`PUT /api/{index}/_config` changes the schema on every node of a cluster.** It applied on the
   node that received it alone: peers kept their schema and built columns, nothing reconciled them
   later, and each node judged a retype by its own documents — a node holding none of the index

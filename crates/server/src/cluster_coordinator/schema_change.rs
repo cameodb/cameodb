@@ -11,8 +11,15 @@
 //! against is refused while the cluster holds any document of the index. Then every node stores
 //! that one schema ([`ClientOp::ApplySchema`]).
 //!
+//! `PATCH /api/{index}/_schema` takes the same round ([`patch_schema_cluster`]): its flag edits
+//! are made to the schema the cluster holds, and the result is declared like any other. Phase
+//! one then confirms the cluster still holds what the edit was made to; if another change landed
+//! first, the edit is made again on that one.
+//!
 //! Run from the HTTP task, not the coordinator's mailbox, for the reason given on
 //! [`super::delete_index_cluster`]: the coordinator hands over who to reach and this reaches them.
+
+use std::collections::BTreeMap;
 
 use serde_json::Value as JsonValue;
 use tracing::{info, warn};
@@ -21,7 +28,7 @@ use uuid::Uuid;
 use super::DeleteTargets;
 use crate::distributed::ClusterStatus;
 use crate::node::{ClientOp, NodeOrchestrator, OrchestratorError, SchemaApplied, SchemaReadiness};
-use storage::IndexSchema;
+use storage::{IndexSchema, SchemaFieldUpdate};
 
 /// How many times a change that finds its index held by another change asks again.
 const BUSY_ATTEMPTS: u32 = 5;
@@ -29,6 +36,8 @@ const BUSY_ATTEMPTS: u32 = 5;
 /// stepped back together ask again apart.
 const BUSY_BACKOFF_MS: u64 = 50;
 const BUSY_JITTER_MS: u64 = 200;
+/// How many times a flag edit is made again on a schema that changed under it.
+const MOVED_ATTEMPTS: u32 = 5;
 
 /// A node a schema change reaches: this one, or a peer.
 #[derive(Clone)]
@@ -147,8 +156,30 @@ pub(crate) async fn change_schema_cluster(
     targets: DeleteTargets,
     status: Option<ClusterStatus>,
     index: String,
-    mut schema: IndexSchema,
+    schema: IndexSchema,
 ) -> Result<JsonValue, OrchestratorError> {
+    let reach = reach_whole_cluster(&targets, status.as_ref(), &index)?;
+    match run_change(&reach, &index, schema, None).await? {
+        Step::Applied(done) => Ok(serde_json::json!({
+            "acknowledged": true,
+            "index": index,
+            "version": done.version,
+            "nodes": done.nodes,
+            "field_names": done.field_names,
+        })),
+        Step::Refused(body) => Ok(body),
+        Step::Moved { .. } | Step::Unchanged { .. } => {
+            unreachable!("only an edit moves or stands")
+        }
+    }
+}
+
+/// Every node, this one first, when every configured member is connected; `503` otherwise.
+fn reach_whole_cluster(
+    targets: &DeleteTargets,
+    status: Option<&ClusterStatus>,
+    index: &str,
+) -> Result<Reach, OrchestratorError> {
     let Some(local) = targets.local_orchestrator.clone() else {
         return Err(OrchestratorError::NotReady(
             "Local orchestrator not available".to_string(),
@@ -158,7 +189,7 @@ pub(crate) async fn change_schema_cluster(
     // Every configured member, connected, or nothing is changed: a node not asked keeps the old
     // schema, and the cluster is split until someone notices. Counted against the configured
     // membership, not the peers this node happens to know, as the schema canvass does.
-    if let Some(status) = status.as_ref().filter(|status| status.cluster_enabled) {
+    if let Some(status) = status.filter(|status| status.cluster_enabled) {
         let lost: Vec<String> = targets
             .peers
             .iter()
@@ -182,12 +213,49 @@ pub(crate) async fn change_schema_cluster(
             });
         }
     }
-    let reach = Reach {
+    Ok(Reach {
         nodes: std::iter::once(Node::Local(local))
             .chain(targets.peers.iter().map(|peer| Node::Peer(peer.node_id)))
             .collect(),
         pool: targets.pool.clone(),
-    };
+    })
+}
+
+/// What one round of a schema change came to.
+enum Step {
+    /// Stored on every node.
+    Applied(Done),
+    /// Refused with nothing changed; the body says why, and the handler answers it `409`.
+    Refused(JsonValue),
+    /// The cluster holds another schema than the edit was made to: the round was released, and
+    /// the caller sends `proposal`, the edit made again to `held`.
+    Moved {
+        held: Box<IndexSchema>,
+        proposal: Box<IndexSchema>,
+    },
+    /// Every node already holds the edit's schema, at this version; nothing was written.
+    Unchanged { version: u64 },
+}
+
+/// A change every node stored.
+struct Done {
+    version: u64,
+    nodes: usize,
+    field_names: Vec<String>,
+    /// Fields marked indexed that a node holding documents has no column for yet.
+    unbuilt: Vec<String>,
+}
+
+/// One round of a schema change: phase one on every node, the decision, phase two. With `edit`,
+/// `schema` is that edit made to the schema the caller last saw, and phase one confirms it is
+/// still the edit made to the schema the cluster holds — [`Step::Moved`] when it is not.
+async fn run_change(
+    reach: &Reach,
+    index: &str,
+    mut schema: IndexSchema,
+    edit: Option<&FieldEdit>,
+) -> Result<Step, OrchestratorError> {
+    let index = index.to_string();
 
     // Phase one: what every node holds, and what the change would ask of it. Each node
     // reserves the index for this change until it is applied or released.
@@ -236,7 +304,7 @@ pub(crate) async fn change_schema_cluster(
         // on top of it, at the next version, and both callers are told the truth.
         reach.release(&index, change).await;
         if attempt >= BUSY_ATTEMPTS {
-            return Ok(refused(
+            return Ok(Step::Refused(refused(
                 &index,
                 0,
                 &[],
@@ -245,7 +313,7 @@ pub(crate) async fn change_schema_cluster(
                      was changed. Read the schema again (GET /api/{index}/_config) and send \
                      this change again if it is still wanted"
                 ),
-            ));
+            )));
         }
         let jitter = BUSY_BACKOFF_MS + (Uuid::new_v4().as_u128() % BUSY_JITTER_MS as u128) as u64;
         tokio::time::sleep(std::time::Duration::from_millis(jitter)).await;
@@ -265,6 +333,52 @@ pub(crate) async fn change_schema_cluster(
         .filter_map(|(_, ready)| ready.current.clone())
         .filter(|current| current.state != storage::SchemaState::Dropped)
         .reduce(NodeOrchestrator::preferred_schema);
+    if let Some(edit) = edit {
+        // The edit is made to the schema the cluster holds now. When that is not what it was
+        // made to, the round is given up and the caller sends the edit made again.
+        let Some(view) = held_view(&readiness) else {
+            reach.release(&index, change).await;
+            return Err(OrchestratorError::Storage(
+                storage::StoreError::IndexNotFound(index.clone()),
+            ));
+        };
+        let edited = match edit.apply(&view) {
+            Ok(edited) => edited,
+            Err(err) => {
+                reach.release(&index, change).await;
+                return Err(err);
+            }
+        };
+        let proposal = match edited {
+            Edited::Unknown(outcome) => {
+                reach.release(&index, change).await;
+                return Ok(Step::Refused(NodeOrchestrator::schema_update_response(
+                    &index, &outcome,
+                )));
+            }
+            Edited::Proposal(proposal, _) => proposal,
+        };
+        let fingerprint = proposal.calculate_fingerprint();
+        if fingerprint != schema.calculate_fingerprint() {
+            reach.release(&index, change).await;
+            return Ok(Step::Moved {
+                held: Box::new(view),
+                proposal,
+            });
+        }
+        // Every node holds it already: nothing to write, and no version to spend.
+        if readiness.iter().all(|(_, ready)| {
+            ready.current.as_ref().is_some_and(|current| {
+                current.state != storage::SchemaState::Dropped
+                    && current.calculate_fingerprint() == fingerprint
+            })
+        }) {
+            reach.release(&index, change).await;
+            return Ok(Step::Unchanged {
+                version: view.version,
+            });
+        }
+    }
     // The owner is recorded once, by whoever created the index. A re-declaration keeps it, so
     // updating with an admin key (which carries no tenant) cannot unstamp an index and hand its
     // owner their quota back.
@@ -296,7 +410,7 @@ pub(crate) async fn change_schema_cluster(
             .map(|(node, ready)| format!("{} {}", node.name(), ready.documents))
             .collect();
         reach.release(&index, change).await;
-        return Ok(refused(
+        return Ok(Step::Refused(refused(
             &index,
             documents,
             &conflicts,
@@ -307,7 +421,7 @@ pub(crate) async fn change_schema_cluster(
                 holders.join(", "),
                 conflicts.join("; ")
             ),
-        ));
+        )));
     }
 
     // Phase two: every node stores the one schema. This node first, so a refusal of its own —
@@ -404,7 +518,7 @@ pub(crate) async fn change_schema_cluster(
                 }
             }
         }
-        return Ok(refused(
+        return Ok(Step::Refused(refused(
             &index,
             arrived,
             &late_conflicts,
@@ -415,14 +529,14 @@ pub(crate) async fn change_schema_cluster(
                  apply this schema, then load again",
                 late_conflicts.join("; ")
             ),
-        ));
+        )));
     }
 
     // Another change to the same index was applied at the same time, and the cluster prefers
     // it. Every node ends on that one — the rule is the same everywhere, whichever change
     // reached a node first — so this one is reported as not taken, rather than half taken.
     if !superseded.is_empty() {
-        return Ok(refused(
+        return Ok(Step::Refused(refused(
             &index,
             0,
             &[],
@@ -432,7 +546,7 @@ pub(crate) async fn change_schema_cluster(
                  send the change again if it is still wanted",
                 superseded.join(", ")
             ),
-        ));
+        )));
     }
 
     if !unconfirmed.is_empty() {
@@ -449,11 +563,170 @@ pub(crate) async fn change_schema_cluster(
         });
     }
 
-    Ok(serde_json::json!({
-        "acknowledged": true,
-        "index": index,
-        "version": schema.version,
-        "nodes": applied.len(),
-        "field_names": field_names,
+    let mut unbuilt: Vec<String> = readiness
+        .iter()
+        .filter(|(_, ready)| ready.documents > 0)
+        .flat_map(|(_, ready)| ready.unbuilt.iter().cloned())
+        .collect();
+    unbuilt.sort();
+    unbuilt.dedup();
+    Ok(Step::Applied(Done {
+        version: schema.version,
+        nodes: applied.len(),
+        field_names,
+        unbuilt,
     }))
+}
+
+/// The schema the cluster holds, as an edit is made to it: the one it prefers, with every field
+/// some node learned from a write and the preferred one lacks. Made to the preferred schema
+/// alone, an edit stored on every node would drop such a field from the nodes that hold it.
+fn held_view(readiness: &[(Node, SchemaReadiness)]) -> Option<IndexSchema> {
+    let held: Vec<&IndexSchema> = readiness
+        .iter()
+        .filter_map(|(_, ready)| ready.current.as_ref())
+        .filter(|current| current.state != storage::SchemaState::Dropped)
+        .collect();
+    let mut view = held
+        .iter()
+        .map(|current| (*current).clone())
+        .reduce(NodeOrchestrator::preferred_schema)?;
+    for current in held {
+        for (name, field) in &current.fields {
+            view.fields
+                .entry(name.clone())
+                .or_insert_with(|| field.clone());
+        }
+    }
+    Some(view)
+}
+
+/// A `PATCH /_schema`: `indexed` flags, and the fields an unqualified term searches.
+#[derive(Debug, Clone)]
+pub(crate) struct FieldEdit {
+    pub(crate) field_updates: BTreeMap<String, bool>,
+    /// `Some(vec![])` clears the declaration; `None` leaves it as it is.
+    pub(crate) default_fields: Option<Vec<String>>,
+}
+
+/// An edit made to a schema.
+enum Edited {
+    /// The schema the edit leaves, and which flags it changed.
+    Proposal(Box<IndexSchema>, SchemaFieldUpdate),
+    /// It names fields the schema does not have; nothing is changed.
+    Unknown(SchemaFieldUpdate),
+}
+
+impl FieldEdit {
+    /// This edit made to `held`. A default-field list the result would get wrong — a name it
+    /// lacks, or a field the same edit stops indexing — is refused `400`.
+    fn apply(&self, held: &IndexSchema) -> Result<Edited, OrchestratorError> {
+        let mut next = held.clone();
+        let mut outcome = SchemaFieldUpdate::default();
+        for (name, indexed) in &self.field_updates {
+            match next.fields.get_mut(name) {
+                None => outcome.unknown.push(name.clone()),
+                Some(field) if field.indexed == *indexed => outcome.unchanged.push(name.clone()),
+                Some(field) => {
+                    field.indexed = *indexed;
+                    outcome.applied.push(name.clone());
+                }
+            }
+        }
+        if !outcome.unknown.is_empty() {
+            return Ok(Edited::Unknown(outcome));
+        }
+        if let Some(list) = &self.default_fields {
+            next.default_fields = (!list.is_empty()).then(|| list.clone());
+        }
+        if self.default_fields.is_some() || self.field_updates.values().any(|indexed| !indexed) {
+            next.validate_default_fields().map_err(|reason| {
+                OrchestratorError::Validation(if self.default_fields.is_some() {
+                    reason
+                } else {
+                    format!(
+                        "{reason}; it is listed in default_fields, so remove it from the list \
+                         first, or in the same request"
+                    )
+                })
+            })?;
+        }
+        Ok(Edited::Proposal(Box::new(next), outcome))
+    }
+}
+
+/// Apply `edit` to `index` on every node of the cluster. See the module documentation.
+///
+/// `base` is the schema the cluster held when the request arrived, which the first round edits.
+/// Answers as `PATCH /_schema` always has — `updated_fields`, `unchanged_fields`, and
+/// `pending_reindex_fields` with a note for a field marked indexed that a node holding documents
+/// has no column for — plus the `version` and the `nodes` that stored it.
+pub(crate) async fn patch_schema_cluster(
+    targets: DeleteTargets,
+    status: Option<ClusterStatus>,
+    index: String,
+    base: IndexSchema,
+    edit: FieldEdit,
+) -> Result<JsonValue, OrchestratorError> {
+    let reach = reach_whole_cluster(&targets, status.as_ref(), &index)?;
+    let mut proposal = match edit.apply(&base)? {
+        Edited::Proposal(proposal, _) => proposal,
+        Edited::Unknown(outcome) => {
+            return Ok(NodeOrchestrator::schema_update_response(&index, &outcome));
+        }
+    };
+    let mut held = base;
+    for _ in 0..MOVED_ATTEMPTS {
+        // What the edit changes, against the schema it was last made to.
+        let Edited::Proposal(_, mut outcome) = edit.apply(&held)? else {
+            unreachable!("made to this schema already");
+        };
+        let (version, nodes) =
+            match run_change(&reach, &index, (*proposal).clone(), Some(&edit)).await? {
+                Step::Applied(done) => {
+                    outcome.pending_reindex = done
+                        .unbuilt
+                        .into_iter()
+                        .filter(|name| outcome.applied.contains(name))
+                        .collect();
+                    (done.version, done.nodes)
+                }
+                Step::Unchanged { version } => {
+                    // Already held everywhere: whatever this request asked is already so.
+                    outcome.unchanged.append(&mut outcome.applied);
+                    outcome.unchanged.sort();
+                    (version, reach.nodes.len())
+                }
+                Step::Refused(body) => return Ok(body),
+                Step::Moved {
+                    held: now,
+                    proposal: next,
+                } => {
+                    held = *now;
+                    proposal = next;
+                    continue;
+                }
+            };
+        let mut response = NodeOrchestrator::schema_update_response(&index, &outcome);
+        if let Some(list) = &edit.default_fields {
+            response["default_fields"] = if list.is_empty() {
+                JsonValue::Null
+            } else {
+                serde_json::json!(list)
+            };
+        }
+        response["version"] = serde_json::json!(version);
+        response["nodes"] = serde_json::json!(nodes);
+        return Ok(response);
+    }
+    Ok(refused(
+        &index,
+        0,
+        &[],
+        format!(
+            "index '{index}' kept changing while this edit was being applied; nothing was \
+             changed. Read the schema again (GET /api/{index}/_config) and send the edit again \
+             if it is still wanted"
+        ),
+    ))
 }

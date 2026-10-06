@@ -60,7 +60,7 @@
 //! - [`shard`] — [`MicroshardActor`] and the writer-thread boundary.
 
 use rayon::prelude::*;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -1237,19 +1237,6 @@ pub enum ClientOp {
     /// End `change`'s reservation of `index` on this node without applying anything: sent by
     /// the coordinating node when it refuses the change after phase one.
     ReleaseSchemaChange { index: String, change: Uuid },
-    /// Set the `indexed` flag on named fields of an existing schema.
-    ///
-    /// Distinct from `CreateConfig` because it must *not* re-create the Tantivy index: the
-    /// index is already open, and replaying a create against it fails on the writer lockfile.
-    /// It edits the stored schema in place, so no property is erased by the edit.
-    UpdateSchema {
-        index: String,
-        field_updates: BTreeMap<String, bool>,
-        /// `Some(list)` declares the fields an unqualified term searches; `Some([])` clears the
-        /// declaration; `None` leaves it alone. Defaulted so an older peer's op still decodes.
-        #[serde(default)]
-        default_fields: Option<Vec<String>>,
-    },
     /// Get index configuration/schema
     GetConfig { index: String },
     /// This node's stored schema for an index, serialised whole, or `null` if it holds none.
@@ -1333,6 +1320,11 @@ pub struct SchemaReadiness {
     pub conflicts: Vec<String>,
     /// Changes that only declare a column this node's built index lacks.
     pub pending: Vec<String>,
+    /// Fields the change marks indexed that this node's built index has no column for: they
+    /// become searchable only when the index is rebuilt, which happens here now only if this node
+    /// holds none of its documents.
+    #[serde(default)]
+    pub unbuilt: Vec<String>,
     /// Why this node would refuse the index as a new one for the calling tenant, if it would.
     pub quota_exceeded: Option<String>,
     /// Another change to this index was prepared here and has not been applied or released.

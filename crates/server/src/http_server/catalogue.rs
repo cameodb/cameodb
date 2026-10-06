@@ -235,23 +235,55 @@ pub(super) async fn update_schema_handler(
         ));
     }
 
-    let result = state
+    // Made to the schema the cluster holds and applied on every node, as `PUT /_config` is —
+    // see `patch_schema_cluster`. The first edit is made to the schema found here; the change
+    // confirms the cluster still holds it before anything is written.
+    let found = state
         .router
         .route_and_handle(
-            ClientOp::UpdateSchema {
+            ClientOp::FindSchemaInCluster {
                 index: index.clone(),
-                field_updates: payload.field_updates.into_iter().collect(),
-                default_fields: payload.default_fields,
             },
             None,
-            OperationType::Write,
+            OperationType::Read,
         )
         .await
         .map_err(AppError::from_route)?;
+    if found.is_null() {
+        return Err(AppError::not_found(format!(
+            "index '{}' does not exist",
+            index
+        )));
+    }
+    let base: IndexSchema = serde_json::from_value(found)
+        .map_err(|e| AppError::from(anyhow::anyhow!("Failed to read the schema found: {e}")))?;
+    let targets = state
+        .coordinator
+        .ask(crate::cluster_coordinator::GetDeleteTargets)
+        .await
+        .map_err(|e| AppError::from(anyhow::anyhow!("Failed to reach the cluster: {}", e)))?;
+    let status = state
+        .coordinator
+        .ask(crate::cluster_coordinator::GetStatus)
+        .await
+        .ok();
+    let edit = crate::cluster_coordinator::FieldEdit {
+        field_updates: payload.field_updates.into_iter().collect(),
+        default_fields: payload.default_fields,
+    };
+    let result = crate::cluster_coordinator::patch_schema_cluster(
+        targets,
+        status,
+        index.clone(),
+        base,
+        edit,
+    )
+    .await
+    .map_err(AppError::from_route)?;
 
-    // The engine reports a refusal rather than raising it, because which HTTP status it deserves
-    // is this layer's question. Nothing was written in that case, and only an unknown field
-    // gets here — a flag that cannot take effect yet is applied and noted, not refused.
+    // A refusal is reported rather than raised, because which HTTP status it deserves is this
+    // layer's question. Nothing was written in that case: an unknown field, or another change
+    // holding the index — a flag that cannot take effect yet is applied and noted, not refused.
     if result.get("acknowledged").and_then(|v| v.as_bool()) == Some(false) {
         let reason = result
             .get("reason")

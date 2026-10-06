@@ -5182,14 +5182,6 @@ impl NodeOrchestrator {
                 self.release_schema_change(&index, change);
                 Ok(JsonValue::Null)
             }
-            ClientOp::UpdateSchema {
-                index,
-                field_updates,
-                default_fields,
-            } => {
-                self.orch_update_schema(&index, &field_updates, default_fields.as_deref())
-                    .await
-            }
             ClientOp::GetConfig { index } => self.orch_get_config(&index).await,
             ClientOp::GetRawSchema { index, minting_by } => {
                 self.raw_schema_for_peer(index, minting_by).await
@@ -5886,6 +5878,10 @@ impl NodeOrchestrator {
             }
             _ => None,
         };
+        let unbuilt = match held {
+            Some(held) => self.unbuilt_promotions(index, held, &schema).await?,
+            None => Vec::new(),
+        };
         let (conflicts, pending): (Vec<_>, Vec<_>) =
             changes.into_iter().partition(|change| change.conflicts);
         let readiness = SchemaReadiness {
@@ -5893,10 +5889,42 @@ impl NodeOrchestrator {
             documents,
             conflicts: conflicts.into_iter().map(|c| c.what).collect(),
             pending: pending.into_iter().map(|c| c.what).collect(),
+            unbuilt,
             quota_exceeded,
             busy,
         };
         serde_json::to_value(readiness).map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))
+    }
+
+    /// The fields `next` marks indexed that `held` does not, and that some shard's built index
+    /// has no column for — asked of the shards, since only the built index knows. A field whose
+    /// column was built and later switched off is searchable again as soon as it is switched on.
+    async fn unbuilt_promotions(
+        &self,
+        index: &str,
+        held: &IndexSchema,
+        next: &IndexSchema,
+    ) -> Result<Vec<String>, OrchestratorError> {
+        let promoted: BTreeMap<String, bool> = next
+            .fields
+            .iter()
+            .filter(|(name, field)| {
+                field.indexed && !held.fields.get(*name).is_some_and(|was| was.indexed)
+            })
+            .map(|(name, _)| (name.clone(), true))
+            .collect();
+        if promoted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let stores: Vec<Arc<HybridStore>> = self
+            .shards
+            .values()
+            .filter_map(|shard| shard.store.as_ref().map(Arc::clone))
+            .collect();
+        Ok(self
+            .fan_out_schema_update(&stores, index, &promoted)
+            .await?
+            .pending_reindex)
     }
 
     /// Phase two of `PUT /_config` on this node: see [`ClientOp::ApplySchema`].
@@ -6114,141 +6142,12 @@ impl NodeOrchestrator {
         }
     }
 
-    /// Set `indexed` flags on an existing schema, across every shard that holds it.
-    ///
-    /// Two properties this owes the caller, neither of which `CreateConfig` could provide.
-    ///
-    /// It does not re-create the Tantivy index, so it works on an index that is open — which
-    /// is every index that has ever been written to, and the reason the previous
-    /// implementation answered `500` for all of them.
-    ///
-    /// And it is all-or-nothing across shards: every shard is asked whether it would accept
-    /// the edit before any shard writes. A shard can legitimately disagree — one that has not
-    /// materialised the index yet accepts a promotion the others refuse — so a single shard's
-    /// refusal has to refuse the whole request, or the schema diverges between shards.
-    ///
-    /// The gap between asking and writing is not locked, so a schema change racing this one can
-    /// still leave a shard refusing during the apply pass. Each shard re-validates before it
-    /// writes, so the outcome of that race is a reported refusal and an edit applied to some
-    /// shards — never a shard that wrote something it had already judged impossible. Schema
-    /// edits are rare administrative operations against a rare competing writer, which is why
-    /// this is a documented bound rather than a lock.
-    pub(super) async fn orch_update_schema(
-        &self,
-        index: &str,
-        field_updates: &BTreeMap<String, bool>,
-        default_fields: Option<&[String]>,
-    ) -> Result<JsonValue, OrchestratorError> {
-        let stores: Vec<Arc<HybridStore>> = self
-            .shards
-            .values()
-            .filter_map(|shard| shard.store.as_ref().map(Arc::clone))
-            .collect();
-
-        if stores.is_empty() {
-            return Err(OrchestratorError::Missing(
-                "No local stores available to update schema".to_string(),
-            ));
-        }
-
-        // Judge the schema this request would leave, before any shard writes. Two things can
-        // make a declared list wrong: the list itself, and a flag in the same request turning off
-        // a field it names — the edit that would leave an unqualified term pointed at a field
-        // that no longer matches anything. Both are refused whole.
-        if default_fields.is_some() || field_updates.values().any(|indexed| !indexed) {
-            let Some(current) = self.durable_schema(index).await? else {
-                return Err(OrchestratorError::Storage(
-                    storage::StoreError::IndexNotFound(index.to_string()),
-                ));
-            };
-            let mut proposed = (*current).clone();
-            for (name, indexed) in field_updates {
-                if let Some(field) = proposed.fields.get_mut(name) {
-                    field.indexed = *indexed;
-                }
-            }
-            if let Some(list) = default_fields {
-                proposed.default_fields = (!list.is_empty()).then(|| list.to_vec());
-            }
-            proposed.validate_default_fields().map_err(|reason| {
-                OrchestratorError::Validation(if default_fields.is_some() {
-                    reason
-                } else {
-                    format!(
-                        "{reason}; it is listed in default_fields, so remove it from the list \
-                         first, or in the same request"
-                    )
-                })
-            })?;
-        }
-
-        let applied = if field_updates.is_empty() {
-            SchemaFieldUpdate::default()
-        } else {
-            let plan = self
-                .fan_out_schema_update(&stores, index, field_updates, true)
-                .await?;
-
-            if plan.is_rejected() {
-                return Ok(Self::schema_update_response(index, &plan));
-            }
-
-            self.fan_out_schema_update(&stores, index, field_updates, false)
-                .await?
-        };
-
-        if let Some(list) = default_fields {
-            let declared = (!list.is_empty()).then(|| list.to_vec());
-            let handles: Vec<_> = stores
-                .iter()
-                .map(|store| {
-                    let store = Arc::clone(store);
-                    let idx = index.to_string();
-                    let declared = declared.clone();
-                    tokio::task::spawn_blocking(move || store.set_default_fields(&idx, declared))
-                })
-                .collect();
-            for handle in handles {
-                handle
-                    .await
-                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-                    .map_err(OrchestratorError::Storage)?;
-            }
-        }
-
-        // Every shard now agrees on the stored schema, so refresh the orchestrator's own copy
-        // from one of them rather than reconstructing what it should be.
-        if let Some(store) = stores.first()
-            && let Ok(Some(schema)) = store.get_schema(index)
-        {
-            self.schema_cache.put(index, &schema);
-        }
-
-        tracing::info!(
-            index = %index,
-            num_shards = stores.len(),
-            applied = ?applied.applied,
-            "Schema field flags updated across shards"
-        );
-
-        let mut response = Self::schema_update_response(index, &applied);
-        if let Some(list) = default_fields {
-            response["default_fields"] = if list.is_empty() {
-                JsonValue::Null
-            } else {
-                serde_json::json!(list)
-            };
-        }
-        Ok(response)
-    }
-
-    /// Run the plan or apply half of a schema update on every shard and merge the verdicts.
+    /// What setting `field_updates` would do on every shard, merged; nothing is written.
     pub(super) async fn fan_out_schema_update(
         &self,
         stores: &[Arc<HybridStore>],
         index: &str,
         field_updates: &BTreeMap<String, bool>,
-        plan_only: bool,
     ) -> Result<SchemaFieldUpdate, OrchestratorError> {
         let handles: Vec<_> = stores
             .iter()
@@ -6256,13 +6155,7 @@ impl NodeOrchestrator {
                 let store = Arc::clone(store);
                 let idx = index.to_string();
                 let updates = field_updates.clone();
-                tokio::task::spawn_blocking(move || {
-                    if plan_only {
-                        store.plan_field_indexing(&idx, &updates)
-                    } else {
-                        store.update_field_indexing(&idx, &updates)
-                    }
-                })
+                tokio::task::spawn_blocking(move || store.plan_field_indexing(&idx, &updates))
             })
             .collect();
 
@@ -6314,7 +6207,7 @@ impl NodeOrchestrator {
     }
 
     /// The body describing a schema update, whether it was accepted or refused.
-    pub(super) fn schema_update_response(index: &str, outcome: &SchemaFieldUpdate) -> JsonValue {
+    pub(crate) fn schema_update_response(index: &str, outcome: &SchemaFieldUpdate) -> JsonValue {
         let mut body = serde_json::json!({
             "acknowledged": !outcome.is_rejected(),
             "index": index,

@@ -11,4 +11,4 @@ mod tests;
 
 pub use coordinator::*;
 pub use messages::*;
-pub(crate) use schema_change::change_schema_cluster;
+pub(crate) use schema_change::{FieldEdit, change_schema_cluster, patch_schema_cluster};

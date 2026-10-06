@@ -258,9 +258,9 @@ fn demoting_an_indexed_field_stops_new_documents_being_indexed_into_it() {
 /// sampled from the first 200 documents and persisted everywhere before the first write lands.
 /// Semi-structured input written a document at a time is the exception: a field only some
 /// documents carry reaches only some shards. So "absent here" does not mean "absent everywhere",
-/// and only the caller spanning the shards can tell the two apart. That caller
-/// (`NodeOrchestrator::orch_update_schema`) refuses the request when every shard says unknown,
-/// and plans across all of them before any writes.
+/// and only the caller spanning the shards can tell the two apart. `PATCH /_schema` now edits the
+/// schema the cluster holds (`patch_schema_cluster`), refusing a name no node's schema has; each
+/// node plans across its shards for the fields its built index cannot search yet.
 #[test]
 fn an_unknown_field_is_reported_without_blocking_the_rest() {
     let temp = TempDir::new().unwrap();

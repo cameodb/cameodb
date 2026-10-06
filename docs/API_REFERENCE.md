@@ -673,8 +673,8 @@ steps leaves the change stored on the rest, which the `503` says; sending the sa
 finishes it. Two changes sent at once are applied one after the other: each holds the index on
 every node from its first step to its second, and one that finds another there waits a moment and
 asks again — so both are applied, the later at the next version. One still finding the index busy
-after a few tries answers `409` with nothing changed. `PATCH /_schema` still applies
-on the node that receives it.
+after a few tries answers `409` with nothing changed. `PATCH /_schema` takes the same two steps.
+
 
 **`id_fields`** records the fields whose values, joined with `|` in order, make each document's
 id — `["Hr", "cmMacAddress"]`. The CLI loader writes it and keys every later load the same way.
@@ -733,7 +733,7 @@ has one description. `fields` is ordered with `id` first, then alphabetically.
 
 | Key | Meaning |
 |-----|---------|
-| `version` | Advances on every change to this schema, starting at 1 — a `PUT /_config`, a field added by a write, a flag flipped by `PATCH /_schema`. **Monotonic, not a count of requests:** one request touching three fields may advance it three times, so compare versions for order and never for how much happened. Adopting a schema that already exists elsewhere keeps the version it came with, which is the point of an agreed version. Two nodes reporting different versions for one index have not converged yet |
+| `version` | Advances on every change to this schema, starting at 1 — a `PUT /_config`, a field added by a write, a `PATCH /_schema`. **Monotonic, not a count of requests:** a `PUT` or `PATCH` advances it once however many fields it touches, but writes adding fields each advance it, so compare versions for order and never for how much happened. Adopting a schema that already exists elsewhere keeps the version it came with, which is the point of an agreed version. Two nodes reporting different versions for one index have not converged yet |
 | `default_fields` | Present only when declared: the fields an unqualified term searches, in priority order. Under the name `PUT /_config` accepts, so reading a schema and writing it back keeps the declaration |
 | `id_fields` | Present only when recorded: the fields whose values, joined in this order with a vertical bar, make each document's id |
 | `held_here` | Present, and `false`, when this node holds no copy of the schema and answered with the one its peers hold. A node takes an index's schema once one of its documents reaches it, so on a cluster a new index is held by some nodes before others. Its fields are then reported as declared: `searchable` when indexed, `sortable` when fast. Not found (`404`) only when every peer answered and none holds one; a peer that could not be asked is `503` |
@@ -780,11 +780,20 @@ curl -s -X PATCH http://localhost:9480/api/books/_schema \
   "acknowledged": true,
   "index": "books",
   "updated_fields": ["publication_year"],
-  "unchanged_fields": []
+  "unchanged_fields": [],
+  "version": 4,
+  "nodes": 3
 }
 ```
 
-A name no shard recognises refuses the whole request with `409`, and nothing is written. A
+The edit is made to the schema the cluster holds and applied on every node, as a `PUT /_config`
+is: one `version` for the whole request, stored by `nodes` nodes. With a configured node not
+connected it is refused with `503` and nothing changes. A change landing between the two steps is
+not overwritten — the edit is made again on top of it. A field marked indexed on an index with no
+documents is searchable at once, because the index is built again with its column; an edit that
+changes nothing (every flag already as asked) writes nothing and keeps the version.
+
+A name the schema does not have refuses the whole request with `409`, and nothing is written. A
 request with neither `field_updates` nor `default_fields` is a `400`.
 
 **Choosing the default search fields.** The same endpoint declares which fields a term with no
@@ -806,8 +815,8 @@ the cap, first entries first.
 **Declaring a field that the index cannot search yet.** A field is only searchable if the
 Tantivy index has a column for it, and that is fixed when the index is built. Fields present on
 the **first** write are indexed then; a field that first appears in a **later** document is
-recorded non-indexed, so marking it `indexed` does not make it searchable immediately. The edit
-is still accepted, because the stored schema is the *declaration* the index gets rebuilt from —
+recorded non-indexed, so on an index that holds documents, marking it `indexed` does not make it
+searchable immediately. The edit is still accepted, because the stored schema is the *declaration* the index gets rebuilt from —
 so this is the first step of making the field searchable, not a mistake. Such fields come back
 under `pending_reindex_fields`:
 
