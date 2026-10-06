@@ -613,7 +613,9 @@ impl RouterActor {
                 // Local in the sense that matters here: it fans out to peers itself, from the
                 // node that received it, so routing it anywhere would only add a hop.
                 | ClientOp::FindSchemaInCluster { .. }
-                | ClientOp::CreateConfig { .. }
+                | ClientOp::PrepareSchema { .. }
+                | ClientOp::ApplySchema { .. }
+                | ClientOp::ReleaseSchemaChange { .. }
                 | ClientOp::UpdateSchema { .. }
         ) {
             return self.handle_client_op(op).await;

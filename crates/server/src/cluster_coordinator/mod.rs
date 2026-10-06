@@ -4,9 +4,11 @@
 
 mod coordinator;
 mod messages;
+mod schema_change;
 
 #[cfg(test)]
 mod tests;
 
 pub use coordinator::*;
 pub use messages::*;
+pub(crate) use schema_change::change_schema_cluster;
