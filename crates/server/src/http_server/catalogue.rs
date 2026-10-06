@@ -122,8 +122,8 @@ pub(super) async fn create_config_handler(
     // deserialized field, so a body can carry one — naming another tenant, or `null` to escape
     // a quota entirely. Overwritten here, before the op is built, so nothing downstream has to
     // wonder whether this value came from a key or from a request body. Whether it is then
-    // *used* is `orch_create_config`'s decision: it keeps the existing stamp on a
-    // re-declaration and takes this one only when the index is being created.
+    // *used* is the cluster's decision (`change_schema_cluster`): it keeps the existing stamp
+    // on a re-declaration and takes this one only when the index is new to the cluster.
     schema.tenant = crate::http_server::tenant_of(authz);
     // Checked here rather than in the engine so that an over-long description is a 400 naming
     // the offender, instead of a write that half-succeeds across shards.
@@ -132,11 +132,20 @@ pub(super) async fn create_config_handler(
         .map_err(AppError::bad_request)?;
     info!("Create config request - index: {}", index);
 
-    let client_op = ClientOp::CreateConfig { index, schema };
-
-    let result = state
-        .router
-        .route_and_handle(client_op, None, OperationType::Write)
+    // Decided once for the whole cluster and applied on every node — see
+    // `change_schema_cluster`. The coordinator says who to reach and this task reaches them,
+    // as a cluster-wide delete does.
+    let targets = state
+        .coordinator
+        .ask(crate::cluster_coordinator::GetDeleteTargets)
+        .await
+        .map_err(|e| AppError::from(anyhow::anyhow!("Failed to reach the cluster: {}", e)))?;
+    let status = state
+        .coordinator
+        .ask(crate::cluster_coordinator::GetStatus)
+        .await
+        .ok();
+    let result = crate::cluster_coordinator::change_schema_cluster(targets, status, index, schema)
         .await
         .map_err(AppError::from_route)?;
     // A change the built index cannot take while it holds documents: refused, nothing written.

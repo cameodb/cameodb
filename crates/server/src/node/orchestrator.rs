@@ -1403,6 +1403,11 @@ pub(super) fn held_schema(answer: JsonValue) -> Result<Option<IndexSchema>, Stri
 
 pub(super) const PEER_SCHEMA_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a prepared schema change holds its index on a node when neither its apply nor its
+/// release arrives — the node coordinating it stopped between the two. Long enough to cover
+/// both phases' peer round trips, short enough that a retry is not shut out for long.
+pub(super) const SCHEMA_CHANGE_RESERVATION: Duration = Duration::from_secs(60);
+
 /// The schema body to send after a receiver asked for it, or `None` if there is none to send.
 ///
 /// **An empty schema is never sent.** A receiver adopts what it is handed and then treats the
@@ -3189,6 +3194,10 @@ pub(crate) struct NodeOrchestrator {
     /// Read when this node decides whether it mints or yields (`MintAfterCanvass`), and cleared
     /// with `minting` once no write here is minting the index any more.
     pub(super) mint_rivals: HashMap<String, BTreeSet<Uuid>>,
+    /// The schema change each index is reserved for here, from its `PrepareSchema` until its
+    /// `ApplySchema` or `ReleaseSchemaChange` — or [`SCHEMA_CHANGE_RESERVATION`], should the
+    /// node coordinating it stop before either.
+    pub(super) schema_changes: HashMap<String, (Uuid, Instant)>,
     /// Map of shard UUIDs to their microshard actors.
     ///
     /// `pub(crate)` rather than `pub(super)`, and the only field of this actor that is: the
@@ -3376,7 +3385,7 @@ impl NodeOrchestrator {
     /// communication and is a pure function of the two candidates, so every node reaches the
     /// same verdict without anyone deciding it — which is what lets schemas converge with no
     /// leader and no consensus round.
-    pub(super) fn preferred_schema(a: IndexSchema, b: IndexSchema) -> IndexSchema {
+    pub(crate) fn preferred_schema(a: IndexSchema, b: IndexSchema) -> IndexSchema {
         match a.version.cmp(&b.version) {
             std::cmp::Ordering::Greater => a,
             std::cmp::Ordering::Less => b,
@@ -4167,6 +4176,7 @@ impl NodeOrchestrator {
             minting: HashMap::new(),
             peer_lane: None,
             mint_rivals: HashMap::new(),
+            schema_changes: HashMap::new(),
             shards: HashMap::new(),
             writer_liveness: Arc::new(WriterLiveness::default()),
             identity,
@@ -5141,8 +5151,36 @@ impl NodeOrchestrator {
                 docs,
                 forwarded,
             } => return self.orch_bulk_delete(&index, docs, forwarded).await.into(),
-            ClientOp::CreateConfig { index, schema } => {
-                self.orch_create_config(&index, schema).await
+            ClientOp::PrepareSchema {
+                index,
+                schema,
+                tenant,
+                change,
+            } => {
+                let now = Instant::now();
+                let busy = self
+                    .schema_changes
+                    .get(&index)
+                    .is_some_and(|(held, until)| *held != change && *until > now);
+                if !busy {
+                    self.schema_changes
+                        .insert(index.clone(), (change, now + SCHEMA_CHANGE_RESERVATION));
+                }
+                self.orch_prepare_schema(&index, schema, tenant, busy).await
+            }
+            ClientOp::ApplySchema {
+                index,
+                schema,
+                check_quota,
+                change,
+            } => {
+                let applied = self.orch_apply_schema(&index, schema, check_quota).await;
+                self.release_schema_change(&index, change);
+                applied
+            }
+            ClientOp::ReleaseSchemaChange { index, change } => {
+                self.release_schema_change(&index, change);
+                Ok(JsonValue::Null)
             }
             ClientOp::UpdateSchema {
                 index,
@@ -5749,61 +5787,23 @@ impl NodeOrchestrator {
         .await
     }
 
-    pub(super) async fn orch_create_config(
-        &self,
-        index: &str,
-        mut schema: IndexSchema,
-    ) -> Result<JsonValue, OrchestratorError> {
-        // Normalize schema from external sources (populate field names from map keys, etc.)
-        schema.normalize_after_deserialization();
-
-        // The version is assigned here and never taken from the caller. It exists to order
-        // schema changes, so a caller able to set it could name any version at all — `999` on a
-        // first PUT, and every later change made on any node loses to it for good. `version` is
-        // a deserialized field on `IndexSchema`, so a body carrying one arrives with it set;
-        // this overwrites it. A PUT over an index that already has a schema advances the version
-        // that schema holds, which is what makes a re-declaration a newer one rather than a
-        // sibling of the original.
-        //
-        // Read from durable state rather than the cache. The cache is filled lazily, so on a
-        // node that has not touched this index since it booted a re-declaration was stamped
-        // `1` — not "one past what exists" but "the first there has ever been". Version is how
-        // the cluster orders two schemas for the same index (`preferred_schema`), so a v1
-        // stamped over a v3 does not merely lose the increment: the node holding it is behind
-        // for good, and its declaration is the one discarded.
-        let current = self.durable_schema(index).await?;
-        schema.version = current
-            .as_ref()
-            .map_or(1, |current| current.version.saturating_add(1));
-
-        // Ownership follows `version`'s rule, and for the same reason: a field the caller can
-        // set is a field the caller can lie about. `tenant` arrives here already overwritten
-        // with the calling key's own — the handler does that, so a body naming someone else's
-        // tenant, or none, buys nothing.
-        //
-        // What is decided *here* is create-versus-update. A re-declaration keeps whatever the
-        // mint decided, so updating a schema with an admin key (which carries no tenant) cannot
-        // silently unstamp an index and hand its owner their quota back. The stamp is written
-        // once, by whoever created the index.
-        //
-        // A deletion record is not an index, so declaring over one is a mint: the declaring key
-        // owns what it creates, rather than whoever owned the index that was dropped.
-        let minting = current
-            .as_ref()
-            .is_none_or(|current| current.state == storage::SchemaState::Dropped);
-        if let Some(current) = current.as_ref().filter(|_| !minting) {
-            schema.tenant = current.tenant.clone();
-        }
-        // The explicit mint counts against `max_indexes` exactly as the implicit one does. Both
-        // run on this mailbox, so the count cannot race.
-        if minting
-            && let Some(tenant) = schema.tenant.as_deref()
-            && self.quotas.max_indexes(tenant).is_some()
+    /// End `change`'s reservation of `index`, if it still holds it.
+    fn release_schema_change(&mut self, index: &str, change: Uuid) {
+        if self
+            .schema_changes
+            .get(index)
+            .is_some_and(|(held, _)| *held == change)
         {
-            let owned = owned_index_count(&self.shards, tenant).await?;
-            self.quotas.check_mint(tenant, owned)?;
+            self.schema_changes.remove(index);
         }
+    }
 
+    /// A declaration as every node stores it: normalized, with an explicit `id`, and refused
+    /// with a `400` naming the field when it lists a default field it lacks or a tokenizer this
+    /// node cannot build. Each node checks with its own tokenizers, so a node on an older build
+    /// refuses in phase one rather than failing every commit after phase two.
+    fn checked_declaration(mut schema: IndexSchema) -> Result<IndexSchema, OrchestratorError> {
+        schema.normalize_after_deserialization();
         // A declared default-field list names fields of this schema, or it is refused: a typo
         // left to be filtered out at query time would search fewer fields than the caller wrote,
         // and nothing would say so. Its length is not checked against the node's cap — the cap
@@ -5818,7 +5818,6 @@ impl NodeOrchestrator {
         schema
             .validate_tokenizers()
             .map_err(OrchestratorError::Validation)?;
-
         // Ensure 'id' field is explicitly in the schema for visibility
         if !schema.fields.contains_key("id") {
             schema.fields.insert(
@@ -5826,58 +5825,167 @@ impl NodeOrchestrator {
                 FieldDef::new("id".to_string(), TantivyFieldType::Text),
             );
         }
+        Ok(schema)
+    }
+
+    /// This node's documents of an index, across its shards.
+    async fn local_document_count(&self, index: &str) -> Result<u64, OrchestratorError> {
+        let mut documents = 0u64;
+        for store in self
+            .shards
+            .values()
+            .filter_map(|shard| shard.store.as_ref())
+        {
+            let store = Arc::clone(store);
+            let idx = index.to_string();
+            documents += tokio::task::spawn_blocking(move || store.document_count(&idx))
+                .await
+                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))??;
+        }
+        Ok(documents)
+    }
+
+    /// Phase one of `PUT /_config` on this node: see [`ClientOp::PrepareSchema`]. Writes
+    /// nothing.
+    ///
+    /// A built index keeps the columns it was built with, so a change to one needs the index
+    /// built again — free while it holds no documents. The coordinating node adds up what every
+    /// node reports here and refuses a change the built index would act against while the
+    /// cluster holds any document of it: a retype, a tokenizer, another id.
+    pub(super) async fn orch_prepare_schema(
+        &self,
+        index: &str,
+        schema: IndexSchema,
+        tenant: Option<String>,
+        busy: bool,
+    ) -> Result<JsonValue, OrchestratorError> {
+        let schema = Self::checked_declaration(schema)?;
+        // Read from durable state rather than the cache, which is filled lazily: its version is
+        // what the coordinating node counts the next one from.
+        let current = self.durable_schema(index).await?;
+        let held = current
+            .as_deref()
+            .filter(|current| current.state != storage::SchemaState::Dropped);
+        let changes = held
+            .map(|current| current.rebuild_changes(&schema))
+            .unwrap_or_default();
+        let documents = if changes.is_empty() {
+            0
+        } else {
+            self.local_document_count(index).await?
+        };
+        // A new index here counts against the caller's quota. Whether the index is new to the
+        // cluster is the coordinating node's to say, so this only reports.
+        let quota_exceeded = match tenant.as_deref() {
+            Some(tenant) if held.is_none() && self.quotas.max_indexes(tenant).is_some() => {
+                let owned = owned_index_count(&self.shards, tenant).await?;
+                self.quotas
+                    .check_mint(tenant, owned)
+                    .err()
+                    .map(|e| e.to_string())
+            }
+            _ => None,
+        };
+        let (conflicts, pending): (Vec<_>, Vec<_>) =
+            changes.into_iter().partition(|change| change.conflicts);
+        let readiness = SchemaReadiness {
+            current: current.map(|current| (*current).clone()),
+            documents,
+            conflicts: conflicts.into_iter().map(|c| c.what).collect(),
+            pending: pending.into_iter().map(|c| c.what).collect(),
+            quota_exceeded,
+            busy,
+        };
+        serde_json::to_value(readiness).map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))
+    }
+
+    /// Phase two of `PUT /_config` on this node: see [`ClientOp::ApplySchema`].
+    ///
+    /// `schema` arrives with its version and owner decided by the coordinating node, and both
+    /// are kept. A schema this node holds and the cluster prefers — newer, or winning the tie at
+    /// the same version (`preferred_schema`) — is kept instead, and the answer says so.
+    ///
+    /// A change to a built column rebuilds this node's shards when they hold none of the
+    /// index's documents; otherwise the declaration is stored over the built index, which is
+    /// right only for a column declared ahead of it — phase one refused the rest. Each shard
+    /// checks again and rebuilds in one step on its writer thread, so a write landing after
+    /// phase one is counted there rather than dropped with the data; a conflicting change it
+    /// meets is undone on the shards it reached and refused.
+    pub(super) async fn orch_apply_schema(
+        &self,
+        index: &str,
+        schema: IndexSchema,
+        check_quota: bool,
+    ) -> Result<JsonValue, OrchestratorError> {
+        let schema = Self::checked_declaration(schema)?;
+        let answer = |outcome: SchemaApplied| {
+            serde_json::to_value(outcome)
+                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))
+        };
+        let current = self.durable_schema(index).await?;
+        if let Some(current) = current.as_deref() {
+            let same = current.version == schema.version
+                && current.calculate_fingerprint() == schema.calculate_fingerprint();
+            if same {
+                // A retry of a change already applied here.
+                return answer(SchemaApplied {
+                    applied: true,
+                    field_names: Self::sorted_field_names(current),
+                    ..Default::default()
+                });
+            }
+            let preferred = Self::preferred_schema(current.clone(), schema.clone());
+            if preferred.calculate_fingerprint() == current.calculate_fingerprint()
+                && preferred.version == current.version
+            {
+                return answer(SchemaApplied {
+                    superseded: true,
+                    ..Default::default()
+                });
+            }
+        }
+        let held = current
+            .as_deref()
+            .filter(|current| current.state != storage::SchemaState::Dropped);
+
+        // The explicit mint counts against `max_indexes` exactly as the implicit one does. Both
+        // run on this mailbox, so the count cannot race.
+        if check_quota
+            && held.is_none()
+            && let Some(tenant) = schema.tenant.as_deref()
+            && self.quotas.max_indexes(tenant).is_some()
+        {
+            let owned = owned_index_count(&self.shards, tenant).await?;
+            self.quotas.check_mint(tenant, owned)?;
+        }
 
         let stores: Vec<Arc<HybridStore>> = self
             .shards
             .values()
             .filter_map(|shard| shard.store.as_ref().map(Arc::clone))
             .collect();
-
         if stores.is_empty() {
             return Err(OrchestratorError::Missing(
                 "No local stores available to persist schema".to_string(),
             ));
         }
 
-        // A built index keeps the columns it was built with; storing a schema that says otherwise
-        // only made the two disagree. A change the index must be rebuilt for is applied by
-        // rebuilding it — which costs nothing while the index holds no documents. Holding some,
-        // a change the index would act against — a retype, a tokenizer, another id — is refused,
-        // naming each and the way through: delete the documents (the schema stays), apply this,
-        // load again. A column declared ahead of the index is accepted, as it always was: the
-        // listing reports it unsearchable or unsortable until a rebuild.
-        let changes = current
-            .as_ref()
-            .filter(|_| !minting)
+        let changes = held
             .map(|current| current.rebuild_changes(&schema))
             .unwrap_or_default();
         if !changes.is_empty() {
-            let mut documents = 0u64;
-            for store in &stores {
-                let store = Arc::clone(store);
-                let idx = index.to_string();
-                documents += tokio::task::spawn_blocking(move || store.document_count(&idx))
-                    .await
-                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))??;
-            }
-            let conflicts: Vec<&str> = changes
+            let conflicts: Vec<String> = changes
                 .iter()
                 .filter(|c| c.conflicts)
-                .map(|c| c.what.as_str())
+                .map(|c| c.what.clone())
                 .collect();
+            let documents = self.local_document_count(index).await?;
             if documents > 0 && !conflicts.is_empty() {
-                return Ok(serde_json::json!({
-                    "acknowledged": false,
-                    "index": index,
-                    "documents": documents,
-                    "changes": conflicts,
-                    "reason": format!(
-                        "index '{index}' holds {documents} documents, and its built index cannot \
-                         change under them: {}. Delete its documents (DELETE /api/{index} without \
-                         delete_schema keeps the schema), apply this schema, then load again",
-                        conflicts.join("; ")
-                    ),
-                }));
+                return answer(SchemaApplied {
+                    arrived: documents,
+                    conflicts,
+                    ..Default::default()
+                });
             }
             if documents == 0 {
                 tracing::info!(
@@ -5885,21 +5993,15 @@ impl NodeOrchestrator {
                     changes = ?changes,
                     "Schema changes a built column of an empty index; rebuilding it"
                 );
-                // Each shard checks again and rebuilds in one step on its writer thread, so a
-                // write landing after the count above is counted there rather than dropped
-                // with the data. Shards are not locked against one another, so documents can
-                // reach one shard while another is being rebuilt; then a conflicting change is
-                // undone on the shards it reached — empty a moment ago, so rebuilding them back
-                // is as free — and refused, as it would have been had they arrived first.
                 let found = self.rebuild_shards_if_empty(index, &schema).await?;
                 let arrived: u64 = found.iter().map(|(_, documents)| documents).sum();
                 if arrived == 0 {
                     self.schema_cache.put(index, &schema);
-                    return Ok(serde_json::json!({
-                        "acknowledged": true,
-                        "index": index,
-                        "field_names": Self::sorted_field_names(&schema)
-                    }));
+                    return answer(SchemaApplied {
+                        applied: true,
+                        field_names: Self::sorted_field_names(&schema),
+                        ..Default::default()
+                    });
                 }
                 if !conflicts.is_empty() {
                     let rebuilt: Vec<Uuid> = found
@@ -5907,23 +6009,14 @@ impl NodeOrchestrator {
                         .filter(|(_, documents)| *documents == 0)
                         .map(|(shard_id, _)| *shard_id)
                         .collect();
-                    if let Some(previous) = current.as_deref() {
+                    if let Some(previous) = held {
                         self.rebuild_shards_back(index, previous, &rebuilt).await;
                     }
-                    return Ok(serde_json::json!({
-                        "acknowledged": false,
-                        "index": index,
-                        "documents": arrived,
-                        "changes": conflicts,
-                        "reason": format!(
-                            "{arrived} documents reached index '{index}' while its schema was \
-                             changing, and its built index cannot change under them: {}. The \
-                             schema is unchanged; delete its documents (DELETE /api/{index} \
-                             without delete_schema keeps the schema), apply this schema, then \
-                             load again",
-                            conflicts.join("; ")
-                        ),
-                    }));
+                    return answer(SchemaApplied {
+                        arrived,
+                        conflicts,
+                        ..Default::default()
+                    });
                 }
                 // Only columns declared ahead of the index: the shards holding documents take
                 // the schema as a populated index does, below, and the rebuilt ones take it
@@ -5931,57 +6024,40 @@ impl NodeOrchestrator {
             }
         }
 
-        let index_name = index.to_string();
-        let schema_clone = schema.clone();
-
         // Persist schema AND pre-create Tantivy index to all stores concurrently
         // This prevents race conditions where bulk writes start before the index exists
         tracing::info!(
             index = %index,
+            version = schema.version,
             num_shards = stores.len(),
             num_fields = schema.fields.len(),
-            "Creating schema and pre-creating Tantivy indexes on all shards"
+            "Storing schema and pre-creating Tantivy indexes on all shards"
         );
-
         let handles: Vec<_> = stores
             .into_iter()
             .map(|store| {
-                let idx = index_name.clone();
-                let sch = schema_clone.clone();
+                let idx = index.to_string();
+                let sch = schema.clone();
                 tokio::task::spawn_blocking(move || {
-                    // First store the schema
                     store.store_schema_and_cache(&idx, &sch)?;
-                    tracing::debug!(index = %idx, "Schema stored and cached");
-
-                    // Then pre-create the Tantivy index with the full schema
-                    // This ensures the index exists before any writes occur
                     drop(store.get_or_create_index(&idx)?);
-                    tracing::debug!(index = %idx, "Tantivy index created");
-
                     Ok::<_, storage::StoreError>(())
                 })
             })
             .collect();
-
         for handle in handles {
             handle
                 .await
                 .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
                 .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
         }
-
         self.schema_cache.put(index, &schema);
 
-        tracing::info!(
-            index = %index,
-            "Schema creation completed successfully"
-        );
-
-        Ok(serde_json::json!({
-            "acknowledged": true,
-            "index": index,
-            "field_names": Self::sorted_field_names(&schema)
-        }))
+        answer(SchemaApplied {
+            applied: true,
+            field_names: Self::sorted_field_names(&schema),
+            ..Default::default()
+        })
     }
 
     /// [`MicroshardActor::rebuild_if_empty`] on every local shard at once: each shard's id and

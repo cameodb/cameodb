@@ -46,6 +46,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`PUT /api/{index}/_config` changes the schema on every node of a cluster.** It applied on the
+  node that received it alone: peers kept their schema and built columns, nothing reconciled them
+  later, and each node judged a retype by its own documents — a node holding none of the index
+  accepted a change that the node holding the data refused, leaving one field typed two ways. The
+  receiving node now asks every node first (`PrepareSchema`) and decides once: one version past
+  the highest held, the owner already recorded, and a `409` for a change the built index would act
+  against while the cluster holds any of its documents. Every node then stores that schema
+  (`ApplySchema`), rebuilding where needed. A missing node refuses the change with `503`. Two
+  changes at once are applied one after the other: each holds the index on every node between
+  its two steps, and one finding it held waits and asks again, so neither caller is told a change
+  was applied that another then overwrote.
+
 - **A schema change no longer drops documents written while it rebuilds an empty index.** The
   rebuild deleted each shard's data from a blocking task beside the shard's writer, so a write
   acknowledged between the document count and the delete went with the data, and the delete could

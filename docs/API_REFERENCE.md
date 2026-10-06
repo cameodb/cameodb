@@ -659,12 +659,20 @@ documents again in the same step: documents reaching it after the first count st
 conflicting change is then undone on the shards it reached and refused with `409` as above. Fields
 are compared as they build: `string` is a `text` field with
 tokenizer `raw` and `index_record_option` `Basic`, so changing one to the other changes no column
-and is accepted on an index holding documents. **On a cluster, a change to an existing schema is per node.** `PUT /_config`
-counts the documents and applies the schema on the node that receives it; peers already holding
-the index keep their schema and built columns, and nothing reconciles the two later. A node that
-holds no schema for the index yet takes the cluster's on its first write, so a change made before
-the index has spread reaches every node; after that, send the same `PUT` to every node, or delete
-the index (`DELETE /api/{index}` reaches every node) and declare it again.
+and is accepted on an index holding documents. **On a cluster, a schema is decided once and stored on every node.** The node receiving the
+`PUT` asks every node first what the change would ask of it — the version it holds, its documents
+of the index, the built columns the change touches — and decides from all of them: the new
+`version` is one past the highest any node holds, the index keeps the owner it was created with,
+and a change the built index would act against is refused with `409` while the cluster holds any
+document of the index, naming each node holding some. Then every node stores that schema,
+rebuilding its shards where the change needs it. Every configured node has to be connected: with
+one missing the request is refused with `503` and nothing is changed. A node lost between the two
+steps leaves the change stored on the rest, which the `503` says; sending the same request again
+finishes it. Two changes sent at once are applied one after the other: each holds the index on
+every node from its first step to its second, and one that finds another there waits a moment and
+asks again — so both are applied, the later at the next version. One still finding the index busy
+after a few tries answers `409` with nothing changed. `PATCH /_schema` still applies
+on the node that receives it.
 
 **`id_fields`** records the fields whose values, joined with `|` in order, make each document's
 id — `["Hr", "cmMacAddress"]`. The CLI loader writes it and keys every later load the same way.

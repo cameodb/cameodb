@@ -1197,8 +1197,46 @@ pub enum ClientOp {
         #[serde(default)]
         forwarded: bool,
     },
-    /// Create or update index configuration/schema
-    CreateConfig { index: String, schema: IndexSchema },
+    /// Phase one of `PUT /_config`: what storing `schema` here would ask of this node, without
+    /// storing it — answered as a [`SchemaReadiness`].
+    ///
+    /// Internal to the cluster: the node that received the `PUT` asks every node, itself
+    /// included, and decides once from all the answers — one version, one owner, and whether
+    /// the change may go ahead at all. Decided per node, a change reached only the node that
+    /// received it, and each node judged a retype by its own documents alone: one holding none
+    /// accepted a change that another, holding the data, refused.
+    PrepareSchema {
+        index: String,
+        schema: IndexSchema,
+        /// The calling key's tenant, for the quota a new index counts against.
+        #[serde(default)]
+        tenant: Option<String>,
+        /// This change, reserving the index on this node until it is applied or released. A
+        /// second change prepared meanwhile is answered `busy` — see [`SchemaReadiness::busy`].
+        #[serde(default)]
+        change: Uuid,
+    },
+    /// Phase two of `PUT /_config`: store `schema` here, at the version and with the owner the
+    /// coordinating node decided — answered as a [`SchemaApplied`].
+    ///
+    /// A node holding a newer schema, or one the cluster prefers at the same version, keeps it
+    /// and says so: two changes applied at once then settle on one schema on every node,
+    /// whichever reached each node first.
+    ApplySchema {
+        index: String,
+        schema: IndexSchema,
+        /// Count a new index against its tenant's quota here. Set for the coordinating node
+        /// only: the quota is checked in phase one everywhere, and this repeats it on the node
+        /// whose mailbox serialises it against other mints.
+        #[serde(default)]
+        check_quota: bool,
+        /// The change being applied; its reservation here ends with it.
+        #[serde(default)]
+        change: Uuid,
+    },
+    /// End `change`'s reservation of `index` on this node without applying anything: sent by
+    /// the coordinating node when it refuses the change after phase one.
+    ReleaseSchemaChange { index: String, change: Uuid },
     /// Set the `indexed` flag on named fields of an existing schema.
     ///
     /// Distinct from `CreateConfig` because it must *not* re-create the Tantivy index: the
@@ -1281,6 +1319,46 @@ pub struct ShutdownAllShards;
 pub struct ShutdownReadRuntime {
     /// How long to wait for in-flight reads before abandoning the threads.
     pub timeout: Duration,
+}
+
+/// One node's answer to [`ClientOp::PrepareSchema`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SchemaReadiness {
+    /// The schema this node holds for the index, a dropped index's record included — its
+    /// version still counts, so a re-declaration is newer than the drop.
+    pub current: Option<IndexSchema>,
+    /// This node's documents of the index; counted only when the change touches a built column.
+    pub documents: u64,
+    /// Changes this node's built index would act against: see `SchemaChange::conflicts`.
+    pub conflicts: Vec<String>,
+    /// Changes that only declare a column this node's built index lacks.
+    pub pending: Vec<String>,
+    /// Why this node would refuse the index as a new one for the calling tenant, if it would.
+    pub quota_exceeded: Option<String>,
+    /// Another change to this index was prepared here and has not been applied or released.
+    ///
+    /// Two changes prepared at once would each pick the same next version, and both be told
+    /// they were applied: every node settles on the one the cluster prefers, so the other was
+    /// overwritten while its caller heard success. Refused before anything is written instead.
+    #[serde(default)]
+    pub busy: bool,
+}
+
+/// One node's answer to [`ClientOp::ApplySchema`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SchemaApplied {
+    /// The schema is stored here.
+    pub applied: bool,
+    /// Not stored: this node holds a schema the cluster prefers — a newer one, or one that
+    /// wins the tie at the same version.
+    pub superseded: bool,
+    /// Not stored: documents reached this node while it was rebuilding for a change they
+    /// conflict with, so the rebuild was undone here.
+    pub arrived: u64,
+    /// The conflicting changes behind a refusal.
+    pub conflicts: Vec<String>,
+    /// The stored schema's field names, sorted, for the caller's answer.
+    pub field_names: Vec<String>,
 }
 
 /// Commands sent to the dedicated writer thread via `tokio::sync::mpsc` channel.
