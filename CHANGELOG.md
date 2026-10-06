@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `string` field takes every string.** The write path asked what type a string's spelling
+  inferred, so a version `284.08.25` or a code `10.0.0.1` — a date and an address to the
+  inference — was refused from a `string` field the writer stores any string in.
 - **`NOT` beside `AND`/`OR` or at the head of a query now answers the boolean it reads as.** The
   parser accepted every one of these forms, and evaluated none of them: `a AND NOT b` matched
   nothing, `a OR NOT b` silently dropped the `NOT` arm, and a bare `NOT b` matched correctly while

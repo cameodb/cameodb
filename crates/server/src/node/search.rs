@@ -735,8 +735,8 @@ pub(super) fn infer_field_type(value: &JsonValue) -> TantivyFieldType {
 /// The refusals that matter still stand, because `as_*` returns `None` for exactly them: a
 /// negative into a `u64`, a fraction into an integer, an integer past `i64::MAX` into an `i64`.
 ///
-/// `String` is `Text` under an older name, and is the only widening left that is about names.
-/// A type is never *changed* to fit a value — widening an already-built column needs a rebuild,
+/// **A string field is asked the same way**: the writer stores any string, so any string fits,
+/// whatever type its spelling would infer. A type is never *changed* to fit a value — widening an already-built column needs a rebuild,
 /// which no write path performs (see `IndexSchema::evolve_field`).
 ///
 /// Values whose *shape* rather than type decides the answer — a list, a null, a text or json
@@ -746,17 +746,14 @@ pub(super) fn scalar_type_is_storable(declared: &TantivyFieldType, value: &JsonV
         TantivyFieldType::U64 => return value.as_u64().is_some(),
         TantivyFieldType::I64 => return value.as_i64().is_some(),
         TantivyFieldType::F64 => return value.as_f64().is_some(),
+        // The writer stores any string under a string field with `as_str()`. Asking what the
+        // string looks like refused a version `284.08.25` or a code `10.0.0.1` there — values
+        // that infer as a date or an address — though the field holds them as they are.
+        TantivyFieldType::String => return value.is_string(),
         _ => {}
     }
 
-    let inferred = infer_field_type(value);
-    if *declared == inferred {
-        return true;
-    }
-    matches!(
-        (declared, &inferred),
-        (TantivyFieldType::String, TantivyFieldType::Text)
-    )
+    *declared == infer_field_type(value)
 }
 
 /// Why the field cannot hold this value, if it cannot.
