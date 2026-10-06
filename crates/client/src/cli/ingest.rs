@@ -4,7 +4,6 @@
 use super::*;
 use crate::sdk::CameoClient;
 use anyhow::{Context, Result, anyhow};
-use csv::ReaderBuilder;
 use flate2::read::GzDecoder;
 use reqwest::Url;
 use serde_json::Map as JsonMap;
@@ -22,7 +21,6 @@ use storage::{FieldDef, IndexSchema, TantivyFieldType};
 
 // Only import colored on non-Windows platforms
 
-pub(crate) const SCHEMA_SAMPLE_LIMIT: usize = 200;
 pub(crate) const DEFAULT_BATCH_SIZE: usize = 4000;
 pub(crate) const SOURCE_SNIFF_BYTES: usize = 64 * 1024;
 
@@ -33,8 +31,17 @@ pub(crate) struct ProgressSpinner {
 }
 
 impl ProgressSpinner {
+    /// A spinner on stderr, and only when stderr is a terminal. On stdout its frames led the
+    /// output, so `schema detect data.csv > schema.json` saved a file `schema load` could not read.
     pub(crate) fn new() -> Self {
+        use std::io::IsTerminal;
         let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        if !std::io::stderr().is_terminal() {
+            return Self {
+                active,
+                handle: None,
+            };
+        }
         let active_clone = active.clone();
 
         let handle = thread::spawn(move || {
@@ -49,8 +56,8 @@ impl ProgressSpinner {
             let mut i = 0;
 
             while active_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                print!("\r{} ", spinner_chars[i % spinner_chars.len()]);
-                std::io::Write::flush(&mut std::io::stdout()).ok();
+                eprint!("\r{} ", spinner_chars[i % spinner_chars.len()]);
+                std::io::Write::flush(&mut std::io::stderr()).ok();
                 i += 1;
                 // Use slightly slower timing on Windows for better visibility
                 let sleep_ms = if cfg!(target_os = "windows") {
@@ -61,8 +68,8 @@ impl ProgressSpinner {
                 thread::sleep(Duration::from_millis(sleep_ms));
             }
             // Clear the spinner character when done, leaving cursor at start of line
-            print!("\r");
-            std::io::Write::flush(&mut std::io::stdout()).ok();
+            eprint!("\r");
+            std::io::Write::flush(&mut std::io::stderr()).ok();
         });
 
         Self {
@@ -168,145 +175,444 @@ pub(crate) fn parse_batch_size_arg<'a>(
     Ok((batch_size, remaining))
 }
 
-/// Result of ID field detection
-#[derive(Debug)]
-pub(crate) struct IdFieldDetection {
-    pub(crate) index: usize,
-    pub(crate) original_field_name: String,
-    pub(crate) is_shadow: bool, // true if original field != "id"
-}
-
-/// The id-candidate ranking every source format shares: a field named exactly `id`,
-/// then a hash column (`sha256`, `sha1`, `md5` in that order — more digest bits, better
-/// spread), then anything ending in `id` (`user_id`, `videoId`), then anything containing
-/// it. Inside a rank the first field in source order wins; an altogether unmatched list
-/// falls back to its first field.
-pub(crate) fn id_field_rank(name: &str) -> u8 {
-    let lower = name.to_lowercase();
-    if lower == "id" {
-        0
-    } else if lower == "sha256" {
-        1
-    } else if lower == "sha1" {
-        2
-    } else if lower == "md5" {
-        3
-    } else if lower.ends_with("id") {
-        4
-    } else if lower.contains("id") {
-        5
-    } else {
-        6
-    }
-}
-
-pub(crate) fn detect_id_field_index<'a>(names: impl Iterator<Item = &'a str>) -> Option<usize> {
-    names
-        .enumerate()
-        .min_by_key(|(_, name)| id_field_rank(name))
-        .map(|(idx, _)| idx)
-}
-
-/// Detect the ID field from CSV headers with shadow field support.
-pub(crate) fn detect_id_field(headers: &[(String, Option<TantivyFieldType>)]) -> IdFieldDetection {
-    let index = detect_id_field_index(headers.iter().map(|(name, _)| name.as_str()))
-        .expect("CSV headers are non-empty");
-    let name = &headers[index].0;
-    let lower = name.to_lowercase();
-    IdFieldDetection {
-        index,
-        // Exact and hash matches canonicalize to lowercase — "ID" and "SHA256" name the
-        // same field their spelling hides. Suffix and substring matches keep the source
-        // spelling, which is what the shadow field is named after.
-        original_field_name: if id_field_rank(name) <= 3 {
-            lower.clone()
+/// `--id <COLUMN[,COLUMN...]>`, and the arguments left.
+pub(crate) fn parse_id_arg<'a>(args: &'a [&'a str]) -> Result<(Option<IdSpec>, Vec<&'a str>)> {
+    let mut id = None;
+    let mut remaining = Vec::new();
+    let mut iter = args.iter();
+    while let Some(&arg) = iter.next() {
+        if arg == "--id" {
+            let value = iter
+                .next()
+                .copied()
+                .ok_or_else(|| anyhow!("Missing value for --id"))?;
+            id = Some(IdSpec::parse(value)?);
         } else {
-            name.clone()
-        },
-        is_shadow: lower != "id",
+            remaining.push(arg);
+        }
+    }
+    Ok((id, remaining))
+}
+
+/// Whether a bare flag is among the arguments, and the arguments without it.
+pub(crate) fn take_flag<'a>(args: &[&'a str], flag: &str) -> (bool, Vec<&'a str>) {
+    let present = args.contains(&flag);
+    (
+        present,
+        args.iter().copied().filter(|a| *a != flag).collect(),
+    )
+}
+
+/// Everything a scan settles about a source before a schema is built or a row is sent.
+pub(crate) struct SourceAnalysis {
+    pub(crate) format: SourceFormat,
+    /// The source's bytes, for the load to read again from the start; `None` for a remote JSON
+    /// source, which is streamed instead.
+    pub(crate) data: Option<SourceData>,
+    /// The CSV delimiter; `None` for JSON.
+    pub(crate) delimiter: Option<u8>,
+    /// The CSV header with its type hints; empty for JSON.
+    pub(crate) headers: Vec<(String, Option<TantivyFieldType>)>,
+    pub(crate) profiler: Profiler,
+    pub(crate) summary: ScanSummary,
+    /// The field each column becomes, in the profiler's column order. A header hint wins.
+    pub(crate) choices: Vec<FieldChoice>,
+    pub(crate) id: IdChoice,
+}
+
+impl SourceAnalysis {
+    pub(crate) fn new(
+        format: SourceFormat,
+        data: Option<SourceData>,
+        delimiter: Option<u8>,
+        headers: Vec<(String, Option<TantivyFieldType>)>,
+        scan: (Profiler, ScanSummary),
+        ids: &IdOptions<'_>,
+    ) -> Result<Self> {
+        let (profiler, summary) = scan;
+        let mut choices = profiler.choices();
+        for (choice, (_, hint)) in choices.iter_mut().zip(&headers) {
+            if let Some(hint) = hint {
+                choice.field_type = hint.clone();
+                choice.category = false;
+                choice.tokenizer = None;
+                choice.note = Some("declared in the header".to_string());
+            }
+        }
+        let id = profiler.choose_id(ids.explicit, ids.recorded)?;
+        Ok(Self {
+            format,
+            data,
+            delimiter,
+            headers,
+            profiler,
+            summary,
+            choices,
+            id,
+        })
+    }
+
+    /// The shadow field that keeps a single id column's name: a CSV's `ID` and `SHA256`
+    /// lowercased, any other name as written. `None` for the column named `id`, and for a
+    /// composite id — its columns stay fields of their own, returned apart, not as the id.
+    pub(crate) fn shadow_name(&self) -> Option<String> {
+        let name = self.id.spec.single()?;
+        let shadow = if self.delimiter.is_some() && is_canonical_id_name(name) {
+            name.to_lowercase()
+        } else {
+            name.to_string()
+        };
+        (shadow != "id").then_some(shadow)
+    }
+
+    /// Each column's position among the profiler's columns, for the id.
+    pub(crate) fn id_columns(&self) -> Vec<usize> {
+        self.id
+            .spec
+            .columns()
+            .iter()
+            .map(|name| {
+                self.profiler
+                    .index_of(name)
+                    .expect("the id names columns the scan saw")
+            })
+            .collect()
+    }
+
+    /// How the load reads each column: the type the index's field declares, the date order the
+    /// scan found, and whether its values are lists.
+    pub(crate) fn shapes(
+        &self,
+        field_types: &HashMap<String, TantivyFieldType>,
+    ) -> Vec<ColumnShape> {
+        self.profiler
+            .columns
+            .iter()
+            .zip(&self.choices)
+            .map(|(column, choice)| {
+                let field_type = field_types.get(&column.name).cloned();
+                let dates = match field_type {
+                    Some(TantivyFieldType::Date) => choice.dates,
+                    _ => DateOrders::default(),
+                };
+                ColumnShape {
+                    field_type,
+                    dates,
+                    list: choice.list,
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn report(&self, source: &str) -> String {
+        render_report(source, &self.summary, &self.profiler, &self.id)
     }
 }
 
-/// The CSV schema's final pass, run the same way whether the schema was built by
-/// `detect_schema_from_csv` or mid-ingest: every non-shadow field is marked indexed —
-/// an explicit load is not write-time evolution, where fields start non-indexed — and
-/// only `id` stays stored in Tantivy (the rest comes from redb). Shadow fields keep
-/// their non-indexed, non-stored status, and header type hints are applied last.
-pub(crate) fn finalize_csv_schema(
-    schema: &mut IndexSchema,
-    headers: &[(String, Option<TantivyFieldType>)],
-) {
-    for (name, field_def) in schema.fields.iter_mut() {
-        if !field_def.is_shadow {
-            field_def.indexed = true;
-            field_def.stored = name == "id";
-        }
-    }
+/// How the id is to be chosen: the columns `--id` named, and the id the index already records.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct IdOptions<'a> {
+    pub(crate) explicit: Option<&'a IdSpec>,
+    pub(crate) recorded: Option<&'a IdSpec>,
+}
 
-    for (name, hint) in headers {
-        if let Some(t) = hint.clone()
-            && !schema.fields.get(name).is_some_and(|f| f.is_shadow)
-        {
-            // FieldDef::new already sets the stored flag — only 'id' = true.
-            let mut field_def = FieldDef::new(name.clone(), t);
-            field_def.indexed = true;
-            schema.fields.insert(name.clone(), field_def);
-        }
+impl IdOptions<'_> {
+    /// The id the scan should follow as the load will compose it, when one is named.
+    fn followed(&self) -> Option<IdSpec> {
+        self.explicit.or(self.recorded).cloned()
     }
 }
 
-/// Build the schema a buffered CSV sample describes: the shadow for a non-`id` source
-/// column, one evolution pass per sampled row, then the CSV finalization.
-pub(crate) fn csv_sample_schema<'a>(
-    headers: &[(String, Option<TantivyFieldType>)],
-    id_detection: &IdFieldDetection,
-    rows: impl IntoIterator<Item = &'a csv::StringRecord>,
-    date_orders: &[DateOrders],
-) -> Result<JsonValue> {
+/// Scan a source and settle what it holds. See [`scan`](super::scan) for how much is read.
+pub(crate) async fn analyze_source(
+    client: &CameoClient,
+    source: &str,
+    delimiter: Delimiter,
+    ids: IdOptions<'_>,
+) -> Result<SourceAnalysis> {
+    let limits = ScanLimits::default();
+    let format = detect_source_format_for_source(client, source).await?;
+    match format {
+        SourceFormat::CsvLike => {
+            let data = SourceData::open(client, source).await?;
+            let delimiter = delimiter_byte(delimiter, &data)?;
+            let named = ids.followed();
+            let (scan, data) = tokio::task::spawn_blocking(move || {
+                scan_csv(&data, delimiter, &limits, named.as_ref()).map(|scan| (scan, data))
+            })
+            .await
+            .map_err(|err| anyhow!("CSV scan failed: {err}"))??;
+            SourceAnalysis::new(
+                format,
+                Some(data),
+                Some(delimiter),
+                scan.headers,
+                (scan.profiler, scan.summary),
+                &ids,
+            )
+        }
+        SourceFormat::JsonDocument | SourceFormat::JsonArray | SourceFormat::JsonLines => {
+            if is_http_source(source) && detect_compression(source) == Compression::None {
+                let scan = scan_http_json(client, source, format, &limits, ids.followed().as_ref())
+                    .await?;
+                return SourceAnalysis::new(
+                    format,
+                    None,
+                    None,
+                    Vec::new(),
+                    (scan.profiler, scan.summary),
+                    &ids,
+                );
+            }
+            let data = SourceData::open(client, source).await?;
+            let named = ids.followed();
+            let (scan, data) = tokio::task::spawn_blocking(move || {
+                scan_json(&data, format, &limits, named.as_ref()).map(|scan| (scan, data))
+            })
+            .await
+            .map_err(|err| anyhow!("JSON scan failed: {err}"))??;
+            SourceAnalysis::new(
+                format,
+                Some(data),
+                None,
+                Vec::new(),
+                (scan.profiler, scan.summary),
+                &ids,
+            )
+        }
+        SourceFormat::SchemaJson => Err(anyhow!(
+            "Source is a schema, not data: there is nothing to scan"
+        )),
+    }
+}
+
+/// The schema a scan describes: `id` first, then a field per column in source order, each typed
+/// by what all its scanned values fit. A single id column not named `id` becomes a shadow field
+/// keeping its name; a composite id's columns stay fields of their own.
+pub(crate) fn schema_from_analysis(analysis: &SourceAnalysis) -> Result<JsonValue> {
     let mut schema = IndexSchema::default();
-    if id_detection.is_shadow {
-        let field_type = headers[id_detection.index]
-            .1
-            .clone()
-            .unwrap_or(TantivyFieldType::Text);
-        schema.add_shadow_field(id_detection.original_field_name.clone(), field_type);
+    let columns = &analysis.profiler.columns;
+    if let Some(shadow) = analysis.shadow_name() {
+        let idx = analysis.id_columns()[0];
+        let field_type = match analysis.delimiter {
+            Some(_) => analysis.headers[idx].1.clone(),
+            None => Some(analysis.choices[idx].field_type.clone()),
+        };
+        schema.add_shadow_field(shadow, field_type.unwrap_or(TantivyFieldType::Text));
+    } else if analysis.id.reason == IdReason::Named && analysis.profiler.rows > 0 {
+        // The source has its own `id`: an id-like column that held the same value in every row
+        // is that id under its other name, and is kept as its shadow.
+        if let Some(column) = columns
+            .iter()
+            .filter(|c| c.equals_id && !c.name.eq_ignore_ascii_case("id"))
+            .filter(|c| is_id_like_name(&c.name))
+            .min_by_key(|c| id_name_rank(&c.name))
+        {
+            schema.add_shadow_field(column.name.clone(), TantivyFieldType::Text);
+        }
     }
 
-    for row in rows {
-        let mut obj: JsonMap<String, JsonValue> = JsonMap::new();
-        for (idx, value) in row.iter().enumerate() {
-            if let Some((header, _)) = headers.get(idx) {
-                let dates = date_orders.get(idx).copied().unwrap_or_default();
-                obj.insert(header.clone(), sample_cell(value, &dates));
-            }
+    for (column, choice) in columns.iter().zip(&analysis.choices) {
+        if column.name == "id" || schema.fields.contains_key(&column.name) {
+            continue;
         }
-        if let Some(raw_id) = row.get(id_detection.index) {
-            let id_val = raw_id.trim();
-            if !id_val.is_empty() {
-                obj.insert("id".to_string(), JsonValue::String(id_val.to_string()));
-            }
+        let mut field = FieldDef::new(column.name.clone(), choice.field_type.clone());
+        if choice.category {
+            // A category is filtered and grouped on: give it the column that takes.
+            field.fast = Some(true);
         }
-        schema.evolve_from_document(&JsonValue::Object(obj));
+        if let Some(tokenizer) = choice.tokenizer {
+            // One term per value: no positions to keep.
+            field.tokenizer = Some(tokenizer.to_string());
+            field.index_record_option = Some("Basic".to_string());
+        }
+        schema.fields.insert(column.name.clone(), field);
     }
 
-    finalize_csv_schema(&mut schema, headers);
-    serde_json::to_value(&schema).context("Failed to serialize schema")
+    // Recorded so every later load keys documents the same way, unless told otherwise.
+    schema.id_fields = analysis
+        .id
+        .spec
+        .columns()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    schema.fields.insert(
+        "id".to_string(),
+        FieldDef {
+            name: "id".to_string(),
+            field_type: TantivyFieldType::Text,
+            indexed: true,
+            stored: true,
+            fast: Some(false),
+            is_shadow: false,
+            description: None,
+            tokenizer: Some("raw".to_string()),
+            index_record_option: Some("Basic".to_string()),
+        },
+    );
+    schema.auto_detect_routing_field();
+
+    let mut schema_json = serde_json::to_value(schema).context("Failed to serialize schema")?;
+    // The fields map in source order, `id` first, so the schema reads like the source.
+    if let JsonValue::Object(ref mut root) = schema_json
+        && let Some(JsonValue::Object(mut fields)) = root.remove("fields")
+    {
+        let mut ordered = JsonMap::new();
+        if let Some(id) = fields.remove("id") {
+            ordered.insert("id".to_string(), id);
+        }
+        if let Some(shadow) = analysis.shadow_name()
+            && let Some(field) = fields.remove(&shadow)
+        {
+            ordered.insert(shadow, field);
+        }
+        for column in columns {
+            if let Some(field) = fields.remove(&column.name) {
+                ordered.insert(column.name.clone(), field);
+            }
+        }
+        ordered.extend(fields);
+        root.insert("fields".to_string(), JsonValue::Object(ordered));
+    }
+    Ok(schema_json)
 }
 
-/// Serialize one CSV record as the NDJSON payload line the ingest stream accepts:
-/// canonical `id`, the routing key (the source column's value, or the id), and the row.
+/// The schema for loading an index by another id: the one the scan describes for that id, with
+/// each field the index already declares kept as declared — a type, tokenizer, fast column or
+/// description a person chose survives the change of key. Fields the index declares and the
+/// source lacks are kept too. Only the id's shadow field is decided anew.
+pub(crate) fn schema_for_new_id(
+    analysis: &SourceAnalysis,
+    existing: &ExistingSchema,
+) -> Result<JsonValue> {
+    let mut schema = schema_from_analysis(analysis)?;
+    let fields = schema
+        .get_mut("fields")
+        .and_then(JsonValue::as_object_mut)
+        .ok_or_else(|| anyhow!("A built schema has fields"))?;
+    for declared in &existing.fields {
+        let Some(name) = declared.get("name").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        if name == "id" || declared.get("shadow").and_then(JsonValue::as_bool) == Some(true) {
+            continue;
+        }
+        if fields
+            .get(name)
+            .is_some_and(|f| f.get("is_shadow").and_then(JsonValue::as_bool) == Some(true))
+        {
+            continue;
+        }
+        let Some(field_type) = declared
+            .get("type")
+            .and_then(|t| serde_json::from_value::<TantivyFieldType>(t.clone()).ok())
+        else {
+            continue;
+        };
+        let mut field = FieldDef::new(name.to_string(), field_type);
+        field.indexed = declared
+            .get("indexed")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(true);
+        field.fast = declared.get("fast").and_then(JsonValue::as_bool);
+        field.tokenizer = declared
+            .get("tokenizer")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string);
+        if field.tokenizer.as_deref() == Some("raw") {
+            field.index_record_option = Some("Basic".to_string());
+        }
+        field.description = declared
+            .get("description")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string);
+        fields.insert(
+            name.to_string(),
+            serde_json::to_value(field).context("Failed to serialize a field")?,
+        );
+    }
+    if let Some(description) = &existing.description {
+        schema["description"] = JsonValue::String(description.clone());
+    }
+    Ok(schema)
+}
+
+/// A row's id from its id columns' values: the one value, or each joined with `|` in the order
+/// `--id` named them. `None` when any of them has no value.
+pub(crate) fn compose_id(parts: impl IntoIterator<Item = Option<String>>) -> Option<String> {
+    let parts: Option<Vec<String>> = parts.into_iter().collect();
+    Some(parts?.join(ID_SEPARATOR))
+}
+
+/// What a load did with ids: the rows that repeated one already sent, and the rows that had
+/// none and were skipped. A repeat replaces the document before it, so a source whose id is not
+/// unique loads fewer documents than it has rows, with nothing refused to say so.
+#[derive(Debug, Default)]
+pub(crate) struct IdLedger {
+    seen: HashSet<u64>,
+    pub(crate) repeats: u64,
+    first_repeat: Option<(Location, String)>,
+    pub(crate) skipped: u64,
+    first_skip: Option<Location>,
+}
+
+impl IdLedger {
+    pub(crate) fn admit(&mut self, id: &str, at: Location) {
+        if !self.seen.insert(hash_text(id)) {
+            self.repeats += 1;
+            self.first_repeat
+                .get_or_insert_with(|| (at, id.to_string()));
+        }
+    }
+
+    pub(crate) fn skip(&mut self, at: Location) {
+        self.skipped += 1;
+        self.first_skip.get_or_insert(at);
+    }
+
+    /// Say what the load could not keep. `candidate` is a unique key the scan found, offered as
+    /// a suggestion; the id stays as it was named.
+    /// An id named with `--id` repeats on purpose, so its replacements are information; an id
+    /// the loader fell back to repeats by accident, so they are a warning with a better key.
+    pub(crate) fn report(&self, id: &IdSpec, explicit: bool, candidate: Option<&str>) {
+        let columns = id.columns().join(",");
+        if let Some(at) = self.first_skip {
+            eprintln!(
+                "⚠️  {} rows had no value in the id ({columns}) and were skipped, the first at {at}.",
+                grouped(self.skipped)
+            );
+        }
+        if let Some((at, value)) = &self.first_repeat
+            && explicit
+        {
+            eprintln!(
+                "ℹ️  {} rows replaced a document an earlier row with the same id ({columns}) made, \
+                 the first at {at} ('{value}').",
+                grouped(self.repeats)
+            );
+        } else if let Some((at, value)) = &self.first_repeat {
+            eprintln!(
+                "⚠️  {} rows repeated an id already loaded, each replacing the document before it — \
+                 the first at {at} ('{value}'). The id ({columns}) is not unique in this source.{}",
+                grouped(self.repeats),
+                candidate
+                    .filter(|c| *c != columns)
+                    .map(|c| format!(" Detected unique key candidate: --id {c}"))
+                    .unwrap_or_default()
+            );
+        }
+    }
+}
+
+/// Serialize one CSV record as the NDJSON payload line the ingest stream accepts: the row, its
+/// id, and the id as its routing key.
 pub(crate) fn csv_ndjson_line(
     record: &csv::StringRecord,
     headers: &[(String, Option<TantivyFieldType>)],
     columns: &[ColumnShape],
-    id_detection: &IdFieldDetection,
-    id_header: &str,
+    id: &str,
 ) -> Result<Vec<u8>> {
-    let id_value = record
-        .get(id_detection.index)
-        .unwrap_or_default()
-        .trim()
-        .to_string();
     let unknown = ColumnShape::default();
     let mut doc_obj: JsonMap<String, JsonValue> = JsonMap::new();
     for (idx, value) in record.iter().enumerate() {
@@ -317,28 +623,21 @@ pub(crate) fn csv_ndjson_line(
             );
         }
     }
-    doc_obj.insert("id".to_string(), JsonValue::String(id_value.clone()));
-    let routing_key = doc_obj
-        .get(id_header)
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| id_value.clone());
-    let payload = json!({"id": id_value, "routing_key": routing_key, "doc": doc_obj});
+    doc_obj.insert("id".to_string(), JsonValue::String(id.to_string()));
+    let payload = json!({"id": id, "routing_key": id, "doc": doc_obj});
     let mut line = serde_json::to_vec(&payload).context("Failed to serialize CSV payload")?;
     line.push(b'\n');
     Ok(line)
 }
 
-/// The CSV loader's batch state: payload serialization, accumulation, and the flush
-/// that ships a full batch. Kept as a struct because the loader's two phases (replay
-/// the sample buffer, then stream) both write through it.
+/// The CSV loader's batch state: payload serialization, accumulation, and the flush that ships
+/// a full batch.
 pub(crate) struct CsvIngest {
     pub(crate) headers: Vec<(String, Option<TantivyFieldType>)>,
-    /// How each column's cells are read, settled from the index's schema and the sample before
-    /// the first row is sent.
+    /// How each column's cells are read, settled by the scan before the first row is sent.
     pub(crate) columns: Vec<ColumnShape>,
-    pub(crate) id_detection: IdFieldDetection,
-    pub(crate) id_header: String,
+    /// The columns the id is made of.
+    pub(crate) id_columns: Vec<usize>,
     pub(crate) batch_size: usize,
     pub(crate) batch_body: Vec<u8>,
     pub(crate) docs_in_batch: usize,
@@ -346,30 +645,31 @@ pub(crate) struct CsvIngest {
     pub(crate) batch_lines: Vec<u64>,
     pub(crate) total_sent: usize,
     pub(crate) total_failed: usize,
+    pub(crate) ledger: IdLedger,
 }
 
 impl CsvIngest {
     pub(crate) fn new(
         headers: Vec<(String, Option<TantivyFieldType>)>,
-        id_detection: IdFieldDetection,
-        id_header: String,
+        columns: Vec<ColumnShape>,
+        id_columns: Vec<usize>,
         batch_size: usize,
     ) -> Self {
         Self {
             headers,
-            columns: Vec::new(),
-            id_detection,
-            id_header,
+            columns,
+            id_columns,
             batch_size: batch_size.max(1),
             batch_body: Vec::new(),
             docs_in_batch: 0,
             batch_lines: Vec::new(),
             total_sent: 0,
             total_failed: 0,
+            ledger: IdLedger::default(),
         }
     }
 
-    /// Queue one row, read from file line `line`.
+    /// Queue one row, read from file line `line`. A row with no id is skipped and counted.
     pub(crate) async fn push_row(
         &mut self,
         client: &CameoClient,
@@ -377,64 +677,24 @@ impl CsvIngest {
         record: &csv::StringRecord,
         line: u64,
     ) -> Result<()> {
-        let payload = csv_ndjson_line(
-            record,
-            &self.headers,
-            &self.columns,
-            &self.id_detection,
-            &self.id_header,
-        )?;
+        let id = compose_id(self.id_columns.iter().map(|&idx| {
+            record
+                .get(idx)
+                .map(str::trim)
+                .filter(|cell| !cell.is_empty())
+                .map(str::to_string)
+        }));
+        let Some(id) = id else {
+            self.ledger.skip(Location::Line(line));
+            return Ok(());
+        };
+        self.ledger.admit(&id, Location::Line(line));
+        let payload = csv_ndjson_line(record, &self.headers, &self.columns, &id)?;
         self.batch_body.extend_from_slice(&payload);
         self.docs_in_batch += 1;
         self.batch_lines.push(line);
         if self.docs_in_batch >= self.batch_size {
             self.flush(client, index).await?;
-        }
-        Ok(())
-    }
-
-    /// Settle how each column is read, then send the sampled rows as ordinary data.
-    ///
-    /// The field types are the index's when it has a schema. When it has none, the sample's
-    /// schema is built, installed, and read back — the index must have its schema before any
-    /// row is sent. Either way the sample decides which date columns are written day first.
-    pub(crate) async fn settle_and_drain(
-        &mut self,
-        client: &CameoClient,
-        index: &str,
-        sample: &mut Vec<(csv::StringRecord, u64)>,
-        existing: Option<HashMap<String, TantivyFieldType>>,
-    ) -> Result<()> {
-        let date_orders =
-            date_orders_by_column(sample.iter().map(|(row, _)| row), self.headers.len());
-        let field_types = match existing {
-            Some(field_types) => field_types,
-            None => {
-                let schema_json = csv_sample_schema(
-                    &self.headers,
-                    &self.id_detection,
-                    sample.iter().map(|(row, _)| row),
-                    &date_orders,
-                )?;
-                client
-                    .put_index_config(index, &schema_json)
-                    .await
-                    .with_context(|| format!("Failed to create schema for index '{}'", index))?;
-                println!(
-                    "Schema was missing; detected and applied schema to index '{}'",
-                    index
-                );
-                schema_field_types(&schema_json)
-            }
-        };
-        self.columns = column_shapes(&self.headers, &field_types, &date_orders);
-        for ((name, _), shape) in self.headers.iter().zip(&self.columns) {
-            for departure in shape.dates.departures() {
-                println!("Column '{name}' writes {departure}; loading them as YYYY-MM-DD");
-            }
-        }
-        for (row, line) in sample.drain(..) {
-            self.push_row(client, index, &row, line).await?;
         }
         Ok(())
     }
@@ -454,171 +714,6 @@ impl CsvIngest {
     }
 }
 
-pub(crate) async fn detect_schema_from_csv(
-    client: &CameoClient,
-    source: &str,
-    delimiter: Delimiter,
-) -> Result<JsonValue> {
-    let mut reader = open_csv_reader(client, source, delimiter).await?;
-    let raw_headers = reader
-        .headers()
-        .context("CSV file is missing headers")?
-        .clone();
-
-    let headers: Vec<(String, Option<TantivyFieldType>)> =
-        raw_headers.iter().map(parse_header_with_hint).collect();
-
-    let id_detection = detect_id_field(&headers);
-
-    let mut schema = IndexSchema::default();
-
-    // Add a single shadow field for the detected id source when its name is not "id"
-    if id_detection.is_shadow {
-        let field_type = headers[id_detection.index]
-            .1
-            .clone()
-            .unwrap_or(TantivyFieldType::Text);
-        schema.add_shadow_field(id_detection.original_field_name.clone(), field_type);
-    }
-
-    // Collect id-like candidates (excluding primary) ordered by priority for equality promotion
-    // Tuple: (priority, idx, name, hint, all_match, seen_any)
-    let mut id_like_candidates: Vec<(u8, usize, String, Option<TantivyFieldType>, bool, bool)> =
-        headers
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, (name, hint))| {
-                if idx == id_detection.index {
-                    return None;
-                }
-
-                let lower = name.to_lowercase();
-                let (priority, looks_like_id) =
-                    if ["sha256", "sha1", "md5"].contains(&lower.as_str()) {
-                        (0u8, true)
-                    } else if lower.ends_with("_id") || lower.ends_with("id") {
-                        (1u8, true)
-                    } else if lower.contains("id") {
-                        (2u8, true)
-                    } else {
-                        (u8::MAX, false)
-                    };
-
-                if looks_like_id {
-                    Some((priority, idx, name.clone(), hint.clone(), true, false))
-                } else {
-                    None
-                }
-            })
-            .collect();
-    id_like_candidates.sort_by_key(|(priority, _, _, _, _, _)| *priority);
-
-    // The sample is read whole first: which date columns are written day first is a question
-    // about the column, answered before any one of its cells is typed.
-    let sample: Vec<csv::StringRecord> = reader
-        .records()
-        .take(SCHEMA_SAMPLE_LIMIT)
-        .collect::<Result<_, _>>()
-        .context("Failed to read CSV record")?;
-    let date_orders = date_orders_by_column(&sample, headers.len());
-
-    for record in &sample {
-        let mut obj: JsonMap<String, JsonValue> = JsonMap::new();
-
-        let canonical_id_raw = record.get(id_detection.index).unwrap_or("");
-
-        // Update equality flags for candidates
-        for (_, idx, _, _, all_match, seen_any) in id_like_candidates.iter_mut() {
-            if let Some(val) = record.get(*idx) {
-                *seen_any = true;
-                if *all_match && val.trim() != canonical_id_raw.trim() {
-                    *all_match = false;
-                }
-            }
-        }
-
-        // Process all fields in CSV column order
-        for (idx, value) in record.iter().enumerate() {
-            if let Some((header, _)) = headers.get(idx) {
-                let dates = date_orders.get(idx).copied().unwrap_or_default();
-                obj.insert(header.clone(), sample_cell(value, &dates));
-            }
-        }
-
-        // Inject canonical "id" field from the detected source field
-        if let Some(raw_id) = record.get(id_detection.index) {
-            let id_val = raw_id.trim();
-            if !id_val.is_empty() {
-                obj.insert("id".to_string(), JsonValue::String(id_val.to_string()));
-            }
-        }
-
-        schema.evolve_from_document(&JsonValue::Object(obj));
-    }
-
-    // If canonical name was "id", promote the first candidate whose values always matched
-    if !id_detection.is_shadow
-        && let Some((_, _, name, hint, _all_match, _seen_any)) = id_like_candidates
-            .into_iter()
-            .find(|(_, _, _, _, all_match, seen_any)| *seen_any && *all_match)
-    {
-        let field_type = hint.unwrap_or(TantivyFieldType::Text);
-        schema.add_shadow_field(name, field_type);
-    }
-
-    finalize_csv_schema(&mut schema, &headers);
-
-    // Ensure 'id' field is explicitly defined in schema with proper settings
-    if !schema.fields.contains_key("id") {
-        let id_field = FieldDef {
-            name: "id".to_string(),
-            field_type: TantivyFieldType::Text,
-            indexed: true,
-            stored: true,
-            fast: Some(false),
-            is_shadow: false, // The canonical 'id' field is not a shadow field
-            description: None,
-            tokenizer: Some("raw".to_string()),
-            index_record_option: Some("Basic".to_string()),
-        };
-        schema.fields.insert("id".to_string(), id_field);
-    }
-
-    schema.auto_detect_routing_field();
-
-    let mut schema_json = serde_json::to_value(schema).context("Failed to serialize schema")?;
-
-    // Reorder fields map: id first, then preserve CSV column order
-    if let JsonValue::Object(ref mut root) = schema_json
-        && let Some(JsonValue::Object(mut fields)) = root.remove("fields")
-    {
-        let mut ordered = JsonMap::new();
-
-        // Always place 'id' first
-        if let Some(id_val) = fields.remove("id") {
-            ordered.insert("id".to_string(), id_val);
-        }
-
-        // Then add fields in CSV column order (preserving source structure)
-        for (header_name, _) in &headers {
-            if header_name != "id"
-                && let Some(field_val) = fields.remove(header_name)
-            {
-                ordered.insert(header_name.clone(), field_val);
-            }
-        }
-
-        // Add any remaining fields that weren't in headers (shouldn't happen, but safe)
-        for (k, v) in fields {
-            ordered.insert(k, v);
-        }
-
-        root.insert("fields".to_string(), JsonValue::Object(ordered));
-    }
-
-    Ok(schema_json)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SourceFormat {
     SchemaJson,
@@ -626,12 +721,6 @@ pub(crate) enum SourceFormat {
     JsonArray,
     JsonLines,
     CsvLike,
-}
-
-#[derive(Debug)]
-pub(crate) struct JsonSourceAnalysis {
-    pub(crate) sample_docs: Vec<JsonValue>,
-    pub(crate) id_field: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -797,36 +886,6 @@ pub(crate) fn effective_json_document(doc: &JsonValue) -> Result<JsonValue> {
     }
 }
 
-pub(crate) fn collect_effective_json_documents(docs: &[JsonValue]) -> Result<Vec<JsonValue>> {
-    docs.iter().map(effective_json_document).collect()
-}
-
-/// The same ranking as [`detect_id_field`], but JSON keeps the field's own spelling —
-/// the shadow field is named after it.
-pub(crate) fn detect_id_field_name(field_names: &[String]) -> Option<String> {
-    detect_id_field_index(field_names.iter().map(String::as_str))
-        .map(|idx| field_names[idx].clone())
-}
-
-pub(crate) fn detect_json_id_field_name(docs: &[JsonValue]) -> Result<String> {
-    let mut field_names = Vec::new();
-    let mut seen = HashSet::new();
-
-    for doc in docs {
-        let obj = doc
-            .as_object()
-            .ok_or_else(|| anyhow!("JSON source documents must be objects"))?;
-        for key in obj.keys() {
-            if seen.insert(key.clone()) {
-                field_names.push(key.clone());
-            }
-        }
-    }
-
-    detect_id_field_name(&field_names)
-        .ok_or_else(|| anyhow!("Unable to detect an id field from JSON documents"))
-}
-
 pub(crate) fn json_value_to_id_string(value: &JsonValue) -> Option<String> {
     match value {
         JsonValue::String(s) => {
@@ -841,132 +900,6 @@ pub(crate) fn json_value_to_id_string(value: &JsonValue) -> Option<String> {
         JsonValue::Bool(b) => Some(b.to_string()),
         _ => None,
     }
-}
-
-pub(crate) fn infer_json_field_type(docs: &[JsonValue], field_name: &str) -> TantivyFieldType {
-    docs.iter()
-        .filter_map(|doc| doc.as_object())
-        .filter_map(|obj| obj.get(field_name))
-        .find(|value| !value.is_null())
-        .map(FieldDef::infer_type_from_value)
-        .unwrap_or(TantivyFieldType::Text)
-}
-
-pub(crate) fn normalize_json_document_for_schema(
-    doc: &JsonValue,
-    id_field: &str,
-) -> Result<JsonValue> {
-    let mut obj = effective_json_document(doc)?
-        .as_object()
-        .cloned()
-        .ok_or_else(|| anyhow!("JSON source documents must be objects"))?;
-
-    let id = obj
-        .get("id")
-        .and_then(json_value_to_id_string)
-        .or_else(|| obj.get(id_field).and_then(json_value_to_id_string))
-        .ok_or_else(|| anyhow!("JSON document is missing a usable id field"))?;
-
-    obj.insert("id".to_string(), JsonValue::String(id));
-    Ok(JsonValue::Object(obj))
-}
-
-pub(crate) fn build_schema_from_effective_json_documents(
-    effective_docs: &[JsonValue],
-    id_field: &str,
-) -> Result<JsonValue> {
-    let mut schema = IndexSchema::default();
-    if id_field != "id" {
-        let field_type = infer_json_field_type(effective_docs, id_field);
-        schema.add_shadow_field(id_field.to_string(), field_type);
-    }
-
-    let mut sampled = 0usize;
-    for doc in effective_docs.iter().take(SCHEMA_SAMPLE_LIMIT) {
-        let normalized = normalize_json_document_for_schema(doc, id_field)?;
-        schema.evolve_from_document(&normalized);
-        sampled += 1;
-    }
-
-    if sampled == 0 {
-        anyhow::bail!("JSON source does not contain any valid object documents");
-    }
-
-    for (name, field_def) in schema.fields.iter_mut() {
-        if !field_def.is_shadow {
-            field_def.indexed = true;
-            field_def.stored = name == "id";
-        }
-    }
-
-    if !schema.fields.contains_key("id") {
-        let id_field = FieldDef {
-            name: "id".to_string(),
-            field_type: TantivyFieldType::Text,
-            indexed: true,
-            stored: true,
-            fast: Some(false),
-            is_shadow: false,
-            description: None,
-            tokenizer: Some("raw".to_string()),
-            index_record_option: Some("Basic".to_string()),
-        };
-        schema.fields.insert("id".to_string(), id_field);
-    }
-
-    schema.auto_detect_routing_field();
-
-    serde_json::to_value(schema).context("Failed to serialize schema")
-}
-
-pub(crate) fn build_schema_from_json_documents(docs: &[JsonValue]) -> Result<JsonValue> {
-    let effective_docs = collect_effective_json_documents(docs)?;
-    let id_field = detect_json_id_field_name(&effective_docs)?;
-    build_schema_from_effective_json_documents(&effective_docs, &id_field)
-}
-
-pub(crate) fn build_json_source_analysis_from_docs(
-    docs: &[JsonValue],
-) -> Result<JsonSourceAnalysis> {
-    let effective_docs = collect_effective_json_documents(docs)?;
-    if effective_docs.is_empty() {
-        anyhow::bail!("JSON source does not contain any valid object documents");
-    }
-
-    let id_field = detect_json_id_field_name(&effective_docs)?;
-    let sample_docs = effective_docs
-        .into_iter()
-        .take(SCHEMA_SAMPLE_LIMIT)
-        .collect::<Vec<_>>();
-
-    Ok(JsonSourceAnalysis {
-        sample_docs,
-        id_field,
-    })
-}
-
-pub(crate) fn collect_json_analysis_doc(
-    raw_doc: &JsonValue,
-    sample_docs: &mut Vec<JsonValue>,
-    field_names: &mut Vec<String>,
-    seen: &mut HashSet<String>,
-) -> Result<()> {
-    let effective_doc = effective_json_document(raw_doc)?;
-    let obj = effective_doc
-        .as_object()
-        .ok_or_else(|| anyhow!("JSON source documents must be objects"))?;
-
-    if sample_docs.len() < SCHEMA_SAMPLE_LIMIT {
-        sample_docs.push(JsonValue::Object(obj.clone()));
-    }
-
-    for key in obj.keys() {
-        if seen.insert(key.clone()) {
-            field_names.push(key.clone());
-        }
-    }
-
-    Ok(())
 }
 
 #[derive(Debug)]
@@ -1432,53 +1365,25 @@ where
     }
 }
 
-/// The shared tail of every analyze pass: a stream that produced no usable document
-/// cannot describe a schema, and one that did must name its id field.
-pub(crate) fn json_source_analysis(
-    sample_docs: Vec<JsonValue>,
-    field_names: Vec<String>,
-    count: usize,
-) -> Result<JsonSourceAnalysis> {
-    if count == 0 || sample_docs.is_empty() {
-        anyhow::bail!("JSON source does not contain any valid object documents");
-    }
-
-    let id_field = detect_id_field_name(&field_names)
-        .ok_or_else(|| anyhow!("Unable to detect an id field from JSON documents"))?;
-
-    Ok(JsonSourceAnalysis {
-        sample_docs,
-        id_field,
-    })
+/// How a JSON load turns a source document into a payload: which fields make its id, and how
+/// each field's values are read.
+#[derive(Debug, Clone)]
+pub(crate) struct JsonLoadPlan {
+    pub(crate) id: IdSpec,
+    /// Named with `--id`: the named fields make the id, whatever else the document carries.
+    pub(crate) explicit: bool,
+    pub(crate) shapes: HashMap<String, ColumnShape>,
 }
 
-pub(crate) fn analyze_local_json_source_for_schema(
-    source: &str,
-    format: SourceFormat,
-) -> Result<JsonSourceAnalysis> {
-    let reader = open_local_reader(Path::new(source), detect_compression(source))?;
-    analyze_reader_json_source_for_schema(reader, format)
-}
-
-pub(crate) fn analyze_reader_json_source_for_schema<R: Read>(
-    reader: R,
-    format: SourceFormat,
-) -> Result<JsonSourceAnalysis> {
-    let mut sample_docs = Vec::new();
-    let mut field_names = Vec::new();
-    let mut seen = HashSet::new();
-
-    let count = for_each_json_document_in_reader(reader, format, |raw_doc| {
-        collect_json_analysis_doc(&raw_doc, &mut sample_docs, &mut field_names, &mut seen)
-    })?;
-
-    json_source_analysis(sample_docs, field_names, count)
-}
-
+/// The payload line for one source document and its id; `None` when the document has no id.
+///
+/// The id is the document's own `id` when it has one, else the id field's value — unless
+/// `--id` named the fields, which then make it alone. Each field's value is fitted to its field
+/// first: `"12"` in a count is 12, `"NA"` no value, `"TRUE"` in a flag `true`.
 pub(crate) fn build_doc_payload_from_json_document(
     raw_doc: &JsonValue,
-    id_field: &str,
-) -> Result<JsonValue> {
+    plan: &JsonLoadPlan,
+) -> Result<Option<(String, JsonValue)>> {
     let raw_obj = raw_doc
         .as_object()
         .ok_or_else(|| anyhow!("JSON source documents must be objects"))?;
@@ -1492,56 +1397,104 @@ pub(crate) fn build_doc_payload_from_json_document(
         raw_obj.clone()
     };
 
-    let id = raw_obj
-        .get("id")
-        .and_then(json_value_to_id_string)
-        .or_else(|| doc_obj.get("id").and_then(json_value_to_id_string))
-        .or_else(|| doc_obj.get(id_field).and_then(json_value_to_id_string))
-        .ok_or_else(|| anyhow!("JSON document is missing a usable id field"))?;
-
-    doc_obj.insert("id".to_string(), JsonValue::String(id.clone()));
-
+    let field_id = |name: &str| doc_obj.get(name).and_then(json_value_to_id_string);
+    let id = match (&plan.id, plan.explicit) {
+        (IdSpec::Column(name), false) => raw_obj
+            .get("id")
+            .and_then(json_value_to_id_string)
+            .or_else(|| field_id("id"))
+            .or_else(|| field_id(name)),
+        (spec, _) => compose_id(spec.columns().into_iter().map(field_id)),
+    };
+    let Some(id) = id else {
+        return Ok(None);
+    };
     let routing_key = raw_obj
         .get("routing_key")
         .and_then(json_value_to_id_string)
-        .or_else(|| doc_obj.get(id_field).and_then(json_value_to_id_string))
+        .or_else(|| plan.id.single().and_then(field_id))
         .unwrap_or_else(|| id.clone());
 
-    Ok(json!({
+    for (name, value) in doc_obj.iter_mut() {
+        if let Some(shape) = plan.shapes.get(name) {
+            *value = fit_json(std::mem::take(value), shape);
+        }
+    }
+    doc_obj.insert("id".to_string(), JsonValue::String(id.clone()));
+
+    let payload = json!({
         "id": id,
         "routing_key": routing_key,
         "doc": JsonValue::Object(doc_obj),
-    }))
+    });
+    Ok(Some((id, payload)))
 }
 
-/// Whether the index already has a schema to load into, or the loader should apply the one it
+/// What a load needs from the index's schema: each field's type, and the shadow field that
+/// carries the source's own id, when there is one.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ExistingSchema {
+    pub(crate) field_types: HashMap<String, TantivyFieldType>,
+    pub(crate) shadow_field: Option<String>,
+    /// The fields the index records its ids are made of.
+    pub(crate) id_fields: Vec<String>,
+    pub(crate) description: Option<String>,
+    /// Each field as the node describes it, for carrying a person's edits into a schema rebuilt
+    /// for another id.
+    pub(crate) fields: Vec<JsonValue>,
+}
+
+impl ExistingSchema {
+    /// The id the index already keys its documents by: its recorded fields, else its shadow
+    /// field — the one record an index written before `id_fields` keeps of its id.
+    pub(crate) fn recorded_id(&self) -> Option<IdSpec> {
+        match self.id_fields.len() {
+            0 => self.shadow_field.clone().map(IdSpec::Column),
+            1 => Some(IdSpec::Column(self.id_fields[0].clone())),
+            _ => Some(IdSpec::Composite(self.id_fields.clone())),
+        }
+    }
+}
+
+/// Whether two ids are made of the same columns in the same order, whatever their case.
+pub(crate) fn same_id(a: &IdSpec, b: &IdSpec) -> bool {
+    let (a, b) = (a.columns(), b.columns());
+    a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| x.eq_ignore_ascii_case(y))
+}
+
+/// The schema the index already has to load into; `None` when the loader should apply the one it
 /// detects from the source.
 ///
 /// A schema with no fields is none. A node on an older build answers a dropped index with the
 /// record of the drop — no fields — and taken as a schema it made the loader skip the declared
 /// types in the file's header, leaving the node to type every field by guesswork from its
 /// documents.
-pub(crate) async fn index_has_schema(client: &CameoClient, index: &str) -> bool {
-    index_field_types(client, index).await.is_some()
-}
-
-/// Each field's type, as the index's schema declares it; `None` when the index has no schema,
-/// or one with no fields.
-pub(crate) async fn index_field_types(
-    client: &CameoClient,
-    index: &str,
-) -> Option<HashMap<String, TantivyFieldType>> {
+pub(crate) async fn existing_schema(client: &CameoClient, index: &str) -> Option<ExistingSchema> {
     let config = client.get_index_config(index).await.ok()?;
-    let field_types: HashMap<String, TantivyFieldType> = config
-        .fields
-        .iter()
-        .filter_map(|field| {
-            let name = field.get("name")?.as_str()?.to_string();
-            let field_type = serde_json::from_value(field.get("type")?.clone()).ok()?;
-            Some((name, field_type))
-        })
-        .collect();
-    (!config.fields.is_empty()).then_some(field_types)
+    if config.fields.is_empty() {
+        return None;
+    }
+    let mut existing = ExistingSchema {
+        id_fields: config.id_fields.clone(),
+        description: config.description.clone(),
+        fields: config.fields.clone(),
+        ..Default::default()
+    };
+    for field in &config.fields {
+        let Some(name) = field.get("name").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        if let Some(field_type) = field
+            .get("type")
+            .and_then(|t| serde_json::from_value(t.clone()).ok())
+        {
+            existing.field_types.insert(name.to_string(), field_type);
+        }
+        if field.get("shadow").and_then(JsonValue::as_bool) == Some(true) {
+            existing.shadow_field = Some(name.to_string());
+        }
+    }
+    Some(existing)
 }
 
 /// Each field's type in a schema the loader built, as it will be stored.
@@ -1571,9 +1524,9 @@ pub(crate) fn schema_field_types(schema_json: &JsonValue) -> HashMap<String, Tan
 pub(crate) enum SourceLines {
     /// The file line each body line was read from, in order: a delimited file.
     File(Vec<u64>),
-    /// Documents numbered through the whole source, and the number of the body's first: a JSON
-    /// source, where one document need not be one line.
-    Documents { first: u64 },
+    /// The source document number of each body line, in order: a JSON source, where one
+    /// document need not be one line.
+    Documents(Vec<u64>),
 }
 
 impl SourceLines {
@@ -1585,7 +1538,10 @@ impl SourceLines {
                 .ok()
                 .and_then(|i| lines.get(i))
                 .map(|line| format!("line {line}")),
-            SourceLines::Documents { first } => Some(format!("document {}", first + index)),
+            SourceLines::Documents(documents) => usize::try_from(index)
+                .ok()
+                .and_then(|i| documents.get(i))
+                .map(|document| format!("document {document}")),
         }
     }
 }
@@ -1775,65 +1731,6 @@ where
     Ok(count)
 }
 
-pub(crate) async fn analyze_http_json_source_for_schema(
-    client: &CameoClient,
-    source: &str,
-    format: SourceFormat,
-) -> Result<JsonSourceAnalysis> {
-    let mut sample_docs = Vec::new();
-    let mut field_names = Vec::new();
-    let mut seen = HashSet::new();
-
-    let count = for_each_json_document_in_http_source(client, source, format, |raw_doc| {
-        collect_json_analysis_doc(&raw_doc, &mut sample_docs, &mut field_names, &mut seen)
-    })
-    .await?;
-
-    json_source_analysis(sample_docs, field_names, count)
-}
-
-pub(crate) async fn analyze_json_source_for_schema(
-    client: &CameoClient,
-    source: &str,
-    format: SourceFormat,
-) -> Result<JsonSourceAnalysis> {
-    match format {
-        SourceFormat::JsonDocument => {
-            let value = load_json_value_from_source(client, source).await?;
-            if value.get("fields").is_some() {
-                anyhow::bail!("Schema JSON object cannot be used as document data");
-            }
-            build_json_source_analysis_from_docs(&[value])
-        }
-        SourceFormat::JsonArray | SourceFormat::JsonLines => {
-            let compression = detect_compression(source);
-            if is_http_source(source) && compression == Compression::None {
-                analyze_http_json_source_for_schema(client, source, format).await
-            } else if is_http_source(source) {
-                // Compressed remote: download all, decompress, analyze in memory
-                let bytes = fetch_bytes_source(client, source).await?;
-                tokio::task::spawn_blocking(move || {
-                    let reader = Cursor::new(bytes);
-                    analyze_reader_json_source_for_schema(reader, format)
-                })
-                .await
-                .map_err(|err| anyhow!("Compressed JSON source analysis failed: {}", err))?
-            } else {
-                let source = source.to_string();
-                tokio::task::spawn_blocking(move || {
-                    analyze_local_json_source_for_schema(&source, format)
-                })
-                .await
-                .map_err(|err| anyhow!("Local JSON source analysis failed: {}", err))?
-            }
-        }
-        SourceFormat::SchemaJson => Err(anyhow!(
-            "Schema JSON object cannot be used as document data"
-        )),
-        SourceFormat::CsvLike => Err(anyhow!("Source is not JSON data")),
-    }
-}
-
 pub(crate) async fn flush_ndjson_batch(
     client: &CameoClient,
     index: &str,
@@ -1853,54 +1750,35 @@ pub(crate) async fn flush_ndjson_batch(
     Ok(())
 }
 
-/// What a document pushed through [`JsonIngestPipeline`] made ready. The schema is
-/// emitted once, the moment the sample names an id field; a batch is emitted each time
-/// the buffer fills — and once at the end with whatever is left.
 pub(crate) enum JsonIngestEvent {
-    CreateSchema(JsonSourceAnalysis),
-    /// A batch's NDJSON body, and the number of its first document in the source.
-    DataBatch {
-        body: Vec<u8>,
-        first_document: u64,
-    },
+    /// A batch's NDJSON body, and where in the source each of its documents came from.
+    DataBatch { body: Vec<u8>, lines: SourceLines },
 }
 
-/// The single-pass JSON ingest protocol both loaders run: buffer up to
-/// `SCHEMA_SAMPLE_LIMIT` documents until their fields name an id, emit the schema (when
-/// the index has none), replay the buffer as the first batches, then stream the rest
-/// straight into NDJSON batches. What differs between the loaders is only how the events
-/// are delivered — awaited inline for an HTTP stream, sent down a channel from the
-/// blocking reader thread.
+/// The JSON ingest protocol both loaders run, once the scan has settled the schema and the id:
+/// each document becomes a payload line, and full batches become events. What differs between
+/// the loaders is only how the events are delivered — awaited inline for an HTTP stream, sent
+/// down a channel from the blocking reader thread.
 pub(crate) struct JsonIngestPipeline {
-    pub(crate) schema_exists: bool,
+    pub(crate) plan: JsonLoadPlan,
     pub(crate) batch_size: usize,
-    pub(crate) sample_docs: Vec<JsonValue>,
-    pub(crate) raw_sample_docs: Vec<JsonValue>,
-    pub(crate) field_names: Vec<String>,
-    pub(crate) seen_fields: HashSet<String>,
     pub(crate) batch_body: Vec<u8>,
-    pub(crate) docs_in_batch: usize,
-    /// Documents in the batches already emitted, so each batch knows where in the source it
-    /// starts. See [`SourceLines::Documents`].
-    pub(crate) documents_batched: u64,
-    pub(crate) id_field: Option<String>,
-    pub(crate) samples_flushed: bool,
+    /// The source document number of each line in `batch_body`.
+    pub(crate) batch_documents: Vec<u64>,
+    /// Documents read from the source so far.
+    pub(crate) documents: u64,
+    pub(crate) ledger: IdLedger,
 }
 
 impl JsonIngestPipeline {
-    pub(crate) fn new(batch_size: usize, schema_exists: bool) -> Self {
+    pub(crate) fn new(batch_size: usize, plan: JsonLoadPlan) -> Self {
         Self {
-            schema_exists,
+            plan,
             batch_size: batch_size.max(1),
-            sample_docs: Vec::new(),
-            raw_sample_docs: Vec::new(),
-            field_names: Vec::new(),
-            seen_fields: HashSet::new(),
             batch_body: Vec::new(),
-            docs_in_batch: 0,
-            documents_batched: 0,
-            id_field: None,
-            samples_flushed: false,
+            batch_documents: Vec::new(),
+            documents: 0,
+            ledger: IdLedger::default(),
         }
     }
 
@@ -1909,102 +1787,39 @@ impl JsonIngestPipeline {
         raw_doc: &JsonValue,
         events: &mut Vec<JsonIngestEvent>,
     ) -> Result<()> {
-        if self.samples_flushed {
-            return self.append_doc(raw_doc, events);
-        }
-
-        let effective_doc = effective_json_document(raw_doc)?;
-        let obj = effective_doc
-            .as_object()
-            .ok_or_else(|| anyhow!("JSON source documents must be objects"))?;
-        if self.sample_docs.len() < SCHEMA_SAMPLE_LIMIT {
-            self.sample_docs.push(JsonValue::Object(obj.clone()));
-            self.raw_sample_docs.push(raw_doc.clone());
-            for key in obj.keys() {
-                if self.seen_fields.insert(key.clone()) {
-                    self.field_names.push(key.clone());
-                }
-            }
-        }
-        if self.id_field.is_none() && self.sample_docs.len() >= SCHEMA_SAMPLE_LIMIT {
-            self.id_field = Some(self.detect_id_field()?);
-        }
-        if self.id_field.is_some() {
-            self.flush_samples(events)?;
-        }
-        Ok(())
-    }
-
-    /// End of stream: name the id field from whatever sample the source produced, replay
-    /// it, and emit the last partial batch. An empty source is simply an empty load.
-    pub(crate) fn finish(&mut self, events: &mut Vec<JsonIngestEvent>) -> Result<()> {
-        if !self.samples_flushed && !self.sample_docs.is_empty() {
-            if self.id_field.is_none() {
-                self.id_field = Some(self.detect_id_field()?);
-            }
-            self.flush_samples(events)?;
-        }
-        if !self.batch_body.is_empty() {
-            self.emit_batch(events);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn detect_id_field(&self) -> Result<String> {
-        detect_id_field_name(&self.field_names)
-            .ok_or_else(|| anyhow!("Unable to detect an id field from JSON documents"))
-    }
-
-    /// The sample has named an id field: emit the schema built from it, then replay the
-    /// buffered documents through the normal append path so they land in batches.
-    pub(crate) fn flush_samples(&mut self, events: &mut Vec<JsonIngestEvent>) -> Result<()> {
-        if !self.schema_exists {
-            events.push(JsonIngestEvent::CreateSchema(JsonSourceAnalysis {
-                sample_docs: self.sample_docs.clone(),
-                id_field: self.id_field.clone().expect("set before flush_samples"),
-            }));
-        }
-        let buffered = std::mem::take(&mut self.raw_sample_docs);
-        self.samples_flushed = true;
-        for raw_doc in &buffered {
-            self.append_doc(raw_doc, events)?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn append_doc(
-        &mut self,
-        raw_doc: &JsonValue,
-        events: &mut Vec<JsonIngestEvent>,
-    ) -> Result<()> {
-        let id_field = self
-            .id_field
-            .as_deref()
-            .expect("set before the first append");
-        let payload = build_doc_payload_from_json_document(raw_doc, id_field)?;
+        self.documents += 1;
+        let at = Location::Document(self.documents);
+        let Some((id, payload)) = build_doc_payload_from_json_document(raw_doc, &self.plan)? else {
+            self.ledger.skip(at);
+            return Ok(());
+        };
+        self.ledger.admit(&id, at);
         let mut line = serde_json::to_vec(&payload).context("Failed to serialize JSON payload")?;
         line.push(b'\n');
         self.batch_body.extend_from_slice(&line);
-        self.docs_in_batch += 1;
-        if self.docs_in_batch >= self.batch_size {
+        self.batch_documents.push(self.documents);
+        if self.batch_documents.len() >= self.batch_size {
             self.emit_batch(events);
         }
         Ok(())
     }
 
-    /// Ship the buffered batch, numbered from where it starts in the source.
+    /// End of stream: emit the last partial batch.
+    pub(crate) fn finish(&mut self, events: &mut Vec<JsonIngestEvent>) {
+        if !self.batch_body.is_empty() {
+            self.emit_batch(events);
+        }
+    }
+
     fn emit_batch(&mut self, events: &mut Vec<JsonIngestEvent>) {
         events.push(JsonIngestEvent::DataBatch {
             body: std::mem::take(&mut self.batch_body),
-            first_document: self.documents_batched + 1,
+            lines: SourceLines::Documents(std::mem::take(&mut self.batch_documents)),
         });
-        self.documents_batched += self.docs_in_batch as u64;
-        self.docs_in_batch = 0;
     }
 }
 
-/// Deliver one event the HTTP way: the schema becomes a `PUT /index` and a batch becomes
-/// an NDJSON stream. The reader loader's consumer runs the same match per channel message.
+/// Deliver one event the HTTP way: a batch becomes an NDJSON stream.
 pub(crate) async fn deliver_json_ingest_event(
     client: &CameoClient,
     index: &str,
@@ -2012,38 +1827,15 @@ pub(crate) async fn deliver_json_ingest_event(
     total_sent: &mut usize,
     total_failed: &mut usize,
 ) -> Result<()> {
-    match event {
-        JsonIngestEvent::CreateSchema(analysis) => {
-            let schema = build_schema_from_effective_json_documents(
-                &analysis.sample_docs,
-                &analysis.id_field,
-            )
-            .context("Failed to detect schema while auto-creating index schema")?;
-            client
-                .put_index_config(index, &schema)
-                .await
-                .with_context(|| format!("Failed to create schema for index '{}'", index))?;
-            println!(
-                "Schema was missing; detected and applied schema to index '{}'",
-                index
-            );
-        }
-        JsonIngestEvent::DataBatch {
-            body,
-            first_document,
-        } => {
-            let response = client.stream_index_ndjson(index, body).await?;
-            record_ingest_response(
-                &response,
-                &SourceLines::Documents {
-                    first: first_document,
-                },
-                total_sent,
-                total_failed,
-            );
-        }
-    }
-    Ok(())
+    let JsonIngestEvent::DataBatch { mut body, lines } = event;
+    flush_ndjson_batch(client, index, &mut body, lines, total_sent, total_failed).await
+}
+
+/// What a load sent, and what it did with ids.
+pub(crate) struct LoadTotals {
+    pub(crate) sent: usize,
+    pub(crate) failed: usize,
+    pub(crate) ledger: IdLedger,
 }
 
 pub(crate) async fn load_data_from_http_json_source_single_pass(
@@ -2052,62 +1844,40 @@ pub(crate) async fn load_data_from_http_json_source_single_pass(
     source: &str,
     format: SourceFormat,
     batch_size: usize,
-    schema_exists: bool,
-) -> Result<()> {
-    let batch_size = batch_size.max(1);
-    let mut spinner = ProgressSpinner::new();
+    plan: JsonLoadPlan,
+) -> Result<LoadTotals> {
+    let mut pipeline = JsonIngestPipeline::new(batch_size, plan);
+    let mut events = Vec::new();
+    let mut total_sent = 0usize;
+    let mut total_failed = 0usize;
+    let mut response = open_http_json_stream(client, source).await?;
+    let mut parser = JsonChunkParser::new(format)?;
 
-    let result: Result<(usize, usize)> = async {
-        let mut response = open_http_json_stream(client, source).await?;
-        let mut parser = JsonChunkParser::new(format)?;
-        let mut pipeline = JsonIngestPipeline::new(batch_size, schema_exists);
-        let mut events = Vec::new();
-        let mut total_sent = 0usize;
-        let mut total_failed = 0usize;
-
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .context("Failed to read remote JSON source body")?
-        {
-            for raw_doc in parser.push_chunk(&chunk)? {
-                pipeline.push(&raw_doc, &mut events)?;
-                for event in events.drain(..) {
-                    deliver_json_ingest_event(
-                        client,
-                        index,
-                        event,
-                        &mut total_sent,
-                        &mut total_failed,
-                    )
-                    .await?;
-                }
-            }
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("Failed to read remote JSON source body")?
+    {
+        for doc in parser.push_chunk(&chunk)? {
+            pipeline.push(&doc, &mut events)?;
         }
-        for raw_doc in parser.finish()? {
-            pipeline.push(&raw_doc, &mut events)?;
-            for event in events.drain(..) {
-                deliver_json_ingest_event(client, index, event, &mut total_sent, &mut total_failed)
-                    .await?;
-            }
-        }
-        pipeline.finish(&mut events)?;
         for event in events.drain(..) {
             deliver_json_ingest_event(client, index, event, &mut total_sent, &mut total_failed)
                 .await?;
         }
-        Ok((total_sent, total_failed))
     }
-    .await;
-
-    spinner.stop();
-    let (total_sent, total_failed) = result?;
-
-    println!(
-        "Ingestion complete for index '{}': loaded={} failed={} (batch size {})",
-        index, total_sent, total_failed, batch_size
-    );
-    Ok(())
+    for doc in parser.finish()? {
+        pipeline.push(&doc, &mut events)?;
+    }
+    pipeline.finish(&mut events);
+    for event in events.drain(..) {
+        deliver_json_ingest_event(client, index, event, &mut total_sent, &mut total_failed).await?;
+    }
+    Ok(LoadTotals {
+        sent: total_sent,
+        failed: total_failed,
+        ledger: pipeline.ledger,
+    })
 }
 
 pub(crate) async fn load_data_from_reader_json_source_single_pass(
@@ -2116,16 +1886,14 @@ pub(crate) async fn load_data_from_reader_json_source_single_pass(
     reader: Box<dyn Read + Send + 'static>,
     format: SourceFormat,
     batch_size: usize,
-    schema_exists: bool,
-) -> Result<()> {
-    let batch_size = batch_size.max(1);
-    let mut spinner = ProgressSpinner::new();
+    plan: JsonLoadPlan,
+) -> Result<LoadTotals> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<JsonIngestEvent>(2);
 
     // The reader is blocking, so the pipeline runs on a worker thread and reports
     // readiness as events; the async side delivers them in the order they arrive.
-    let producer = tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut pipeline = JsonIngestPipeline::new(batch_size, schema_exists);
+    let producer = tokio::task::spawn_blocking(move || -> Result<IdLedger> {
+        let mut pipeline = JsonIngestPipeline::new(batch_size, plan);
         let mut events = Vec::new();
         let send_err = || anyhow!("Failed to send message because receiver was dropped");
         let drain = |events: &mut Vec<JsonIngestEvent>| -> Result<()> {
@@ -2139,9 +1907,9 @@ pub(crate) async fn load_data_from_reader_json_source_single_pass(
             pipeline.push(&raw_doc, &mut events)?;
             drain(&mut events)
         })?;
-        pipeline.finish(&mut events)?;
+        pipeline.finish(&mut events);
         drain(&mut events)?;
-        Ok(())
+        Ok(pipeline.ledger)
     });
 
     let mut total_sent = 0usize;
@@ -2157,198 +1925,252 @@ pub(crate) async fn load_data_from_reader_json_source_single_pass(
     .await;
 
     drop(rx);
-    producer
+    let ledger = producer
         .await
         .map_err(|err| anyhow!("Local JSON batch producer failed: {}", err))??;
-
-    spinner.stop();
     send_result?;
-
-    println!(
-        "Ingestion complete for index '{}': loaded={} failed={} (batch size {})",
-        index, total_sent, total_failed, batch_size
-    );
-    Ok(())
+    Ok(LoadTotals {
+        sent: total_sent,
+        failed: total_failed,
+        ledger,
+    })
 }
 
+/// The schema a source describes: a schema file as it is, or the one its data describes.
 pub(crate) async fn detect_schema_from_source(
     client: &CameoClient,
     source: &str,
     delimiter: Delimiter,
-) -> Result<JsonValue> {
-    load_schema_from_source(client, source, delimiter).await
-}
-
-pub(crate) async fn load_schema_from_source(
-    client: &CameoClient,
-    source: &str,
-    delimiter: Delimiter,
+    id: Option<&IdSpec>,
 ) -> Result<JsonValue> {
     let mut spinner = ProgressSpinner::new();
-    let format = detect_source_format_for_source(client, source).await?;
-
-    let result = match format {
-        SourceFormat::CsvLike => detect_schema_from_csv(client, source, delimiter).await,
-        SourceFormat::SchemaJson => load_json_value_from_source(client, source).await,
-        SourceFormat::JsonDocument => {
-            let value = load_json_value_from_source(client, source).await?;
-            if value.get("fields").is_some() {
-                Ok(value)
-            } else {
-                build_schema_from_json_documents(&[value])
-            }
+    let result = async {
+        let format = detect_source_format_for_source(client, source).await?;
+        if format == SourceFormat::SchemaJson
+            || (format == SourceFormat::JsonDocument
+                && load_json_value_from_source(client, source)
+                    .await?
+                    .get("fields")
+                    .is_some())
+        {
+            return load_json_value_from_source(client, source).await;
         }
-        SourceFormat::JsonArray | SourceFormat::JsonLines => {
-            let analysis = analyze_json_source_for_schema(client, source, format).await?;
-            build_schema_from_effective_json_documents(&analysis.sample_docs, &analysis.id_field)
-        }
-    };
-
+        let ids = IdOptions {
+            explicit: id,
+            recorded: None,
+        };
+        let analysis = analyze_source(client, source, delimiter, ids).await?;
+        analysis.profiler.warn_about_id(&analysis.id);
+        schema_from_analysis(&analysis)
+    }
+    .await;
     spinner.stop();
     result
 }
 
+/// The schema a source describes, to apply to an index.
+pub(crate) async fn load_schema_from_source(
+    client: &CameoClient,
+    source: &str,
+    delimiter: Delimiter,
+    id: Option<&IdSpec>,
+) -> Result<JsonValue> {
+    detect_schema_from_source(client, source, delimiter, id).await
+}
+
+/// The analysis `schema detect --report` prints, in place of the schema.
+pub(crate) async fn report_source(
+    client: &CameoClient,
+    source: &str,
+    delimiter: Delimiter,
+    id: Option<&IdSpec>,
+) -> Result<String> {
+    let mut spinner = ProgressSpinner::new();
+    let ids = IdOptions {
+        explicit: id,
+        recorded: None,
+    };
+    let analysis = analyze_source(client, source, delimiter, ids).await;
+    spinner.stop();
+    Ok(analysis?.report(source))
+}
+
+/// Load a source into an index: scan it, apply the schema it describes when the index has none,
+/// then send every row.
 pub(crate) async fn load_data_from_source(
     client: &CameoClient,
     index: &str,
     source: &str,
     delimiter: Delimiter,
     batch_size: usize,
+    id: Option<&IdSpec>,
+    recreate: bool,
 ) -> Result<()> {
+    let batch_size = batch_size.max(1);
     let format = detect_source_format_for_source(client, source).await?;
-
-    match format {
-        SourceFormat::CsvLike => {
-            let field_types = index_field_types(client, index).await;
-            load_data_from_csv_single_pass(
-                client,
-                index,
-                source,
-                delimiter,
-                batch_size,
-                field_types,
-            )
-            .await
-        }
-        SourceFormat::SchemaJson => {
-            Err(anyhow!("Schema JSON object cannot be loaded as index data"))
-        }
-        SourceFormat::JsonDocument | SourceFormat::JsonArray | SourceFormat::JsonLines => {
-            let schema_exists = index_has_schema(client, index).await;
-            let compression = detect_compression(source);
-
-            if is_http_source(source) && compression == Compression::None {
-                load_data_from_http_json_source_single_pass(
-                    client,
-                    index,
-                    source,
-                    format,
-                    batch_size,
-                    schema_exists,
-                )
-                .await
-            } else if is_http_source(source) {
-                // Compressed remote: download all, decompress, process via reader
-                let bytes = fetch_bytes_source(client, source).await?;
-                let reader: Box<dyn Read + Send> = Box::new(Cursor::new(bytes));
-                load_data_from_reader_json_source_single_pass(
-                    client,
-                    index,
-                    reader,
-                    format,
-                    batch_size,
-                    schema_exists,
-                )
-                .await
-            } else {
-                let path = Path::new(source);
-                let reader = open_local_reader(path, compression)?;
-                load_data_from_reader_json_source_single_pass(
-                    client,
-                    index,
-                    reader,
-                    format,
-                    batch_size,
-                    schema_exists,
-                )
-                .await
-            }
-        }
+    if format == SourceFormat::SchemaJson {
+        return Err(anyhow!("Schema JSON object cannot be loaded as index data"));
     }
+    let existing = existing_schema(client, index).await;
+    // Asked for by name, since it is the one step here that cannot be undone: the documents go,
+    // the schema stays, and the load fills the index again.
+    if recreate && existing.is_some() {
+        client
+            .delete_index(index, false)
+            .await
+            .with_context(|| format!("Failed to delete the documents of index '{index}'"))?;
+        println!("Deleted the documents of index '{index}'; its schema is kept");
+    }
+    let recorded = existing.as_ref().and_then(ExistingSchema::recorded_id);
+    let mut spinner = ProgressSpinner::new();
+    let result = async {
+        let ids = IdOptions {
+            explicit: id,
+            recorded: recorded.as_ref(),
+        };
+        let analysis = analyze_source(client, source, delimiter, ids).await?;
+        analysis.profiler.warn_about_id(&analysis.id);
+        let field_types = match &existing {
+            // Another id than the index records: its schema has to say so before a row is sent.
+            // The node rebuilds an index with no documents for it, and refuses one with some —
+            // two keys in one index cannot be told apart.
+            Some(existing)
+                if id.is_some_and(|id| recorded.as_ref().is_none_or(|r| !same_id(id, r))) =>
+            {
+                let schema = schema_for_new_id(&analysis, existing)?;
+                client
+                    .put_index_config(index, &schema)
+                    .await
+                    .map_err(|err| {
+                        anyhow!(
+                            "{err}\nIndex '{index}' keys its documents by {}. To load it by {} \
+                         instead, add --recreate: it deletes the documents, keeps the schema, and \
+                         loads again.",
+                            recorded
+                                .as_ref()
+                                .map(|r| r.columns().join(","))
+                                .unwrap_or_else(|| "another id".to_string()),
+                            analysis.id.spec.columns().join(","),
+                        )
+                    })?;
+                println!(
+                    "Index '{index}' now keys its documents by {}",
+                    analysis.id.spec.columns().join(",")
+                );
+                schema_field_types(&schema)
+            }
+            Some(existing) => existing.field_types.clone(),
+            None => {
+                let schema = schema_from_analysis(&analysis)?;
+                client
+                    .put_index_config(index, &schema)
+                    .await
+                    .with_context(|| format!("Failed to create schema for index '{}'", index))?;
+                println!(
+                    "Schema was missing; detected and applied schema to index '{}'",
+                    index
+                );
+                schema_field_types(&schema)
+            }
+        };
+        let totals = match analysis.format {
+            SourceFormat::CsvLike => {
+                load_csv(client, index, &analysis, &field_types, batch_size).await?
+            }
+            format => {
+                let plan = JsonLoadPlan {
+                    id: analysis.id.spec.clone(),
+                    explicit: matches!(analysis.id.reason, IdReason::Explicit | IdReason::Existing),
+                    shapes: analysis
+                        .profiler
+                        .columns
+                        .iter()
+                        .map(|c| c.name.clone())
+                        .zip(analysis.shapes(&field_types))
+                        .collect(),
+                };
+                match &analysis.data {
+                    Some(data) => {
+                        load_data_from_reader_json_source_single_pass(
+                            client,
+                            index,
+                            data.reader()?,
+                            format,
+                            batch_size,
+                            plan,
+                        )
+                        .await?
+                    }
+                    None => {
+                        load_data_from_http_json_source_single_pass(
+                            client, index, source, format, batch_size, plan,
+                        )
+                        .await?
+                    }
+                }
+            }
+        };
+        let candidate = analysis.profiler.suggested_id();
+        let explicit = matches!(analysis.id.reason, IdReason::Explicit | IdReason::Existing);
+        Ok::<_, anyhow::Error>((totals, analysis.id.spec, explicit, candidate))
+    }
+    .await;
+    spinner.stop();
+    let (totals, id, explicit, candidate) = result?;
+    // `loaded` counts rows written; a row that replaced an earlier one with its id is among them,
+    // so the documents the index gained are `loaded - replaced`.
+    println!(
+        "Ingestion complete for index '{}': loaded={} replaced={} skipped={} failed={} (batch size {})",
+        index, totals.sent, totals.ledger.repeats, totals.ledger.skipped, totals.failed, batch_size
+    );
+    totals.ledger.report(&id, explicit, candidate.as_deref());
+    Ok(())
 }
 
-pub(crate) async fn load_data_from_csv_single_pass(
+/// Send every row of a CSV the scan has settled.
+async fn load_csv(
     client: &CameoClient,
     index: &str,
-    source: &str,
-    delimiter: Delimiter,
+    analysis: &SourceAnalysis,
+    field_types: &HashMap<String, TantivyFieldType>,
     batch_size: usize,
-    field_types: Option<HashMap<String, TantivyFieldType>>,
-) -> Result<()> {
-    let mut spinner = ProgressSpinner::new();
-    let mut reader = open_csv_reader(client, source, delimiter).await?;
+) -> Result<LoadTotals> {
+    let data = analysis
+        .data
+        .as_ref()
+        .expect("a CSV is scanned from its data");
+    let delimiter = analysis.delimiter.expect("a CSV has a delimiter");
+    let mut reader = csv_reader(data.reader()?, delimiter);
     let raw_headers = reader
         .headers()
         .context("CSV file is missing headers")?
         .clone();
-    let headers: Vec<(String, Option<TantivyFieldType>)> =
-        raw_headers.iter().map(parse_header_with_hint).collect();
-    let id_detection = detect_id_field(&headers);
-    let id_header = id_detection.original_field_name.clone();
-    let mut ingest = CsvIngest::new(headers, id_detection, id_header, batch_size);
-
     let mut lines = RecordLines::after_header(&raw_headers, reader.position().line());
-
-    // Rows whose id cell is empty are skipped. Nothing is sent until the sample has settled
-    // how each column is read — and, for an index with no schema, what its schema is.
-    let mut field_types = field_types;
-    let mut settled = false;
-    let mut sample: Vec<(csv::StringRecord, u64)> = Vec::new();
+    let mut ingest = CsvIngest::new(
+        analysis.headers.clone(),
+        analysis.shapes(field_types),
+        analysis.id_columns(),
+        batch_size,
+    );
+    for ((name, _), shape) in analysis.headers.iter().zip(&ingest.columns) {
+        for departure in shape.dates.departures() {
+            println!("Column '{name}' writes {departure}; loading them as YYYY-MM-DD");
+        }
+    }
     let mut record = csv::StringRecord::new();
-
     while reader
         .read_record(&mut record)
         .context("Failed to read CSV record")?
     {
         let line = lines.locate(&record, reader.position().line());
-        if record
-            .get(ingest.id_detection.index)
-            .unwrap_or_default()
-            .trim()
-            .is_empty()
-        {
-            continue;
-        }
-
-        if !settled {
-            sample.push((record.clone(), line));
-            if sample.len() >= SCHEMA_SAMPLE_LIMIT {
-                ingest
-                    .settle_and_drain(client, index, &mut sample, field_types.take())
-                    .await?;
-                settled = true;
-            }
-            continue;
-        }
-
         ingest.push_row(client, index, &record, line).await?;
     }
-
-    // A source smaller than the sample is settled at its end instead.
-    if !settled && !sample.is_empty() {
-        ingest
-            .settle_and_drain(client, index, &mut sample, field_types)
-            .await?;
-    }
-
     ingest.flush(client, index).await?;
-    spinner.stop();
-
-    println!(
-        "Ingestion complete for index '{}': loaded={} failed={} (batch size {})",
-        index, ingest.total_sent, ingest.total_failed, batch_size
-    );
-    Ok(())
+    Ok(LoadTotals {
+        sent: ingest.total_sent,
+        failed: ingest.total_failed,
+        ledger: ingest.ledger,
+    })
 }
 
 pub(crate) fn parse_csv_cell(raw: &str) -> JsonValue {
@@ -2407,15 +2229,6 @@ pub(crate) enum DateOrder {
     DayFirst,
 }
 
-impl DateOrder {
-    fn other(self) -> Self {
-        match self {
-            DateOrder::MonthFirst => DateOrder::DayFirst,
-            DateOrder::DayFirst => DateOrder::MonthFirst,
-        }
-    }
-}
-
 /// The separators a numeric date is written with, and the order the node reads each in: slashes
 /// American, month first; dots European, day first.
 const NODE_DATE_ORDERS: [(char, DateOrder); 2] =
@@ -2447,7 +2260,7 @@ impl DateOrders {
         }
     }
 
-    fn set(&mut self, separator: char, order: DateOrder) {
+    pub(crate) fn set(&mut self, separator: char, order: DateOrder) {
         if separator == '/' {
             self.slash = order;
         } else {
@@ -2522,45 +2335,6 @@ pub(crate) fn numeric_date_order(cell: &str) -> Option<(char, DateOrder)> {
     }
 }
 
-/// How each column writes its numeric dates, judged from the sample.
-///
-/// The node reads each separator one way, always, so that one value never decides how another
-/// is read. The column is what knows its convention: a sample holding a date only the other
-/// order can read, and none only the node's order can, is written the other way — a slash column
-/// holding `15/03/2024` is day first, and its `03/04/2024` is the 3rd of April; a dotted column
-/// holding `03.15.2024` is month first. A sample holding both kinds is not a convention at all
-/// and keeps the node's order, so its other dates are refused, each by its line, not guessed.
-pub(crate) fn date_orders_by_column<'a>(
-    rows: impl IntoIterator<Item = &'a csv::StringRecord>,
-    width: usize,
-) -> Vec<DateOrders> {
-    // Per column, the (separator, order) pairs some sampled value could only be read as.
-    let mut seen: Vec<Vec<(char, DateOrder)>> = vec![Vec::new(); width];
-    for row in rows {
-        for (column, cell) in row.iter().enumerate().take(width) {
-            if let Some(evidence) = numeric_date_order(cell.trim())
-                && !seen[column].contains(&evidence)
-            {
-                seen[column].push(evidence);
-            }
-        }
-    }
-    seen.into_iter()
-        .map(|evidence| {
-            let mut orders = DateOrders::default();
-            for (separator, node_order) in NODE_DATE_ORDERS {
-                let other = node_order.other();
-                if evidence.contains(&(separator, other))
-                    && !evidence.contains(&(separator, node_order))
-                {
-                    orders.set(separator, other);
-                }
-            }
-            orders
-        })
-        .collect()
-}
-
 /// A numeric date the node would read the other way, as the ISO date the column means, its time
 /// kept: in a day-first slash column `15/03/2024 16:13` becomes `2024-03-15 16:13`. `None` for a
 /// date the node reads as meant, anything that is not a numeric date, or a day the calendar
@@ -2583,49 +2357,14 @@ pub(crate) fn reordered_date(cell: &str, orders: &DateOrders) -> Option<String> 
     storage::parse_date_to_timestamp_secs(&iso).map(|_| iso)
 }
 
-/// How the loader reads one column: the type its field declares, and how it writes its numeric
-/// dates.
+/// How the loader reads one column: the type its field declares, how it writes its numeric
+/// dates, and whether each value is a list of them.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct ColumnShape {
     pub(crate) field_type: Option<TantivyFieldType>,
     pub(crate) dates: DateOrders,
-}
-
-/// Each header's shape, from the index's field types and the sample's date orders. Only a date
-/// field reorders its dates; any other column keeps what it holds.
-pub(crate) fn column_shapes(
-    headers: &[(String, Option<TantivyFieldType>)],
-    field_types: &HashMap<String, TantivyFieldType>,
-    date_orders: &[DateOrders],
-) -> Vec<ColumnShape> {
-    headers
-        .iter()
-        .enumerate()
-        .map(|(column, (name, _))| {
-            let field_type = field_types.get(name).cloned();
-            let dates = match field_type {
-                Some(TantivyFieldType::Date) => {
-                    date_orders.get(column).copied().unwrap_or_default()
-                }
-                _ => DateOrders::default(),
-            };
-            ColumnShape { field_type, dates }
-        })
-        .collect()
-}
-
-/// A sampled cell as schema inference should see it: a missing marker is no value, and a column
-/// written the other way round has its dates read as the dates they are — `15/03/2024` would
-/// otherwise make the column text, because the node cannot read it.
-pub(crate) fn sample_cell(raw: &str, dates: &DateOrders) -> JsonValue {
-    let trimmed = raw.trim();
-    if is_missing_marker(trimmed) {
-        return JsonValue::Null;
-    }
-    if let Some(iso) = reordered_date(trimmed, dates) {
-        return JsonValue::String(iso);
-    }
-    parse_csv_cell(raw)
+    /// Each value is a list written into the cell, `['a', 'b']`, loaded as several values.
+    pub(crate) list: bool,
 }
 
 /// A CSV cell as the value its field can hold.
@@ -2635,13 +2374,25 @@ pub(crate) fn sample_cell(raw: &str, dates: &DateOrders) -> JsonValue {
 /// the row refused. `20240315` in a date column was sent as a number, which a date field reads
 /// as seconds since 1970 — the row landed in August 1970. And a text column's `007` was sent as
 /// the number 7. A column no field describes is still read by its look, as it always was.
+///
+/// A blank cell is no value in every field, a boolean one included: `false` would be a guess.
 pub(crate) fn csv_cell(raw: &str, shape: &ColumnShape) -> JsonValue {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return JsonValue::Null;
     }
+    if shape.list
+        && let Some(items) = parse_list(trimmed)
+    {
+        return fit_list(items, shape);
+    }
+    fit_text(trimmed, shape)
+}
+
+/// A non-blank text value as its field reads it.
+fn fit_text(trimmed: &str, shape: &ColumnShape) -> JsonValue {
     match &shape.field_type {
-        Some(TantivyFieldType::Text | TantivyFieldType::String) => {
+        Some(TantivyFieldType::Text | TantivyFieldType::String | TantivyFieldType::Ip) => {
             JsonValue::String(trimmed.to_string())
         }
         Some(
@@ -2649,12 +2400,71 @@ pub(crate) fn csv_cell(raw: &str, shape: &ColumnShape) -> JsonValue {
             | TantivyFieldType::U64
             | TantivyFieldType::F64
             | TantivyFieldType::Date
-            | TantivyFieldType::Boolean
-            | TantivyFieldType::Ip,
+            | TantivyFieldType::Boolean,
         ) if is_missing_marker(trimmed) => JsonValue::Null,
         Some(TantivyFieldType::Date) => date_cell(trimmed, &shape.dates),
-        Some(TantivyFieldType::Boolean) => boolean_cell(trimmed),
-        _ => parse_csv_cell(raw),
+        Some(TantivyFieldType::Boolean) => boolean_word(trimmed)
+            .map(JsonValue::Bool)
+            .unwrap_or_else(|| JsonValue::String(trimmed.to_string())),
+        _ => parse_csv_cell(trimmed),
+    }
+}
+
+/// A list's elements, each fitted to the field, as several values of it; no value at all when
+/// none is left.
+fn fit_list(items: Vec<JsonValue>, shape: &ColumnShape) -> JsonValue {
+    let element = ColumnShape {
+        list: false,
+        ..shape.clone()
+    };
+    let values: Vec<JsonValue> = items
+        .into_iter()
+        .map(|item| fit_json(item, &element))
+        .filter(|value| !value.is_null())
+        .collect();
+    if values.is_empty() {
+        JsonValue::Null
+    } else {
+        JsonValue::Array(values)
+    }
+}
+
+/// A JSON value as the value its field can hold: the conversions a CSV cell gets, for a source
+/// that writes `"12"` for a count, `"NA"` or `""` for none, or `"TRUE"` for a flag. A text field
+/// keeps the string it is given; a json, bytes or facet field takes the value as it is.
+pub(crate) fn fit_json(value: JsonValue, shape: &ColumnShape) -> JsonValue {
+    use TantivyFieldType as T;
+    let Some(field_type) = &shape.field_type else {
+        return value;
+    };
+    if matches!(field_type, T::Json | T::Bytes | T::Facet) {
+        return value;
+    }
+    let text_field = matches!(field_type, T::Text | T::String);
+    match value {
+        JsonValue::String(s) => {
+            let trimmed = s.trim();
+            if shape.list
+                && let Some(items) = parse_list(trimmed)
+            {
+                return fit_list(items, shape);
+            }
+            if text_field {
+                JsonValue::String(s)
+            } else if trimmed.is_empty() {
+                JsonValue::Null
+            } else {
+                fit_text(trimmed, shape)
+            }
+        }
+        JsonValue::Number(n) if text_field => JsonValue::String(n.to_string()),
+        JsonValue::Number(n) if *field_type == T::Boolean => {
+            let number = JsonValue::Number(n);
+            boolean_value(&number).map_or(number, JsonValue::Bool)
+        }
+        JsonValue::Bool(b) if text_field => JsonValue::String(b.to_string()),
+        JsonValue::Array(items) => fit_list(items, shape),
+        other => other,
     }
 }
 
@@ -2671,15 +2481,6 @@ fn date_cell(trimmed: &str, dates: &DateOrders) -> JsonValue {
         return JsonValue::Number(seconds.into());
     }
     JsonValue::String(trimmed.to_string())
-}
-
-/// A boolean cell, in the spellings that cannot mean anything else in a boolean column.
-fn boolean_cell(trimmed: &str) -> JsonValue {
-    match trimmed.to_ascii_lowercase().as_str() {
-        "true" | "yes" | "y" | "1" => JsonValue::Bool(true),
-        "false" | "no" | "n" | "0" => JsonValue::Bool(false),
-        _ => JsonValue::String(trimmed.to_string()),
-    }
 }
 
 /// Where each record of a delimited file starts, as `sed -n <N>p` counts lines.
@@ -2727,79 +2528,6 @@ impl RecordLines {
         self.next_start = start + breaks + 1;
         start
     }
-}
-
-pub(crate) async fn open_csv_source(
-    client: &CameoClient,
-    source: &str,
-) -> Result<Box<dyn Read + Send>> {
-    let compression = detect_compression(source);
-    let is_http = source.starts_with("http://") || source.starts_with("https://");
-
-    if is_http {
-        let url = Url::parse(source).context("Invalid URL for CSV source")?;
-        let raw_bytes = client
-            .source_http()
-            .get(url)
-            .send()
-            .await
-            .context("Failed to fetch remote CSV")?
-            .bytes()
-            .await
-            .context("Failed to read remote CSV body")?;
-        let decompressed = decompress_bytes(raw_bytes.to_vec(), compression)?;
-        Ok(Box::new(Cursor::new(decompressed)) as Box<dyn Read + Send>)
-    } else {
-        let path = Path::new(source);
-        open_local_reader(path, compression)
-    }
-}
-
-pub(crate) async fn open_csv_reader(
-    client: &CameoClient,
-    source: &str,
-    delimiter: Delimiter,
-) -> Result<csv::Reader<Box<dyn Read + Send>>> {
-    let mut builder = ReaderBuilder::new();
-    // Remote TSV samples (e.g., book summaries) sometimes contain stray delimiters;
-    // allow variable-length records so schema detection doesn't abort early.
-    builder.flexible(true);
-    match delimiter {
-        Delimiter::Detect => {
-            let bytes = fetch_bytes_source(client, source).await?;
-            // Detect delimiter on first line
-            let first_line_end = bytes
-                .iter()
-                .position(|b| *b == b'\n')
-                .unwrap_or(bytes.len());
-            let first_line = &bytes[..first_line_end];
-            let tab_count = first_line.iter().filter(|b| **b == b'\t').count();
-            let comma_count = first_line.iter().filter(|b| **b == b',').count();
-            let semi_count = first_line.iter().filter(|b| **b == b';').count();
-
-            let detected = if semi_count >= tab_count && semi_count >= comma_count {
-                b';'
-            } else if tab_count >= comma_count {
-                b'\t'
-            } else {
-                b','
-            };
-            builder.delimiter(detected);
-            return Ok(builder.from_reader(Box::new(Cursor::new(bytes)) as Box<dyn Read + Send>));
-        }
-        Delimiter::Comma => {
-            builder.delimiter(b',');
-        }
-        Delimiter::Tab => {
-            builder.delimiter(b'\t');
-        }
-        Delimiter::Semicolon => {
-            builder.delimiter(b';');
-        }
-    }
-    // Re-open source since detect may have consumed none; builder will read fresh
-    let reader_source = open_csv_source(client, source).await?;
-    Ok(builder.from_reader(reader_source))
 }
 
 pub(crate) async fn fetch_bytes_source(client: &CameoClient, source: &str) -> Result<Vec<u8>> {

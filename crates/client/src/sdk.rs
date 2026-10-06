@@ -850,6 +850,10 @@ pub struct IndexConfigResponse {
     pub field_count: usize,
     #[serde(default)]
     pub fields: Vec<JsonValue>,
+    /// The fields the index's ids are made of, joined with `|` in this order. Empty when the
+    /// schema does not record them, as on a node from before it could.
+    #[serde(default)]
+    pub id_fields: Vec<String>,
     /// Raised by every change to the schema, and above a dropped index's when the name is
     /// reused. Defaulted, so an older node that does not send it still parses.
     #[serde(default)]

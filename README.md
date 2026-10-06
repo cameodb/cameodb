@@ -268,6 +268,21 @@ The CLI client features a robust ingestion pipeline that transparently handles:
 - **Compression:** Automatically detects and decompresses `Gzip (.gz/.gzip)` and `Zip (.zip)` archives on the fly.
 - **Sources:** Ingest data from local disk files, mounted network paths, or by streaming directly from public `HTTP/HTTPS` URLs.
 
+### 🔎 Schema Detection and Ids
+Detection reads a local file up to 1 GB whole, and a larger one from the head and in blocks spread over the rest, then types each column by every value it saw. To see what it found and why:
+
+```bash
+cameodb client schema detect ./wifi_kpi_hourly.csv --report
+```
+
+The id is the column filled and unique in every scanned row, preferring names such as `sha256`, `uuid` or `*_id`. When no single column is unique, name the columns whose values together are — the report suggests them — and they are joined with `|`, each staying a field of its own:
+
+```bash
+cameodb client data load wifi ./wifi_kpi_hourly.csv --id Hr,cmMacAddress
+```
+
+The index records its id, and later loads key documents the same way without `--id`. A schema can be edited and applied before loading (`schema detect … > schema.json`, then `schema load wifi schema.json`); once the index holds documents, a change to a field's type or tokenizer, or to the id, needs its documents deleted first — `data load --recreate` does that, keeping the schema, and loads again.
+
 ## 🔒 Security
 
 ### Authentication

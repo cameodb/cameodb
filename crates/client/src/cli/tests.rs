@@ -394,7 +394,7 @@ mod tests {
             relocate_reason("line 3: Type mismatch for field 'when'", &file),
             "line 4005: Type mismatch for field 'when'"
         );
-        let json = SourceLines::Documents { first: 8001 };
+        let json = SourceLines::Documents(vec![8001, 8002, 8004]);
         assert_eq!(
             relocate_reason("line 2: not an object", &json),
             "document 8002: not an object"
@@ -421,7 +421,7 @@ mod tests {
                 "errors": listed,
                 "suppressed_errors": 3800,
             }),
-            &SourceLines::Documents { first: 1 },
+            &SourceLines::Documents((1..=4000).collect()),
             &mut sent,
             &mut failed,
         );
@@ -429,61 +429,76 @@ mod tests {
         assert_eq!(sent + failed, 4000, "written plus refused is what was sent");
     }
 
-    /// Each batch a JSON source emits knows the number of its first document in the source.
+    /// `schema load` takes the index first, as `data load` does, and still the form it was first
+    /// written in.
+    #[test]
+    fn schema_load_names_the_index_first() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let load = SchemaOperation::Load;
+        assert_eq!(
+            schema_targets(load, args(&["wifi", "s.json"]), None).unwrap(),
+            (Some("wifi".to_string()), "s.json".to_string())
+        );
+        assert_eq!(
+            schema_targets(load, args(&["s.json"]), Some("wifi".to_string())).unwrap(),
+            (Some("wifi".to_string()), "s.json".to_string())
+        );
+        assert_eq!(
+            schema_targets(load, args(&["wifi", "s.json"]), Some("wifi".to_string())).unwrap(),
+            (Some("wifi".to_string()), "s.json".to_string())
+        );
+        assert!(schema_targets(load, args(&["a", "s.json"]), Some("b".to_string())).is_err());
+        assert!(schema_targets(SchemaOperation::Detect, args(&["a", "b"]), None).is_err());
+    }
+
+    /// Each batch a JSON source emits knows where in the source each of its documents came
+    /// from — a document skipped for having no id included.
     #[test]
     fn json_batches_are_numbered_through_the_source() {
-        let mut pipeline = JsonIngestPipeline::new(2, true);
+        let plan = JsonLoadPlan {
+            id: IdSpec::Column("id".to_string()),
+            explicit: false,
+            shapes: HashMap::new(),
+        };
+        let mut pipeline = JsonIngestPipeline::new(2, plan);
         let mut events = Vec::new();
-        for n in 0..5 {
-            pipeline
-                .push(
-                    &serde_json::json!({"id": format!("d{n}"), "n": n}),
-                    &mut events,
-                )
-                .expect("push");
+        for n in 0..6 {
+            let doc = if n == 2 {
+                serde_json::json!({"n": n})
+            } else {
+                serde_json::json!({"id": format!("d{n}"), "n": n})
+            };
+            pipeline.push(&doc, &mut events).expect("push");
         }
-        pipeline.finish(&mut events).expect("finish");
-        let firsts: Vec<u64> = events
-            .iter()
-            .filter_map(|event| match event {
-                JsonIngestEvent::DataBatch { first_document, .. } => Some(*first_document),
-                JsonIngestEvent::CreateSchema(_) => None,
-            })
+        pipeline.finish(&mut events);
+        let batches: Vec<SourceLines> = events
+            .into_iter()
+            .map(|JsonIngestEvent::DataBatch { lines, .. }| lines)
             .collect();
-        assert_eq!(firsts, vec![1, 3, 5]);
+        assert_eq!(
+            batches,
+            vec![
+                SourceLines::Documents(vec![1, 2]),
+                SourceLines::Documents(vec![4, 5]),
+                SourceLines::Documents(vec![6]),
+            ]
+        );
+        assert_eq!(pipeline.ledger.skipped, 1);
     }
 }
 
-/// How a CSV cell is read: by the field it lands in, and by its column's date order.
+/// How a cell is read: by the field it lands in, and by its column's date order.
 #[cfg(test)]
 mod csv_cell_tests {
     use super::*;
     use serde_json::json;
-    use std::collections::HashMap;
     use storage::TantivyFieldType;
 
     fn typed(field_type: TantivyFieldType) -> ColumnShape {
         ColumnShape {
             field_type: Some(field_type),
-            dates: DateOrders::default(),
+            ..Default::default()
         }
-    }
-
-    fn dated(slash: DateOrder, dot: DateOrder) -> ColumnShape {
-        ColumnShape {
-            field_type: Some(TantivyFieldType::Date),
-            dates: DateOrders { slash, dot },
-        }
-    }
-
-    fn rows(csv_text: &str) -> Vec<csv::StringRecord> {
-        csv::ReaderBuilder::new()
-            .delimiter(b';')
-            .has_headers(false)
-            .from_reader(csv_text.as_bytes())
-            .records()
-            .collect::<Result<_, _>>()
-            .expect("rows")
     }
 
     /// `NA` in a count column is a count nobody reported, and the row loads without it. The ted
@@ -496,11 +511,11 @@ mod csv_cell_tests {
             TantivyFieldType::Date,
             TantivyFieldType::Boolean,
         ] {
-            for marker in ["NA", "n/a", "#N/A", "NaN", "null", "None", "-"] {
+            for marker in ["NA", "n/a", "#N/A", "NaN", "null", "None", "-", "", "  "] {
                 assert_eq!(
                     csv_cell(marker, &typed(field_type.clone())),
                     JsonValue::Null,
-                    "{marker} under {field_type:?}"
+                    "{marker:?} under {field_type:?}"
                 );
             }
         }
@@ -529,10 +544,13 @@ mod csv_cell_tests {
         let text = typed(TantivyFieldType::Text);
         assert_eq!(csv_cell(" 007 ", &text), json!("007"));
         assert_eq!(csv_cell("TRUE", &text), json!("TRUE"));
+        assert_eq!(csv_cell("8023954622E7", &text), json!("8023954622E7"));
         // A column no field describes is read by its look, as before.
         assert_eq!(csv_cell("007", &ColumnShape::default()), json!(7));
     }
 
+    /// The spellings that cannot mean anything else in a boolean column; a blank is no value,
+    /// not `false` — that would be a guess.
     #[test]
     fn a_boolean_cell_takes_the_spellings_that_cannot_mean_anything_else() {
         let flag = typed(TantivyFieldType::Boolean);
@@ -543,121 +561,75 @@ mod csv_cell_tests {
             assert_eq!(csv_cell(no, &flag), json!(false), "{no}");
         }
         assert_eq!(csv_cell("maybe", &flag), json!("maybe"));
+        assert_eq!(csv_cell("", &flag), JsonValue::Null);
     }
 
-    /// A slash column whose sample has a date only day-first can read, and none only month-first
-    /// can, is day first — and its ambiguous dates are read that way too.
+    /// A list written into a cell is several values of the field, each fitted to it; an empty
+    /// list is no value.
     #[test]
-    fn a_slash_column_that_writes_day_first_is_read_day_first() {
-        let sample = rows("a;03/04/2024;x\nb;15/03/2024;y\nc;01/02/2024 16:13;z\n");
-        let orders = date_orders_by_column(&sample, 3);
-        assert_eq!(orders[1].slash, DateOrder::DayFirst);
-        assert_eq!(orders[0], DateOrders::default());
-        assert_eq!(orders[2], DateOrders::default());
-
-        let shape = dated(DateOrder::DayFirst, DateOrder::DayFirst);
-        assert_eq!(csv_cell("03/04/2024", &shape), json!("2024-04-03"));
-        assert_eq!(csv_cell("15/03/2024", &shape), json!("2024-03-15"));
-        assert_eq!(
-            csv_cell("01/02/2024 16:13", &shape),
-            json!("2024-02-01 16:13")
-        );
-        // Not a slash date: sent as written, as in any date column.
-        assert_eq!(csv_cell("2024-03-15", &shape), json!("2024-03-15"));
-        // A dotted date the node reads as meant is sent as written.
-        assert_eq!(csv_cell("15.03.2024", &shape), json!("15.03.2024"));
-    }
-
-    /// The mirror for dots: the node reads them day first, and a column whose sample has a date
-    /// only month-first can read, and none only day-first can, is month first.
-    #[test]
-    fn a_dotted_column_that_writes_month_first_is_read_month_first() {
-        let sample = rows("03.04.2024\n03.15.2024\n");
-        let orders = date_orders_by_column(&sample, 1);
-        assert_eq!(orders[0].dot, DateOrder::MonthFirst);
-        assert_eq!(orders[0].slash, DateOrder::MonthFirst);
-
-        let shape = dated(DateOrder::MonthFirst, DateOrder::MonthFirst);
-        assert_eq!(csv_cell("03.04.2024", &shape), json!("2024-03-04"));
-        assert_eq!(
-            csv_cell("03.15.2024 16:13:13", &shape),
-            json!("2024-03-15 16:13:13")
-        );
-    }
-
-    /// With no evidence, or evidence both ways, a column keeps the node's order for that
-    /// separator, and its dates go as written for the node to read.
-    #[test]
-    fn a_column_keeps_the_nodes_order_unless_its_sample_says_otherwise() {
-        for sample in [
-            "03/04/2024\n05/06/2024\n",
-            "03/15/2024\n03/04/2024\n",
-            "15/03/2024\n03/15/2024\n",
-            "03.04.2024\n15.03.2024\n",
-            "15.03.2024\n03.15.2024\n",
-        ] {
-            assert_eq!(
-                date_orders_by_column(&rows(sample), 1),
-                vec![DateOrders::default()],
-                "{sample:?}"
-            );
-        }
-        let as_the_node_reads = typed(TantivyFieldType::Date);
-        assert_eq!(
-            csv_cell("03/04/2024", &as_the_node_reads),
-            json!("03/04/2024")
-        );
-        assert_eq!(
-            csv_cell("03.04.2024", &as_the_node_reads),
-            json!("03.04.2024")
-        );
-    }
-
-    /// Each separator is judged on its own evidence.
-    #[test]
-    fn slashes_and_dots_in_one_column_are_judged_apart() {
-        let sample = rows("15/03/2024\n03.15.2024\n");
-        assert_eq!(
-            date_orders_by_column(&sample, 1),
-            vec![DateOrders {
-                slash: DateOrder::DayFirst,
-                dot: DateOrder::MonthFirst,
-            }]
-        );
-    }
-
-    /// The order is only taken for a date field, so a text column of slash dates keeps them as
-    /// written.
-    #[test]
-    fn only_a_date_column_is_reordered() {
-        let headers = vec![("when".to_string(), None), ("note".to_string(), None)];
-        let field_types = HashMap::from([
-            ("when".to_string(), TantivyFieldType::Date),
-            ("note".to_string(), TantivyFieldType::Text),
-        ]);
-        let day_first = DateOrders {
-            slash: DateOrder::DayFirst,
-            dot: DateOrder::DayFirst,
+    fn a_list_cell_is_several_values() {
+        let list = |field_type| ColumnShape {
+            list: true,
+            ..typed(field_type)
         };
-        let shapes = column_shapes(&headers, &field_types, &[day_first, day_first]);
-        assert_eq!(shapes[0].dates, day_first);
-        assert_eq!(shapes[1].dates, DateOrders::default());
+        assert_eq!(
+            csv_cell("['FRITZ!Box 6670 CM','x']", &list(TantivyFieldType::Text)),
+            json!(["FRITZ!Box 6670 CM", "x"])
+        );
+        assert_eq!(
+            csv_cell("[\"1\", 2, None]", &list(TantivyFieldType::I64)),
+            json!([1, 2])
+        );
+        assert_eq!(
+            csv_cell("[]", &list(TantivyFieldType::Text)),
+            JsonValue::Null
+        );
+        // Not a list after all: the value as it is.
+        assert_eq!(
+            csv_cell("[draft] note", &list(TantivyFieldType::Text)),
+            json!("[draft] note")
+        );
     }
 
-    /// With no schema, inference sees a day-first column's dates as dates. `15/03/2024` is text
-    /// to the node, so the column would have been typed text and never sorted.
     #[test]
-    fn a_day_first_sample_infers_a_date_field() {
-        let headers = vec![("id".to_string(), None), ("when".to_string(), None)];
-        let detection = detect_id_field(&headers);
-        let sample = rows("a;15/03/2024\nb;03/04/2024\nc;NA\n");
-        let date_orders = date_orders_by_column(&sample, 2);
-        let schema =
-            csv_sample_schema(&headers, &detection, &sample, &date_orders).expect("schema");
+    fn a_list_is_parsed_as_python_and_json_write_one() {
+        assert_eq!(parse_list("['a', 'b']"), Some(vec![json!("a"), json!("b")]));
         assert_eq!(
-            schema_field_types(&schema).get("when"),
-            Some(&TantivyFieldType::Date)
+            parse_list(r#"["a","b"]"#),
+            Some(vec![json!("a"), json!("b")])
         );
+        assert_eq!(
+            parse_list("['it\\'s', 1, True, None]"),
+            Some(vec![json!("it's"), json!(1), json!(true), JsonValue::Null])
+        );
+        assert_eq!(parse_list("[]"), Some(vec![]));
+        assert_eq!(parse_list("[draft]"), None);
+        assert_eq!(parse_list("['a' 'b']"), None);
+        assert_eq!(parse_list("[[1], [2]]"), None);
+    }
+
+    /// A JSON source's values are fitted to their fields as a CSV's cells are.
+    #[test]
+    fn a_json_value_is_fitted_to_its_field() {
+        let count = typed(TantivyFieldType::I64);
+        assert_eq!(fit_json(json!("12"), &count), json!(12));
+        assert_eq!(fit_json(json!("NA"), &count), JsonValue::Null);
+        assert_eq!(fit_json(json!(""), &count), JsonValue::Null);
+        assert_eq!(fit_json(json!(12), &count), json!(12));
+        let flag = typed(TantivyFieldType::Boolean);
+        assert_eq!(fit_json(json!("TRUE"), &flag), json!(true));
+        assert_eq!(fit_json(json!(""), &flag), JsonValue::Null);
+        assert_eq!(fit_json(json!(0), &flag), json!(false));
+        assert_eq!(fit_json(json!([true, "no"]), &flag), json!([true, false]));
+        let text = typed(TantivyFieldType::Text);
+        assert_eq!(
+            fit_json(json!(" kept as is "), &text),
+            json!(" kept as is ")
+        );
+        assert_eq!(fit_json(json!(""), &text), json!(""));
+        assert_eq!(fit_json(json!(7), &text), json!("7"));
+        let doc = typed(TantivyFieldType::Json);
+        assert_eq!(fit_json(json!({"a": "1"}), &doc), json!({"a": "1"}));
     }
 
     /// Each record's line as `sed -n <N>p` counts: with LF or CRLF endings, a quoted field over
@@ -691,5 +663,546 @@ mod csv_cell_tests {
             }
             assert_eq!(found, expected, "{text:?}");
         }
+    }
+}
+
+/// What a scan says about a column, and the field it becomes.
+#[cfg(test)]
+mod detect_tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use storage::TantivyFieldType;
+
+    fn profile(csv_text: &str) -> (Vec<(String, Option<TantivyFieldType>)>, Profiler) {
+        let mut reader = csv::ReaderBuilder::new().from_reader(csv_text.as_bytes());
+        let headers: Vec<(String, Option<TantivyFieldType>)> = reader
+            .headers()
+            .expect("headers")
+            .iter()
+            .map(parse_header_with_hint)
+            .collect();
+        let names: Vec<String> = headers.iter().map(|(n, _)| n.clone()).collect();
+        let mut profiler = Profiler::new(&names, 8192);
+        for (n, record) in reader.records().enumerate() {
+            profiler.observe_csv(&record.expect("record"), Location::Line(n as u64 + 2));
+        }
+        profiler.finish();
+        (headers, profiler)
+    }
+
+    fn analysis(csv_text: &str, explicit: Option<&IdSpec>) -> SourceAnalysis {
+        let (headers, profiler) = profile(csv_text);
+        let ids = IdOptions {
+            explicit,
+            recorded: None,
+        };
+        SourceAnalysis::new(
+            SourceFormat::CsvLike,
+            None,
+            Some(b','),
+            headers,
+            (profiler, ScanSummary::default()),
+            &ids,
+        )
+        .expect("analysis")
+    }
+
+    fn types(csv_text: &str) -> HashMap<String, TantivyFieldType> {
+        let analysis = analysis(csv_text, None);
+        analysis
+            .profiler
+            .columns
+            .iter()
+            .zip(&analysis.choices)
+            .map(|(c, choice)| (c.name.clone(), choice.field_type.clone()))
+            .collect()
+    }
+
+    /// Strict: a column takes a type only when every value fits it, whatever order they come
+    /// in. Evolution typed `abc, 5` and `5, abc` both as integers, and refused the `abc` rows.
+    #[test]
+    fn a_column_is_typed_by_all_its_values_not_the_first() {
+        let t = types(
+            "id,a,b,c,d,e\n\
+             1,abc,5,1,1.5,2024-01-01\n\
+             2,5,abc,2,2,2024-01-02\n\
+             3,7,9,3,3,soon\n",
+        );
+        assert_eq!(t["a"], TantivyFieldType::Text);
+        assert_eq!(t["b"], TantivyFieldType::Text);
+        assert_eq!(t["c"], TantivyFieldType::I64);
+        assert_eq!(t["d"], TantivyFieldType::F64);
+        assert_eq!(t["e"], TantivyFieldType::Text);
+    }
+
+    /// A boolean column says `true` or `false` somewhere and nothing a flag cannot hold;
+    /// blanks and `NA` are no value. `no data` beside `false` makes it text.
+    #[test]
+    fn a_column_is_boolean_only_when_every_value_can_be() {
+        let t = types(
+            "id,flag,anomaly,late,numbers\n\
+             1,TRUE,false,true,1\n\
+             2,,no data,unknown,0\n\
+             3,False,ok,false,1\n\
+             4,NA,false,TRUE,true\n",
+        );
+        assert_eq!(t["flag"], TantivyFieldType::Boolean);
+        assert_eq!(t["anomaly"], TantivyFieldType::Text);
+        assert_eq!(t["late"], TantivyFieldType::Text);
+        assert_eq!(t["numbers"], TantivyFieldType::Boolean);
+        // Only 1 and 0 say nothing of the kind, and stay a number.
+        assert_eq!(types("id,n\n1,1\n2,0\n")["n"], TantivyFieldType::I64);
+    }
+
+    /// Numbers that are codes stay text: a leading zero anywhere, and in a column named as an
+    /// identifier, a number too long for a double or written with an exponent.
+    #[test]
+    fn a_number_that_is_a_code_stays_text() {
+        let t = types(
+            "id,zip,serialNumber,reading,big_serial\n\
+             1,01234,8023954622E7,8023954622E7,1234567890123456\n\
+             2,10115,802395453830,2.5,1234567890123457\n",
+        );
+        assert_eq!(t["zip"], TantivyFieldType::Text);
+        assert_eq!(t["serialNumber"], TantivyFieldType::Text);
+        assert_eq!(t["reading"], TantivyFieldType::F64);
+        assert_eq!(t["big_serial"], TantivyFieldType::Text);
+    }
+
+    /// Codes — no spaces, nearly one per row — are text indexed whole with the raw tokenizer;
+    /// prose and a handful of repeated words are not.
+    #[test]
+    fn a_column_of_codes_is_raw_text() {
+        let mut text = String::from("id,mac,note,word\n");
+        for n in 0..100 {
+            text.push_str(&format!(
+                "{n},00:7A:A4:E5:{n:02X}:28,note number {n},w{}\n",
+                n % 10
+            ));
+        }
+        let analysis = analysis(&text, None);
+        assert_eq!(analysis.choices[1].field_type, TantivyFieldType::Text);
+        assert_eq!(analysis.choices[1].tokenizer, Some("raw"));
+        assert_eq!(analysis.choices[2].tokenizer, None);
+        assert_eq!(analysis.choices[3].tokenizer, None);
+        let schema = schema_from_analysis(&analysis).expect("schema");
+        assert_eq!(schema["fields"]["mac"]["tokenizer"], json!("raw"));
+        assert_eq!(
+            schema["fields"]["mac"]["index_record_option"],
+            json!("Basic")
+        );
+    }
+
+    /// A short set of repeated values is a category, kept whole as a string field.
+    #[test]
+    fn a_short_repeated_set_is_a_category() {
+        let mut text = String::from("id,status,name\n");
+        for n in 0..100 {
+            text.push_str(&format!(
+                "{n},{},name {n}\n",
+                ["ok", "no data", "warning"][n % 3]
+            ));
+        }
+        let analysis = analysis(&text, None);
+        let status = &analysis.choices[1];
+        assert_eq!(status.field_type, TantivyFieldType::String);
+        assert!(status.category);
+        // Names have spaces: prose, the default tokenizer.
+        assert_eq!(analysis.choices[2].field_type, TantivyFieldType::Text);
+        assert_eq!(analysis.choices[2].tokenizer, None);
+        // Four values in four rows are not a category.
+        assert_eq!(
+            types("id,s\n1,a\n2,b\n3,a\n4,b\n")["s"],
+            TantivyFieldType::Text
+        );
+    }
+
+    /// A column of written lists is a multi-valued field of what the lists hold.
+    #[test]
+    fn a_column_of_lists_is_multivalued() {
+        let analysis = analysis(
+            "id,ssids,counts,mixed\n1,\"['a b','c']\",[1],x\n2,\"['d']\",\"[2, 3]\",\"['y']\"\n",
+            None,
+        );
+        let ssids = &analysis.choices[1];
+        assert!(ssids.list);
+        assert_eq!(ssids.field_type, TantivyFieldType::Text);
+        assert!(analysis.choices[2].list);
+        assert_eq!(analysis.choices[2].field_type, TantivyFieldType::I64);
+        assert!(!analysis.choices[3].list);
+    }
+
+    /// A slash column holding a date only day first can read is day first; one holding both
+    /// kinds is no convention at all, and strictness makes it text rather than refuse half.
+    #[test]
+    fn a_date_column_is_read_in_the_order_it_writes() {
+        let analysis = analysis(
+            "id,when,dotted,both\n\
+             a,03/04/2024,03.04.2024,15/03/2024\n\
+             b,15/03/2024,03.15.2024,03/15/2024\n",
+            None,
+        );
+        let when = &analysis.choices[1];
+        assert_eq!(when.field_type, TantivyFieldType::Date);
+        assert_eq!(when.dates.slash, DateOrder::DayFirst);
+        assert_eq!(analysis.choices[2].dates.dot, DateOrder::MonthFirst);
+        assert_eq!(analysis.choices[3].field_type, TantivyFieldType::Text);
+
+        let field_types = HashMap::from([
+            ("when".to_string(), TantivyFieldType::Date),
+            ("dotted".to_string(), TantivyFieldType::Text),
+        ]);
+        let shapes = analysis.shapes(&field_types);
+        assert_eq!(csv_cell("03/04/2024", &shapes[1]), json!("2024-04-03"));
+        assert_eq!(
+            csv_cell("15/03/2024 16:13", &shapes[1]),
+            json!("2024-03-15 16:13")
+        );
+        // Only a date field is reordered: a text column keeps what it holds.
+        assert_eq!(csv_cell("03.15.2024", &shapes[2]), json!("03.15.2024"));
+    }
+
+    #[test]
+    fn a_field_name_splits_into_its_words() {
+        assert_eq!(id_name_rank("fileSHA256"), id_name_rank("sha256"));
+        assert_eq!(id_name_rank("MD5Hash"), id_name_rank("md5"));
+        assert!(id_name_rank("sha512") < id_name_rank("sha256"));
+        assert!(id_name_rank("sha256") < id_name_rank("sha1"));
+        assert!(id_name_rank("sha1") < id_name_rank("md5"));
+        assert!(id_name_rank("md5") < id_name_rank("file_hash"));
+        assert!(id_name_rank("file_hash") < id_name_rank("uuid"));
+        assert!(id_name_rank("uuid") < id_name_rank("userID"));
+        assert_eq!(id_name_rank("userID"), id_name_rank("user_id"));
+        assert_eq!(id_name_rank("videoid"), id_name_rank("user_id"));
+        assert!(id_name_rank("user_id") < id_name_rank("id_user"));
+        assert!(id_name_rank("record_key") < id_name_rank("seq"));
+        assert_eq!(id_name_rank("SequenceNumber"), id_name_rank("seq"));
+        assert!(id_name_rank("seq") < id_name_rank("provider"));
+        assert_eq!(id_name_rank("title"), UNNAMED_RANK);
+    }
+
+    fn chosen(csv_text: &str) -> (IdSpec, IdReason) {
+        let analysis = analysis(csv_text, None);
+        (analysis.id.spec, analysis.id.reason)
+    }
+
+    fn column(name: &str) -> IdSpec {
+        IdSpec::Column(name.to_string())
+    }
+
+    /// A name says which column to prefer; only one filled and distinct in every scanned row
+    /// can be chosen.
+    #[test]
+    fn the_id_is_the_best_named_column_that_is_unique() {
+        assert_eq!(
+            chosen("parent_sha1,seq,title\na,1,x\na,2,y\nb,3,z\n").0,
+            column("seq")
+        );
+        assert_eq!(chosen("seq,SHA256\n1,a\n2,b\n").0, column("SHA256"));
+        assert_eq!(chosen("user_id,uuid\n1,a\n,b\n3,c\n").0, column("uuid"));
+        // Named exactly `id`, it is the id whatever it holds.
+        assert_eq!(
+            chosen("sha256,ID\na,1\nb,1\n"),
+            (column("ID"), IdReason::Named)
+        );
+        // Failing a named one, the first whose values look like keys.
+        assert_eq!(
+            chosen("title,created,code\nA b,2024-01-01,X1\nC d,2024-01-02,X2\n").0,
+            column("code")
+        );
+        // None unique: the best name, and the load says so.
+        assert_eq!(
+            chosen("kind,user_id\na,1\na,1\n"),
+            (column("user_id"), IdReason::NameOnly)
+        );
+    }
+
+    /// The hourly-readings case: no column is unique, a device and its hour are. The pair is
+    /// found, suggested, and taken when named with --id.
+    #[test]
+    fn a_unique_pair_is_found_and_named_with_id() {
+        let mut text = String::from("Hr,cmMacAddress,serialNumber,status\n");
+        for hour in 0..3 {
+            for device in 0..50 {
+                text.push_str(&format!(
+                    "2026-10-05 0{hour}:00:00,mac{device},sn{device},ok\n"
+                ));
+            }
+        }
+        let auto = analysis(&text, None);
+        assert_eq!(auto.id.reason, IdReason::NameOnly);
+        let pairs: Vec<(String, String)> = auto
+            .profiler
+            .unique_pairs()
+            .into_iter()
+            .map(|(a, b)| {
+                let name = |i: usize| auto.profiler.columns[i].name.clone();
+                (name(a), name(b))
+            })
+            .collect();
+        assert!(
+            pairs.contains(&("Hr".to_string(), "cmMacAddress".to_string())),
+            "{pairs:?}"
+        );
+        assert!(auto.profiler.suggested_id().is_some());
+
+        let spec = IdSpec::parse("Hr, cmMacAddress").expect("spec");
+        let named = analysis(&text, Some(&spec));
+        assert_eq!(named.id.reason, IdReason::Explicit);
+        assert_eq!(named.shadow_name(), None);
+        let schema = schema_from_analysis(&named).expect("schema");
+        let fields = schema["fields"].as_object().expect("fields");
+        // The id's columns stay fields of their own, returned apart; no shadow field.
+        for name in ["Hr", "cmMacAddress"] {
+            assert_eq!(fields[name]["is_shadow"], json!(false), "{name}");
+            assert_eq!(fields[name]["indexed"], json!(true), "{name}");
+        }
+        // A column the source does not have is refused, not guessed at.
+        let missing = IdSpec::parse("Hr,nope").expect("spec");
+        assert!(auto.profiler.choose_id(Some(&missing), None).is_err());
+    }
+
+    /// The id `--id` names is followed through the scan as the load composes it, so a pair that
+    /// repeats is reported before anything is overwritten.
+    #[test]
+    fn a_named_id_is_checked_by_the_scan() {
+        let mut text = String::from("Hr,cmMacAddress,serialNumber\n");
+        for hour in 0..2 {
+            for device in 0..20 {
+                // Two devices share a serial: the hour and serial pair repeats, the hour and MAC
+                // pair does not.
+                let serial = if device == 7 { 6 } else { device };
+                text.push_str(&format!("0{hour}:00,mac{device},sn{serial}\n"));
+            }
+        }
+        let track = |id: &str| {
+            let spec = IdSpec::parse(id).expect("spec");
+            let (headers, _) = profile(&text);
+            let names: Vec<String> = headers.iter().map(|(n, _)| n.clone()).collect();
+            let mut profiler = Profiler::new(&names, 8192);
+            profiler.track_id(&spec);
+            let mut reader = csv::ReaderBuilder::new().from_reader(text.as_bytes());
+            for (n, record) in reader.records().enumerate() {
+                profiler.observe_csv(&record.expect("record"), Location::Line(n as u64 + 2));
+            }
+            profiler.named_id_state().cloned()
+        };
+        assert_eq!(track("Hr,cmMacAddress"), Some(KeyState::Unique));
+
+        // A named id is used as named, even when the scan finds a better one, which it offers
+        // only as a suggestion.
+        let spec = IdSpec::parse("serialNumber,Hr").expect("spec");
+        let named = analysis(&text, Some(&spec));
+        assert_eq!(named.id.spec, spec);
+        assert_eq!(named.id.reason, IdReason::Explicit);
+        assert_eq!(
+            named.profiler.suggested_id().as_deref(),
+            Some("Hr,cmMacAddress")
+        );
+        assert!(named.report("wifi.csv").contains("--id Hr,cmMacAddress"));
+        assert_eq!(
+            track("Hr,serialNumber"),
+            Some(KeyState::Repeats {
+                at: Location::Line(9),
+                value: "00:00|sn6".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_composite_id_joins_its_parts_in_order() {
+        assert_eq!(
+            compose_id([
+                Some("2026-10-05 06:00:00".to_string()),
+                Some("00:7A".to_string())
+            ]),
+            Some("2026-10-05 06:00:00|00:7A".to_string())
+        );
+        assert_eq!(compose_id([Some("a".to_string()), None]), None);
+
+        let mut ingest = CsvIngest::new(Vec::new(), Vec::new(), vec![0, 1], 10);
+        let mut ledger_rows = |cells: &[&str], line| {
+            let record = csv::StringRecord::from(cells.to_vec());
+            let id = compose_id(ingest.id_columns.iter().map(|&i| {
+                record
+                    .get(i)
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_string)
+            }));
+            match id {
+                Some(id) => ingest.ledger.admit(&id, Location::Line(line)),
+                None => ingest.ledger.skip(Location::Line(line)),
+            }
+        };
+        ledger_rows(&["h1", "m1"], 2);
+        ledger_rows(&["h1", "m2"], 3);
+        ledger_rows(&["h1", "m1"], 4);
+        ledger_rows(&["h1", ""], 5);
+        assert_eq!((ingest.ledger.repeats, ingest.ledger.skipped), (1, 1));
+    }
+
+    /// A load keys rows by the id the index records — its `id_fields`, or the shadow field of an
+    /// index written before them — whatever the scan would pick. A source without those columns
+    /// is refused rather than keyed another way.
+    #[test]
+    fn a_load_keeps_the_id_the_index_records() {
+        let (_, profiler) = profile("seq,SHA1,Hr\n1,a,x\n2,b,x\n");
+        let existing = profiler.choose_id(None, Some(&column("seq"))).expect("id");
+        assert_eq!(
+            (existing.spec, existing.reason),
+            (column("seq"), IdReason::Existing)
+        );
+        let composite = IdSpec::parse("hr,sha1").expect("spec");
+        let recorded = profiler.choose_id(None, Some(&composite)).expect("id");
+        assert_eq!(
+            recorded.spec,
+            IdSpec::Composite(vec!["Hr".to_string(), "SHA1".to_string()])
+        );
+        assert!(profiler.choose_id(None, Some(&column("md5"))).is_err());
+        // --id wins over what the index records.
+        let named = profiler
+            .choose_id(Some(&column("SHA1")), Some(&column("seq")))
+            .expect("id");
+        assert_eq!(named.reason, IdReason::Explicit);
+
+        let existing = ExistingSchema {
+            id_fields: vec!["Hr".to_string(), "cmMacAddress".to_string()],
+            shadow_field: Some("ignored".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            existing.recorded_id(),
+            IdSpec::parse("Hr,cmMacAddress").ok()
+        );
+        let legacy = ExistingSchema {
+            shadow_field: Some("sha256".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(legacy.recorded_id(), Some(column("sha256")));
+        assert!(same_id(
+            &IdSpec::parse("hr,CMMACADDRESS").unwrap(),
+            &IdSpec::parse("Hr,cmMacAddress").unwrap()
+        ));
+        assert!(!same_id(
+            &IdSpec::parse("cmMacAddress,Hr").unwrap(),
+            &IdSpec::parse("Hr,cmMacAddress").unwrap()
+        ));
+    }
+
+    /// The schema records how its ids are made, in the order --id named the columns; and a
+    /// schema rebuilt for another id keeps every field a person declared.
+    #[test]
+    fn a_schema_records_its_id_and_keeps_declared_fields_across_a_change() {
+        let text =
+            "Hr,mac,serial,ssids\n06,AA,s1,\"['x']\"\n06,BB,s2,\"['y']\"\n07,AA,s1,\"['x']\"\n";
+        let spec = IdSpec::parse("mac,Hr").expect("spec");
+        let schema = schema_from_analysis(&analysis(text, Some(&spec))).expect("schema");
+        assert_eq!(schema["id_fields"], json!(["mac", "Hr"]));
+
+        let existing = ExistingSchema {
+            id_fields: vec!["serial".to_string()],
+            shadow_field: Some("serial".to_string()),
+            description: Some("hourly wifi".to_string()),
+            fields: vec![
+                json!({"name": "serial", "type": "text", "shadow": true}),
+                json!({"name": "ssids", "type": "text", "tokenizer": "raw", "indexed": true,
+                       "description": "SSIDs seen"}),
+                json!({"name": "extra", "type": "i64", "indexed": true}),
+            ],
+            ..Default::default()
+        };
+        let rebuilt = schema_for_new_id(&analysis(text, Some(&spec)), &existing).expect("schema");
+        let fields = &rebuilt["fields"];
+        assert_eq!(rebuilt["id_fields"], json!(["mac", "Hr"]));
+        // The old id's shadow is an ordinary field again; the edits survive.
+        assert_eq!(fields["serial"]["is_shadow"], json!(false));
+        assert_eq!(fields["ssids"]["tokenizer"], json!("raw"));
+        assert_eq!(fields["ssids"]["description"], json!("SSIDs seen"));
+        assert_eq!(fields["extra"]["field_type"], json!("i64"));
+        assert_eq!(rebuilt["description"], json!("hourly wifi"));
+    }
+
+    /// A JSON source is profiled by its documents' values: `"12"` is a count, `"true"` a flag,
+    /// and a field missing from earlier documents was empty in them.
+    #[test]
+    fn a_json_source_is_typed_by_its_values() {
+        let mut profiler = Profiler::new(&[], 8192);
+        for n in 0..4u64 {
+            let active = ["true", "FALSE", ""][n as usize % 3];
+            let mut doc = json!({
+                "seq_no": n,
+                "count": n.to_string(),
+                "active": active,
+                "valid": n % 2 == 0,
+                "tags": ["a", "b"],
+            });
+            if n >= 2 {
+                doc["late"] = json!("x");
+            }
+            profiler.observe_json(doc.as_object().unwrap(), Location::Document(n + 1));
+        }
+        profiler.finish();
+        let choices: HashMap<String, FieldChoice> = profiler
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .zip(profiler.choices())
+            .collect();
+        assert_eq!(choices["count"].field_type, TantivyFieldType::I64);
+        assert_eq!(choices["active"].field_type, TantivyFieldType::Boolean);
+        assert!(choices["tags"].list);
+        let id = profiler.choose_id(None, None).expect("id");
+        assert_eq!(id.spec, column("seq_no"));
+        assert!(matches!(
+            profiler.columns[profiler.index_of("late").unwrap()].key_state(),
+            KeyState::NotFilled { .. }
+        ));
+    }
+
+    /// A file larger than the whole-file limit is read from the head until its columns are
+    /// stable, then in blocks spread over the rest — which is where a sorted file keeps what its
+    /// head does not show.
+    #[test]
+    fn a_large_file_is_read_across_its_whole_length() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sorted.csv");
+        let mut text = String::from("seq,reading\n");
+        for n in 0..40_000 {
+            // Whole numbers in the first half, decimals in the second.
+            if n < 20_000 {
+                text.push_str(&format!("{n:06},{}\n", n % 97));
+            } else {
+                text.push_str(&format!("{n:06},{}.5\n", n % 97));
+            }
+        }
+        std::fs::write(&path, &text).expect("write");
+        let data = SourceData::File {
+            path: path.clone(),
+            compression: Compression::None,
+        };
+        let limits = ScanLimits {
+            whole_file_bytes: 1024,
+            min_rows: 1_000,
+            batch_rows: 500,
+            ..Default::default()
+        };
+        let scan = scan_csv(&data, b',', &limits, None).expect("scan");
+        assert!(!scan.summary.whole);
+        assert!(
+            scan.summary.head_rows < 20_000,
+            "{}",
+            scan.summary.head_rows
+        );
+        assert_eq!(scan.summary.spread_blocks, limits.blocks);
+        assert_eq!(scan.profiler.choices()[1].field_type, TantivyFieldType::F64);
+        let estimated = scan.summary.rows.expect("estimate");
+        assert!((36_000..44_000).contains(&estimated), "{estimated}");
+
+        // Under the limit, the file is read whole and its rows counted.
+        let whole = scan_csv(&data, b',', &ScanLimits::default(), None).expect("scan");
+        assert!(whole.summary.whole);
+        assert_eq!(whole.summary.rows, Some(40_000));
     }
 }
