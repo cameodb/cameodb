@@ -51,6 +51,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A list in a `text` field is several values, not one.** It was indexed as its JSON spelling,
+  so a phrase matched across two elements and, under the `raw` tokenizer, no element matched at
+  all. Each element is now a value of its own, as numeric and `string` fields already took them.
+  Documents written before keep the old indexing until the index is rebuilt.
 - **The search-window bound is spelled once.** The MCP dispatcher and the node's own
   `SearchWindow::checked` enforced `offset + limit ≤ max_search_limit` with two copies of the
   arithmetic whose refusal text had already drifted; both now call
