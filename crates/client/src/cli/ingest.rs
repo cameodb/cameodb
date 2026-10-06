@@ -1469,10 +1469,22 @@ pub(crate) fn same_id(a: &IdSpec, b: &IdSpec) -> bool {
 /// record of the drop — no fields — and taken as a schema it made the loader skip the declared
 /// types in the file's header, leaving the node to type every field by guesswork from its
 /// documents.
-pub(crate) async fn existing_schema(client: &CameoClient, index: &str) -> Option<ExistingSchema> {
-    let config = client.get_index_config(index).await.ok()?;
+///
+/// Only a node's `404` says there is none. Any other failure was once read the same way, and the
+/// loader went on to declare a schema of its own over the index it could not read.
+pub(crate) async fn existing_schema(
+    client: &CameoClient,
+    index: &str,
+) -> Result<Option<ExistingSchema>> {
+    let Some(config) = client
+        .find_index_config(index)
+        .await
+        .with_context(|| format!("Failed to read the schema of index '{index}'"))?
+    else {
+        return Ok(None);
+    };
     if config.fields.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut existing = ExistingSchema {
         id_fields: config.id_fields.clone(),
@@ -1494,7 +1506,7 @@ pub(crate) async fn existing_schema(client: &CameoClient, index: &str) -> Option
             existing.shadow_field = Some(name.to_string());
         }
     }
-    Some(existing)
+    Ok(Some(existing))
 }
 
 /// Each field's type in a schema the loader built, as it will be stored.
@@ -2011,7 +2023,7 @@ pub(crate) async fn load_data_from_source(
     if format == SourceFormat::SchemaJson {
         return Err(anyhow!("Schema JSON object cannot be loaded as index data"));
     }
-    let existing = existing_schema(client, index).await;
+    let existing = existing_schema(client, index).await?;
     // Asked for by name, since it is the one step here that cannot be undone: the documents go,
     // the schema stays, and the load fills the index again.
     if recreate && existing.is_some() {

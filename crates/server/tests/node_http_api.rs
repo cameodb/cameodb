@@ -1337,6 +1337,67 @@ async fn a_declared_tokenizer_must_be_one_the_node_has() {
     assert_eq!(tokenizer("testo"), Some(json!("it_stem")), "{config}");
 }
 
+/// A change to a built column rebuilds an index that holds no documents, and is refused with
+/// `409` on one that holds some, leaving its schema as it was. A rename over the same column —
+/// `string` and a raw, `Basic` `text` — is no change, and is taken either way.
+#[tokio::test]
+async fn a_retype_rebuilds_an_empty_index_and_is_refused_on_a_populated_one() {
+    let node = TestNode::start("").await;
+    let declare = |score: &str| {
+        json!({"fields": {
+            "score": {"field_type": score, "indexed": true},
+            "mac": {"field_type": "text", "indexed": true, "tokenizer": "raw",
+                    "index_record_option": "Basic"}
+        }})
+    };
+    let score_type = |config: &serde_json::Value| {
+        config["fields"]
+            .as_array()
+            .and_then(|fields| fields.iter().find(|field| field["name"] == "score"))
+            .map(|field| field["type"].clone())
+    };
+
+    let (status, body) = put_config(&node, "kpi", &declare("i64")).await;
+    assert_eq!(status, 200, "{body}");
+    // Empty: the retype is applied, by building the index again.
+    let (status, body) = put_config(&node, "kpi", &declare("f64")).await;
+    assert_eq!(status, 200, "an empty index takes a retype: {body}");
+    let config = get_json(&node, "/api/kpi/_config").await;
+    assert_eq!(score_type(&config), Some(json!("f64")), "{config}");
+
+    let (status, body) = put_document(
+        &node,
+        "kpi",
+        "d1",
+        &json!({"score": 1.5, "mac": "00:7A:A4:E5:90:28"}),
+    )
+    .await;
+    assert_eq!(status, 200, "the rebuilt index takes a decimal: {body}");
+
+    // Populated: the retype is refused, naming it and the documents in the way.
+    let (status, body) = put_config(&node, "kpi", &declare("i64")).await;
+    assert_eq!(status, 409, "a populated index refuses a retype: {body}");
+    let message = body.to_string();
+    assert!(
+        message.contains("holds 1 documents") && message.contains("score: f64 → i64"),
+        "the refusal names the documents and the change: {message}"
+    );
+    let config = get_json(&node, "/api/kpi/_config").await;
+    assert_eq!(score_type(&config), Some(json!("f64")), "{config}");
+
+    // The same column under another name is taken, documents or not.
+    let (status, body) = put_config(
+        &node,
+        "kpi",
+        &json!({"fields": {
+            "score": {"field_type": "f64", "indexed": true},
+            "mac": {"field_type": "string", "indexed": true}
+        }}),
+    )
+    .await;
+    assert_eq!(status, 200, "string over a raw, Basic text column: {body}");
+}
+
 async fn put_config(
     node: &TestNode,
     index: &str,

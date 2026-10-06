@@ -46,6 +46,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A schema change no longer drops documents written while it rebuilds an empty index.** The
+  rebuild deleted each shard's data from a blocking task beside the shard's writer, so a write
+  acknowledged between the document count and the delete went with the data, and the delete could
+  tear down a writer in use. Each shard now counts and rebuilds in one step on its writer thread,
+  after any write already queued; documents found there stop the rebuild, and a conflicting change
+  is undone on the shards it reached and refused with `409`.
+- **`GET /api/{index}/_config` answers for an index its peers hold.** A node holds a schema only
+  once a document reaches it, and answered `404` before then. The loader read that — and any other
+  failure — as "no schema", declared one of its own at version 1 beside the cluster's, skipped
+  `--recreate`, and keyed ids without the recorded `id_fields`. A node holding none now asks its
+  peers and answers with theirs, marked `held_here: false`; the loader takes only a `404` as no
+  schema and stops on any other failure.
+- **A forwarded share refused for a disputed shard names the document's position.** It named the
+  document's id, which the node returning the reasons to the caller read as a position when the id
+  was a number, blaming another row.
+
 - **A schema change now reaches the built index, or is refused.** `PUT /_config` stored the new
   schema and left the Tantivy index as first built, empty or not: a field retyped `i64` to `f64`
   refused range queries with decimals and silently skipped every decimal written, and a changed

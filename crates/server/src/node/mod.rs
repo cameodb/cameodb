@@ -1317,6 +1317,19 @@ pub enum StorageCommand {
         delete_schema: bool,
         reply: tokio::sync::oneshot::Sender<Result<(), StoreError>>,
     },
+    /// Build an index again from `schema`, if this shard holds none of its documents: drop its
+    /// data, store the schema, and open the index under it. Answers the documents found — `0`
+    /// when it rebuilt, otherwise how many stopped it, untouched.
+    ///
+    /// One writer step, so the check and the rebuild see the same index: a write queued ahead
+    /// of it is applied first and counted, and none can land between the two. Run apart, a
+    /// write landing after an empty count was dropped with the data, though it had been
+    /// acknowledged.
+    RebuildIfEmpty {
+        index: String,
+        schema: Box<IndexSchema>,
+        reply: tokio::sync::oneshot::Sender<Result<u64, StoreError>>,
+    },
     Shutdown,
 }
 
