@@ -2938,4 +2938,37 @@ mod rebuild_changes_tests {
             vec![("id: mac → Hr,mac".to_string(), true)]
         );
     }
+
+    #[test]
+    fn a_type_renamed_over_the_same_column_is_not_listed() {
+        // `string` is a raw, `Basic` text column under another name, either way round.
+        let exact = schema(&[("mac", TantivyFieldType::String)]);
+        let mut raw = schema(&[("mac", TantivyFieldType::Text)]);
+        let field = raw.fields.get_mut("mac").unwrap();
+        field.tokenizer = Some("raw".to_string());
+        field.index_record_option = Some("Basic".to_string());
+        assert!(listed(&exact, &raw).is_empty());
+        assert!(listed(&raw, &exact).is_empty());
+
+        // A tokenizer a `string` field declares builds nothing: its column stays raw.
+        let mut declared = exact.clone();
+        declared.fields.get_mut("mac").unwrap().tokenizer = Some("default".to_string());
+        assert!(listed(&exact, &declared).is_empty());
+
+        // Any other analysis is a different column.
+        let analysed = schema(&[("mac", TantivyFieldType::Text)]);
+        assert_eq!(
+            listed(&exact, &analysed),
+            vec![("mac: string → text".to_string(), true)]
+        );
+        let mut positions = raw.clone();
+        positions.fields.get_mut("mac").unwrap().index_record_option = None;
+        assert_eq!(
+            listed(&raw, &positions),
+            vec![(
+                "mac: index record option Basic → WithFreqsAndPositions".to_string(),
+                true
+            )]
+        );
+    }
 }

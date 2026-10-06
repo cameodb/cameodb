@@ -1367,7 +1367,7 @@ impl HybridStore {
     pub(crate) fn create_schema_from_definition(
         index_schema: &IndexSchema,
     ) -> (Schema, SchemaFields) {
-        use tantivy::schema::{IndexRecordOption, TextFieldIndexing, TextOptions};
+        use tantivy::schema::{TextFieldIndexing, TextOptions};
 
         let mut schema_builder = Schema::builder();
 
@@ -1396,11 +1396,9 @@ impl HybridStore {
                     let mut options = TextOptions::default().set_indexing_options(
                         TextFieldIndexing::default()
                             .set_tokenizer(field_def.tokenizer.as_deref().unwrap_or("default"))
-                            .set_index_option(match field_def.index_record_option.as_deref() {
-                                Some("Basic") => IndexRecordOption::Basic,
-                                Some("WithFreqs") => IndexRecordOption::WithFreqs,
-                                _ => IndexRecordOption::WithFreqsAndPositions,
-                            }),
+                            .set_index_option(crate::schema::index_record_option(
+                                field_def.index_record_option.as_deref(),
+                            )),
                     );
                     if field_def.stored {
                         options = options.set_stored();

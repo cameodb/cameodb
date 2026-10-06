@@ -53,7 +53,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that holds no documents; on one that does, a change the index would act against — a retype, a
   tokenizer, an index record option, another id — is refused with `409`, naming each change and
   the document count. A column declared ahead of the index is still accepted, and reported not
-  searchable or sortable until a rebuild.
+  searchable or sortable until a rebuild. Columns are compared as they build, not as they are
+  named: `string` and a `text` field with the raw tokenizer and `Basic` postings are one Tantivy
+  column, so retyping one to the other is accepted on a populated index.
 - **`schema detect data.csv > schema.json` saves valid JSON.** The progress spinner wrote its
   frames to stdout ahead of the schema; it now writes to stderr, and only to a terminal.
 - **Detecting a CSV delimiter no longer reads the whole file into memory.** `schema detect` and
