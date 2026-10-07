@@ -1211,6 +1211,64 @@ mod tests {
         HybridStore::new(config, 1).unwrap()
     }
 
+    /// The schema rows list a drop's record beside live schemas, one above the schema it dropped.
+    #[test]
+    fn schema_records_list_a_drop_above_the_schema_it_dropped() {
+        let dir = TempDir::new().unwrap();
+        let store = single_shard_store(&dir);
+        let mut schema = IndexSchema::default();
+        schema.fields.insert(
+            "title".to_string(),
+            FieldDef::new("title".to_string(), TantivyFieldType::Text),
+        );
+        schema.version = 3;
+        store.store_schema("gone", &schema).unwrap();
+        store.store_schema("kept", &schema).unwrap();
+        store.delete_index_data("gone", true).unwrap();
+
+        let mut records = store.schema_records().unwrap();
+        records.sort_by(|a, b| a.index.cmp(&b.index));
+        let summary: Vec<(&str, u64, bool)> = records
+            .iter()
+            .map(|record| (record.index.as_str(), record.version, record.dropped))
+            .collect();
+        assert_eq!(summary, vec![("gone", 4, true), ("kept", 3, false)]);
+        assert_eq!(records[1].thumbprint, schema.calculate_fingerprint());
+    }
+
+    /// A drop's record overtakes every live schema at or below it — the nodes holding one missed
+    /// the drop — and nothing minted above it; a drop known from elsewhere counts the same.
+    #[test]
+    fn a_drop_overtakes_the_schemas_it_removed_and_nothing_minted_above_it() {
+        let record = |version, dropped| SchemaRecord {
+            index: "books".to_string(),
+            version,
+            dropped,
+            thumbprint: 0,
+        };
+        let counted = crate::count_drops(
+            [
+                ("late", record(2, false)),
+                ("dropped", record(3, true)),
+                ("minted_again", record(4, false)),
+            ],
+            0,
+        );
+        assert_eq!(counted.dropped_at, 3);
+        assert_eq!(counted.missed, vec!["late"]);
+        let standing: Vec<&str> = counted.standing.iter().map(|(node, _)| *node).collect();
+        assert_eq!(standing, vec!["dropped", "minted_again"]);
+
+        let counted = crate::count_drops([("peer", record(5, false))], 5);
+        assert_eq!(
+            counted.missed,
+            vec!["peer"],
+            "a drop recorded by the asker counts too"
+        );
+        let counted = crate::count_drops([("peer", record(5, false))], 0);
+        assert!(counted.missed.is_empty() && counted.dropped_at == 0);
+    }
+
     /// An unknown tokenizer is refused when the schema is stored, not discovered at commit.
     ///
     /// Before the check, `hr_stem` — a name this engine did not have — stored, took a write into

@@ -1359,6 +1359,17 @@ impl Message<PeerDiscovered> for ClusterCoordinator {
         // Evaluate state (e.g., WaitingForPeers -> Active if all nodes joined)
         self.evaluate_and_transition_state();
 
+        // A peer back from being down may hold an index dropped meanwhile, or this node may:
+        // compare schema records once its orchestrator is reachable. The timer catches a peer
+        // that is not by then.
+        let weak = ctx.actor_ref().downgrade();
+        task::spawn(async move {
+            tokio::time::sleep(SCHEMA_SWEEP_AFTER_CONNECT).await;
+            if let Some(coordinator) = weak.upgrade() {
+                super::sweep_schemas(&coordinator).await;
+            }
+        });
+
         // Persist snapshot after peer discovery (debounced)
         self.persist_snapshot();
 
@@ -2314,6 +2325,30 @@ const SHARD_MAP_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// Bound on each step of one pull — the lookup and the ask — so a dead peer costs a task a
 /// few seconds, not forever: kameo remote asks carry no reply timeout of their own.
 const SHARD_MAP_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long after a peer connects its schema records are compared with this node's.
+const SCHEMA_SWEEP_AFTER_CONNECT: std::time::Duration = std::time::Duration::from_secs(2);
+/// How often each node compares its schema records with its peers' — see `sweep_schemas`.
+const SCHEMA_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Start the periodic schema sweep for a clustered node: phase-shifted by node id as the
+/// shard-map sync is. The task ends with the coordinator.
+pub fn spawn_schema_sweep(coordinator: &ActorRef<ClusterCoordinator>, node_id: Uuid) {
+    let weak = coordinator.downgrade();
+    let phase = std::time::Duration::from_millis(u64::from(node_id.as_bytes()[1]) * 40);
+    task::spawn(async move {
+        let start = tokio::time::Instant::now() + SCHEMA_SWEEP_INTERVAL + phase;
+        let mut ticks = tokio::time::interval_at(start, SCHEMA_SWEEP_INTERVAL);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticks.tick().await;
+            let Some(coordinator) = weak.upgrade() else {
+                break;
+            };
+            super::sweep_schemas(&coordinator).await;
+        }
+    });
+}
 
 /// Start the periodic shard-map sync for a clustered node.
 ///

@@ -72,6 +72,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kept reporting the index as dropped until restarted. Peers now report the record's version and
   the mint goes above it. Creating an index's tantivy files also adds `id` to the schema as it
   stands under the schema lock, instead of writing back a snapshot taken before.
+- **An index dropped while a node was down stays dropped when that node returns.** The node
+  came back holding the old schema and documents, and the first lookup through any other node
+  adopted that schema over the record of the drop, bringing the index back everywhere with only
+  the late node's documents. A drop's record now overtakes any schema at or below its version:
+  lookups, schema changes and the fields-learned reconcile ignore such a schema and tell its
+  node to finish the drop, and every node compares its schema records with a peer's when the
+  peer connects (and every 30 s), dropping what it missed — so the late node drops it within
+  seconds of rejoining, and the retried `DELETE` the `503` asked for answers `404`. A write
+  creating the index again goes above the drop, as before.
 - **A load that fails says how far it got.** A failing batch let the batches in flight finish and
   counted them, and the error names the rows loaded and refused; a JSON load reports the send
   that failed rather than the reader stopping behind it; the shell prints an error's cause.

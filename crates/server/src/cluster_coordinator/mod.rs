@@ -13,4 +13,5 @@ pub use coordinator::*;
 pub use messages::*;
 pub(crate) use schema_change::{
     FieldEdit, SchemaReconciler, change_schema_cluster, merge_learned, patch_schema_cluster,
+    sweep_schemas,
 };

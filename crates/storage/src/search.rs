@@ -1287,6 +1287,22 @@ impl HybridStore {
         Ok(index_names)
     }
 
+    /// What this store holds for every index, a dropped index's record included.
+    pub fn schema_records(&self) -> Result<Vec<SchemaRecord>, StoreError> {
+        let read_txn = self.kv.begin_read()?;
+        let Ok(schema_table) = read_txn.open_table(TABLE_SCHEMA) else {
+            return Ok(Vec::new());
+        };
+        let mut records = Vec::new();
+        for result in schema_table.iter()? {
+            let (name, bytes) = result?;
+            let schema: IndexSchema = serde_json::from_slice(bytes.value())
+                .map_err(|e| StoreError::Serialization(e.to_string()))?;
+            records.push(SchemaRecord::of(name.value().to_string(), &schema));
+        }
+        Ok(records)
+    }
+
     pub(crate) fn measure_tantivy_bytes(&self, index_name: &str) -> Result<u64, StoreError> {
         let index_dir = self.index_dir(index_name)?;
         if !index_dir.exists() {

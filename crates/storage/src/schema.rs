@@ -912,6 +912,105 @@ pub(crate) fn schema_records_a_deletion(bytes: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
+/// One node's record of one index's schema, as drops are judged: its version, and whether it
+/// records a drop. A schema and the summary [`SchemaRecord`] nodes trade are both judged by the
+/// same rule, [`SchemaVersion::dropped_by`].
+pub trait SchemaVersion {
+    fn version(&self) -> u64;
+    fn records_drop(&self) -> bool;
+
+    /// Whether this is the index a drop recorded at version `dropped_at` removed: a live schema
+    /// at or below it. A drop is recorded one above the schema it dropped, and an index created
+    /// again over it is minted above the record, so nothing newer can be at or below it — and a
+    /// node still holding such a schema missed the drop.
+    fn dropped_by(&self, dropped_at: u64) -> bool {
+        !self.records_drop() && self.version() <= dropped_at
+    }
+}
+
+/// Several nodes' records of one index, with drops counted: see [`count_drops`].
+#[derive(Debug)]
+pub struct DropsCounted<N, S> {
+    /// The highest drop recorded, `0` when none is.
+    pub dropped_at: u64,
+    /// Nodes holding a schema that drop removed: they were down for it, and have to finish it
+    /// before anything is concluded from what they hold.
+    pub missed: Vec<N>,
+    /// Every other record, beside its node: live schemas the drops left standing, and the drops'
+    /// own records.
+    pub standing: Vec<(N, S)>,
+}
+
+/// Count the drops among nodes' records of one index. `dropped_at` is a drop known from
+/// elsewhere — the asking node's own record — and `0` when there is none.
+pub fn count_drops<N, S: SchemaVersion>(
+    records: impl IntoIterator<Item = (N, S)>,
+    dropped_at: u64,
+) -> DropsCounted<N, S> {
+    let records: Vec<(N, S)> = records.into_iter().collect();
+    let dropped_at = records
+        .iter()
+        .filter(|(_, record)| record.records_drop())
+        .map(|(_, record)| record.version())
+        .fold(dropped_at, u64::max);
+    let (missed, standing): (Vec<_>, Vec<_>) = records
+        .into_iter()
+        .partition(|(_, record)| record.dropped_by(dropped_at));
+    DropsCounted {
+        dropped_at,
+        missed: missed.into_iter().map(|(node, _)| node).collect(),
+        standing,
+    }
+}
+
+/// What a node holds for one index, as nodes compare their records when they connect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchemaRecord {
+    pub index: String,
+    pub version: u64,
+    /// It records a drop.
+    pub dropped: bool,
+    pub thumbprint: u64,
+}
+
+impl SchemaRecord {
+    pub fn of(index: String, schema: &IndexSchema) -> Self {
+        Self {
+            index,
+            version: schema.version,
+            dropped: schema.records_drop(),
+            thumbprint: schema.calculate_fingerprint(),
+        }
+    }
+}
+
+impl SchemaVersion for SchemaRecord {
+    fn version(&self) -> u64 {
+        self.version
+    }
+    fn records_drop(&self) -> bool {
+        self.dropped
+    }
+}
+
+impl SchemaVersion for IndexSchema {
+    fn version(&self) -> u64 {
+        self.version
+    }
+    fn records_drop(&self) -> bool {
+        self.state == SchemaState::Dropped
+    }
+}
+
+impl<S: SchemaVersion> SchemaVersion for &S {
+    fn version(&self) -> u64 {
+        (**self).version()
+    }
+    fn records_drop(&self) -> bool {
+        (**self).records_drop()
+    }
+}
+
 /// Whether a schema describes a live index or records that one was dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]

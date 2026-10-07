@@ -908,7 +908,10 @@ index then reads as one that never existed (`GET /api/{index}/_config` answers `
 `/_indexes` does not list it), and the next write — or `PUT /api/{index}/_config`, or a load that
 declares its types — creates it afresh. Internally the node keeps a record of the drop, versioned
 above the dropped schema, so a write that was already in flight when the index was deleted
-cannot bring the old schema back; that record is never reported as a schema.
+cannot bring the old schema back; that record is never reported as a schema. A node that was down
+when the index was dropped finishes the drop itself within seconds of rejoining — it compares its
+schemas with its peers' records when it connects — and until it has, no node takes the dropped
+schema back from it.
 
 #### List All Indexes
 Get comprehensive information about all available indexes.
