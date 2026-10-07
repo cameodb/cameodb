@@ -708,6 +708,22 @@ mod detect_tests {
         .expect("analysis")
     }
 
+    /// The report explains the schema it goes with: a column's header hint wins over what its
+    /// values look like, in the report as in the schema.
+    #[test]
+    fn the_report_shows_the_type_a_header_hint_gives() {
+        let analysis = analysis("id,code.text\n1,10\n2,20\n3,30\n", None);
+        let report = analysis.report("codes.csv");
+        let line = report
+            .lines()
+            .find(|line| line.starts_with("  code "))
+            .unwrap_or_else(|| panic!("no line for the column:\n{report}"));
+        assert!(
+            line.contains("text") && !line.contains("i64"),
+            "{line}\n{report}"
+        );
+    }
+
     fn types(csv_text: &str) -> HashMap<String, TantivyFieldType> {
         let analysis = analysis(csv_text, None);
         analysis

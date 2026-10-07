@@ -1205,9 +1205,6 @@ pub enum ClientOp {
     PrepareSchema {
         index: String,
         schema: IndexSchema,
-        /// The calling key's tenant, for the quota a new index counts against.
-        #[serde(default)]
-        tenant: Option<String>,
         /// This change, reserving the index on this node until it is applied or released. A
         /// second change prepared meanwhile is answered `busy` — see [`SchemaReadiness::busy`].
         #[serde(default)]
@@ -1326,8 +1323,6 @@ pub struct SchemaReadiness {
     pub documents: u64,
     /// Changes this node's built index would act against: see `SchemaChange::conflicts`.
     pub conflicts: Vec<String>,
-    /// Changes that only declare a column this node's built index lacks.
-    pub pending: Vec<String>,
     /// Fields the change marks indexed that this node's built index has no column for: they
     /// become searchable only when the index is rebuilt, which happens here now only if this node
     /// holds none of its documents.

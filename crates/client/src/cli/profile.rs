@@ -1254,11 +1254,13 @@ pub(crate) fn human_bytes(bytes: u64) -> String {
 }
 
 /// The report `schema detect --report` prints: how the source was read, what identifies its
-/// rows, and why each column became the field it did.
+/// rows, and why each column became the field it did. `choices` are the fields the schema
+/// takes, a column's header hint included, so the report explains the schema it goes with.
 pub(crate) fn render_report(
     source: &str,
     summary: &ScanSummary,
     profiler: &Profiler,
+    choices: &[FieldChoice],
     id: &IdChoice,
 ) -> String {
     let mut out = String::new();
@@ -1372,7 +1374,7 @@ pub(crate) fn render_report(
         .max()
         .unwrap_or(4)
         .max(4);
-    for (column, choice) in profiler.columns.iter().zip(profiler.choices()) {
+    for (column, choice) in profiler.columns.iter().zip(choices) {
         let mut field_type = choice.field_type.to_string().to_string();
         if let Some(tokenizer) = choice.tokenizer {
             field_type.push_str(&format!(" ({tokenizer})"));

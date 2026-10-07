@@ -287,7 +287,6 @@ async fn run_change(
     let prepare = ClientOp::PrepareSchema {
         index: index.clone(),
         schema: schema.clone(),
-        tenant: tenant.clone(),
         change,
     };
     let mut attempt = 0;

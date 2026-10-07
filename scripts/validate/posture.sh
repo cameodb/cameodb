@@ -145,9 +145,8 @@ else
         "$(body "$BASE/api/autoschema/_config")"
 fi
 
-# Type inference samples the first 200 documents. A field that first appears past that point
-# is found by validation instead, and it is still part of the same initial creation — so it
-# has to be indexed too, or one load would produce two classes of field.
+# The batch that creates an index is typed whole. A field that first appears late in it is part
+# of the same creation, so it is indexed too — or one load would produce two classes of field.
 awk 'BEGIN{
     printf "["
     for (i = 0; i < 250; i++) {
@@ -162,9 +161,9 @@ status -X POST "$BASE/api/sampled/_bulk" -H "$json" --data-binary @"$WORK/bulk.j
 status -X POST "$BASE/_admin/index/sampled/commit" > /dev/null
 if body -X POST "$BASE/api/sampled/search" -H "$json" -d '{"query":"late:sampling","limit":1}' \
     | grep -q '"total_hits":30'; then
-    pass "a field first seen past the sampling limit is still indexed"
+    pass "a field first seen late in the creating batch is still indexed"
 else
-    fail "a field first seen past the sampling limit is still indexed" \
+    fail "a field first seen late in the creating batch is still indexed" \
         "$(body "$BASE/api/sampled/_config")"
 fi
 

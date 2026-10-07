@@ -348,7 +348,13 @@ impl SourceAnalysis {
     }
 
     pub(crate) fn report(&self, source: &str) -> String {
-        render_report(source, &self.summary, &self.profiler, &self.id)
+        render_report(
+            source,
+            &self.summary,
+            &self.profiler,
+            &self.choices,
+            &self.id,
+        )
     }
 }
 
@@ -366,8 +372,8 @@ impl IdOptions<'_> {
     }
 }
 
-/// Scan a source within `limits` and settle what it holds. See [`scan`](super::scan) for how much
-/// is read.
+/// Read `source` and scan it: its format, its bytes — unless it is a remote JSON source, which
+/// is streamed instead — and what `limits` lets the scan see of them.
 pub(crate) async fn analyze_source(
     client: &CameoClient,
     source: &str,
@@ -376,11 +382,69 @@ pub(crate) async fn analyze_source(
     limits: ScanLimits,
 ) -> Result<SourceAnalysis> {
     let format = detect_source_format_for_source(client, source).await?;
+    let data = match format {
+        SourceFormat::SchemaJson => {
+            return Err(anyhow!(
+                "Source is a schema, not data: there is nothing to scan"
+            ));
+        }
+        SourceFormat::JsonDocument | SourceFormat::JsonArray | SourceFormat::JsonLines
+            if is_http_source(source) && detect_compression(source) == Compression::None =>
+        {
+            None
+        }
+        _ => Some(SourceData::open(client, source).await?),
+    };
+    scan_source(client, source, format, data, delimiter, ids, limits).await
+}
+
+/// Scan again, with `limits`, the source `analysis` read: its bytes are scanned where they are,
+/// not fetched again.
+pub(crate) async fn rescan_source(
+    client: &CameoClient,
+    source: &str,
+    analysis: SourceAnalysis,
+    delimiter: Delimiter,
+    ids: IdOptions<'_>,
+    limits: ScanLimits,
+) -> Result<SourceAnalysis> {
+    scan_source(
+        client,
+        source,
+        analysis.format,
+        analysis.data,
+        delimiter,
+        ids,
+        limits,
+    )
+    .await
+}
+
+/// Scan a source already read: `data` its bytes, `None` for a remote JSON source to stream.
+async fn scan_source(
+    client: &CameoClient,
+    source: &str,
+    format: SourceFormat,
+    data: Option<SourceData>,
+    delimiter: Delimiter,
+    ids: IdOptions<'_>,
+    limits: ScanLimits,
+) -> Result<SourceAnalysis> {
+    let named = ids.followed();
+    let Some(data) = data else {
+        let scan = scan_http_json(client, source, format, &limits, named.as_ref()).await?;
+        return SourceAnalysis::new(
+            format,
+            None,
+            None,
+            Vec::new(),
+            (scan.profiler, scan.summary),
+            &ids,
+        );
+    };
     match format {
         SourceFormat::CsvLike => {
-            let data = SourceData::open(client, source).await?;
             let delimiter = delimiter_byte(delimiter, &data)?;
-            let named = ids.followed();
             let (scan, data) = tokio::task::spawn_blocking(move || {
                 scan_csv(&data, delimiter, &limits, named.as_ref()).map(|scan| (scan, data))
             })
@@ -396,20 +460,6 @@ pub(crate) async fn analyze_source(
             )
         }
         SourceFormat::JsonDocument | SourceFormat::JsonArray | SourceFormat::JsonLines => {
-            if is_http_source(source) && detect_compression(source) == Compression::None {
-                let scan = scan_http_json(client, source, format, &limits, ids.followed().as_ref())
-                    .await?;
-                return SourceAnalysis::new(
-                    format,
-                    None,
-                    None,
-                    Vec::new(),
-                    (scan.profiler, scan.summary),
-                    &ids,
-                );
-            }
-            let data = SourceData::open(client, source).await?;
-            let named = ids.followed();
             let (scan, data) = tokio::task::spawn_blocking(move || {
                 scan_json(&data, format, &limits, named.as_ref()).map(|scan| (scan, data))
             })
@@ -496,7 +546,6 @@ pub(crate) fn schema_from_analysis(analysis: &SourceAnalysis) -> Result<JsonValu
             learned: false,
         },
     );
-    schema.auto_detect_routing_field();
 
     let mut schema_json = serde_json::to_value(schema).context("Failed to serialize schema")?;
     // The fields map in source order, `id` first, so the schema reads like the source.
@@ -1793,18 +1842,7 @@ pub(crate) async fn fetch_source_prefix_bytes(
             return Ok(all_bytes[..len].to_vec());
         }
 
-        let url = Url::parse(source).context("Invalid URL for source")?;
-        let mut response = client
-            .source_http()
-            .get(url)
-            .send()
-            .await
-            .context("Failed to fetch remote source")?;
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to fetch remote source: {} - {}", status, text);
-        }
+        let mut response = open_remote_source(client, source).await?;
 
         let mut prefix = Vec::new();
         while prefix.len() < max_bytes {
@@ -1858,23 +1896,23 @@ pub(crate) async fn load_json_value_from_source(
     }
 }
 
-/// Open a streaming GET against a remote JSON source, refusing a non-2xx status before
-/// the caller reads an error page as documents.
-pub(crate) async fn open_http_json_stream(
+/// Open a streaming GET against a remote source, refusing a non-2xx status before the caller
+/// reads an error page as data.
+pub(crate) async fn open_remote_source(
     client: &CameoClient,
     source: &str,
 ) -> Result<reqwest::Response> {
-    let url = Url::parse(source).context("Invalid URL for JSON source")?;
+    let url = Url::parse(source).context("Invalid URL for source")?;
     let response = client
         .source_http()
         .get(url)
         .send()
         .await
-        .context("Failed to fetch remote JSON source")?;
+        .context("Failed to fetch remote source")?;
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
-        anyhow::bail!("Failed to fetch remote JSON source: {} - {}", status, text);
+        anyhow::bail!("Failed to fetch remote source: {} - {}", status, text);
     }
     Ok(response)
 }
@@ -1888,7 +1926,7 @@ pub(crate) async fn for_each_json_document_in_http_source<F>(
 where
     F: FnMut(JsonValue) -> Result<()>,
 {
-    let mut response = open_http_json_stream(client, source).await?;
+    let mut response = open_remote_source(client, source).await?;
     let mut parser = JsonChunkParser::new(format)?;
     let mut count = 0usize;
 
@@ -2022,7 +2060,7 @@ pub(crate) async fn load_data_from_http_json_source_single_pass(
     let mut pipeline = JsonIngestPipeline::new(batch_size, plan);
     let mut events = Vec::new();
     let mut sender = BatchSender::new(client, index, parallel);
-    let mut response = open_http_json_stream(client, source).await?;
+    let mut response = open_remote_source(client, source).await?;
     let mut parser = JsonChunkParser::new(format)?;
 
     while let Some(chunk) = response
@@ -2140,16 +2178,6 @@ pub(crate) async fn detect_schema_from_source(
     result
 }
 
-/// The schema a source describes, to apply to an index.
-pub(crate) async fn load_schema_from_source(
-    client: &CameoClient,
-    source: &str,
-    delimiter: Delimiter,
-    id: Option<&IdSpec>,
-) -> Result<JsonValue> {
-    detect_schema_from_source(client, source, delimiter, id).await
-}
-
 /// The analysis `schema detect --report` prints, in place of the schema.
 pub(crate) async fn report_source(
     client: &CameoClient,
@@ -2206,10 +2234,6 @@ pub(crate) async fn load_data_from_source(
 ) -> Result<()> {
     let batch_size = pace.batch_size.max(1);
     let parallel = check_parallel(pace.parallel)?;
-    let format = detect_source_format_for_source(client, source).await?;
-    if format == SourceFormat::SchemaJson {
-        return Err(anyhow!("Schema JSON object cannot be loaded as index data"));
-    }
     let existing = existing_schema(client, index).await?;
     let recorded = existing.as_ref().and_then(ExistingSchema::recorded_id);
     let new_id = id.is_some_and(|id| recorded.as_ref().is_none_or(|r| !same_id(id, r)));
@@ -2235,8 +2259,15 @@ pub(crate) async fn load_data_from_source(
                 .map(|existing| existing.field_types.clone())
                 .unwrap_or_default();
             if first_batch_inconclusive(&analysis, &field_types) {
-                analysis =
-                    analyze_source(client, source, delimiter, ids, ScanLimits::sampled()).await?;
+                analysis = rescan_source(
+                    client,
+                    source,
+                    analysis,
+                    delimiter,
+                    ids,
+                    ScanLimits::sampled(),
+                )
+                .await?;
             }
         }
         analysis.profiler.warn_about_id(&analysis.id);
@@ -2783,17 +2814,12 @@ pub(crate) async fn fetch_bytes_source(client: &CameoClient, source: &str) -> Re
     let is_http = source.starts_with("http://") || source.starts_with("https://");
 
     let raw_bytes = if is_http {
-        let url = Url::parse(source).context("Invalid URL for schema source")?;
-        let bytes = client
-            .source_http()
-            .get(url)
-            .send()
-            .await
-            .context("Failed to fetch remote schema")?
+        open_remote_source(client, source)
+            .await?
             .bytes()
             .await
-            .context("Failed to read remote schema body")?;
-        bytes.to_vec()
+            .context("Failed to read remote source body")?
+            .to_vec()
     } else {
         let path = Path::new(source);
         fs::read(path).with_context(|| format!("Failed to read schema file: {}", path.display()))?

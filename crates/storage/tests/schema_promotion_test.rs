@@ -11,7 +11,7 @@
 //! therefore a *declaration*, applied and flagged rather than refused, and these tests walk that
 //! round trip: declare, observe that the clause matches nothing and says so, rebuild, find it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use storage::{FieldDef, HybridStore, IndexSchema, StorageConfig, TantivyFieldType, WalOp};
 use tempfile::TempDir;
@@ -39,6 +39,13 @@ fn indexed_text(name: &str) -> FieldDef {
     def.indexed = true;
     def.stored = true;
     def
+}
+
+/// Mark `field` indexed or not, as a node stores an agreed schema: the edited schema, whole.
+fn set_indexed(store: &HybridStore, index: &str, field: &str, indexed: bool) {
+    let mut schema = store.get_schema(index).unwrap().unwrap();
+    schema.fields.get_mut(field).unwrap().indexed = indexed;
+    store.store_schema_and_cache(index, &schema).unwrap();
 }
 
 /// An index holding one document, with `title` indexed from the start and `author` arriving only
@@ -126,13 +133,11 @@ fn promoting_a_discovered_field_is_applied_and_reported_as_pending() {
     let temp = TempDir::new().unwrap();
     let store = store_with_a_discovered_field(&temp, "docs");
 
-    let updates = BTreeMap::from([("author".to_string(), true)]);
-    let outcome = store.update_field_indexing("docs", &updates).unwrap();
-
-    assert!(!outcome.is_rejected(), "{outcome:?}");
-    assert_eq!(outcome.applied, vec!["author".to_string()]);
+    set_indexed(&store, "docs", "author", true);
     assert_eq!(
-        outcome.pending_reindex,
+        store
+            .unbuilt_fields("docs", &["author".to_string(), "title".to_string()])
+            .unwrap(),
         vec!["author".to_string()],
         "the caller has to be told it is not searchable yet"
     );
@@ -154,8 +159,7 @@ fn a_promoted_field_becomes_searchable_once_the_index_is_rebuilt() {
     let temp = TempDir::new().unwrap();
     let store = store_with_a_discovered_field(&temp, "docs");
 
-    let updates = BTreeMap::from([("author".to_string(), true)]);
-    store.update_field_indexing("docs", &updates).unwrap();
+    set_indexed(&store, "docs", "author", true);
 
     // Before the rebuild the clause matches nothing — and says so rather than passing silently.
     let before = store
@@ -208,11 +212,14 @@ fn promotion_is_allowed_while_the_index_is_still_unmaterialised() {
     };
     store.store_schema_and_cache("docs", &schema).unwrap();
 
-    let updates = BTreeMap::from([("author".to_string(), true)]);
-    let outcome = store.update_field_indexing("docs", &updates).unwrap();
-
-    assert!(!outcome.is_rejected(), "{outcome:?}");
-    assert_eq!(outcome.applied, vec!["author".to_string()]);
+    set_indexed(&store, "docs", "author", true);
+    assert!(
+        store
+            .unbuilt_fields("docs", &["author".to_string()])
+            .unwrap()
+            .is_empty(),
+        "nothing is built yet, so the first write builds the column"
+    );
     assert!(store.get_schema("docs").unwrap().unwrap().fields["author"].indexed);
 }
 
@@ -222,11 +229,7 @@ fn demoting_an_indexed_field_stops_new_documents_being_indexed_into_it() {
     let temp = TempDir::new().unwrap();
     let store = store_with_a_discovered_field(&temp, "docs");
 
-    let updates = BTreeMap::from([("title".to_string(), false)]);
-    let outcome = store.update_field_indexing("docs", &updates).unwrap();
-
-    assert!(!outcome.is_rejected(), "{outcome:?}");
-    assert_eq!(outcome.applied, vec!["title".to_string()]);
+    set_indexed(&store, "docs", "title", false);
 
     store
         .apply_write(
@@ -247,69 +250,6 @@ fn demoting_an_indexed_field_stops_new_documents_being_indexed_into_it() {
         hits.is_empty(),
         "`title` was demoted, so a document written afterwards should not be reachable by it"
     );
-}
-
-/// An unknown field is reported and skipped; the rest of the request still applies.
-///
-/// One shard is deliberately mechanical here. Shards normally hold the same schema — one declared
-/// through `PUT /_config` is fanned out to all of them, and one inferred from a bulk load is
-/// sampled from the first 200 documents and persisted everywhere before the first write lands.
-/// Semi-structured input written a document at a time is the exception: a field only some
-/// documents carry reaches only some shards. So "absent here" does not mean "absent everywhere",
-/// and only the caller spanning the shards can tell the two apart. `PATCH /_schema` now edits the
-/// schema the cluster holds (`patch_schema_cluster`), refusing a name no node's schema has; each
-/// node plans across its shards for the fields its built index cannot search yet.
-#[test]
-fn an_unknown_field_is_reported_without_blocking_the_rest() {
-    let temp = TempDir::new().unwrap();
-    let store = store_with_a_discovered_field(&temp, "docs");
-
-    let updates = BTreeMap::from([("title".to_string(), false), ("nonesuch".to_string(), true)]);
-    let outcome = store.update_field_indexing("docs", &updates).unwrap();
-
-    assert_eq!(outcome.unknown, vec!["nonesuch".to_string()]);
-    assert_eq!(outcome.applied, vec!["title".to_string()]);
-    assert!(
-        !store.get_schema("docs").unwrap().unwrap().fields["title"].indexed,
-        "the field this shard does know should still have been changed"
-    );
-}
-
-/// Every property the schema carries survives a flag change.
-///
-/// The endpoint used to read the schema out through a response shape that carried only `fields`
-/// and `description`, mutate that, and write it back — so `routing_field_name`, `version`,
-/// `created_at` and the fingerprint were reset by any unrelated edit. Resetting the routing field
-/// silently changes which shard a document lands on.
-#[test]
-fn updating_a_flag_preserves_every_other_schema_property() {
-    let temp = TempDir::new().unwrap();
-    let store = store_with_a_discovered_field(&temp, "docs");
-
-    let mut schema = store.get_schema("docs").unwrap().unwrap();
-    schema.version = 7;
-    schema.created_at = 1_600_000_000;
-    schema.description = Some("the corpus".to_string());
-    schema.set_routing_field("title".to_string()).unwrap();
-    store.store_schema_and_cache("docs", &schema).unwrap();
-
-    let updates = BTreeMap::from([("title".to_string(), false)]);
-    let outcome = store.update_field_indexing("docs", &updates).unwrap();
-    assert!(!outcome.is_rejected(), "{outcome:?}");
-
-    let after = store.get_schema("docs").unwrap().unwrap();
-    assert_eq!(after.get_routing_field(), "title", "routing field erased");
-    // Advanced by one, not reset to 1. The property this test guards is that an unrelated edit
-    // does not *erase* what the schema carries — and a version that stood still would fail that
-    // in the other direction, since a cluster comparing versions has to see a local edit move it.
-    assert_eq!(after.version, 8, "version did not advance with the edit");
-    assert_eq!(after.created_at, 1_600_000_000, "created_at reset");
-    assert_eq!(
-        after.description.as_deref(),
-        Some("the corpus"),
-        "description erased"
-    );
-    assert!(!after.fields["title"].indexed, "the edit itself was lost");
 }
 
 /// `searchable_fields` reports what a query can actually reach, which is not what `indexed` says.
@@ -337,8 +277,7 @@ fn searchable_fields_reports_the_built_index_not_the_declaration() {
     );
 
     // Declaring it does not change what the built index holds — that is the whole distinction.
-    let updates = BTreeMap::from([("author".to_string(), true)]);
-    store.update_field_indexing("docs", &updates).unwrap();
+    set_indexed(&store, "docs", "author", true);
     assert!(
         store.get_schema("docs").unwrap().unwrap().fields["author"].indexed,
         "declared indexed"

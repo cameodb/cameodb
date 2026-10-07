@@ -2,7 +2,7 @@
 //! and single writes, commits and checkpoints, WAL persistence and recovery,
 //! warmup, and schema storage.
 use crate::*;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,7 +13,6 @@ use dashmap::DashMap;
 use redb::{
     Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
 };
-use serde_json::Value as JsonValue;
 use tantivy::collector::TopDocs;
 use tantivy::query::AllQuery;
 use tantivy::schema::{FAST, INDEXED, STORED, STRING, Schema, TEXT, Value as TantivyValue};
@@ -1631,20 +1630,17 @@ impl HybridStore {
             "Derived index schema from Tantivy"
         );
 
-        let now = chrono::Utc::now().timestamp();
         IndexSchema {
             fields,
             // Derived from an index on disk, so it describes a live one.
             state: SchemaState::Active,
             version: 1,
-            created_at: now,
-            updated_at: now,
             description: None,
             // Tantivy stores fields, not ownership, so there is nothing to recover here. Safe
             // because this value is only ever used for its `fields`: `get_schema_cached` merges
-            // them onto the *stored* schema, which is where `tenant` — and `description`, and
-            // the timestamps — come from. A caller that used this whole value as a schema would
-            // silently unstamp the index.
+            // them onto the *stored* schema, which is where `tenant` — and `description` — come
+            // from. A caller that used this whole value as a schema would silently unstamp the
+            // index.
             tenant: None,
             // Query-time only, and never in tantivy; recovered from the stored schema the same
             // way `tenant` is.
@@ -2888,8 +2884,6 @@ impl HybridStore {
                         // Above the dropped schema's, so a write still carrying it cannot
                         // install it over this row.
                         version: previous.version.saturating_add(1),
-                        created_at: previous.created_at,
-                        updated_at: chrono::Utc::now().timestamp(),
                         ..IndexSchema::default()
                     };
                     new_tombstone.fields.clear();
@@ -2938,35 +2932,6 @@ impl HybridStore {
         }
         write_txn.commit()?;
 
-        Ok(())
-    }
-
-    /// Persist a schema on its own, with `Immediate` durability (critical metadata).
-    ///
-    /// For metadata-only changes, where there is no document for the schema row to ride along
-    /// with — `update_field_indexing` is the one caller. The write path does *not* use this: a
-    /// schema a document evolved is written into that document's own transaction by
-    /// [`HybridStore::apply_write`], so the pair is atomic and costs one fsync rather than two.
-    pub(crate) fn persist_schema_evolution(
-        &self,
-        index_name: &str,
-        schema: &IndexSchema,
-    ) -> Result<(), StoreError> {
-        let schema_bytes =
-            serde_json::to_vec(schema).map_err(|e| StoreError::Serialization(e.to_string()))?;
-
-        let mut write_txn = self.kv.begin_write()?;
-        {
-            // Schema evolution always uses Immediate durability for critical metadata
-            write_txn.set_durability(Durability::Immediate)?;
-            tracing::trace!(index = %index_name, durability = "Immediate", "Schema evolution persistence durability set");
-
-            let mut schema_table = write_txn.open_table(TABLE_SCHEMA)?;
-            schema_table.insert(index_name, schema_bytes.as_slice())?;
-        }
-        write_txn.commit()?;
-
-        tracing::debug!(index = %index_name, "Schema evolution persisted with Immediate durability");
         Ok(())
     }
 
@@ -3067,37 +3032,6 @@ impl HybridStore {
         tracing::debug!(index = %index, "Invalidated schema and fields cache");
     }
 
-    /// Evolve schema from a JSON document and invalidate caches if changed
-    pub fn evolve_schema_from_document(
-        &self,
-        index: &str,
-        json_blob: &JsonValue,
-    ) -> Result<Vec<String>, StoreError> {
-        // Get current schema
-        let mut schema = self
-            .get_schema_cached(index)?
-            .unwrap_or_else(|| Arc::new(IndexSchema::default()));
-
-        // Make it mutable for evolution
-        let evolved_fields = Arc::make_mut(&mut schema).evolve_from_document(json_blob);
-
-        if !evolved_fields.is_empty() {
-            tracing::info!(
-                index = %index,
-                evolved_fields = ?evolved_fields,
-                "Schema evolved with new fields"
-            );
-
-            // Store the evolved schema
-            self.store_schema_and_cache(index, &schema)?;
-
-            // Invalidate caches to force rebuild with new schema
-            self.invalidate_schema_cache(index);
-        }
-
-        Ok(evolved_fields)
-    }
-
     /// Update both redb and cache atomically
     pub fn store_schema_and_cache(
         &self,
@@ -3151,164 +3085,25 @@ impl HybridStore {
         Ok(())
     }
 
-    /// Set the `indexed` flag on named fields of a stored schema.
-    ///
-    /// This is the engine half of `PATCH /api/{index}/_schema`, and it exists because the two
-    /// things the operation has to get right are both only knowable here.
-    ///
-    /// The first is that the schema must be edited in place rather than round-tripped through
-    /// a response shape. Reading the schema out as JSON, mutating it and writing it back
-    /// erases every property that shape does not carry — `routing_field_name` among them,
-    /// which silently changes which shard a document routes to.
-    ///
-    /// The second is that the stored schema is a *declaration*, and the Tantivy index is built
-    /// from it — at creation, and again whenever the index data is rebuilt. So marking a field
-    /// indexed is meaningful even when the current Tantivy index has no column for it: it is the
-    /// first step of declare-then-reingest, which is how a discovered field is made searchable
-    /// today (`delete_index_data` with `delete_schema = false`, then write again).
-    ///
-    /// Such a field is reported in `pending_reindex` rather than refused. Until the rebuild it
-    /// simply does not match, and that is not silent — the query path reports the clause as
-    /// discarded and the MCP layer refuses the search outright, so nothing reads a narrower
-    /// answer as a complete one.
-    pub fn update_field_indexing(
+    /// Which of `fields` the built index has no column for: marked indexed after it was built,
+    /// they match nothing until it is built again. None while nothing is built — the first
+    /// write builds it from the schema as it stands. Opening the index reads `meta.json` only,
+    /// so a live writer is not disturbed.
+    pub fn unbuilt_fields(
         &self,
         index: &str,
-        updates: &BTreeMap<String, bool>,
-    ) -> Result<SchemaFieldUpdate, StoreError> {
-        // From the read inside the plan to the cache update: see `lock_schema`.
-        let schema_lock = self.lock_schema(index);
-        let _schema_guard = schema_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let (mut schema, outcome) = self.plan_field_indexing_inner(index, updates)?;
-
-        // Applies what this shard knows and reports what it does not, rather than refusing the
-        // whole request. Shards usually hold the same schema, but semi-structured input written a
-        // document at a time can leave a field on only the shards that received it — so "unknown
-        // here" is not by itself a bad request. Whether a name is unknown *everywhere*, and so
-        // worth refusing, is a question only the caller spanning the shards can answer.
-        if outcome.applied.is_empty() {
-            return Ok(outcome);
-        }
-
-        for field_name in &outcome.applied {
-            if let Some(field_def) = schema.fields.get_mut(field_name) {
-                field_def.indexed = updates[field_name];
-            }
-        }
-        schema.mark_modified();
-
-        // Persist without re-creating the index. A field in `pending_reindex` deliberately does
-        // not get a Tantivy column here: building one would mean recreating the index and
-        // discarding every document in it, which is the caller's decision to make, not this
-        // function's.
-        self.persist_schema_evolution(index, &schema)?;
-        self.schema_cache
-            .insert(index.to_string(), Arc::new(schema));
-
-        tracing::info!(
-            index = %index,
-            applied = ?outcome.applied,
-            "Field indexing flags updated"
-        );
-
-        Ok(outcome)
-    }
-
-    /// Declare which fields an unqualified term searches, or clear the declaration with `None`.
-    ///
-    /// Query-time only, like everything about default fields: no column changes and nothing is
-    /// rebuilt, so it takes effect on the next search. The list is checked against this shard's
-    /// schema before it is stored, and the version advances as for any schema edit, so a peer
-    /// holding the older list loses to this one.
-    pub fn set_default_fields(
-        &self,
-        index: &str,
-        default_fields: Option<Vec<String>>,
-    ) -> Result<(), StoreError> {
-        // From the read to the cache update: see `lock_schema`.
-        let schema_lock = self.lock_schema(index);
-        let _schema_guard = schema_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let mut schema = self
-            .get_schema_cached(index)?
-            .map(|arc| (*arc).clone())
-            .ok_or_else(|| StoreError::IndexNotFound(index.to_string()))?;
-        if schema.default_fields == default_fields {
-            return Ok(());
-        }
-        schema.default_fields = default_fields;
-        schema
-            .validate_default_fields()
-            .map_err(StoreError::Serialization)?;
-        schema.mark_modified();
-        self.persist_schema_evolution(index, &schema)?;
-        self.schema_cache
-            .insert(index.to_string(), Arc::new(schema));
-        Ok(())
-    }
-
-    /// What [`HybridStore::update_field_indexing`] would do, without doing it.
-    ///
-    /// A schema spans every shard that holds the index, so a caller that wants the edit to be
-    /// all-or-nothing across them has to learn whether each one would accept it before any of
-    /// them writes.
-    pub fn plan_field_indexing(
-        &self,
-        index: &str,
-        updates: &BTreeMap<String, bool>,
-    ) -> Result<SchemaFieldUpdate, StoreError> {
-        self.plan_field_indexing_inner(index, updates)
-            .map(|(_, outcome)| outcome)
-    }
-
-    /// The classification both the plan and the apply path share, with the schema it read.
-    pub(crate) fn plan_field_indexing_inner(
-        &self,
-        index: &str,
-        updates: &BTreeMap<String, bool>,
-    ) -> Result<(IndexSchema, SchemaFieldUpdate), StoreError> {
-        let schema = self
-            .get_schema_cached(index)?
-            .map(|arc| (*arc).clone())
-            .ok_or_else(|| StoreError::IndexNotFound(index.to_string()))?;
-
-        // Whether the built index has a column for a field decides only whether the edit takes
-        // effect *now* or at the next rebuild — not whether it is allowed. Opening the index
-        // reads `meta.json`; it does not touch the writer lockfile, so this is safe against a
-        // live writer.
+        fields: &[String],
+    ) -> Result<Vec<String>, StoreError> {
         let index_path = self.index_dir(index)?;
-        let tantivy_schema = if index_path.join("meta.json").exists() {
-            Some(open_tantivy_index(&index_path)?.schema())
-        } else {
-            None
-        };
-
-        let mut outcome = SchemaFieldUpdate::default();
-
-        for (field_name, want_indexed) in updates {
-            let Some(field_def) = schema.fields.get(field_name) else {
-                outcome.unknown.push(field_name.clone());
-                continue;
-            };
-
-            if field_def.indexed == *want_indexed {
-                outcome.unchanged.push(field_name.clone());
-                continue;
-            }
-
-            let is_promotion = *want_indexed;
-            let missing_from_tantivy = tantivy_schema
-                .as_ref()
-                .is_some_and(|schema| schema.get_field(field_name).is_err());
-
-            // Applied either way. The flag is a declaration, and the index is built from the
-            // declaration — so this takes effect at the next rebuild rather than immediately.
-            outcome.applied.push(field_name.clone());
-            if is_promotion && missing_from_tantivy {
-                outcome.pending_reindex.push(field_name.clone());
-            }
+        if !index_path.join("meta.json").exists() {
+            return Ok(Vec::new());
         }
-
-        Ok((schema, outcome))
+        let built = open_tantivy_index(&index_path)?.schema();
+        Ok(fields
+            .iter()
+            .filter(|name| built.get_field(name).is_err())
+            .cloned()
+            .collect())
     }
 
     /// How many WAL entries are waiting for Tantivy to catch up on this index.
