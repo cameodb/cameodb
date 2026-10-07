@@ -20,6 +20,11 @@
 #                                                             re-adds by default and which is the
 #                                                             entire 30MB
 #
+# `--exclude './tools/**'` keeps the lock files of the offline dev tools out. `tools/hr-lexicon/
+# fstbuild` has its own Cargo.lock, which the cargo cataloger finds under the tree: five packages
+# (the tool itself, tantivy-fst, byteorder, regex-syntax, utf8-ranges) that no shipped binary
+# contains, and a second file entry that tripped the per-file warning below.
+#
 # --source-name/--source-version replace the scan path in the document header, so no local
 # filesystem layout reaches a published file.
 
@@ -49,6 +54,7 @@ syft_scan() {
     syft dir:"$PROJECT_ROOT" \
         --override-default-catalogers rust-cargo-lock-cataloger \
         --select-catalogers -file \
+        --exclude './tools/**' \
         --source-name cameodb \
         --source-version "$VERSION" \
         -o "$1=$2" 2> >(grep -v 'no file catalogers selected' >&2 || true)
