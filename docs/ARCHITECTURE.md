@@ -27,10 +27,15 @@ The system is designed without a central master ("Leaderless" / "Decentralized")
 
 ### 2.1. Node Identity
 Nodes are "Self-Sovereign." They do not request an ID from a master.
-* **UUID (v4):** The immutable, cryptographic identity of the node.
+* **UUID (v5):** Derived from the node's libp2p peer id, and so from its private key: the same
+  key always gives the same UUID.
 * **Friendly Name:** A Base36 string derived from the first 2 bytes of the UUID (e.g., `7FX`).
 * **Node Label:** A human-readable identifier configured via `node.label` (e.g., `cameodb-node-1`).
-* **Storage:** Identity is generated on Cold Boot and persisted to `./data/cameodb/node_identity.json`.
+* **Storage:** The key is generated on the first boot and saved, owner-only, to
+  `node_identity.json` in the first data path. Back it up with the data. A node whose file is
+  there but cannot be read, or holds a key that does not decode, refuses to start rather than
+  make a new key — which would bring it up as another node over the same data. Removing the
+  file is how to start it as a new node deliberately.
 
 ### 2.2. The Ring (Consistent Hashing)
 To ensure uniform data distribution without coordination:

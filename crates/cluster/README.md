@@ -155,8 +155,9 @@ pub fn get_owner(&self, key: &str) -> Option<Uuid> {
 use cluster::{NodeIdentity, ConsistentRing};
 use std::path::PathBuf;
 
-// Create or load node identity
-let identity = NodeIdentity::load_or_create(PathBuf::from("./data/meta.json"))?;
+// A node's identity is derived from its libp2p peer id, and saved beside its data
+let identity = NodeIdentity::from_peer_id_bytes(b"peer id bytes");
+identity.save(&PathBuf::from("./data/node_identity.json"))?;
 println!("Node: {} ({})", identity.name, identity.uuid);
 
 // Set up consistent hash ring

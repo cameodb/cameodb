@@ -25,8 +25,9 @@
 //! use cluster::{NodeIdentity, ConsistentRing};
 //! use std::path::PathBuf;
 //!
-//! // Create or load node identity (use appropriate data directory for your use case)
-//! let identity = NodeIdentity::load_or_create(PathBuf::from("./data/cameodb/meta.json"))?;
+//! // A node's identity is derived from its libp2p peer id, and saved beside its data
+//! let identity = NodeIdentity::from_peer_id_bytes(b"peer id bytes");
+//! identity.save(&PathBuf::from("./data/cameodb/node_identity.json"))?;
 //! println!("Node: {} ({})", identity.name, identity.uuid);
 //!
 //! // Set up consistent hash ring
@@ -40,7 +41,7 @@
 //! ```
 
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -194,10 +195,10 @@ impl NodeIdentity {
     /// Save the identity to disk, atomically and owner-only.
     ///
     /// This file holds the node's libp2p private key, and the node's UUID is derived from it.
-    /// A torn write therefore costs more than the file: the next boot cannot parse it,
-    /// generates a fresh keypair, and comes up under a new UUID that the persisted shard
-    /// assignments no longer name. Hence temp-file-and-rename, and `0o600` rather than
-    /// whatever the umask allows for a private key.
+    /// A torn write therefore costs more than the file: the next boot cannot parse it and
+    /// refuses to start, since a new key would bring the node up under a new UUID that the
+    /// persisted shard assignments no longer name. Hence temp-file-and-rename, and `0o600`
+    /// rather than whatever the umask allows for a private key.
     pub fn save(&self, path: &std::path::Path) -> Result<(), IdentityError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -252,63 +253,6 @@ impl NodeIdentity {
     pub fn load(path: PathBuf) -> Result<Self, IdentityError> {
         let data = fs::read_to_string(path)?;
         let identity: NodeIdentity = serde_json::from_str(&data)?;
-        Ok(identity)
-    }
-
-    /// Loads an existing identity from disk or creates a new one.
-    ///
-    /// If the file exists, it loads the identity and validates that it has
-    /// the correct number of virtual node tokens (256). If the token count
-    /// is incorrect, it regenerates them and saves the updated identity.
-    ///
-    /// If the file doesn't exist, it creates a new identity and saves it.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - Path to the identity file (typically `meta.json`)
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// use cluster::NodeIdentity;
-    /// use std::path::PathBuf;
-    ///
-    /// // Use appropriate data directory for your use case
-    /// let identity_path = PathBuf::from("./data/cameodb/meta.json");
-    ///
-    /// // First call creates new identity
-    /// let identity1 = NodeIdentity::load_or_create(identity_path.clone())?;
-    ///
-    /// // Second call loads the same identity
-    /// let identity2 = NodeIdentity::load_or_create(identity_path)?;
-    ///
-    /// assert_eq!(identity1.uuid, identity2.uuid);
-    /// assert_eq!(identity1.name, identity2.name);
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn load_or_create(path: PathBuf) -> Result<Self, IdentityError> {
-        if path.exists() {
-            let data = fs::read_to_string(&path)?;
-            let mut identity: NodeIdentity = serde_json::from_str(&data)?;
-
-            if identity.vnode_tokens.len() != VNODE_COUNT {
-                identity.vnode_tokens = generate_tokens(identity.uuid);
-                let file = File::create(&path)?;
-                serde_json::to_writer_pretty(file, &identity)?;
-            }
-
-            return Ok(identity);
-        }
-
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let identity = Self::new();
-
-        let file = File::create(&path)?;
-        serde_json::to_writer_pretty(file, &identity)?;
-
         Ok(identity)
     }
 }

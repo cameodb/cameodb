@@ -5678,7 +5678,17 @@ tokenizer case) asserts a 400.
 
 ### N4 — Node identity is loaded twice, and a broken file is silently replaced
 
-**Defect.** 📋 **Planned.** **Checked.** `main.rs:375` calls `load_or_generate_keypair` and throws
+**Defect.** ✅ **Done** 2026-10-07. `swarm::load_node_identity` is called once, in `main`, and the
+`Keypair` moves into `DistributedCluster` (which held a path only to load it again). A file that
+is there but unreadable, or holds a key that does not decode, stops the start with the file named
+and left untouched; a failed save stops it too; a file from an earlier build with no key is the
+one given a new key. `cluster::NodeIdentity::load_or_create` is deleted, with its examples and
+tests. Covered by `a_node_identity_is_generated_once_and_then_kept`,
+`a_damaged_node_identity_stops_the_start`, `a_node_identity_without_a_key_is_given_one` and, through
+the binary, `a_node_with_a_damaged_identity_does_not_start`. `ARCHITECTURE.md` now says the UUID
+is v5 from the key and what a damaged file does.
+
+**Original entry.** **Checked.** `main.rs:375` calls `load_or_generate_keypair` and throws
 the keypair away (`_keypair`); `swarm/mod.rs:406` calls it again. Inside it, a corrupt
 `node_identity.json`, or a keypair that does not decode, makes a new key with a `warn!` and goes
 on (`:631–663`) — and since the node's UUID is derived from the key, the node becomes a different
