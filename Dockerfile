@@ -85,8 +85,13 @@ COPY crates/ ./crates/
 
 # 6. Build — uses release-docker profile (thin LTO for memory-constrained builders)
 #    Profile defined in Cargo.toml: inherits release with lto="thin", codegen-units=4
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
+#    Each architecture has its own cache ids. A multi-platform build runs its platforms side by
+#    side, and a cache mount is shared by default: two cargo processes unpacking one crate into
+#    the same registry directory fail on whichever is second ("failed to unpack package ...
+#    .cargo-ok: File exists"). The target cache holds build-script output for the architecture
+#    it ran on, which another architecture has no use for.
+RUN --mount=type=cache,id=cargo-registry-${TARGET_ABI}-${TARGETARCH},target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cargo-target-${TARGET_ABI}-${TARGETARCH},target=/src/target \
     set -e; \
     export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt; \
     export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt; \
