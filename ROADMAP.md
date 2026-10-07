@@ -5804,7 +5804,18 @@ cannot run: the Search merge arm marked "Unreachable" (`:1100–1167`), the Writ
 
 ### N9 — Storage `shutdown` is a fourth commit path, with the race fixed elsewhere
 
-**Defect.** 📋 **Planned.** **Reported.** `HybridStore::shutdown` (`store.rs:584–643`) reads
+**Defect.** ✅ **Done** 2026-10-07, and smaller than filed. The race does not exist today: every
+write holds its writer from reserving its sequence until its document is added, so a sequence
+`shutdown` read before locking belonged to a write finished by the time it had the lock, and the
+commit contained it. What was real is the copy itself — its own lock loop, which waited out a
+poisoned lock until it timed out — and the wait done while iterating `writers`, holding one of the
+map's shards. `shutdown` now collects the writers first and commits each through
+`commit_locked_writer` and `checkpoint_after_commit`, as `close_index` does, locking with
+`lock_writer_within`. Covered by `shutdown_commits_a_writer_it_had_to_wait_for`: a writer held on
+another thread through the shutdown is committed and checkpointed once released, and the next
+open replays nothing. The subset of maps `shutdown` clears is left to N15.
+
+**Original entry.** **Reported.** `HybridStore::shutdown` (`store.rs:584–643`) reads
 `current_seq` before it locks the writer — the order `commit_locked_writer`'s doc (`:2211`)
 describes as the bug it fixed — and its comment at `:588` says the opposite. It iterates
 `self.writers` while spinning up to five seconds on a `try_lock`, holding a map shard guard while

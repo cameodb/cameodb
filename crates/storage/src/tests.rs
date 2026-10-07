@@ -156,6 +156,46 @@ mod tests {
             .expect("shutdown recovers the guard rather than panicking");
     }
 
+    /// Shutdown waits for a writer another thread holds, then commits and checkpoints it as a
+    /// close does — so the next open has nothing to replay. It used to wait while iterating the
+    /// writer map, holding one of its shards for as long as the wait lasted.
+    #[test]
+    fn shutdown_commits_a_writer_it_had_to_wait_for() {
+        let temp_dir = TempDir::new().unwrap();
+        let index = "held";
+        {
+            let store = HybridStore::new(small_store_config(&temp_dir), 1).unwrap();
+            for n in 0..5 {
+                store
+                    .apply_write(
+                        index,
+                        WalOp::Put {
+                            id: format!("d{n}"),
+                            json_blob: Some(serde_json::json!({ "title": "held" })),
+                        },
+                    )
+                    .unwrap();
+            }
+            let writer = Arc::clone(store.writers.get(index).unwrap().value());
+            let held = std::thread::spawn(move || {
+                let _guard = writer.lock().unwrap();
+                std::thread::sleep(Duration::from_millis(300));
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            store.shutdown().expect("shutdown");
+            held.join().unwrap();
+        }
+
+        let store = HybridStore::new(small_store_config(&temp_dir), 1).unwrap();
+        let plan = store.recover_indices().expect("recovery");
+        assert!(
+            plan.recovered.is_empty(),
+            "shutdown committed and checkpointed: {:?}",
+            plan.recovered
+        );
+        assert_eq!(store.document_count(index).unwrap(), 5);
+    }
+
     /// A value that is not a facet path is refused, not handed to a constructor that panics.
     ///
     /// `Facet: From<&str>` unwraps `from_text`, so `add_facet(field, "electronics/phones")` panics
