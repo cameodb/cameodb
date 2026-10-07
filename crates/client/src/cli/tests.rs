@@ -724,6 +724,21 @@ mod detect_tests {
         );
     }
 
+    /// A date column holding years a date field cannot place says how many, beside its type.
+    #[test]
+    fn the_report_counts_dates_a_date_field_cannot_place() {
+        let analysis = analysis(
+            "id,published.date\n1,1605\n2,1945-08-17\n3,0398\n4,1962\n",
+            None,
+        );
+        let report = analysis.report("books.csv");
+        let line = report
+            .lines()
+            .find(|line| line.starts_with("  published "))
+            .unwrap_or_else(|| panic!("no line for the column:\n{report}"));
+        assert!(line.contains("2 outside 1677-09-21"), "{line}");
+    }
+
     fn types(csv_text: &str) -> HashMap<String, TantivyFieldType> {
         let analysis = analysis(csv_text, None);
         analysis

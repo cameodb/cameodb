@@ -41,6 +41,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A load reports the ids it could not keep.** Rows repeating an id already sent each replace the
   document before it; a load now counts them and names the first, and counts the rows skipped for
   having no id, instead of finishing with fewer documents and nothing said.
+- **A load and `schema detect --report` say which dates a date field cannot place.** A date field
+  holds 1677-09-21 to 2262-04-11, and an earlier or later date is indexed at the nearer end —
+  stored as written, but searched and sorted as that end. The book summaries example dates 48
+  books earlier, back to the year 398; they sorted together, and no range below 1677 found them,
+  with nothing said. `data load` now counts such values per field and names the first, and the
+  report counts them beside the column's type. The range is in the API reference.
 - **Language analyzers for text fields: `hr_stem`, `hr_stem_fold`, `it_stem`, `it_stem_fold`,
   `de_stem`, `fr_stem` and `es_stem`.** A text field names one as its `tokenizer`, and index-time and
   query-time analysis both use it, so a query for one form of a word finds the others. Italian,
@@ -59,6 +65,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Range queries on text and string fields, and on the id, answer what they say.** The query
+  grammar reads a range bound as a bare word, so on a field kept whole a quoted bound compared
+  against its quote characters: `label:>"S"` matched every document and `label:["A" TO "M"]` none,
+  and a bound with a space could not be written at all. A range clause with a quoted bound is now
+  held aside while the query is parsed and put back as the range it names, so
+  `category:["Film & Animation" TO Music]` works in every range and comparison form. And a whole
+  query `id:>9000` was answered as a lookup of the key `>9000`, finding nothing, while
+  `id:{9000 TO *}` found 691; a range on the id is now always the parser's.
 - **The batch that creates an index types each field by all its values.** An index created by
   a write was typed from its first 200 documents by a rule that could narrow: `"hello"` then `5`
   made an indexed `i64`, and the first document was refused — which one depended on the order.
@@ -179,6 +193,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The load summary counts `repeated_ids`, not `replaced`.** The count was of rows whose id an
+  earlier row of the same load had; a reload that replaced every document reported
+  `replaced=0`. The report also says when a text column's missing markers (`NA`, `None`) are kept
+  as text, as the load keeps them.
+- **The Python examples declare their schema and share one loader.** `ingest_books.py` and
+  `ingest_ted.py` are worked examples of loading with hand-written transformations — genres and
+  tags as lists, a timestamp made of two columns, a duration in seconds — beside `data load`,
+  which the examples README now leads with. Both declare their schema with the id as a shadow
+  field recorded in `id_fields`; the books script had left its declaration commented out, so its
+  id was an ordinary indexed field. A count the source writes as `NA` is left out rather than
+  sent as 0, and the cluster's shard count is reported rather than one node's.
 - **A load into an index that has a schema reads only its first batch ahead, not the file.** The
   scan typed columns the schema had already typed: a file up to 1 GB was read whole before its
   first row was sent, about 10 s of a 600,000-row, 600 MB load. The schema types the fields and

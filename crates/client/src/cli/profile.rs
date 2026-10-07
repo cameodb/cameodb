@@ -389,6 +389,10 @@ pub(crate) struct ColumnProfile {
     date_evidence: Vec<(char, DateOrder)>,
     /// It held a numeric date that reads as a date either way round, `03/04/2024`.
     ambiguous_dates: bool,
+    /// Values that, in a date field, would be indexed as another date: see
+    /// [`storage::date_out_of_range`]. Counted for dates and four-digit years, the integers a
+    /// date field reads as a year.
+    dates_out_of_range: u64,
     /// The values inside its lists.
     elements: Option<Box<ColumnProfile>>,
     key: KeyTrack,
@@ -411,6 +415,7 @@ impl ColumnProfile {
             over_i64: false,
             date_evidence: Vec::new(),
             ambiguous_dates: false,
+            dates_out_of_range: 0,
             elements: None,
             key: KeyTrack::new(),
             equals_id: true,
@@ -474,15 +479,23 @@ impl ColumnProfile {
                 self.only_zero_one &= digits == "0" || digits == "1";
                 self.negative |= digits.starts_with('-');
                 self.over_i64 |= digits.parse::<i64>().is_err();
-            }
-            Shape::Date => match numeric_date_order(&text) {
-                Some(evidence) => {
-                    if !self.date_evidence.contains(&evidence) {
-                        self.date_evidence.push(evidence);
-                    }
+                if digits.len() == 4 {
+                    self.note_date_range(&text);
                 }
-                None => self.ambiguous_dates |= is_numeric_date(&text),
-            },
+            }
+            // `0398` too is a year to a date field.
+            Shape::LeadingZero if text.len() == 4 => self.note_date_range(&text),
+            Shape::Date => {
+                match numeric_date_order(&text) {
+                    Some(evidence) => {
+                        if !self.date_evidence.contains(&evidence) {
+                            self.date_evidence.push(evidence);
+                        }
+                    }
+                    None => self.ambiguous_dates |= is_numeric_date(&text),
+                }
+                self.note_date_range(&text);
+            }
             Shape::List => {
                 let items = match value {
                     JsonValue::Array(items) => Some(items.clone()),
@@ -514,6 +527,12 @@ impl ColumnProfile {
         };
         *entries += self.key.observe(hash, key_shape, &text, at);
         hash
+    }
+
+    fn note_date_range(&mut self, text: &str) {
+        if storage::date_out_of_range(&JsonValue::String(text.to_string())) {
+            self.dates_out_of_range += 1;
+        }
     }
 
     /// It wrote numeric dates that read either way round and none that say which: the order
@@ -664,6 +683,11 @@ impl ColumnProfile {
     }
 
     /// The kinds of value seen, most common first, for the report.
+    /// The first value of `shape` the scan met, and where.
+    fn first_of(&self, shape: Shape) -> Option<&(Location, String)> {
+        self.first[shape.index()].as_ref()
+    }
+
     fn shape_summary(&self) -> String {
         let mut kinds: Vec<Shape> = SHAPES
             .iter()
@@ -1397,6 +1421,21 @@ pub(crate) fn render_report(
         }
         if let Some(note) = &choice.note {
             notes.push(note.clone());
+        }
+        // A text field holds `NA` or `None` as a value; only a field that cannot hold text reads
+        // them as no value.
+        if matches!(
+            choice.field_type,
+            TantivyFieldType::Text | TantivyFieldType::String
+        ) && let Some((_, marker)) = column.first_of(Shape::Missing)
+        {
+            notes.push(format!("its missing markers ('{marker}') are kept as text"));
+        }
+        if choice.field_type == TantivyFieldType::Date && column.dates_out_of_range > 0 {
+            notes.push(format!(
+                "{} outside 1677-09-21 … 2262-04-11, searched and sorted as the nearest of those",
+                grouped(column.dates_out_of_range)
+            ));
         }
         out.push_str(&format!(
             "  {:width$}  {:12} {}\n",

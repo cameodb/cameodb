@@ -1211,6 +1211,32 @@ mod tests {
         HybridStore::new(config, 1).unwrap()
     }
 
+    /// A date field holds 1677-09-21 to 2262-04-11; anything past either end is indexed at it.
+    #[test]
+    fn a_date_past_either_end_of_the_index_range_is_out_of_range() {
+        use serde_json::json;
+        for value in [
+            json!("1605"),
+            json!("0398"),
+            json!("1677-09-20"),
+            json!("2262-04-12T00:00:00Z"),
+            json!(-9_300_000_000i64),
+            json!(["1945-08-17", "1500"]),
+        ] {
+            assert!(crate::date_out_of_range(&value), "{value}");
+        }
+        for value in [
+            json!("1945-08-17"),
+            json!("1677-09-22"),
+            json!("2262-04-10"),
+            json!(1_700_000_000i64),
+            json!("not a date"),
+            json!(["1945", "2024-01-01"]),
+        ] {
+            assert!(!crate::date_out_of_range(&value), "{value}");
+        }
+    }
+
     /// The schema rows list a drop's record beside live schemas, one above the schema it dropped.
     #[test]
     fn schema_records_list_a_drop_above_the_schema_it_dropped() {

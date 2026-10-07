@@ -706,15 +706,7 @@ pub(crate) fn prepare_query_parser(
     query: &str,
     // `StorageConfig::query`; see `normalize_prefix_query`.
     policy: &QueryPolicy,
-) -> Result<
-    (
-        String,
-        Vec<String>,
-        tantivy::query::QueryParser,
-        Option<NarrowedDefaultFields>,
-    ),
-    StoreError,
-> {
+) -> Result<PreparedQuery, StoreError> {
     // Fold whitespace the grammar's set parser cannot skip down to an ASCII space first, so no
     // later pass — and above all `parse_query_lenient` — is handed a character that makes its
     // element loop spin without consuming input.
@@ -791,8 +783,239 @@ pub(crate) fn prepare_query_parser(
         &default_query_fields,
     );
 
+    // Last, so every pass above has seen the ranges it rewrites — a date range's quoted bounds
+    // are already bare by now — and only what the grammar cannot carry is held.
+    let (text, held) = hold_quoted_ranges(&normalized_query);
     let parser = tantivy::query::QueryParser::for_index(tantivy_index, default_query_fields);
-    Ok((normalized_query, prefix_notes, parser, narrowed))
+    Ok(PreparedQuery {
+        text,
+        notes: prefix_notes,
+        parser,
+        narrowed,
+        held,
+    })
+}
+
+/// A query ready to run: the normalized text, what normalizing it noted, and the parser.
+pub(crate) struct PreparedQuery {
+    /// The query as normalized, with each range clause holding a quoted bound replaced by a
+    /// placeholder — see [`hold_quoted_ranges`]. [`PreparedQuery::shown`] is it as written.
+    text: String,
+    /// What the normalization passes noted, reported as discarded clauses.
+    pub(crate) notes: Vec<String>,
+    pub(crate) parser: tantivy::query::QueryParser,
+    pub(crate) narrowed: Option<NarrowedDefaultFields>,
+    held: Vec<HeldRange>,
+}
+
+impl PreparedQuery {
+    /// Parse leniently, as `QueryParser::parse_query_lenient` does, with each held range put back
+    /// where its placeholder parsed.
+    pub(crate) fn parse(
+        &self,
+    ) -> (
+        Box<dyn tantivy::query::Query>,
+        Vec<tantivy::query::QueryParserError>,
+    ) {
+        if self.held.is_empty() {
+            return self.parser.parse_query_lenient(&self.text);
+        }
+        let (ast, grammar_errors) = tantivy::query_grammar::parse_query_lenient(&self.text);
+        let mut errors: Vec<tantivy::query::QueryParserError> = grammar_errors
+            .into_iter()
+            .map(|error| {
+                tantivy::query::QueryParserError::SyntaxError(format!(
+                    "{} at position {}",
+                    error.message, error.pos
+                ))
+            })
+            .collect();
+        let (query, mut built_errors) = self
+            .parser
+            .build_query_from_user_input_ast_lenient(restore_ranges(ast, &self.held));
+        errors.append(&mut built_errors);
+        (query, errors)
+    }
+
+    /// The normalized query as it reads, held ranges written back.
+    pub(crate) fn shown(&self) -> String {
+        self.held.iter().fold(self.text.clone(), |text, held| {
+            text.replacen(&held.placeholder, &held.written, 1)
+        })
+    }
+}
+
+/// A range clause taken out of the query text because a bound of it is quoted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeldRange {
+    /// The term standing in its place, under the clause's own field.
+    placeholder: String,
+    /// The range as the query wrote it, after the field's colon.
+    written: String,
+    lower: tantivy::query_grammar::UserInputBound,
+    upper: tantivy::query_grammar::UserInputBound,
+}
+
+/// Take each range clause with a quoted bound out of `query`, leaving a placeholder term under
+/// its field.
+///
+/// The grammar reads a range bound as a bare word: a quote is part of it, and a space ends it.
+/// So `label:["Film & Animation" TO G]` cannot be written in the text at all, and
+/// `label:>"S"` compares against the three characters `"S"` — on an untokenized field that
+/// silently matched every value or none. The bound is a plain string once parsed, though, so the
+/// range is held here and put back into the parsed query ([`PreparedQuery::parse`]).
+fn hold_quoted_ranges(query: &str) -> (String, Vec<HeldRange>) {
+    if !query.contains('"') {
+        return (query.to_string(), Vec::new());
+    }
+    let mut held = Vec::new();
+    let mut out = String::with_capacity(query.len());
+    let mut copied = 0usize;
+    for reference in field_references(query) {
+        let start = reference.span.end + 1;
+        if start <= copied || query.as_bytes().get(reference.span.end) != Some(&b':') {
+            continue;
+        }
+        let Some((lower, upper, len)) = quoted_range_at(&query[start..]) else {
+            continue;
+        };
+        let placeholder = format!("cameoheldrange{}", held.len());
+        out.push_str(&query[copied..start]);
+        out.push_str(&placeholder);
+        copied = start + len;
+        held.push(HeldRange {
+            placeholder,
+            written: query[start..start + len].to_string(),
+            lower,
+            upper,
+        });
+    }
+    out.push_str(&query[copied..]);
+    (out, held)
+}
+
+/// The range opening `text` — `[a TO b]`, `{a TO b}` or the mixed pairs, or `>a`, `>=a`, `<a`,
+/// `<=a` — with its byte length, when a bound of it is quoted. A bare `*` is unbounded.
+fn quoted_range_at(
+    text: &str,
+) -> Option<(
+    tantivy::query_grammar::UserInputBound,
+    tantivy::query_grammar::UserInputBound,
+    usize,
+)> {
+    use tantivy::query_grammar::UserInputBound as Bound;
+    let mut quoted = false;
+    let mut bound = |rest: &str| -> Option<(Option<String>, usize)> {
+        let (value, len, was_quoted) = range_bound(rest)?;
+        quoted |= was_quoted;
+        Some(((was_quoted || value != "*").then_some(value), len))
+    };
+    let (lower, upper, len) = if let Some(open) = text.strip_prefix(['[', '{']) {
+        let inclusive_lower = text.starts_with('[');
+        let skip = open.len() - open.trim_start().len();
+        let (lower, lower_len) = bound(&open[skip..])?;
+        let mut at = 1 + skip + lower_len;
+        let rest = &text[at..];
+        let gap = rest.len() - rest.trim_start().len();
+        let rest = rest.trim_start().strip_prefix("TO")?;
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        at += gap + 2;
+        let rest = &text[at..];
+        let gap = rest.len() - rest.trim_start().len();
+        at += gap;
+        let (upper, upper_len) = bound(&text[at..])?;
+        at += upper_len;
+        let rest = &text[at..];
+        let gap = rest.len() - rest.trim_start().len();
+        at += gap;
+        let close = text[at..]
+            .chars()
+            .next()
+            .filter(|c| matches!(c, ']' | '}'))?;
+        at += 1;
+        let lower = match lower {
+            None => Bound::Unbounded,
+            Some(v) if inclusive_lower => Bound::Inclusive(v),
+            Some(v) => Bound::Exclusive(v),
+        };
+        let upper = match upper {
+            None => Bound::Unbounded,
+            Some(v) if close == ']' => Bound::Inclusive(v),
+            Some(v) => Bound::Exclusive(v),
+        };
+        (lower, upper, at)
+    } else {
+        let (op, rest) = [">=", "<=", ">", "<"]
+            .iter()
+            .find_map(|op| text.strip_prefix(op).map(|rest| (*op, rest)))?;
+        let gap = rest.len() - rest.trim_start().len();
+        let (value, value_len) = bound(&rest[gap..])?;
+        let value = value?;
+        let len = op.len() + gap + value_len;
+        match op {
+            ">=" => (Bound::Inclusive(value), Bound::Unbounded, len),
+            ">" => (Bound::Exclusive(value), Bound::Unbounded, len),
+            "<=" => (Bound::Unbounded, Bound::Inclusive(value), len),
+            _ => (Bound::Unbounded, Bound::Exclusive(value), len),
+        }
+    };
+    quoted.then_some((lower, upper, len))
+}
+
+/// One range bound at the start of `text`: its value, its byte length, and whether it was
+/// quoted. A quoted bound ends at its unescaped closing quote, escapes removed; a bare one ends
+/// where the grammar's would, at whitespace or a bracket.
+fn range_bound(text: &str) -> Option<(String, usize, bool)> {
+    if let Some(inner) = text.strip_prefix('"') {
+        let mut value = String::new();
+        let mut chars = inner.char_indices();
+        while let Some((at, ch)) = chars.next() {
+            match ch {
+                '\\' => value.push(chars.next()?.1),
+                '"' => return Some((value, 1 + at + 1, true)),
+                _ => value.push(ch),
+            }
+        }
+        return None;
+    }
+    let len = text
+        .find(|c: char| c.is_whitespace() || matches!(c, '[' | ']' | '{' | '}' | '"' | '(' | ')'))
+        .unwrap_or(text.len());
+    (len > 0).then(|| (text[..len].to_string(), len, false))
+}
+
+/// Put each held range back where its placeholder parsed: a term under the clause's field.
+fn restore_ranges(
+    ast: tantivy::query_grammar::UserInputAst,
+    held: &[HeldRange],
+) -> tantivy::query_grammar::UserInputAst {
+    use tantivy::query_grammar::{UserInputAst, UserInputLeaf};
+    match ast {
+        UserInputAst::Clause(clauses) => UserInputAst::Clause(
+            clauses
+                .into_iter()
+                .map(|(occur, clause)| (occur, restore_ranges(clause, held)))
+                .collect(),
+        ),
+        UserInputAst::Boost(inner, boost) => {
+            UserInputAst::Boost(Box::new(restore_ranges(*inner, held)), boost)
+        }
+        UserInputAst::Leaf(leaf) => match *leaf {
+            UserInputLeaf::Literal(literal) => {
+                match held.iter().find(|h| h.placeholder == literal.phrase) {
+                    Some(range) => UserInputAst::Leaf(Box::new(UserInputLeaf::Range {
+                        field: literal.field_name,
+                        lower: range.lower.clone(),
+                        upper: range.upper.clone(),
+                    })),
+                    None => UserInputAst::Leaf(Box::new(UserInputLeaf::Literal(literal))),
+                }
+            }
+            other => UserInputAst::Leaf(Box::new(other)),
+        },
+    }
 }
 
 /// Whether any clause of `query` names no field, and so goes to the default fields.
@@ -1171,7 +1394,8 @@ pub(crate) fn parse_exact_id_query(query: &str, schema: &IndexSchema) -> Option<
     let field_part = query[..colon].trim();
     let value_part = query[colon + 1..].trim();
 
-    if value_part.contains(QUERY_SYNTAX_IN_VALUE) {
+    // A range is the parser's: `id:>9000` names no key.
+    if value_part.contains(QUERY_SYNTAX_IN_VALUE) || value_part.starts_with(['>', '<', '[', '{']) {
         return None;
     }
 
@@ -1910,6 +2134,63 @@ pub(crate) fn normalize_date_query(query: &str, schema: &IndexSchema) -> String 
     }
 
     normalized
+}
+
+#[cfg(test)]
+mod held_range_tests {
+    use super::*;
+    use tantivy::query_grammar::UserInputBound as Bound;
+
+    /// Only a range with a quoted bound is held, under its own field; the text reads back as
+    /// written.
+    #[test]
+    fn a_range_with_a_quoted_bound_is_held_and_reads_back_as_written() {
+        let query = r#"name:rust AND label:["Film & Animation" TO M} -tag:>="a \"b\"" id:[1 TO 2]"#;
+        let (text, held) = hold_quoted_ranges(query);
+        assert_eq!(
+            text,
+            "name:rust AND label:cameoheldrange0 -tag:cameoheldrange1 id:[1 TO 2]"
+        );
+        assert_eq!(
+            (held[0].lower.clone(), held[0].upper.clone()),
+            (
+                Bound::Inclusive("Film & Animation".to_string()),
+                Bound::Exclusive("M".to_string())
+            )
+        );
+        assert_eq!(
+            (held[1].lower.clone(), held[1].upper.clone()),
+            (Bound::Inclusive(r#"a "b""#.to_string()), Bound::Unbounded)
+        );
+        let prepared_text = held
+            .iter()
+            .fold(text, |text, h| text.replacen(&h.placeholder, &h.written, 1));
+        assert_eq!(prepared_text, query);
+    }
+
+    /// What is not a whole range is left to the parser as it was.
+    #[test]
+    fn what_is_not_a_quoted_range_is_left_alone() {
+        for query in [
+            r#"title:"a phrase""#,
+            r#"label:["unterminated TO b]"#,
+            r#"label:[a TO b] "free text""#,
+            r#"label:>"unterminated"#,
+        ] {
+            let (text, held) = hold_quoted_ranges(query);
+            assert_eq!((text.as_str(), held.len()), (query, 0), "{query}");
+        }
+    }
+
+    /// A whole-query range on the id is the parser's, not a lookup of a key that begins `>`.
+    #[test]
+    fn a_range_on_the_id_is_not_a_key_lookup() {
+        let schema = IndexSchema::default();
+        for query in ["id:>9000", "id:<=9000", "id:[1 TO 2]", "id:{9000 TO *}"] {
+            assert_eq!(parse_exact_id_query(query, &schema), None, "{query}");
+        }
+        assert!(parse_exact_id_query("id:9000", &schema).is_some());
+    }
 }
 
 #[cfg(test)]
