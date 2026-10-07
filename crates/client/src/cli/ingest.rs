@@ -98,25 +98,15 @@ impl Drop for ProgressSpinner {
 }
 
 pub(crate) fn parse_header_with_hint(raw: &str) -> (String, Option<TantivyFieldType>) {
-    let mut parts = raw.splitn(2, '.');
-    let name = parts.next().unwrap_or("").to_string();
-    let hint = parts.next().and_then(map_type_hint);
-    (name, hint)
-}
-
-pub(crate) fn map_type_hint(hint: &str) -> Option<TantivyFieldType> {
-    match hint.to_lowercase().as_str() {
-        "text" | "string" => Some(TantivyFieldType::Text),
-        // No dedicated Exact variant; use String (untokenized) for exact semantics
-        "exact" => Some(TantivyFieldType::String),
-        "numeric" | "number" | "int" | "i64" | "integer" | "u64" => Some(TantivyFieldType::I64),
-        "decimal" | "float" | "double" | "f64" => Some(TantivyFieldType::F64),
-        "date" => Some(TantivyFieldType::Date),
-        "timestamp" => Some(TantivyFieldType::Date),
-        "bool" | "boolean" | "true" | "false" => Some(TantivyFieldType::Boolean),
-        "ip" => Some(TantivyFieldType::Ip),
-        "json" => Some(TantivyFieldType::Json),
-        _ => None,
+    // The hint is what follows the last dot, and only when it names a type: `geo.lat` is a
+    // column named `geo.lat`, not a column `geo` hinted `lat` — two such columns would otherwise
+    // collapse into one.
+    match raw.rsplit_once('.') {
+        Some((name, hint)) if !name.is_empty() => match hint.parse() {
+            Ok(field_type) => (name.to_string(), Some(field_type)),
+            Err(_) => (raw.to_string(), None),
+        },
+        _ => (raw.to_string(), None),
     }
 }
 

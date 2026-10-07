@@ -65,6 +65,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **CSV header type hints: dotted column names are kept, and hints mean what a schema means.**
+  The hint was read at the first dot, so `geo.lat` and `geo.lon` both became a column `geo`, one
+  value overwriting the other. It is now what follows the last dot, and only when it names a type.
+  A hint is read by the schema's own type names, where `u64` had meant a signed integer and
+  `string` tokenized text; `unsigned`, `datetime`, `bytes` and the other schema aliases now work
+  too.
+- **`data load` names `--recreate` when a new id is refused for the documents in the way.** The
+  advice depended on the refusal's status, which only three SDK calls kept; every call now
+  reports a refusal with its status.
 - **A query rewrite touches only the clauses of the field it is for.** Date, facet and prefix
   clauses were found by searching the query for `field:`, so beside a date field named `date`
   the clause `update:2024` was rewritten into a date and matched nothing, and a field name

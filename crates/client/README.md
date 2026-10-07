@@ -101,6 +101,11 @@ becomes several values of one field, and a column with few distinct values repea
 a `string` category; other identifier-like columns become `text` with the `raw` tokenizer.
 `schema detect --report` shows all of it.
 
+A header can name a column's type instead: `publication_date.date`, `price.f64`, `code.string`.
+The hint is what follows the last dot, read by the same type names a schema's `field_type` takes
+(`u64`/`unsigned`, `string`/`exact`, `datetime`, `bytes`, …), and only when it names one — so
+`geo.lat` and `geo.lon` are two columns with those names, and `geo.lat.f64` is a hinted `geo.lat`.
+
 A load into an index that already has a schema reads only the first batch of rows ahead: its
 fields are typed and its id is recorded, and the batch settles what a schema does not hold — the
 order a column writes its numeric dates in, and whether it holds lists. When the batch leaves

@@ -183,44 +183,58 @@ impl TantivyFieldType {
     }
 }
 
+/// A field type name no spelling of a type matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownFieldType(pub String);
+
+impl std::fmt::Display for UnknownFieldType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Unknown field type: '{}'. Supported types: text, string, i64, u64, f64, date, \
+             boolean, bytes, ip, json, facet. Aliases: float, double, decimal, integer, int, \
+             number, numeric, signed, unsigned, uint, bool, datetime, timestamp, binary, blob, \
+             object, document, category, tag, exact",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for UnknownFieldType {}
+
+/// Every spelling of a field type, in one table: a schema's `field_type`, and a CSV header's
+/// type hint (`price.f64`), are read by it alike. Case does not matter.
+impl std::str::FromStr for TantivyFieldType {
+    type Err = UnknownFieldType;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        match name.to_lowercase().as_str() {
+            "text" => Ok(TantivyFieldType::Text),
+            "string" | "exact" => Ok(TantivyFieldType::String),
+            "i64" | "integer" | "int" | "number" | "numeric" | "signed" => {
+                Ok(TantivyFieldType::I64)
+            }
+            "u64" | "unsigned" | "uint" => Ok(TantivyFieldType::U64),
+            "f64" | "float" | "double" | "decimal" => Ok(TantivyFieldType::F64),
+            "date" | "datetime" | "timestamp" => Ok(TantivyFieldType::Date),
+            "boolean" | "bool" => Ok(TantivyFieldType::Boolean),
+            "bytes" | "binary" | "blob" => Ok(TantivyFieldType::Bytes),
+            "ip" => Ok(TantivyFieldType::Ip),
+            "json" | "object" | "document" => Ok(TantivyFieldType::Json),
+            "facet" | "category" | "tag" => Ok(TantivyFieldType::Facet),
+            _ => Err(UnknownFieldType(name.to_string())),
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for TantivyFieldType {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let s = String::deserialize(deserializer)?;
-        let normalized = s.to_lowercase();
-
-        match normalized.as_str() {
-            // Primary canonical names
-            "text" => Ok(TantivyFieldType::Text),
-            "string" => Ok(TantivyFieldType::String),
-            "i64" => Ok(TantivyFieldType::I64),
-            "u64" => Ok(TantivyFieldType::U64),
-            "f64" => Ok(TantivyFieldType::F64),
-            "date" => Ok(TantivyFieldType::Date),
-            "boolean" => Ok(TantivyFieldType::Boolean),
-            "bytes" => Ok(TantivyFieldType::Bytes),
-            "ip" => Ok(TantivyFieldType::Ip),
-            "json" => Ok(TantivyFieldType::Json),
-            "facet" => Ok(TantivyFieldType::Facet),
-
-            // Common aliases for Python/JavaScript/SQL compatibility
-            "float" | "double" | "decimal" => Ok(TantivyFieldType::F64),
-            "integer" | "int" | "number" | "signed" => Ok(TantivyFieldType::I64),
-            "unsigned" | "uint" => Ok(TantivyFieldType::U64),
-            "bool" => Ok(TantivyFieldType::Boolean),
-            "datetime" | "timestamp" => Ok(TantivyFieldType::Date),
-            "binary" | "blob" => Ok(TantivyFieldType::Bytes),
-            "object" | "document" => Ok(TantivyFieldType::Json),
-            "category" | "tag" => Ok(TantivyFieldType::Facet),
-
-            // Fallback with helpful error
-            _ => Err(D::Error::custom(format!(
-                "Unknown field type: '{}'. Supported types: text, string, i64, u64, f64, date, boolean, bytes, ip, json, facet. Aliases: float, double, integer, int, number, bool, datetime, timestamp, binary, blob, object, document, category, tag",
-                s
-            ))),
-        }
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(D::Error::custom)
     }
 }
 

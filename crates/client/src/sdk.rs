@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use reqwest::{Client, Url, header};
+use reqwest::{Client, Response, Url, header};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
@@ -341,29 +341,52 @@ impl CameoClient {
         &self.base_url
     }
 
-    pub async fn health(&self) -> Result<HealthResponse> {
-        let url = self.base_url.join("_cluster/health")?;
-        let resp = self
-            .http
-            .get(url)
+    /// Send `request`, and hand back the response if the node accepted it.
+    async fn send(&self, request: reqwest::RequestBuilder, what: &str) -> Result<Response> {
+        let response = request
             .send()
             .await
-            .context("Failed to send health request")?;
+            .with_context(|| format!("{what} failed: the request could not be sent"))?;
+        self.checked(response, what).await
+    }
 
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Health check failed: {} - {}{}",
-                status,
+    /// The response if the node accepted the request, or its refusal as an [`HttpFailure`]: the
+    /// status, what failed, the readable part of the body, and which side to fix. Every request
+    /// this client makes is refused this one way, so a caller can act on the status of any of
+    /// them — a `409` from a schema change as much as a `503` from a search.
+    async fn checked(&self, response: Response, what: &str) -> Result<Response> {
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+        let text = response.text().await.unwrap_or_default();
+        Err(HttpFailure::new(
+            status,
+            format!(
+                "{what} failed: {status} - {}{}",
                 refusal_text(&text),
                 self.refusal_hint(status)
-            );
-        }
+            ),
+        )
+        .into())
+    }
 
-        resp.json::<HealthResponse>()
+    /// [`Self::send`], and the answer read as `T`.
+    async fn send_json<T: serde::de::DeserializeOwned>(
+        &self,
+        request: reqwest::RequestBuilder,
+        what: &str,
+    ) -> Result<T> {
+        self.send(request, what)
+            .await?
+            .json()
             .await
-            .context("Failed to parse health response")
+            .with_context(|| format!("{what}: the answer could not be read"))
+    }
+
+    pub async fn health(&self) -> Result<HealthResponse> {
+        let url = self.base_url.join("_cluster/health")?;
+        self.send_json(self.http.get(url), "Health check").await
     }
 
     pub async fn list_indexes(&self, include_data_size: bool) -> Result<ListIndexesResponse> {
@@ -371,18 +394,7 @@ impl CameoClient {
         if include_data_size {
             url.set_query(Some("data_size=true"));
         }
-        let resp = self.http.get(url).send().await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            anyhow::bail!(
-                "Failed to list indexes: {}{}",
-                status,
-                self.refusal_hint(status)
-            );
-        }
-        resp.json()
-            .await
-            .context("Failed to parse indexes response")
+        self.send_json(self.http.get(url), "Listing indexes").await
     }
 
     /// Run a search, optionally taking one page of the result.
@@ -411,115 +423,54 @@ impl CameoClient {
             "fields": fields,
             "sort": sort,
         });
-
-        let resp = self.http.post(url).json(&body).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(HttpFailure::new(
-                status,
-                format!(
-                    "Search failed: {} - {}{}",
-                    status,
-                    refusal_text(&text),
-                    self.refusal_hint(status)
-                ),
-            )
-            .into());
-        }
-        resp.json().await.context("Failed to parse search response")
+        self.send_json(self.http.post(url).json(&body), "Search")
+            .await
     }
 
     pub async fn get_index_config(&self, index: &str) -> Result<IndexConfigResponse> {
-        let url = self
-            .base_url
-            .join(&format!("api/{}/_config", index))
-            .context("Invalid config URL")?;
-        let resp = self.http.get(url).send().await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            anyhow::bail!(
-                "Failed to fetch index config: {}{}",
-                status,
-                self.refusal_hint(status)
-            );
-        }
-        resp.json()
+        let url = self.base_url.join(&format!("api/{}/_config", index))?;
+        self.send_json(self.http.get(url), "Reading the index config")
             .await
-            .context("Failed to parse index config response")
     }
 
     /// The index's schema, or `None` when the node answers that it has none (`404`). Any other
     /// failure is an error: a node that could not be asked, or could not canvass its peers, has
     /// not said the index is absent.
     pub async fn find_index_config(&self, index: &str) -> Result<Option<IndexConfigResponse>> {
-        let url = self
-            .base_url
-            .join(&format!("api/{}/_config", index))
-            .context("Invalid config URL")?;
-        let resp = self.http.get(url).send().await?;
-        let status = resp.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
+        const WHAT: &str = "Reading the index config";
+        let url = self.base_url.join(&format!("api/{}/_config", index))?;
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("{WHAT} failed: the request could not be sent"))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Failed to fetch index config: {} - {}{}",
-                status,
-                refusal_text(&text),
-                self.refusal_hint(status)
-            );
-        }
-        resp.json()
+        self.checked(response, WHAT)
+            .await?
+            .json()
             .await
             .map(Some)
-            .context("Failed to parse index config response")
+            .with_context(|| format!("{WHAT}: the answer could not be read"))
     }
 
+    /// Declare the index's schema. A schema that changes a built column of an index holding
+    /// documents is refused `409`, readable through [`failure_status`].
     pub async fn put_index_config(&self, index: &str, config: &JsonValue) -> Result<()> {
-        let url = self
-            .base_url
-            .join(&format!("api/{}/_config", index))
-            .context("Invalid config URL")?;
-        let resp = self.http.put(url).json(config).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Failed to set index config: {} - {}{}",
-                status,
-                refusal_text(&text),
-                self.refusal_hint(status)
-            );
-        }
-        Ok(())
+        let url = self.base_url.join(&format!("api/{}/_config", index))?;
+        self.send(self.http.put(url).json(config), "Setting the index config")
+            .await
+            .map(drop)
     }
 
     pub async fn delete_index(&self, index: &str, delete_schema: bool) -> Result<JsonValue> {
-        let mut url = self
-            .base_url
-            .join(&format!("api/{}", index))
-            .context("Invalid delete URL")?;
+        let mut url = self.base_url.join(&format!("api/{}", index))?;
         if delete_schema {
             url.set_query(Some("delete_schema=true"));
         }
-
-        let resp = self.http.delete(url).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Delete index failed: {} - {}{}",
-                status,
-                refusal_text(&text),
-                self.refusal_hint(status)
-            );
-        }
-
-        resp.json()
-            .await
-            .context("Failed to parse delete index response")
+        self.send_json(self.http.delete(url), "Delete index").await
     }
 
     /// Write a single document.
@@ -539,32 +490,13 @@ impl CameoClient {
         doc: &JsonValue,
         routing_key: Option<&str>,
     ) -> Result<JsonValue> {
-        let url = self
-            .base_url
-            .join(&format!("api/{}/document", index))
-            .context("Invalid document URL")?;
-
+        let url = self.base_url.join(&format!("api/{}/document", index))?;
         let mut payload = serde_json::json!({ "id": id, "doc": doc });
         if let Some(key) = routing_key {
             payload["routing_key"] = JsonValue::String(key.to_string());
         }
-
-        let resp = self.http.put(url).json(&payload).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(HttpFailure::new(
-                status,
-                format!(
-                    "Write failed: {} - {}{}",
-                    status,
-                    refusal_text(&text),
-                    self.refusal_hint(status)
-                ),
-            )
-            .into());
-        }
-        resp.json().await.context("Failed to parse write response")
+        self.send_json(self.http.put(url).json(&payload), "Write")
+            .await
     }
 
     /// Remove one document by its key.
@@ -581,10 +513,7 @@ impl CameoClient {
         id: &str,
         routing_key: Option<&str>,
     ) -> Result<JsonValue> {
-        let mut url = self
-            .base_url
-            .join(&format!("api/{}/document", index))
-            .context("Invalid delete document URL")?;
+        let mut url = self.base_url.join(&format!("api/{}/document", index))?;
         {
             let mut query = url.query_pairs_mut();
             query.append_pair("id", id);
@@ -592,22 +521,8 @@ impl CameoClient {
                 query.append_pair("routing_key", key);
             }
         }
-
-        let resp = self.http.delete(url).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Delete document failed: {} - {}{}",
-                status,
-                refusal_text(&text),
-                self.refusal_hint(status)
-            );
-        }
-
-        resp.json()
+        self.send_json(self.http.delete(url), "Delete document")
             .await
-            .context("Failed to parse delete document response")
     }
 
     /// Remove many documents by key, in one request.
@@ -619,78 +534,27 @@ impl CameoClient {
     /// The reply counts what was deleted and lists per-id errors: an id that cannot be routed is
     /// reported against that id rather than failing the batch.
     pub async fn delete_documents(&self, index: &str, ids: &[JsonValue]) -> Result<JsonValue> {
-        let url = self
-            .base_url
-            .join(&format!("api/{}/_bulk/delete", index))
-            .context("Invalid bulk delete URL")?;
-
-        let resp = self.http.post(url).json(&ids).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Bulk delete failed: {} - {}{}",
-                status,
-                refusal_text(&text),
-                self.refusal_hint(status)
-            );
-        }
-
-        resp.json()
+        let url = self.base_url.join(&format!("api/{}/_bulk/delete", index))?;
+        self.send_json(self.http.post(url).json(&ids), "Bulk delete")
             .await
-            .context("Failed to parse bulk delete response")
     }
 
     pub async fn bulk_index(&self, index: &str, batch: &[JsonValue]) -> Result<JsonValue> {
-        let url = self
-            .base_url
-            .join(&format!("api/{}/_bulk", index))
-            .context("Invalid bulk URL")?;
-        let resp = self.http.post(url).json(batch).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(HttpFailure::new(
-                status,
-                format!(
-                    "Bulk ingest failed: {} - {}{}",
-                    status,
-                    refusal_text(&text),
-                    self.refusal_hint(status)
-                ),
-            )
-            .into());
-        }
-        resp.json()
+        let url = self.base_url.join(&format!("api/{}/_bulk", index))?;
+        self.send_json(self.http.post(url).json(batch), "Bulk ingest")
             .await
-            .context("Failed to parse bulk ingest response")
     }
 
     pub async fn stream_index_ndjson(&self, index: &str, body: Vec<u8>) -> Result<JsonValue> {
         let url = self
             .base_url
-            .join(&format!("api/{}/document/stream", index))
-            .context("Invalid streaming ingest URL")?;
-        let resp = self
+            .join(&format!("api/{}/document/stream", index))?;
+        let request = self
             .http
             .post(url)
             .header(header::CONTENT_TYPE, "application/x-ndjson")
-            .body(body)
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Streaming ingest failed: {} - {}{}",
-                status,
-                refusal_text(&text),
-                self.refusal_hint(status)
-            );
-        }
-        resp.json()
-            .await
-            .context("Failed to parse streaming ingest response")
+            .body(body);
+        self.send_json(request, "Streaming ingest").await
     }
 
     /// Expose underlying HTTP client for auxiliary requests (e.g., fetching CSV schema samples)
@@ -706,20 +570,8 @@ impl CameoClient {
 
     pub async fn admin_memory_stats(&self) -> Result<AdminMemoryResponse> {
         let url = self.base_url.join("_admin/memory")?;
-        let resp = self.http.get(url).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Admin memory stats failed: {} - {}{}",
-                status,
-                refusal_text(&text),
-                self.refusal_hint(status)
-            );
-        }
-        resp.json()
+        self.send_json(self.http.get(url), "Admin memory stats")
             .await
-            .context("Failed to parse memory stats response")
     }
 
     pub async fn admin_memory_purge(&self, force: bool) -> Result<AdminMemoryResponse> {
@@ -727,40 +579,16 @@ impl CameoClient {
         if force {
             url.query_pairs_mut().append_pair("force", "true");
         }
-        let resp = self.http.post(url).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Admin memory purge failed: {} - {}{}",
-                status,
-                refusal_text(&text),
-                self.refusal_hint(status)
-            );
-        }
-        resp.json()
+        self.send_json(self.http.post(url), "Admin memory purge")
             .await
-            .context("Failed to parse memory purge response")
     }
 
     pub async fn admin_index_commit(&self, index: &str) -> Result<AdminIndexCommitResponse> {
         let url = self
             .base_url
             .join(&format!("_admin/index/{}/commit", index))?;
-        let resp = self.http.post(url).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Admin index commit failed: {} - {}{}",
-                status,
-                refusal_text(&text),
-                self.refusal_hint(status)
-            );
-        }
-        resp.json()
+        self.send_json(self.http.post(url), "Admin index commit")
             .await
-            .context("Failed to parse index commit response")
     }
 
     pub async fn admin_index_evict_writer(
@@ -771,38 +599,14 @@ impl CameoClient {
             .base_url
             // Hyphen, not underscore: the route is `/_admin/index/{index}/evict-writer`.
             .join(&format!("_admin/index/{}/evict-writer", index))?;
-        let resp = self.http.post(url).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Admin index evict-writer failed: {} - {}{}",
-                status,
-                refusal_text(&text),
-                self.refusal_hint(status)
-            );
-        }
-        resp.json()
+        self.send_json(self.http.post(url), "Admin index evict-writer")
             .await
-            .context("Failed to parse index evict-writer response")
     }
 
     pub async fn admin_worker_stats(&self) -> Result<AdminWorkersResponse> {
         let url = self.base_url.join("_admin/workers")?;
-        let resp = self.http.get(url).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Admin workers stats failed: {} - {}{}",
-                status,
-                refusal_text(&text),
-                self.refusal_hint(status)
-            );
-        }
-        resp.json()
+        self.send_json(self.http.get(url), "Admin workers stats")
             .await
-            .context("Failed to parse workers stats response")
     }
 }
 
