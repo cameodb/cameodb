@@ -232,10 +232,6 @@ pub(crate) fn default_version() -> u64 {
     1
 }
 
-pub(crate) fn default_timestamp() -> i64 {
-    chrono::Utc::now().timestamp()
-}
-
 pub(crate) fn default_routing_field() -> String {
     "id".to_string()
 }
@@ -305,9 +301,13 @@ pub struct FieldDef {
     /// from the serialised schema when absent so an undescribed index costs nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    // Additional options for Text fields
+    /// How a text field is analysed; omitted when unset, as on every field that is not text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokenizer: Option<String>,
-    pub index_record_option: Option<String>, // "Basic", "WithFreqs", "WithFreqsAndPositions"
+    /// What a text field's postings record: "Basic", "WithFreqs" or "WithFreqsAndPositions";
+    /// omitted when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_record_option: Option<String>,
     /// Added by a write rather than declared. While it is not indexed it has no column, so its
     /// type is only what its values have been — widened to hold each new one
     /// ([`TantivyFieldType::widened`]) rather than refusing it. A declared field keeps the type it
@@ -393,12 +393,6 @@ impl FieldDef {
         }
         self.fast
             .unwrap_or_else(|| Self::fast_by_default(&self.field_type))
-    }
-
-    /// Infer field type from JSON value for schema evolution
-    pub fn infer_from_value(name: String, value: &JsonValue) -> Self {
-        let field_type = Self::infer_type_from_value(value);
-        Self::new(name, field_type)
     }
 
     /// A field a write added, typed by the values it has seen: non-indexed, so no column is
@@ -1094,10 +1088,6 @@ pub struct IndexSchema {
     pub state: SchemaState,
     #[serde(default = "default_version")]
     pub version: u64,
-    #[serde(default = "default_timestamp")]
-    pub created_at: i64,
-    #[serde(default = "default_timestamp")]
-    pub updated_at: i64,
     /// What this index holds, in the operator's words.
     ///
     /// The one thing a caller cannot work out from the schema: field names and types describe the
@@ -1141,13 +1131,10 @@ pub struct IndexSchema {
 
 impl Default for IndexSchema {
     fn default() -> Self {
-        let now = chrono::Utc::now().timestamp();
         Self {
             fields: HashMap::new(),
             state: SchemaState::Active,
             version: 1,
-            created_at: now,
-            updated_at: now,
             description: None,
             tenant: None,
             default_fields: None,
@@ -1241,13 +1228,10 @@ impl IndexSchema {
         // from disk and nothing here removes it.
     }
 
-    /// Record that this schema just changed: advance the version and stamp the time.
+    /// Record that this schema just changed: advance the version.
     ///
-    /// The two move together because they answer the same question and disagreeing about it is
-    /// the failure mode — `updated_at` was stamped on two paths and `version` on none, so a
-    /// schema could be edited a dozen times and still call itself version 1. A cluster comparing
-    /// `(version, fingerprint)` needs the version to actually advance on a local edit, or a node
-    /// holding newer content cannot say so.
+    /// A cluster comparing `(version, fingerprint)` needs the version to actually advance on a
+    /// local edit, or a node holding newer content cannot say so.
     ///
     /// Monotonic, not a count of operations: a change touching three fields may advance it three
     /// times, and nothing downstream depends on the step size — only on later being greater.
@@ -1257,7 +1241,6 @@ impl IndexSchema {
     /// records the same one.
     pub(crate) fn mark_modified(&mut self) {
         self.version = self.version.saturating_add(1);
-        self.updated_at = chrono::Utc::now().timestamp();
     }
 
     /// A hash of everything in this schema that decides how the index behaves.
@@ -1282,9 +1265,7 @@ impl IndexSchema {
     ///
     /// **What is deliberately left out.** `version` is not hashed: the two are compared together
     /// as a pair, so a node whose content matches at a different version has to be able to
-    /// recognise that, which it cannot do if the version is baked into the hash. `created_at`
-    /// and `updated_at` are not hashed either — they are per-node timestamps, and hashing them
-    /// would report every node as divergent from every other.
+    /// recognise that, which it cannot do if the version is baked into the hash.
     ///
     /// **Why lengths rather than a separator.** The previous form separated names with NUL, on
     /// the grounds that no field name may contain one. Descriptions and tokenizer names are freer
@@ -1656,40 +1637,6 @@ impl IndexSchema {
         }
         self.routing_field_name = field_name;
         Ok(())
-    }
-
-    /// Auto-detect and set routing field using priority algorithm
-    /// Priority: id → hash fields (sha256/sha1/md5) → *_id suffix → *id* substring → first sorted field
-    pub fn auto_detect_routing_field(&mut self) {
-        if self.fields.contains_key("id") {
-            self.routing_field_name = "id".to_string();
-            return;
-        }
-        for hash in &["sha256", "sha1", "md5"] {
-            if self.fields.contains_key(*hash) {
-                self.routing_field_name = hash.to_string();
-                return;
-            }
-        }
-        for name in self.fields.keys() {
-            let lower = name.to_lowercase();
-            if lower.ends_with("id") || lower.ends_with("_id") {
-                self.routing_field_name = name.clone();
-                return;
-            }
-        }
-        for name in self.fields.keys() {
-            if name.to_lowercase().contains("id") {
-                self.routing_field_name = name.clone();
-                return;
-            }
-        }
-        let mut sorted: Vec<&String> = self.fields.keys().collect();
-        sorted.sort();
-        self.routing_field_name = sorted
-            .first()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "id".to_string());
     }
 
     /// Record what a written value says about its field, by the same rules the node's write

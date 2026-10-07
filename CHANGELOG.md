@@ -37,7 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   56% of a 300,000-row test file. A load naming another id than the index records updates the
   schema when the index is empty, and is refused before a row is sent when it is not.
 - **`data load --recreate`** deletes the index's documents, keeps its schema, and loads again —
-  the way to change the id, or a field's type or tokenizer, on an index that holds documents.
+  the way to change the id on an index that holds documents.
 - **A load reports the ids it could not keep.** Rows repeating an id already sent each replace the
   document before it; a load now counts them and names the first, and counts the rows skipped for
   having no id, instead of finishing with fewer documents and nothing said.
@@ -81,6 +81,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   peer connects (and every 30 s), dropping what it missed — so the late node drops it within
   seconds of rejoining, and the retried `DELETE` the `503` asked for answers `404`. A write
   creating the index again goes above the drop, as before.
+- **A remote source is read once per load, and an error page is not read as data.** A load into
+  an index with a schema that had to look past its first batch downloaded the source again, and
+  asked for its first bytes three times; it now scans the bytes it already has. Fetching a remote
+  source for `schema detect` or a compressed load accepted any answer, so a `404` page was parsed
+  as the source; every remote fetch now refuses a status that is not a success, naming it.
+- **`schema detect --report` explains the schema it goes with.** A column typed by a header hint
+  (`price.f64`) was reported with the type its values suggested; the report now shows the type
+  the schema takes, noted as declared in the header.
 - **A load that fails says how far it got.** A failing batch let the batches in flight finish and
   counted them, and the error names the rows loaded and refused; a JSON load reports the send
   that failed rather than the reader stopping behind it; the shell prints an error's cause.

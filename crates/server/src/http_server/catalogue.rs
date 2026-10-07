@@ -208,14 +208,12 @@ pub(super) async fn list_indexes_handler(
     Ok(Json(result))
 }
 
-/// Handler for schema updates (maintenance API)
+/// `PATCH /api/{index}/_schema`: fields' `indexed` flags and the default search fields.
 ///
-/// Only the `indexed` flag can be changed, and only through the engine, which edits the stored
-/// schema in place. The two things it must not do are what the previous implementation did: read
-/// the schema out through the `GetConfig` response shape and write it back — which erased every
-/// property that shape does not carry, `routing_field_name` among them — and replay the edit as
-/// `CreateConfig`, which re-creates the Tantivy index and so failed on the writer lockfile for
-/// every index that had ever been written to.
+/// The edit is made to the schema itself — never read out through the `GetConfig` response
+/// shape and written back, which erased every property that shape does not carry,
+/// `routing_field_name` among them — and applied on every node as one change at one version
+/// (`patch_schema_cluster`).
 pub(super) async fn update_schema_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,

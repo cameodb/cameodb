@@ -837,7 +837,7 @@ mod tests {
     /// `get_schema_cached` prefers Tantivy as the source of truth for *fields*, and the tempting
     /// reading of that is that the returned schema is the derived one. It is not: the stored
     /// schema is the base and Tantivy's fields are merged onto it, which is the only reason
-    /// `tenant` — and `description`, and the timestamps — survive a read at all.
+    /// `tenant` — and `description` — survive a read at all.
     ///
     /// Worth pinning because the failure is silent and expensive. `derive_index_schema_from_tantivy`
     /// builds its value with `tenant: None`, since Tantivy stores fields and not ownership. If
@@ -2137,9 +2137,8 @@ mod tests {
     ///
     /// `version` is excluded because the pair `(version, thumbprint)` is compared as a pair: a
     /// node holding matching content at a different version has to be able to recognise that.
-    /// The timestamps are excluded because they are per-node and would never agree.
     #[test]
-    fn the_thumbprint_ignores_version_and_timestamps() {
+    fn the_thumbprint_ignores_version() {
         let mut schema = IndexSchema::default();
         schema
             .fields
@@ -2147,13 +2146,11 @@ mod tests {
         let baseline = schema.calculate_fingerprint();
 
         schema.version = 47;
-        schema.created_at = 1_600_000_000;
-        schema.updated_at = 1_700_000_000;
 
         assert_eq!(
             baseline,
             schema.calculate_fingerprint(),
-            "version and timestamps are not part of what a schema *is*"
+            "the version is not part of what a schema *is*"
         );
     }
 

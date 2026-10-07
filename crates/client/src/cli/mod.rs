@@ -842,7 +842,7 @@ pub async fn run_cli() -> Result<()> {
                         return Err(anyhow!("--report applies to schema detect"));
                     }
                     let schema_json =
-                        load_schema_from_source(&client, &file, delimiter, id.as_ref()).await?;
+                        detect_schema_from_source(&client, &file, delimiter, id.as_ref()).await?;
                     client.put_index_config(index_name, &schema_json).await?;
                     println!("Schema applied to index '{}'", index_name);
                 }

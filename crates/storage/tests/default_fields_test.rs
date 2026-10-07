@@ -241,12 +241,15 @@ fn setting_the_list_takes_effect_without_a_rebuild() {
     let store = open_store(&temp, capped(0), None);
     assert_eq!(reached(&store).len(), 5);
 
-    store
-        .set_default_fields("idx", Some(vec!["b".to_string()]))
-        .unwrap();
+    let declare = |fields: Option<Vec<String>>| {
+        let mut schema = store.get_schema("idx").unwrap().expect("stored schema");
+        schema.default_fields = fields;
+        store.store_schema_and_cache("idx", &schema).unwrap();
+    };
+    declare(Some(vec!["b".to_string()]));
     assert_eq!(reached(&store), ["b"]);
 
-    store.set_default_fields("idx", None).unwrap();
+    declare(None);
     assert_eq!(reached(&store).len(), 5);
 }
 
@@ -317,66 +320,4 @@ fn a_narrowed_search_says_so_and_only_when_it_was() {
     assert_eq!(narrowed.searched, ["e"]);
     assert_eq!(narrowed.available, 2);
     assert!(narrowed.declared);
-}
-
-/// An edit to the schema and a write that evolves it, running at once, lose neither change.
-///
-/// The writer thread adds a field to the schema when a document brings one it has not seen; the
-/// admin path rewrites `default_fields` from the blocking pool. Each used to read the schema,
-/// change a copy and write it back with nothing between them, so either could write over what
-/// the other had just added — in redb and in the cache. Here one thread declares and clears the
-/// default fields in a loop while the other writes documents that each carry a field of their
-/// own; every one of those fields must be in the stored schema and the cached one at the end.
-#[test]
-fn a_schema_edit_and_an_evolving_write_lose_neither_change() {
-    const FIELDS: usize = 60;
-
-    let temp = TempDir::new().unwrap();
-    let store = std::sync::Arc::new(open_store(&temp, QueryPolicy::default(), None));
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    let editor = {
-        let (store, stop) = (std::sync::Arc::clone(&store), std::sync::Arc::clone(&stop));
-        std::thread::spawn(move || {
-            let mut declare = true;
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let fields = declare.then(|| vec!["a".to_string()]);
-                store
-                    .set_default_fields("idx", fields)
-                    .expect("edit default fields");
-                declare = !declare;
-            }
-        })
-    };
-
-    for i in 0..FIELDS {
-        store
-            .apply_write(
-                "idx",
-                WalOp::Put {
-                    id: format!("e{i}"),
-                    json_blob: Some(serde_json::json!({ "a": "wa", format!("extra_{i}"): i })),
-                },
-            )
-            .expect("evolving write");
-    }
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    editor.join().expect("editor thread");
-
-    let stored = store.get_schema("idx").unwrap().expect("stored schema");
-    let cached = store
-        .get_schema_cached("idx")
-        .unwrap()
-        .expect("cached schema");
-    for i in 0..FIELDS {
-        let name = format!("extra_{i}");
-        assert!(
-            stored.fields.contains_key(&name),
-            "{name} was evolved into the schema and is missing from the stored row"
-        );
-        assert!(
-            cached.fields.contains_key(&name),
-            "{name} was evolved into the schema and is missing from the cache"
-        );
-    }
 }

@@ -1448,7 +1448,7 @@ pub(crate) async fn dispatch_interactive_command(
                         .ok_or_else(|| anyhow!("Usage: {}", usage::SCHEMA_LOAD))?;
 
                     let schema_json =
-                        load_schema_from_source(session.client(), file, delimiter, id.as_ref())
+                        detect_schema_from_source(session.client(), file, delimiter, id.as_ref())
                             .await?;
                     session
                         .client()

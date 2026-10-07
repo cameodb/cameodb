@@ -342,8 +342,9 @@ Beyond raw storage, the engine tracks per-index metadata and stats:
 CameoDB tracks schema changes through versioning and deterministic fingerprinting:
 
 **Schema Version (`version: u64`)**
-- Advances on every change to the schema: a `PUT /_config`, a field added by a write, a flag flipped
-  by `PATCH /_schema`. Monotonic, not a count of changes.
+- Advances on every change the cluster agrees: a `PUT /_config`, a `PATCH /_schema`, and the round
+  that agrees on fields learned from writes. Monotonic, not a count of changes. A dropped index
+  leaves a record one above it, and an index created again over it starts above the record.
 - On a cluster, a `PUT /_config` sets one version for every node — one past the highest any node
   holds — and two schemas for the same index are settled by it: the newer version wins, a tie goes
   to the lower fingerprint.
@@ -351,7 +352,8 @@ CameoDB tracks schema changes through versioning and deterministic fingerprintin
 
 **Schema Fingerprint (`calculate_fingerprint()`, shown as `thumbprint`)**
 - XXH3 over the *resolved* schema, not the declaration as written: every field with its type,
-  `indexed`, `stored`, `fast`, shadow flag, description, tokenizer and index record option, then
+  `indexed`, `stored`, `fast`, shadow flag, description, tokenizer and index record option, and
+  whether it was learned from writes (only when it was), then
   the routing field, the index description, the default search fields and the recorded
   `id_fields`. A declaration and the index built from it therefore hash alike (an
   omitted tokenizer and the `default` it resolves to are one schema).
@@ -365,18 +367,12 @@ CameoDB tracks schema changes through versioning and deterministic fingerprintin
   while it holds no documents, refused with `409` while it holds some. The rest only declare a
   column the built index lacks.
 
-**Timestamps**
-- `created_at: i64` - Unix timestamp when schema was first created
-- `updated_at: i64` - Unix timestamp of last schema modification
-
 **Example:**
 ```rust
 let schema = store.get_schema("employees")?;
 if let Some(schema) = schema {
     println!("Schema version: {}", schema.version);
-    println!("Fingerprint: {:016x}", schema.fingerprint);
-    println!("Created: {}", schema.created_at);
-    println!("Updated: {}", schema.updated_at);
+    println!("Fingerprint: {:016x}", schema.calculate_fingerprint());
 }
 ```
 

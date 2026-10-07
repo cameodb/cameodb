@@ -1236,25 +1236,8 @@ pub(super) fn is_write_operation(op: &ClientOp) -> bool {
     )
 }
 
-// ============================================================================
-// Enhanced Schema Sampling for Initial Creation
-// ============================================================================
-
 /// Type alias for shard hydration task results
 pub(super) type ShardTaskResult = Result<(Uuid, Option<MicroshardActor>), OrchestratorError>;
-
-/// Append names not already present, keeping the list sorted and free of duplicates.
-///
-/// Shard verdicts on a schema update overlap almost entirely — they are reading copies of the
-/// same schema — so merging them is a union, not a concatenation.
-pub(super) fn merge_names(into: &mut Vec<String>, from: Vec<String>) {
-    for name in from {
-        if !into.contains(&name) {
-            into.push(name);
-        }
-    }
-    into.sort();
-}
 
 /// Why a schema update was refused, phrased for whoever has to act on it.
 ///
@@ -3582,9 +3565,6 @@ impl NodeOrchestrator {
             let dropped_at = local_dropped_at.max(peer_dropped_at);
             if dropped_at > 0 {
                 minted.version = dropped_at.saturating_add(1);
-                let now = chrono::Utc::now().timestamp();
-                minted.created_at = now;
-                minted.updated_at = now;
             }
             minted.state = storage::SchemaState::Active;
             // The key, as a declaration records it, so a minted schema and a declared one
@@ -5164,7 +5144,6 @@ impl NodeOrchestrator {
             ClientOp::PrepareSchema {
                 index,
                 schema,
-                tenant,
                 change,
             } => {
                 let now = Instant::now();
@@ -5176,7 +5155,7 @@ impl NodeOrchestrator {
                     self.schema_changes
                         .insert(index.clone(), (change, now + SCHEMA_CHANGE_RESERVATION));
                 }
-                self.orch_prepare_schema(&index, schema, tenant, busy).await
+                self.orch_prepare_schema(&index, schema, busy).await
             }
             ClientOp::ApplySchema {
                 index,
@@ -5909,7 +5888,6 @@ impl NodeOrchestrator {
         &self,
         index: &str,
         schema: IndexSchema,
-        tenant: Option<String>,
         busy: bool,
     ) -> Result<JsonValue, OrchestratorError> {
         let schema = Self::checked_declaration(schema)?;
@@ -5929,7 +5907,7 @@ impl NodeOrchestrator {
         };
         // A new index here counts against the caller's quota. Whether the index is new to the
         // cluster is the coordinating node's to say, so this only reports.
-        let quota_exceeded = match tenant.as_deref() {
+        let quota_exceeded = match schema.tenant.as_deref() {
             Some(tenant) if held.is_none() && self.quotas.max_indexes(tenant).is_some() => {
                 let owned = owned_index_count(&self.shards, tenant).await?;
                 self.quotas
@@ -5939,17 +5917,19 @@ impl NodeOrchestrator {
             }
             _ => None,
         };
+        // Counted only where there are documents: an empty index is built again with its columns.
         let unbuilt = match held {
-            Some(held) => self.unbuilt_promotions(index, held, &schema).await?,
-            None => Vec::new(),
+            Some(held) if documents > 0 => self.unbuilt_promotions(index, held, &schema).await?,
+            _ => Vec::new(),
         };
-        let (conflicts, pending): (Vec<_>, Vec<_>) =
-            changes.into_iter().partition(|change| change.conflicts);
         let readiness = SchemaReadiness {
             current: current.map(|current| (*current).clone()),
             documents,
-            conflicts: conflicts.into_iter().map(|c| c.what).collect(),
-            pending: pending.into_iter().map(|c| c.what).collect(),
+            conflicts: changes
+                .into_iter()
+                .filter(|change| change.conflicts)
+                .map(|change| change.what)
+                .collect(),
             unbuilt,
             quota_exceeded,
             busy,
@@ -5966,26 +5946,36 @@ impl NodeOrchestrator {
         held: &IndexSchema,
         next: &IndexSchema,
     ) -> Result<Vec<String>, OrchestratorError> {
-        let promoted: BTreeMap<String, bool> = next
+        let promoted: Vec<String> = next
             .fields
             .iter()
             .filter(|(name, field)| {
                 field.indexed && !held.fields.get(*name).is_some_and(|was| was.indexed)
             })
-            .map(|(name, _)| (name.clone(), true))
+            .map(|(name, _)| name.clone())
             .collect();
         if promoted.is_empty() {
             return Ok(Vec::new());
         }
-        let stores: Vec<Arc<HybridStore>> = self
+        let checks = self
             .shards
             .values()
             .filter_map(|shard| shard.store.as_ref().map(Arc::clone))
-            .collect();
-        Ok(self
-            .fan_out_schema_update(&stores, index, &promoted)
-            .await?
-            .pending_reindex)
+            .map(|store| {
+                let (index, promoted) = (index.to_string(), promoted.clone());
+                tokio::task::spawn_blocking(move || store.unbuilt_fields(&index, &promoted))
+            });
+        let mut unbuilt = Vec::new();
+        for check in futures::future::join_all(checks).await {
+            unbuilt.extend(
+                check
+                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?
+                    .map_err(OrchestratorError::Storage)?,
+            );
+        }
+        unbuilt.sort();
+        unbuilt.dedup();
+        Ok(unbuilt)
     }
 
     /// Phase two of `PUT /_config` on this node: see [`ClientOp::ApplySchema`].
@@ -6210,70 +6200,6 @@ impl NodeOrchestrator {
                 ),
             }
         }
-    }
-
-    /// What setting `field_updates` would do on every shard, merged; nothing is written.
-    pub(super) async fn fan_out_schema_update(
-        &self,
-        stores: &[Arc<HybridStore>],
-        index: &str,
-        field_updates: &BTreeMap<String, bool>,
-    ) -> Result<SchemaFieldUpdate, OrchestratorError> {
-        let handles: Vec<_> = stores
-            .iter()
-            .map(|store| {
-                let store = Arc::clone(store);
-                let idx = index.to_string();
-                let updates = field_updates.clone();
-                tokio::task::spawn_blocking(move || store.plan_field_indexing(&idx, &updates))
-            })
-            .collect();
-
-        let mut merged = SchemaFieldUpdate::default();
-        let mut shard_count = 0usize;
-        let mut unknown_counts: HashMap<String, usize> = HashMap::new();
-
-        for handle in handles {
-            let outcome = handle
-                .await
-                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-                .map_err(OrchestratorError::Storage)?;
-
-            shard_count += 1;
-            for name in outcome.unknown {
-                *unknown_counts.entry(name).or_default() += 1;
-            }
-            merge_names(&mut merged.applied, outcome.applied);
-            merge_names(&mut merged.unchanged, outcome.unchanged);
-            merge_names(&mut merged.pending_reindex, outcome.pending_reindex);
-        }
-
-        // A name is unknown only when *every* shard says so.
-        //
-        // Shards normally agree, and the two paths that create a schema both make sure of it: a
-        // schema declared through `PUT /_config` is fanned out by `orch_create_config`, and one
-        // inferred from a bulk load is typed from the whole minting batch and
-        // persisted to every shard before the first write lands. Uniform input therefore gives
-        // every shard the same schema.
-        //
-        // Divergence comes from per-document writes over semi-structured input, where a field
-        // only some documents carry exists only on the shards those documents reached. That case
-        // is legitimate — those shards genuinely cannot answer a query on that field — so one
-        // shard's "unknown" must not refuse an edit the others can apply.
-        merged.unknown = unknown_counts
-            .into_iter()
-            .filter(|(_, seen)| *seen == shard_count)
-            .map(|(name, _)| name)
-            .collect();
-        merged.unknown.sort();
-
-        // A field one shard applied and another reported unchanged is applied overall; saying
-        // both would read as a contradiction.
-        merged
-            .unchanged
-            .retain(|name| !merged.applied.contains(name));
-
-        Ok(merged)
     }
 
     /// The body describing a schema update, whether it was accepted or refused.

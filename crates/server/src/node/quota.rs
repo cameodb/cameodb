@@ -5,7 +5,8 @@
 //!
 //! - **Index count** is decided at the mint, and exactly. Minting is serialised on the
 //!   orchestrator's mailbox — both the implicit mint in `staged_schema_validation` and the
-//!   explicit one in `orch_create_config` run there — so counting the tenant's indexes from
+//!   explicit one, a `PUT /_config` applied with `check_quota` (`orch_apply_schema`), run
+//!   there — so counting the tenant's indexes from
 //!   durable schemas and refusing at the cap cannot race another mint. Mints are rare, so the
 //!   count is taken fresh each time rather than cached.
 //! - **Bytes** are decided on every write to a tenanted index, against a cached reading. A fresh

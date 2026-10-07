@@ -88,7 +88,7 @@ cameodb client data load myindex https://external.com/data.csv --insecure-source
 - `data load <index> <file> [--delimiter ...] [--batch-size N] [--parallel N] [--id ...] [--recreate]` – ingest CSV, TSV, JSON, JSONL, or NDJSON data in batches. Supports local files and HTTP(S) URLs. Automatically decompresses Gzip (.gz/.gzip) and Zip archives. Default batch size is 4000 documents.
   - `--parallel N` (1 to 16, default 1) keeps up to N batches in flight; 4 halved the load of a 5.2 GB file on a 3-node cluster. A batch repeating an id sent before waits for the batches ahead of it, so the later row still replaces the earlier one.
   - `--id COL[,COL...]` names the column, or the columns joined with `|` in order, whose values make each document's id; the index records it and later loads use it without the flag. Rows repeating an id replace the earlier document.
-  - `--recreate` deletes the index's documents first, keeping its schema — what a change of id, or of a field's type or tokenizer, needs on an index that holds documents.
+  - `--recreate` deletes the index's documents first, keeping its schema, and loads again — what a change of id needs on an index that holds documents. A field's type or tokenizer is changed with the documents gone and the edited schema applied before the load: `delete <index>` (keeps the schema), `schema load <index> schema.json`, then `data load`.
 
 ### How a source is scanned
 

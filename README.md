@@ -281,7 +281,7 @@ The id is the column filled and unique in every scanned row, preferring names su
 cameodb client data load wifi ./wifi_kpi_hourly.csv --id Hr,cmMacAddress
 ```
 
-The index records its id, and later loads key documents the same way without `--id`. A schema can be edited and applied before loading (`schema detect … > schema.json`, then `schema load wifi schema.json`); once the index holds documents, a change to a field's type or tokenizer, or to the id, needs its documents deleted first — `data load --recreate` does that, keeping the schema, and loads again.
+The index records its id, and later loads key documents the same way without `--id`. A schema can be edited and applied before loading (`schema detect … > schema.json`, then `schema load wifi schema.json`); once the index holds documents, a change to the id needs its documents deleted first — `data load --recreate` does that, keeping the schema, and loads again. A change to a field's type or tokenizer needs the edited schema applied in between: `delete wifi` (keeps the schema), `schema load wifi schema.json`, then load.
 
 A load sends one batch at a time unless told otherwise. `--parallel N` (1 to 16) keeps up to N batches in flight, converting rows to documents beside the reading, so the nodes index while the next batches are read:
 
