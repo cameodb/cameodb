@@ -5188,6 +5188,10 @@ impl NodeOrchestrator {
                 self.release_schema_change(&index, change);
                 Ok(JsonValue::Null)
             }
+            ClientOp::ReconcileSchema { index } => {
+                self.request_schema_reconcile(&index);
+                Ok(JsonValue::Null)
+            }
             ClientOp::GetConfig { index } => self.orch_get_config(&index).await,
             ClientOp::GetRawSchema { index, minting_by } => {
                 self.raw_schema_for_peer(index, minting_by).await

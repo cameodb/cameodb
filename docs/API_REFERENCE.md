@@ -248,6 +248,22 @@ curl -s -X POST http://localhost:9480/api/books/search \
 }
 ```
 
+> **The schema searched (`stats.schema`, `schema_divergence`):** `stats.schema` names the
+> `version` and `thumbprint` of the schema the search ran under, spelled as `GET /_config` spells
+> them. In a cluster each node searches under its own copy, and for a moment after a change —
+> while it reaches each node in turn, or while a field one node learned from a write is being
+> agreed — those copies can differ, so a field may match on one node and not another. Such an
+> answer carries `schema_divergence` instead, listing each schema the answering nodes held,
+> and the node that merged it asks the cluster to agree; the same search shortly after answers
+> from one schema. The key is absent whenever every node searched the same schema.
+>
+> ```json
+> "schema_divergence": {
+>   "schemas": [{"version": 3, "thumbprint": "af00d0f44b0e2b7e"}, {"version": 4, "thumbprint": "62e419a9147b82eb"}],
+>   "note": "the nodes answering this search held different schemas for the index, …"
+> }
+> ```
+
 > **Dropped clauses (`_discarded_clauses`):** a clause the query parser cannot interpret is
 > dropped and whatever is left runs. In a conjunction that widens the result set; in a
 > disjunction it narrows it; in a negation it disables the exclusion. None of that is visible in

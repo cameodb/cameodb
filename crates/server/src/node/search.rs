@@ -346,7 +346,10 @@ impl ScatterCtx<'_> {
                     "total": self.shards.len(),
                     "responded": shard_success,
                     "failed": errors.len()
-                }
+                },
+                // The schema these shards were searched under, so a merge across nodes can tell
+                // whether they all searched the same one.
+                "schema": searched_schema_stats(schema),
             },
         });
         attach_shard_errors(&mut response, errors);
@@ -1427,5 +1430,73 @@ pub(super) fn validate_document(
         needs_evolution,
         new_fields,
         validation_error: None,
+    }
+}
+
+/// `stats.schema` on a search answer: the version and thumbprint it was searched under, spelled
+/// as `GET /_config` spells them.
+pub(super) fn searched_schema_stats(schema: &IndexSchema) -> JsonValue {
+    serde_json::json!({
+        "version": schema.version,
+        "thumbprint": format!("{:016x}", schema.calculate_fingerprint()),
+    })
+}
+
+/// Where a merged search answer says its nodes searched different schemas.
+pub(crate) const SCHEMA_DIVERGENCE_FIELD: &str = "schema_divergence";
+
+/// The schema a node's search answer says it searched under, read from its `stats.schema`.
+pub(super) fn searched_schema(value: &JsonValue) -> Option<(u64, String)> {
+    let schema = value.get("stats")?.get("schema")?;
+    Some((
+        schema.get("version")?.as_u64()?,
+        schema.get("thumbprint")?.as_str()?.to_string(),
+    ))
+}
+
+/// Say on a merged search answer which schema its nodes searched under: `stats.schema` when they
+/// agree, and [`SCHEMA_DIVERGENCE_FIELD`] listing each one when they do not. Whether they did not.
+///
+/// Nodes can disagree for a moment — a schema change reaches each node in turn, and a field one
+/// node learned from a write is agreed in the background — and an answer merged across that
+/// moment can match on one node what another does not. Said here, it can be retried.
+pub(super) fn attach_searched_schema(
+    response: &mut JsonValue,
+    seen: &std::collections::BTreeSet<(u64, String)>,
+) -> bool {
+    let Some(object) = response.as_object_mut() else {
+        return false;
+    };
+    match seen.len() {
+        0 => false,
+        1 => {
+            let (version, thumbprint) = seen.iter().next().expect("one");
+            if let Some(stats) = object.get_mut("stats").and_then(JsonValue::as_object_mut) {
+                stats.insert(
+                    "schema".to_string(),
+                    serde_json::json!({"version": version, "thumbprint": thumbprint}),
+                );
+            }
+            false
+        }
+        _ => {
+            let schemas: Vec<JsonValue> = seen
+                .iter()
+                .map(|(version, thumbprint)| {
+                    serde_json::json!({"version": version, "thumbprint": thumbprint})
+                })
+                .collect();
+            object.insert(
+                SCHEMA_DIVERGENCE_FIELD.to_string(),
+                serde_json::json!({
+                    "schemas": schemas,
+                    "note": "the nodes answering this search held different schemas for the \
+                             index, so a field may have matched on some and not on others; the \
+                             cluster is reconciling them, and the same search shortly after \
+                             answers from one schema",
+                }),
+            );
+            true
+        }
     }
 }

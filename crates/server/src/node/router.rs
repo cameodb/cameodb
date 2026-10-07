@@ -616,6 +616,7 @@ impl RouterActor {
                 | ClientOp::PrepareSchema { .. }
                 | ClientOp::ApplySchema { .. }
                 | ClientOp::ReleaseSchemaChange { .. }
+                | ClientOp::ReconcileSchema { .. }
         ) {
             return self.handle_client_op(op).await;
         }
@@ -977,10 +978,11 @@ impl RouterActor {
         } = fanout;
 
         // If this is a search, prefer fastest/local results and stop after hitting the limit.
-        if let ClientOp::Search { sort, .. } = &op {
+        if let ClientOp::Search { index, sort, .. } = &op {
             // `window`, not the op's own limit: the op was widened above to `fetch_count` so
             // that every node returned enough for this merge to page through.
             let sort = sort.clone();
+            let mut searched = std::collections::BTreeSet::new();
             let mut error_count = 0u64;
             let mut stats = BroadcastStats {
                 total_shards_queried: 0,
@@ -996,7 +998,10 @@ impl RouterActor {
             let mut blocks: Vec<Vec<JsonValue>> = Vec::new();
 
             match local_result {
-                Ok(mut val) => push_hits(&mut val, &mut blocks, &mut stats),
+                Ok(mut val) => {
+                    searched.extend(searched_schema(&val));
+                    push_hits(&mut val, &mut blocks, &mut stats)
+                }
                 Err(e) => {
                     error_count += 1;
                     warn!(error = %e, "Broadcast: local search failed");
@@ -1005,7 +1010,10 @@ impl RouterActor {
 
             for (_, result) in remote_results {
                 match result {
-                    Ok(Ok(mut val)) => push_hits(&mut val, &mut blocks, &mut stats),
+                    Ok(Ok(mut val)) => {
+                        searched.extend(searched_schema(&val));
+                        push_hits(&mut val, &mut blocks, &mut stats)
+                    }
                     Ok(Err(e)) => {
                         error_count += 1;
                         warn!(error = %e, "Broadcast: remote search failed");
@@ -1046,6 +1054,9 @@ impl RouterActor {
             attach_discarded(&mut response, stats.discarded);
             attach_approximate_sort(&mut response, stats.approximate_sort);
             attach_narrowed_default_fields(&mut response, stats.narrowed_default_fields);
+            if attach_searched_schema(&mut response, &searched) {
+                self.schemas_diverged(index, &searched);
+            }
             return Ok(response);
         }
 
@@ -1467,10 +1478,12 @@ impl RouterActor {
                 };
                 let window = search_window_for(&op, self.default_search_limit);
                 let op = widen_broadcast_op(op, window);
-                let ClientOp::Search { sort, .. } = &op else {
+                let ClientOp::Search { index, sort, .. } = &op else {
                     unreachable!("a stream was rewritten to a search above")
                 };
                 let sort = sort.clone();
+                let index = index.clone();
+                let mut searched = std::collections::BTreeSet::new();
 
                 let fanout = self
                     .broadcast_fanout(op, window, |op| self.handle_client_op(op))
@@ -1496,6 +1509,7 @@ impl RouterActor {
 
                 match local {
                     Ok(mut val) => {
+                        searched.extend(searched_schema(&val));
                         // Taken whole, the way the remote arm takes its blocks — an earlier
                         // form of this path kept only hits that carried a `_score`, so a
                         // sorted search's local block could shed hits its peers kept.
@@ -1529,6 +1543,7 @@ impl RouterActor {
                     nodes_contacted += 1;
                     match result {
                         Ok(Ok(mut val)) => {
+                            searched.extend(searched_schema(&val));
                             // Take mutable reference to array to move items
                             if let Some(hits) = val.get_mut("hits").and_then(|h| h.as_array_mut()) {
                                 let block: Vec<JsonValue> = std::mem::take(hits);
@@ -1598,6 +1613,9 @@ impl RouterActor {
                     },
                 });
                 attach_shard_errors(&mut response, errors);
+                if attach_searched_schema(&mut response, &searched) {
+                    self.schemas_diverged(&index, &searched);
+                }
                 Ok(response)
             }
             _ => {
@@ -1605,6 +1623,25 @@ impl RouterActor {
                 self.handle_broadcast_request(op).await
             }
         }
+    }
+
+    /// A search found its nodes holding different schemas for `index`: said in the log, and the
+    /// cluster asked to agree on one. Not awaited — the answer has already been merged.
+    fn schemas_diverged(&self, index: &str, searched: &std::collections::BTreeSet<(u64, String)>) {
+        warn!(
+            index = %index,
+            schemas = ?searched,
+            "A search found its nodes holding different schemas; asking the cluster to agree"
+        );
+        let router = self.clone();
+        let op = ClientOp::ReconcileSchema {
+            index: index.to_string(),
+        };
+        tokio::spawn(async move {
+            if let Err(err) = router.handle_client_op(op).await {
+                warn!(error = %err, "Could not ask for a schema reconcile");
+            }
+        });
     }
 
     /// Broadcast request method for non-search operations

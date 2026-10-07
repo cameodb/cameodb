@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A search says which schema it ran under, and whether its nodes agreed.** Each answer carries
+  `stats.schema` (`version`, `thumbprint`). An answer merged from nodes holding different schemas
+  for the index — for a moment after a change, while it reaches each node — carries
+  `schema_divergence` listing them instead of answering as if the result were whole, and the
+  merging node asks the cluster to agree, so a divergence a search meets is repaired by it.
 - **`data load --parallel N`: up to N batches in flight.** A load read and converted a batch,
   sent it, and waited for the answer before reading on, so the client and the nodes took turns
   idling. `--parallel` (default 1, at most 16 — half of a node's 32 concurrent requests in the
