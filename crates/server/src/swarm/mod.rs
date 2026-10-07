@@ -231,90 +231,41 @@ struct PeerBook {
     addr_by_peer: HashMap<String, String>, // last known good address (from established conn or identify)
 }
 
-/// Check if a multiaddr resolves to a local address
-fn resolves_to_local(
-    addr: &Multiaddr,
-    listen_ip4: Option<std::net::Ipv4Addr>,
-    listen_ip6: Option<std::net::Ipv6Addr>,
-) -> bool {
-    let addr_str = addr.to_string();
+/// Whether a seed address is this node's own listener: the same IP — written out, or what its
+/// DNS name resolves to — **and** the same port.
+///
+/// The port is part of the answer. Two nodes on one host share every IP, and matching the IP
+/// alone made each of them skip the other's address as its own, so neither ever dialed the other
+/// and no cluster formed. A container has an IP of its own, which is why it never showed there.
+fn is_own_address(seed: &Multiaddr, own: &Multiaddr) -> bool {
+    use libp2p::multiaddr::Protocol;
 
-    // Check for DNS addresses
-    if let Some(dns_part) = addr_str.strip_prefix("/dns4/") {
-        // Parse /dns4/hostname/tcp/port format
-        if let Some((hostname, port_str)) = dns_part.split_once("/tcp/") {
-            if let Ok(port) = port_str.parse::<u16>() {
-                if let Ok(addrs) = (hostname, port).to_socket_addrs() {
-                    let addrs_vec: Vec<_> = addrs.collect();
-                    debug!(
-                        "Checking DNS4 {}:{} resolves to {:?} (local IP: {:?})",
-                        hostname, port, addrs_vec, listen_ip4
-                    );
-                    for sa in addrs_vec {
-                        match sa.ip() {
-                            IpAddr::V4(ip) => {
-                                if Some(ip) == listen_ip4 {
-                                    info!("DNS4 {} resolves to local IP {}", hostname, ip);
-                                    return true;
-                                }
-                            }
-                            IpAddr::V6(ip) => {
-                                if Some(ip) == listen_ip6 {
-                                    info!("DNS4 {} resolves to local IP {}", hostname, ip);
-                                    return true;
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    debug!("Failed to resolve DNS4 {}:{}", hostname, port);
+    let endpoint = |addr: &Multiaddr| -> Vec<std::net::SocketAddr> {
+        let mut host = None;
+        let mut port = None;
+        for protocol in addr.iter() {
+            match protocol {
+                Protocol::Ip4(ip) => host = Some(Err(IpAddr::V4(ip))),
+                Protocol::Ip6(ip) => host = Some(Err(IpAddr::V6(ip))),
+                Protocol::Dns(name) | Protocol::Dns4(name) | Protocol::Dns6(name) => {
+                    host = Some(Ok(name.to_string()))
                 }
-            } else {
-                debug!("Invalid port in DNS4 address: {}", port_str);
+                Protocol::Tcp(p) => port = Some(p),
+                _ => {}
             }
-        } else {
-            debug!("Invalid DNS4 format: {}", dns_part);
         }
-    } else if let Some(dns_part) = addr_str.strip_prefix("/dns6/") {
-        // Parse /dns6/hostname/tcp/port format
-        if let Some((hostname, port_str)) = dns_part.split_once("/tcp/") {
-            if let Ok(port) = port_str.parse::<u16>() {
-                if let Ok(addrs) = (hostname, port).to_socket_addrs() {
-                    let addrs_vec: Vec<_> = addrs.collect();
-                    debug!(
-                        "Checking DNS6 {}:{} resolves to {:?} (local IP: {:?})",
-                        hostname, port, addrs_vec, listen_ip6
-                    );
-                    for sa in addrs_vec {
-                        match sa.ip() {
-                            IpAddr::V4(ip) => {
-                                if Some(ip) == listen_ip4 {
-                                    info!("DNS6 {} resolves to local IP {}", hostname, ip);
-                                    return true;
-                                }
-                            }
-                            IpAddr::V6(ip) => {
-                                if Some(ip) == listen_ip6 {
-                                    info!("DNS6 {} resolves to local IP {}", hostname, ip);
-                                    return true;
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    debug!("Failed to resolve DNS6 {}:{}", hostname, port);
-                }
-            } else {
-                debug!("Invalid port in DNS6 address: {}", port_str);
-            }
-        } else {
-            debug!("Invalid DNS6 format: {}", dns_part);
+        match (host, port) {
+            (Some(Err(ip)), Some(port)) => vec![std::net::SocketAddr::new(ip, port)],
+            (Some(Ok(name)), Some(port)) => (name.as_str(), port)
+                .to_socket_addrs()
+                .map(Iterator::collect)
+                .unwrap_or_default(),
+            _ => Vec::new(),
         }
-    } else if addr_str.starts_with("/dns4/") || addr_str.starts_with("/dns6/") {
-        debug!("DNS resolution failed for address: {}", addr_str);
-    }
+    };
 
-    false
+    let own = endpoint(own);
+    endpoint(seed).iter().any(|seed| own.contains(seed))
 }
 
 fn select_preferred_address(addrs: &[Multiaddr]) -> Option<Multiaddr> {
@@ -412,17 +363,6 @@ async fn create_production_swarm(
         &config.listen_addrs,
         config.cluster_port,
     )?;
-
-    // Capture our own listen IPs for self-dial filtering
-    let mut listen_ip4 = None;
-    let mut listen_ip6 = None;
-    for p in listen_addr.iter() {
-        match p {
-            libp2p::multiaddr::Protocol::Ip4(ip) => listen_ip4 = Some(ip),
-            libp2p::multiaddr::Protocol::Ip6(ip) => listen_ip6 = Some(ip),
-            _ => {}
-        }
-    }
 
     // Create custom network behaviour with production settings
     let behaviour = DhtBehaviour::new(
@@ -525,45 +465,9 @@ async fn create_production_swarm(
     }
 
     for addr in seed_addrs {
-        debug!(
-            "Checking seed address: {} (local IPs: {:?}, {:?})",
-            addr, listen_ip4, listen_ip6
-        );
-
-        // Skip self-dialing by checking against our listeners and resolved listen IPs
-        if swarm.listeners().any(|l| l == &addr) {
-            info!(
-                "Skipping self-dial to local seed node (listener match): {}",
-                addr
-            );
-            continue;
-        }
-        if let Some(ip4) = listen_ip4
-            && addr.to_string().starts_with(&format!("/ip4/{}/tcp/", ip4))
-        {
-            info!(
-                "Skipping self-dial to local seed node (ip4 match): {}",
-                addr
-            );
-            continue;
-        }
-        if let Some(ip6) = listen_ip6
-            && addr.to_string().starts_with(&format!("/ip6/{}/tcp/", ip6))
-        {
-            info!(
-                "Skipping self-dial to local seed node (ip6 match): {}",
-                addr
-            );
-            continue;
-        }
-
-        // Check if DNS address resolves to local
-        debug!("About to check DNS resolution for: {}", addr);
-        if resolves_to_local(&addr, listen_ip4, listen_ip6) {
-            info!(
-                "Skipping self-dial to local seed node (DNS resolves to local): {}",
-                addr
-            );
+        // This node's own address in the seed list — every node can share one list.
+        if swarm.listeners().any(|l| l == &addr) || is_own_address(&addr, &listen_addr) {
+            info!("Skipping self-dial to local seed node: {}", addr);
             continue;
         }
 
@@ -1496,6 +1400,24 @@ fn handle_identify_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A seed is this node only at this node's port: two nodes on one host share the IP.
+    #[test]
+    fn a_seed_is_this_node_only_at_its_own_port() {
+        let own: Multiaddr = "/ip4/127.0.0.1/tcp/9701".parse().unwrap();
+        let seed = |addr: &str| is_own_address(&addr.parse().unwrap(), &own);
+        assert!(seed("/ip4/127.0.0.1/tcp/9701"));
+        assert!(
+            !seed("/ip4/127.0.0.1/tcp/9702"),
+            "another node on this host"
+        );
+        assert!(seed("/dns4/localhost/tcp/9701"));
+        assert!(!seed("/dns4/localhost/tcp/9702"));
+        assert!(
+            !seed("/ip4/10.0.0.2/tcp/9701"),
+            "another host at the same port"
+        );
+    }
 
     /// A first boot generates and saves the key; every later boot reads the same one back, and
     /// so comes up as the same node.
