@@ -5726,7 +5726,16 @@ field name that is the suffix of another.
 
 ### N6 — Three client errors that lose or mislabel data
 
-**Defect.** 📋 **Planned.** **Checked** (all three).
+**Defect.** ✅ **Done** 2026-10-07. `impl FromStr for TantivyFieldType` in storage is the one table
+of type names — the schema's `Deserialize` and the CSV header hint both read it — and a header's
+hint is what follows the last dot, only when it names a type. Every SDK request goes through one
+`send`/`checked`/`send_json` path, so every refusal is an `HttpFailure` carrying its status and the
+loader's `--recreate` advice is reachable. Covered by `a_header_hint_is_the_type_after_the_last_dot`,
+`a_header_hint_reads_type_names_as_a_schema_does`, and an SDK `put_index_config` refusal asserting
+`failure_status == Some(409)` in `a_retype_rebuilds_an_empty_index_and_is_refused_on_a_populated_one`.
+`sdk.rs` is 200 lines shorter.
+
+**Original entry.** **Checked** (all three).
 
 - **Dotted headers collapse.** `parse_header_with_hint` (`client/src/cli/ingest.rs:100`) splits at
   the first `.`, so `geo.lat` and `geo.lon` both become the column `geo`, and the second value

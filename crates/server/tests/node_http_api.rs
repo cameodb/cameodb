@@ -1622,6 +1622,15 @@ async fn a_retype_rebuilds_an_empty_index_and_is_refused_on_a_populated_one() {
     let config = get_json(&node, "/api/kpi/_config").await;
     assert_eq!(score_type(&config), Some(json!("f64")), "{config}");
 
+    // Through the SDK the refusal keeps its status, which is what the loader's `--recreate`
+    // advice is decided on.
+    let refused = node
+        .client()
+        .put_index_config("kpi", &declare("i64"))
+        .await
+        .expect_err("the SDK reports the refusal");
+    assert_eq!(client::failure_status(&refused), Some(409), "{refused}");
+
     // The same column under another name is taken, documents or not.
     let (status, body) = put_config(
         &node,

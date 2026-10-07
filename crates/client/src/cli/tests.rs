@@ -1317,3 +1317,37 @@ mod parallel_tests {
         assert!(parse_parallel_arg(&["--parallel"]).is_err());
     }
 }
+
+#[cfg(test)]
+mod header_hint_tests {
+    use super::*;
+    use storage::TantivyFieldType;
+
+    /// The hint is what follows the last dot, and only when it names a type: a dotted name that
+    /// is not hinted is a column of its own, not a hint that would merge it with its neighbours.
+    #[test]
+    fn a_header_hint_is_the_type_after_the_last_dot() {
+        let read = |header| parse_header_with_hint(header);
+        assert_eq!(read("geo.lat"), ("geo.lat".to_string(), None));
+        assert_eq!(read("geo.lon"), ("geo.lon".to_string(), None));
+        assert_eq!(
+            read("geo.lat.f64"),
+            ("geo.lat".to_string(), Some(TantivyFieldType::F64))
+        );
+        assert_eq!(read("title"), ("title".to_string(), None));
+        assert_eq!(read(".text"), (".text".to_string(), None));
+    }
+
+    /// One table of type names, the schema's: `u64` is unsigned and `string` is kept whole.
+    #[test]
+    fn a_header_hint_reads_type_names_as_a_schema_does() {
+        let hint = |header| parse_header_with_hint(header).1;
+        assert_eq!(hint("n.u64"), Some(TantivyFieldType::U64));
+        assert_eq!(hint("label.string"), Some(TantivyFieldType::String));
+        assert_eq!(hint("label.exact"), Some(TantivyFieldType::String));
+        assert_eq!(hint("body.TEXT"), Some(TantivyFieldType::Text));
+        assert_eq!(hint("at.datetime"), Some(TantivyFieldType::Date));
+        assert_eq!(hint("n.unsigned"), Some(TantivyFieldType::U64));
+        assert_eq!(hint("x.nonsense"), None);
+    }
+}
