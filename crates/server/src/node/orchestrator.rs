@@ -40,8 +40,8 @@ use cluster::{ConsistentRing, NodeIdentity, generate_tokens};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 pub use storage::SortSpec;
 use storage::{
-    FieldDef, HybridStore, IndexSchema, SchemaFieldUpdate, ShardStatsTimings, StorageConfig,
-    StoreError, TantivyFieldType,
+    FieldDef, HybridStore, IndexSchema, SchemaFieldUpdate, SchemaVersion, ShardStatsTimings,
+    StorageConfig, StoreError, TantivyFieldType,
 };
 
 /// A document on its way to a shard, still carrying where it sat in the batch that arrived.
@@ -1279,16 +1279,8 @@ pub(super) fn describe_pending_reindex(outcome: &SchemaFieldUpdate) -> String {
     )
 }
 
-/// How long to wait for one peer to report its schema for an index.
-///
-/// Bounded because this sits on the write path: a peer that has stopped answering must not hold
-/// a write open indefinitely. It is deliberately not the broadcast timeout — that belongs to the
-/// router and this runs on the orchestrator — and a constant rather than configuration until
-/// there is a reason to tune it, which a metadata read of a few hundred bytes is unlikely to
-/// give. A peer that misses this window counts as unreachable, which refuses the write rather
-/// than letting it invent a schema.
 /// A peer's orchestrator from the pool, for use inside [`RemotePeerPool::converse`].
-async fn lookup_peer_orchestrator(
+pub(crate) async fn lookup_peer_orchestrator(
     pool: &RemotePeerPool,
     node_id: Uuid,
 ) -> Result<kameo::actor::RemoteActorRef<NodeOrchestrator>, OrchestratorError> {
@@ -1324,6 +1316,14 @@ pub(super) fn held_schema(answer: JsonValue) -> Result<Option<IndexSchema>, Stri
     Ok(Some(schema))
 }
 
+/// How long to wait for one peer to report its schema for an index.
+///
+/// Bounded because this sits on the write path: a peer that has stopped answering must not hold
+/// a write open indefinitely. It is deliberately not the broadcast timeout — that belongs to the
+/// router and this runs on the orchestrator — and a constant rather than configuration until
+/// there is a reason to tune it, which a metadata read of a few hundred bytes is unlikely to
+/// give. A peer that misses this window counts as unreachable, which refuses the write rather
+/// than letting it invent a schema.
 pub(super) const PEER_SCHEMA_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a prepared schema change holds its index on a node when neither its apply nor its
@@ -1405,10 +1405,18 @@ impl SchemaCanvass {
     ///
     /// `minting_by` is this node's id when the canvass is for a mint of its own, so that a peer
     /// minting the same index learns of the race too; `None` for a lookup that creates nothing.
+    /// `dropped_here` is the version of this node's own record of a drop of the index, `0` when
+    /// it holds none.
+    ///
+    /// A peer still holding the index at or below a drop this node or another peer recorded
+    /// missed that drop — it was down when it ran. It is not an answer: it is told to finish the
+    /// drop, and the lookup goes on as though it held nothing. Adopted instead, it brought the
+    /// dropped index back on every node, with only the documents the late node kept.
     pub(super) async fn peer_schema_for(
         &self,
         index: &str,
         minting_by: Option<Uuid>,
+        dropped_here: u64,
     ) -> PeerSchemaLookup {
         use crate::cluster_coordinator::{GetKnownPeers, GetStatus, KnownPeer};
 
@@ -1419,11 +1427,15 @@ impl SchemaCanvass {
         // the same fact out of `GetStatus`, which meant a mailbox hop on the first write to
         // every new index on a node that has no peers by construction.
         if !self.clustered {
-            return PeerSchemaLookup::NoneHeld { dropped_at: 0 };
+            return PeerSchemaLookup::NoneHeld {
+                dropped_at: dropped_here,
+            };
         }
 
         let Some(coordinator) = self.coordinator.as_ref() else {
-            return PeerSchemaLookup::NoneHeld { dropped_at: 0 };
+            return PeerSchemaLookup::NoneHeld {
+                dropped_at: dropped_here,
+            };
         };
         let Ok(status): Result<crate::distributed::ClusterStatus, _> =
             coordinator.ask(GetStatus).await
@@ -1457,7 +1469,9 @@ impl SchemaCanvass {
             None => Vec::new(),
         };
         if peers.is_empty() {
-            return PeerSchemaLookup::NoneHeld { dropped_at: 0 };
+            return PeerSchemaLookup::NoneHeld {
+                dropped_at: dropped_here,
+            };
         }
 
         let Some(pool) = self.pool.clone() else {
@@ -1493,33 +1507,43 @@ impl SchemaCanvass {
                         Err(err) => Err(PeerAnswer::Failed(format!("node {node}: {err}"))),
                     }
                 };
-                timeout(PEER_SCHEMA_LOOKUP_TIMEOUT, ask)
+                let answer = timeout(PEER_SCHEMA_LOOKUP_TIMEOUT, ask)
                     .await
-                    .unwrap_or_else(|_| Err(PeerAnswer::Failed(format!("node {node} timed out"))))
+                    .unwrap_or_else(|_| Err(PeerAnswer::Failed(format!("node {node} timed out"))));
+                (node, answer)
             }
         }))
         .await;
 
-        let mut best: Option<IndexSchema> = None;
+        let mut held = Vec::new();
         let mut unreachable = Vec::new();
         let mut rivals = Vec::new();
-        let mut dropped_at = 0u64;
-        for answer in answers {
+        let mut dropped_at = dropped_here;
+        for (node, answer) in answers {
             match answer {
                 Err(PeerAnswer::Failed(why)) => unreachable.push(why),
                 Err(PeerAnswer::Minting(node)) => rivals.push(node),
                 Ok(value) => match held_schema(value.clone()) {
-                    Ok(Some(schema)) => {
-                        best = Some(match best.take() {
-                            None => schema,
-                            Some(current) => NodeOrchestrator::preferred_schema(current, schema),
-                        });
-                    }
+                    Ok(Some(schema)) => held.push((node, schema)),
                     Ok(None) => dropped_at = dropped_at.max(dropped_version(&value)),
                     Err(why) => unreachable.push(why),
                 },
             }
         }
+        let counted = storage::count_drops(held, dropped_at);
+        let dropped_at = counted.dropped_at;
+        for node in counted.missed {
+            // Not finished is not concluded: until it drops, that node keeps the old index's
+            // documents, and an index created over them would take them back.
+            if let Err(err) = finish_drop_on(&pool, node, index, dropped_at).await {
+                unreachable.push(err.to_string());
+            }
+        }
+        let best = counted
+            .standing
+            .into_iter()
+            .map(|(_, schema)| schema)
+            .reduce(NodeOrchestrator::preferred_schema);
 
         // A schema found from any peer settles it even if another peer was unreachable: the
         // declaration exists, and adopting it is strictly better than inventing a second one.
@@ -1536,6 +1560,33 @@ impl SchemaCanvass {
         }
         PeerSchemaLookup::NoneHeld { dropped_at }
     }
+}
+
+/// The version of `held` when it is a record of a drop, `0` otherwise: the drop a lookup by this
+/// node has to go above.
+fn drop_record_version(held: Option<&IndexSchema>) -> u64 {
+    held.filter(|schema| schema.records_drop())
+        .map_or(0, |schema| schema.version)
+}
+
+/// Ask `node` to finish a drop of `index` recorded at `dropped_at` that it missed; see
+/// [`ClientOp::FinishDrop`].
+async fn finish_drop_on(
+    pool: &RemotePeerPool,
+    node: Uuid,
+    index: &str,
+    dropped_at: u64,
+) -> Result<(), OrchestratorError> {
+    let op = ClientOp::FinishDrop {
+        index: index.to_string(),
+        dropped_at,
+    };
+    pool.converse(node, async {
+        let remote = lookup_peer_orchestrator(pool, node).await?;
+        remote_answer(remote.ask(&op).await)
+    })
+    .await
+    .map(|_| ())
 }
 
 /// The version of a dropped index's record a peer answered with, `0` for any other answer.
@@ -1572,11 +1623,14 @@ pub(super) async fn find_schema_in_cluster(
         serde_json::to_value(schema).map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))
     };
     // This node first. A holder answers from its own store without asking anyone, which covers
-    // every standalone node and the ordinary clustered case.
-    if let Some(schema) = held {
-        return to_json(&schema);
+    // every standalone node and the ordinary clustered case. A record of a drop is not a
+    // schema: the peers are asked, above its version — a retried delete then hears `null`, not
+    // the record, once nothing is left.
+    if let Some(schema) = held.as_deref().filter(|schema| !schema.records_drop()) {
+        return to_json(schema);
     }
-    match canvass.peer_schema_for(&index, None).await {
+    let dropped_here = drop_record_version(held.as_deref());
+    match canvass.peer_schema_for(&index, None, dropped_here).await {
         PeerSchemaLookup::Found(schema) => to_json(&schema),
         PeerSchemaLookup::NoneHeld { .. } => Ok(JsonValue::Null),
         // Being created, so not absent — and not yet there to report either.
@@ -1601,8 +1655,9 @@ pub(super) async fn peer_config_response(
     shards: &HashMap<Uuid, MicroshardActor>,
     canvass: &SchemaCanvass,
     index: String,
+    dropped_here: u64,
 ) -> Result<JsonValue, OrchestratorError> {
-    let schema = match canvass.peer_schema_for(&index, None).await {
+    let schema = match canvass.peer_schema_for(&index, None, dropped_here).await {
         PeerSchemaLookup::Found(schema) => schema,
         PeerSchemaLookup::NoneHeld { .. } => {
             return Err(OrchestratorError::Storage(StoreError::IndexNotFound(index)));
@@ -2853,9 +2908,12 @@ impl OrchestratorEngine {
                     Ok(Some(held)) if held.state != storage::SchemaState::Dropped => {
                         WorkerOutcome::UseActor(Box::new(ClientOp::GetConfig { index }))
                     }
-                    Ok(_) => WorkerOutcome::Done(
-                        peer_config_response(&shards, &self.canvass, index).await,
-                    ),
+                    Ok(record) => {
+                        let dropped_here = drop_record_version(record.as_deref());
+                        WorkerOutcome::Done(
+                            peer_config_response(&shards, &self.canvass, index, dropped_here).await,
+                        )
+                    }
                     Err(err) => WorkerOutcome::Done(Err(err)),
                 }
             }
@@ -3307,9 +3365,15 @@ impl NodeOrchestrator {
     /// What the cluster already knows about an index this node has no schema for — see
     /// [`SchemaCanvass::peer_schema_for`].
     pub(super) async fn peer_schema_for(&self, index: &str) -> PeerSchemaLookup {
+        let dropped_here = self.dropped_here(index).await;
         self.schema_canvass()
-            .peer_schema_for(index, Some(self.identity.uuid))
+            .peer_schema_for(index, Some(self.identity.uuid), dropped_here)
             .await
+    }
+
+    /// The version of this node's record of a drop of `index`, `0` when it holds none.
+    pub(super) async fn dropped_here(&self, index: &str) -> u64 {
+        drop_record_version(self.load_schema(index).await.ok().as_deref())
     }
 
     /// What a canvass of the peers needs from this actor, detached from it, so the canvass can
@@ -3384,7 +3448,7 @@ impl NodeOrchestrator {
             ));
         }
 
-        // Enhanced sampling for initial schema creation.
+        // Initial schema creation.
         //
         // Sampling types an index from its first documents, which is the feature that makes
         // semi-structured input work — and, in a cluster, the mechanism by which three nodes came
@@ -3537,6 +3601,11 @@ impl NodeOrchestrator {
             if let Some(tenant) = tenant {
                 minted.tenant = Some(tenant.to_string());
             }
+            tracing::info!(
+                index = %index,
+                version = minted.version,
+                "Minting the index's schema from this batch"
+            );
             // Its fields come from the whole batch below: validation reports every field of
             // every document, and evolution types each by the join of all its values and
             // persists them indexed before any write reaches a shard — the tantivy schema is
@@ -5127,6 +5196,10 @@ impl NodeOrchestrator {
                 self.request_schema_reconcile(&index);
                 Ok(JsonValue::Null)
             }
+            ClientOp::FinishDrop { index, dropped_at } => {
+                self.orch_finish_drop(&index, dropped_at).await
+            }
+            ClientOp::SchemaRecords => self.orch_schema_records().await,
             ClientOp::GetConfig { index } => self.orch_get_config(&index).await,
             ClientOp::GetRawSchema { index, minting_by } => {
                 self.raw_schema_for_peer(index, minting_by).await
@@ -5153,6 +5226,39 @@ impl NodeOrchestrator {
                 delete_schema,
             } => self.orch_delete_index(&index, delete_schema).await,
         })
+    }
+
+    /// See [`ClientOp::FinishDrop`]. Checked here, against what this node holds now, so an index
+    /// created again since the asker looked — minted above the drop — is left alone.
+    async fn orch_finish_drop(
+        &self,
+        index: &str,
+        dropped_at: u64,
+    ) -> Result<JsonValue, OrchestratorError> {
+        let missed = self
+            .durable_schema(index)
+            .await?
+            .is_some_and(|held| held.dropped_by(dropped_at));
+        if missed {
+            tracing::info!(
+                index = %index,
+                dropped_at,
+                "Finishing a drop this node missed: another node recorded it above the schema held here"
+            );
+            self.orch_delete_index(index, true).await?;
+        }
+        Ok(JsonValue::Bool(missed))
+    }
+
+    /// See [`ClientOp::SchemaRecords`]. Every shard stores the same schema rows, so one is read.
+    async fn orch_schema_records(&self) -> Result<JsonValue, OrchestratorError> {
+        let Some(store) = self.shards.values().find_map(|shard| shard.store.clone()) else {
+            return Ok(JsonValue::Array(Vec::new()));
+        };
+        let records = tokio::task::spawn_blocking(move || store.schema_records())
+            .await
+            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))??;
+        serde_json::to_value(records).map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))
     }
 
     /// Delete an index and all its data from all local shards (parallel)
@@ -6763,9 +6869,12 @@ impl NodeOrchestrator {
             *self.minting.entry(index.clone()).or_default() += 1;
             let canvass = self.schema_canvass();
             let me = self.identity.uuid;
+            let dropped_here = self.dropped_here(&index).await;
             let orchestrator = ctx.actor_ref().downgrade();
             tokio::spawn(async move {
-                let lookup = canvass.peer_schema_for(&index, Some(me)).await;
+                let lookup = canvass
+                    .peer_schema_for(&index, Some(me), dropped_here)
+                    .await;
                 let answer = match orchestrator.upgrade() {
                     Some(orchestrator) => orchestrator
                         .ask(MintAfterCanvass {
@@ -6875,7 +6984,7 @@ async fn adopt_when_minted(
         pause = (pause * 2).min(Duration::from_millis(400));
         // Asked as a lookup, not a mint: this node no longer competes, and the winner answers
         // "minting" until it has saved and then answers with the schema.
-        if let PeerSchemaLookup::Found(schema) = canvass.peer_schema_for(&index, None).await {
+        if let PeerSchemaLookup::Found(schema) = canvass.peer_schema_for(&index, None, 0).await {
             let orchestrator = orchestrator.upgrade().ok_or_else(|| {
                 OrchestratorError::NotReady(
                     "the orchestrator stopped before the write could run".to_string(),

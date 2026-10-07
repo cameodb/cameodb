@@ -28,7 +28,7 @@ use uuid::Uuid;
 use super::DeleteTargets;
 use crate::distributed::ClusterStatus;
 use crate::node::{ClientOp, NodeOrchestrator, OrchestratorError, SchemaApplied, SchemaReadiness};
-use storage::{IndexSchema, SchemaFieldUpdate};
+use storage::{IndexSchema, SchemaFieldUpdate, SchemaRecord, SchemaVersion, count_drops};
 
 /// How many times a change that finds its index held by another change asks again.
 const BUSY_ATTEMPTS: u32 = 5;
@@ -80,16 +80,7 @@ impl Reach {
                 };
                 let id = *id;
                 pool.converse(id, async {
-                    use crate::remote_peer_pool::ConnectionChannel;
-                    let remote = pool
-                        .get_orchestrator(id, ConnectionChannel::Operations)
-                        .await
-                        .map_err(|e| OrchestratorError::PeerUnreachable {
-                            message: format!("node {id} lookup failed: {e}"),
-                        })?
-                        .ok_or_else(|| OrchestratorError::PeerUnreachable {
-                            message: format!("node {id} has no reachable orchestrator"),
-                        })?;
+                    let remote = crate::node::lookup_peer_orchestrator(pool, id).await?;
                     crate::node::remote_answer(remote.ask(&op).await)
                 })
                 .await
@@ -109,6 +100,38 @@ impl Reach {
                 warn!(index = %index, node = %node.name(), error = %err, "Schema change not released");
             }
         }
+    }
+
+    /// Finish on each of `missed` a drop of `index` recorded at `dropped_at` that it was down
+    /// for — see [`ClientOp::FinishDrop`]. Every one or an error: a node that has not dropped
+    /// keeps the old index's documents, and a schema applied over them would take them back.
+    async fn finish_missed_drops(
+        &self,
+        index: &str,
+        dropped_at: u64,
+        missed: &[Node],
+    ) -> Result<(), OrchestratorError> {
+        let op = ClientOp::FinishDrop {
+            index: index.to_string(),
+            dropped_at,
+        };
+        let answers =
+            futures::future::join_all(missed.iter().map(|node| self.ask(node, op.clone()))).await;
+        let failed: Vec<String> = missed
+            .iter()
+            .zip(answers)
+            .filter_map(|(node, answer)| answer.err().map(|err| format!("{}: {err}", node.name())))
+            .collect();
+        if failed.is_empty() {
+            return Ok(());
+        }
+        Err(OrchestratorError::PeerUnreachable {
+            message: format!(
+                "index '{index}' was dropped while some nodes were down, and they could not be \
+                 told to drop it too; retry once they answer. Not finished: {}",
+                failed.join("; ")
+            ),
+        })
     }
 
     /// Ask every node at once; each answer beside the node it came from.
@@ -301,6 +324,33 @@ async fn run_change(
                 ),
             });
         }
+        // A node still holding the index at or below a drop the others recorded was down for
+        // that drop. It drops now, and the round is asked again: a change made over its schema
+        // would bring the dropped index back.
+        let counted = count_drops(
+            readiness.iter().filter_map(|(node, ready)| {
+                ready
+                    .current
+                    .as_ref()
+                    .map(|current| (node.clone(), current))
+            }),
+            0,
+        );
+        if !counted.missed.is_empty() {
+            reach.release(&index, change).await;
+            reach
+                .finish_missed_drops(&index, counted.dropped_at, &counted.missed)
+                .await?;
+            if attempt >= BUSY_ATTEMPTS {
+                return Err(OrchestratorError::PeerUnreachable {
+                    message: format!(
+                        "index '{index}' was not changed: nodes kept answering with an index \
+                         that was dropped. Retry"
+                    ),
+                });
+            }
+            continue;
+        }
         if !readiness.iter().any(|(_, ready)| ready.busy) {
             break readiness;
         }
@@ -334,6 +384,7 @@ async fn run_change(
         .unwrap_or(0);
     schema.version = highest.saturating_add(1);
     // The schema the cluster holds now, as it settles a disagreement: newest, then the tie-break.
+    // No node holds a schema a drop overtook: the loop above finished those drops first.
     let held = readiness
         .iter()
         .filter_map(|(_, ready)| ready.current.clone())
@@ -375,17 +426,30 @@ async fn run_change(
         // Every node holds it already, at one version: nothing to write, and no version to
         // spend. The same schema at two versions is applied again, so the nodes agree on the
         // version too — a search compares both.
-        if readiness.iter().all(|(_, ready)| {
-            ready.current.as_ref().is_some_and(|current| {
-                current.state != storage::SchemaState::Dropped
-                    && current.version == view.version
-                    && current.calculate_fingerprint() == fingerprint
-            })
-        }) {
+        let holds_view = |current: &IndexSchema| {
+            !current.records_drop()
+                && current.version == view.version
+                && current.calculate_fingerprint() == fingerprint
+        };
+        if readiness
+            .iter()
+            .all(|(_, ready)| ready.current.as_ref().is_some_and(holds_view))
+        {
             reach.release(&index, change).await;
             return Ok(Step::Unchanged {
                 version: view.version,
             });
+        }
+        // Every node holding the index holds it already, and the rest hold none yet — an index
+        // just created, not yet asked for there. Nothing changes; those nodes take it up at its
+        // version, which a version past it would announce as a change the index never had.
+        if readiness.iter().all(|(_, ready)| {
+            ready
+                .current
+                .as_ref()
+                .is_none_or(|current| current.records_drop() || holds_view(current))
+        }) {
+            schema.version = view.version;
         }
     }
     // The owner is recorded once, by whoever created the index. A re-declaration keeps it, so
@@ -601,11 +665,10 @@ fn held_view(readiness: &[(Node, SchemaReadiness)]) -> Option<IndexSchema> {
     )
 }
 
-/// [`held_view`] over the schemas themselves, a dropped index's record left out.
+/// [`held_view`] over the schemas themselves, a dropped index's record left out. Drops are
+/// counted before this is asked: no schema a drop removed is among them.
 fn merged_view<'a>(schemas: impl Iterator<Item = &'a IndexSchema>) -> Option<IndexSchema> {
-    let held: Vec<&IndexSchema> = schemas
-        .filter(|current| current.state != storage::SchemaState::Dropped)
-        .collect();
+    let held: Vec<&IndexSchema> = schemas.filter(|current| !current.records_drop()).collect();
     let mut view = held
         .iter()
         .map(|current| (*current).clone())
@@ -924,13 +987,28 @@ async fn reconcile_once(
         index: index.to_string(),
         minting_by: None,
     };
-    let mut held = Vec::new();
+    let mut answers = Vec::new();
     for (node, answer) in reach.ask_all(&held_op).await {
         let value = answer.map_err(|e| e.to_string())?;
         if !value.is_null() {
-            held.push(decode::<IndexSchema>(&node, value).map_err(|e| e.to_string())?);
+            let schema = decode::<IndexSchema>(&node, value).map_err(|e| e.to_string())?;
+            answers.push((node, schema));
         }
     }
+    // A node down for a drop the others recorded drops now; agreeing on its schema instead
+    // would bring the dropped index back on every node.
+    let counted = count_drops(answers, 0);
+    if !counted.missed.is_empty() {
+        reach
+            .finish_missed_drops(index, counted.dropped_at, &counted.missed)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    let held: Vec<IndexSchema> = counted
+        .standing
+        .into_iter()
+        .map(|(_, schema)| schema)
+        .collect();
     let Some(base) = merged_view(held.iter()) else {
         return Ok(None);
     };
@@ -952,6 +1030,93 @@ async fn reconcile_once(
     {
         EditOutcome::Done { version, .. } => Ok(Some(version)),
         EditOutcome::Refused(body) => Err(body["reason"].as_str().unwrap_or("refused").to_string()),
+    }
+}
+
+/// What a sweep found this node should set right: drops it missed, as `(index, dropped_at)`,
+/// and indexes whose live schema differs from a peer's.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SweepVerdict {
+    finish: Vec<(String, u64)>,
+    reconcile: Vec<String>,
+}
+
+/// Compare this node's schema records with its peers'. Only this node's own records are judged:
+/// each peer runs the same comparison and sets right its own.
+fn sweep_verdict(local: &[SchemaRecord], peers: &[SchemaRecord]) -> SweepVerdict {
+    let mut verdict = SweepVerdict::default();
+    for mine in local.iter().filter(|record| !record.records_drop()) {
+        let theirs = count_drops(
+            peers
+                .iter()
+                .filter(|record| record.index == mine.index)
+                .map(|record| ((), record)),
+            0,
+        );
+        if mine.dropped_by(theirs.dropped_at) {
+            verdict.finish.push((mine.index.clone(), theirs.dropped_at));
+        } else if theirs.standing.iter().any(|(_, record)| {
+            !record.records_drop()
+                && (record.version, record.thumbprint) != (mine.version, mine.thumbprint)
+        }) {
+            verdict.reconcile.push(mine.index.clone());
+        }
+    }
+    verdict
+}
+
+/// Compare this node's schema records with every connected peer's, and set right this node's:
+/// a drop it was down for is finished here, and an index whose live schema differs from a
+/// peer's is handed to the reconcile. Run when a peer connects — a node back from being down,
+/// or a split healing — and on a timer, for a connection whose sweep found the peer not ready.
+pub(crate) async fn sweep_schemas(coordinator: &kameo::actor::ActorRef<super::ClusterCoordinator>) {
+    let Ok(targets) = coordinator.ask(super::GetDeleteTargets).await else {
+        return;
+    };
+    let Some(local) = targets.local_orchestrator.clone() else {
+        return;
+    };
+    let reach = Reach {
+        nodes: targets
+            .peers
+            .iter()
+            .filter(|peer| peer.connected)
+            .map(|peer| Node::Peer(peer.node_id))
+            .collect(),
+        pool: targets.pool.clone(),
+    };
+    if reach.nodes.is_empty() {
+        return;
+    }
+    let local_node = Node::Local(local);
+    let mine = match reach.ask(&local_node, ClientOp::SchemaRecords).await {
+        Ok(value) => decode::<Vec<SchemaRecord>>(&local_node, value),
+        Err(err) => Err(err),
+    };
+    let Ok(mine) = mine else {
+        return;
+    };
+    let mut theirs = Vec::new();
+    for (node, answer) in reach.ask_all(&ClientOp::SchemaRecords).await {
+        // A peer not ready yet is left to the next sweep.
+        if let Ok(records) = answer.and_then(|value| decode::<Vec<SchemaRecord>>(&node, value)) {
+            theirs.extend(records);
+        }
+    }
+    let verdict = sweep_verdict(&mine, &theirs);
+    for (index, dropped_at) in verdict.finish {
+        let op = ClientOp::FinishDrop {
+            index: index.clone(),
+            dropped_at,
+        };
+        if let Err(err) = reach.ask(&local_node, op).await {
+            warn!(index = %index, error = %err, "Could not finish a drop this node missed");
+        }
+    }
+    for index in verdict.reconcile {
+        let _ = reach
+            .ask(&local_node, ClientOp::ReconcileSchema { index })
+            .await;
     }
 }
 
@@ -1010,5 +1175,41 @@ mod tests {
         assert_eq!(outcome.applied, vec!["level".to_string()]);
         assert!(next.fields["level"].indexed);
         assert!(!next.fields["level"].learned);
+    }
+
+    /// A sweep judges this node's own records: a live schema at or below a peer's drop is a
+    /// drop it missed, a live schema differing from a peer's is reconciled, and a drop here or
+    /// an index only a peer holds is left to that peer's own sweep and to the next lookup.
+    #[test]
+    fn a_sweep_finishes_missed_drops_and_reconciles_differences() {
+        let record = |index: &str, version, dropped, thumbprint| SchemaRecord {
+            index: index.to_string(),
+            version,
+            dropped,
+            thumbprint,
+        };
+        let local = vec![
+            record("dropped_meanwhile", 2, false, 7),
+            record("agreed", 5, false, 1),
+            record("differs", 5, false, 1),
+            record("minted_above", 6, false, 9),
+            record("dropped_here", 4, true, 0),
+        ];
+        let peers = vec![
+            record("dropped_meanwhile", 3, true, 0),
+            record("dropped_meanwhile", 3, true, 0),
+            record("agreed", 5, false, 1),
+            record("differs", 5, false, 2),
+            record("minted_above", 5, true, 0),
+            record("dropped_here", 3, false, 1),
+            record("only_there", 1, false, 1),
+        ];
+        assert_eq!(
+            sweep_verdict(&local, &peers),
+            SweepVerdict {
+                finish: vec![("dropped_meanwhile".to_string(), 3)],
+                reconcile: vec!["differs".to_string()],
+            }
+        );
     }
 }

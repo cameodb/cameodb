@@ -282,7 +282,7 @@ samemint_prefix="$(probe_last_prefix)"
 if [ -n "$samemint_prefix" ]; then
     minted="$(for n in 1 2 3; do
         run_bounded 30 docker logs "$PROJECT-node$n" 2>&1 | sed $'s/\x1b\\[[0-9;]*m//g' \
-            | grep -o "initial schema creation index=${samemint_prefix}[0-9]*x" | sort -u
+            | grep -o "Minting the index's schema from this batch index=${samemint_prefix}[0-9]*x" | sort -u
     done | sort | uniq -c)"
     indexes="$(printf '%s\n' "$minted" | grep -c . || true)"
     twice="$(printf '%s\n' "$minted" | awk '$1 > 1' | grep -c . || true)"

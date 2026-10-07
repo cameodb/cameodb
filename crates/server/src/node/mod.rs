@@ -99,7 +99,7 @@ pub(in crate::node) use shard::*;
 // deliberate act of widening a boundary; nothing else in `node/` is reachable as
 // `crate::node::*` unless it is declared in this file.
 pub(crate) use admission::{OpClass, QueueLoad, WorkerPoolReport};
-pub(crate) use orchestrator::NodeOrchestrator;
+pub(crate) use orchestrator::{NodeOrchestrator, lookup_peer_orchestrator};
 pub(crate) use quota::TenantQuotas;
 pub(crate) use router::{RouterActor, ShardAffineConfig, StreamingSearchConfig};
 pub(crate) use search::{
@@ -1237,6 +1237,14 @@ pub enum ClientOp {
     /// Ask the cluster to agree on this node's schema for `index` — sent to this node by its
     /// router when a search found the nodes answering it holding different schemas.
     ReconcileSchema { index: String },
+    /// Finish on this node a drop it missed: sent by a node that found this one holding the
+    /// index at or below a drop another node recorded at `dropped_at`. Drops the index here,
+    /// data and schema, only if it still holds it at or below that version; answers whether
+    /// it did.
+    FinishDrop { index: String, dropped_at: u64 },
+    /// What this node holds for every index, dropped indexes' records included — see
+    /// [`storage::SchemaRecord`]. Nodes compare them when they connect.
+    SchemaRecords,
     /// Get index configuration/schema
     GetConfig { index: String },
     /// This node's stored schema for an index, serialised whole, or `null` if it holds none.

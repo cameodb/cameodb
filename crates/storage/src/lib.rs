@@ -47,9 +47,10 @@ mod tests;
 // list, on purpose, and everything else stays the crate's own business.
 pub use query::{FieldReference, field_references};
 pub use schema::{
-    FieldDef, IndexSchema, SchemaChange, SchemaFieldUpdate, SchemaFields, SchemaState,
-    TantivyFieldType, WalOp, byte_value_error, date_sort_secs, document_key_field,
-    facet_path_error, is_date_value, parse_date_to_timestamp_secs, select_default_fields,
+    DropsCounted, FieldDef, IndexSchema, SchemaChange, SchemaFieldUpdate, SchemaFields,
+    SchemaRecord, SchemaState, SchemaVersion, TantivyFieldType, WalOp, byte_value_error,
+    count_drops, date_sort_secs, document_key_field, facet_path_error, is_date_value,
+    parse_date_to_timestamp_secs, select_default_fields,
 };
 pub use store::HybridStore;
 // `SchemaFields` is in the list because `HybridStore::get_or_create_index` returns it, not because

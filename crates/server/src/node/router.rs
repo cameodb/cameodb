@@ -617,6 +617,8 @@ impl RouterActor {
                 | ClientOp::ApplySchema { .. }
                 | ClientOp::ReleaseSchemaChange { .. }
                 | ClientOp::ReconcileSchema { .. }
+                | ClientOp::FinishDrop { .. }
+                | ClientOp::SchemaRecords
         ) {
             return self.handle_client_op(op).await;
         }
