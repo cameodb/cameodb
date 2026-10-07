@@ -3988,3 +3988,32 @@ fn a_learned_field_widens_where_a_declared_one_refuses() {
         "a declared type stays strict: {refused:?}"
     );
 }
+
+/// A merged search says which schema its nodes searched under: the one, when they agree, and
+/// each of them beside a note when they do not.
+#[test]
+fn a_merged_search_says_whether_its_nodes_searched_one_schema() {
+    let answer = |version: u64, thumbprint: &str| json!({"hits": [], "stats": {"schema": {"version": version, "thumbprint": thumbprint}}});
+    let mut seen = std::collections::BTreeSet::new();
+    seen.extend(searched_schema(&answer(3, "00000000000000aa")));
+    seen.extend(searched_schema(&answer(3, "00000000000000aa")));
+    let mut merged = json!({"hits": [], "stats": {}});
+    assert!(!attach_searched_schema(&mut merged, &seen));
+    assert_eq!(
+        merged["stats"]["schema"],
+        json!({"version": 3, "thumbprint": "00000000000000aa"})
+    );
+    assert!(merged.get(SCHEMA_DIVERGENCE_FIELD).is_none());
+
+    seen.extend(searched_schema(&answer(2, "00000000000000bb")));
+    let mut merged = json!({"hits": [], "stats": {}});
+    assert!(attach_searched_schema(&mut merged, &seen));
+    assert_eq!(
+        merged[SCHEMA_DIVERGENCE_FIELD]["schemas"]
+            .as_array()
+            .map(Vec::len),
+        Some(2),
+        "{merged}"
+    );
+    assert!(merged["stats"].get("schema").is_none());
+}

@@ -1237,6 +1237,9 @@ pub enum ClientOp {
     /// End `change`'s reservation of `index` on this node without applying anything: sent by
     /// the coordinating node when it refuses the change after phase one.
     ReleaseSchemaChange { index: String, change: Uuid },
+    /// Ask the cluster to agree on this node's schema for `index` — sent to this node by its
+    /// router when a search found the nodes answering it holding different schemas.
+    ReconcileSchema { index: String },
     /// Get index configuration/schema
     GetConfig { index: String },
     /// This node's stored schema for an index, serialised whole, or `null` if it holds none.
