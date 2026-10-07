@@ -4521,6 +4521,16 @@ impl NodeOrchestrator {
         // cannot reproduce its own thread placement is hard to read.
         existing_shards.sort();
         info!("Found {} existing shards", existing_shards.len());
+        // Past the cap a shard is left on disk and not opened. It used to be opened — its store,
+        // its writer thread — and then dropped without a shutdown once the cap was reached.
+        if existing_shards.len() > self.config.max_shards {
+            let unserved = existing_shards.split_off(self.config.max_shards);
+            warn!(
+                max_shards = self.config.max_shards,
+                unserved = ?unserved,
+                "More shards on disk than max_shards_per_node allows; the rest are not opened"
+            );
+        }
 
         // Limit concurrent shard initialization to reduce disk I/O contention.
         // redb::Builder::create() is the bottleneck — too many concurrent opens
@@ -4545,20 +4555,13 @@ impl NodeOrchestrator {
 
         // Create tasks for all shards — semaphore gates actual execution
         let total_shards = existing_shards.len();
-        let writer_shutdown_timeout_secs = self.config.writer_shutdown_timeout_secs;
-        let supervisor_timeout_secs = self.config.supervisor_timeout_secs;
         for &shard_id in &existing_shards {
             let shard_path = self.deterministic_shard_directory(shard_id);
             let storage_config = self.create_shard_storage_config(shard_id, shard_path);
-            let default_search_limit = self.default_search_limit;
-            let read_handle = self.read_runtime.as_ref().map(|rt| rt.handle().clone());
-            let read_pool_health = Some(Arc::clone(&self.read_pool_health));
-            let read_budget = self.read_budget;
             let sem = Arc::clone(&semaphore);
-            let writer_liveness = Arc::clone(&self.writer_liveness);
             // Placed here rather than inside the task: hydration runs concurrently, and an
             // ordinal handed out in completion order would not survive a restart.
-            let writer_core = self.place_shard(shard_id);
+            let runtime = self.shard_runtime(shard_id, total_shards);
 
             let task = tokio::spawn(async move {
                 // Acquire semaphore permit before starting heavy I/O
@@ -4566,21 +4569,7 @@ impl NodeOrchestrator {
                     OrchestratorError::Io(std::io::Error::other(format!("Semaphore closed: {}", e)))
                 })?;
 
-                let mut microshard = MicroshardActor::new(
-                    shard_id,
-                    storage_config,
-                    ShardRuntime {
-                        default_search_limit,
-                        read_pool_handle: read_handle,
-                        read_pool_health,
-                        read_budget,
-                        total_shards,
-                        writer_shutdown_timeout_secs,
-                        supervisor_timeout_secs,
-                        writer_pin: writer_core,
-                        writer_liveness,
-                    },
-                );
+                let mut microshard = MicroshardActor::new(shard_id, storage_config, runtime);
 
                 match microshard.start().await {
                     Ok(()) => {
@@ -4601,11 +4590,9 @@ impl NodeOrchestrator {
         for task in shard_tasks {
             match task.await {
                 Ok(Ok((shard_id, Some(microshard)))) => {
-                    if self.shards.len() < self.config.max_shards {
-                        self.shards.insert(shard_id, microshard);
-                        self.register_shard_for_routing(shard_id);
-                        self.activate_shard(shard_id);
-                    }
+                    self.shards.insert(shard_id, microshard);
+                    self.register_shard_for_routing(shard_id);
+                    self.activate_shard(shard_id);
                 }
                 Ok(Ok((_, None))) => {
                     // Shard failed to hydrate, already logged above
@@ -4743,21 +4730,55 @@ impl NodeOrchestrator {
         }
     }
 
-    /// Handles a ProposeShard message to create a new shard.
-    pub(crate) async fn handle_propose_shard(
+    /// What a shard runs with, budgeted as one of `total_shards`, its writer placed — which
+    /// reserves the shard's ordinal in the pool.
+    ///
+    /// A shard's share of the node's cache and of its open-index cap is fixed when its store
+    /// opens (`HybridStore::new`), so `total_shards` has to be the number the node serves, the
+    /// same for every shard: on a restart the shards found on disk, on a first boot the shards
+    /// being created. A first boot used to pass how many existed *so far*, so the first shard
+    /// budgeted the node's whole cache and whole open-index cap, the second half of each, until
+    /// the node was restarted.
+    fn shard_runtime(&mut self, shard_id: Uuid, total_shards: usize) -> ShardRuntime {
+        ShardRuntime {
+            default_search_limit: self.default_search_limit,
+            read_pool_handle: self.read_runtime.as_ref().map(|rt| rt.handle().clone()),
+            read_pool_health: Some(Arc::clone(&self.read_pool_health)),
+            read_budget: self.read_budget,
+            total_shards,
+            writer_shutdown_timeout_secs: self.config.writer_shutdown_timeout_secs,
+            supervisor_timeout_secs: self.config.supervisor_timeout_secs,
+            writer_pin: self.place_shard(shard_id),
+            writer_liveness: Arc::clone(&self.writer_liveness),
+        }
+    }
+
+    /// Create a node's first shards, `count` of them up to `max_shards`, each budgeted as one
+    /// of that many. A shard that fails to start is logged and the rest go on, so a node comes
+    /// up with what it could open. Returns how many started.
+    pub(crate) async fn create_initial_shards(&mut self, count: usize) -> usize {
+        let count = count.min(self.config.max_shards);
+        let mut started = 0;
+        for _ in 0..count {
+            // Balanced across the data paths, so shards spread over every disk.
+            let shard_id = self.generate_balanced_shard_id();
+            match self.create_shard(shard_id, count).await {
+                Ok(()) => started += 1,
+                Err(err) => warn!(%shard_id, %err, "Failed to create initial shard"),
+            }
+        }
+        started
+    }
+
+    /// Create and start one shard, budgeted as one of `total_shards`.
+    pub(super) async fn create_shard(
         &mut self,
-        msg: ProposeShard,
-    ) -> Result<Uuid, OrchestratorError> {
-        let shard_id = msg.shard_id;
-
-        info!("Received ProposeShard request for {}", shard_id);
-
-        // Check if shard already exists
+        shard_id: Uuid,
+        total_shards: usize,
+    ) -> Result<(), OrchestratorError> {
         if self.shards.contains_key(&shard_id) {
             return Err(OrchestratorError::ShardAlreadyExists { shard_id });
         }
-
-        // Check shard limit
         if self.shards.len() >= self.config.max_shards {
             return Err(OrchestratorError::ShardLimitExceeded {
                 current: self.shards.len(),
@@ -4765,48 +4786,23 @@ impl NodeOrchestrator {
             });
         }
 
-        // Create shard directory using deterministic placement
         let shard_path = self.deterministic_shard_directory(shard_id);
         fs::create_dir_all(&shard_path)?;
-        info!("Created shard directory: {:?}", shard_path);
-
-        // Create and start microshard actor
-        let storage_config = self.create_shard_storage_config(shard_id, shard_path.clone());
-        let read_handle = self.read_runtime.as_ref().map(|rt| rt.handle().clone());
-        let total_shards = self.shards.len() + 1; // Current + new shard
-        let writer_core = self.place_shard(shard_id);
-        let mut microshard = MicroshardActor::new(
-            shard_id,
-            storage_config,
-            ShardRuntime {
-                default_search_limit: self.default_search_limit,
-                read_pool_handle: read_handle,
-                read_pool_health: Some(Arc::clone(&self.read_pool_health)),
-                read_budget: self.read_budget,
-                total_shards,
-                writer_shutdown_timeout_secs: self.config.writer_shutdown_timeout_secs,
-                supervisor_timeout_secs: self.config.supervisor_timeout_secs,
-                writer_pin: writer_core,
-                writer_liveness: Arc::clone(&self.writer_liveness),
-            },
-        );
+        let storage_config = self.create_shard_storage_config(shard_id, shard_path);
+        let runtime = self.shard_runtime(shard_id, total_shards);
+        let mut microshard = MicroshardActor::new(shard_id, storage_config, runtime);
         microshard.start().await?;
 
-        // Add to shards map
         self.shards.insert(shard_id, microshard);
         self.register_shard_for_routing(shard_id);
         self.activate_shard(shard_id);
-        if let Err(err) = self.register_shard_with_coordinator(shard_id).await {
-            warn!(%shard_id, error = %err, "Failed to register new shard with coordinator");
-        }
-
         info!(
-            "Successfully created shard {} ({}/{})",
+            "Created shard {} ({}/{})",
             shard_id,
             self.shard_count(),
             self.config.max_shards
         );
-        Ok(shard_id)
+        Ok(())
     }
 
     /// Gets the node identity.
@@ -4823,26 +4819,6 @@ impl NodeOrchestrator {
             storage_bytes: 0,
             document_count: 0,
         }
-    }
-
-    /// Registers a single shard with the coordinator if available.
-    pub(super) async fn register_shard_with_coordinator(
-        &self,
-        shard_id: Uuid,
-    ) -> Result<(), OrchestratorError> {
-        if let Some(coordinator) = &self.coordinator {
-            let metadata = self.shard_metadata(shard_id);
-            coordinator
-                .ask(RegisterLocalShards {
-                    node_id: self.identity.uuid,
-                    shards: vec![metadata],
-                })
-                .await
-                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?;
-        } else {
-            warn!(%shard_id, "Coordinator not set; skipping shard registration");
-        }
-        Ok(())
     }
 
     /// Registers all known shards with the coordinator (called on startup after coordinator set).

@@ -5757,7 +5757,18 @@ and the 409 reaches the loader.
 
 ### N7 — The first shard's memory budget is the whole node's
 
-**Defect.** 📋 **Planned.** **Checked.** On a first boot `main.rs:476` calls `handle_propose_shard`
+**Defect.** ✅ **Done** 2026-10-07, and wider than filed: the same divisor sets each shard's share
+of the open-index cap, so on a first boot the first shard could hold the node's whole cap open.
+`create_initial_shards(count)` creates up to `max_shards` shards, each budgeted as one of that
+many; `shard_runtime(id, total)` builds what a shard runs with for creation and hydration alike;
+`create_shard(id, total)` replaces `handle_propose_shard`, and the `ProposeShard` wrapper is gone,
+with the per-shard coordinator registration that `main` repeated for every shard. Hydration opens
+only up to `max_shards` and leaves the rest on disk, where it used to open them and drop them
+without a shutdown. Covered by `a_first_boot_budgets_every_shard_as_one_of_all`: three shards each
+budgeted as one of three, then a restart under a cap of two opening two, each budgeted as one of
+two.
+
+**Original entry.** **Checked.** On a first boot `main.rs:476` calls `handle_propose_shard`
 once per shard, and each call passes `total_shards = self.shards.len() + 1`
 (`orchestrator.rs:4776`), so shard *k* of *N* is built with `HybridStore::new(cfg, k)`, which
 divides the cache budget by *k* (`storage/src/store.rs:406`): the first shard budgets the node's

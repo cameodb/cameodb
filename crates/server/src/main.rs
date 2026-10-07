@@ -36,8 +36,8 @@ use config::CameoDbConfig;
 use distributed::{ClusterStatus, DistributedCluster};
 use http_server::create_router;
 use node::{
-    NodeConfig, NodeOrchestrator, ProposeShard, RouterActor, ShardAffineConfig,
-    StreamingSearchConfig, UpdateTopology, orchestrator_remote_name,
+    NodeConfig, NodeOrchestrator, RouterActor, ShardAffineConfig, StreamingSearchConfig,
+    UpdateTopology, orchestrator_remote_name,
 };
 use remote_peer_pool::RemotePeerPool;
 use state::AppState;
@@ -474,17 +474,8 @@ async fn main() -> Result<()> {
     // NOW initialize default shards (after coordinator is set)
     let init_shards = cameodb_config.storage.num_shards_init;
     if orchestrator.shard_count() == 0 && init_shards > 0 {
-        for _ in 0..init_shards {
-            // Use balanced UUID generation for uniform distribution across data paths
-            let shard_id = orchestrator.generate_balanced_shard_id();
-            if let Err(err) = orchestrator
-                .handle_propose_shard(ProposeShard { shard_id })
-                .await
-            {
-                tracing::warn!(%shard_id, %err, "Failed to create initial shard");
-            }
-        }
-        println!("Initialized {} shards", init_shards);
+        let started = orchestrator.create_initial_shards(init_shards).await;
+        println!("Initialized {started} shards");
     }
 
     // Register all shards with coordinator (including newly created ones)

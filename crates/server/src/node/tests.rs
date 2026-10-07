@@ -3364,14 +3364,65 @@ async fn the_placement_counts_the_same_shards_as_the_shard_map() {
 
     for created in 1..=2 {
         orchestrator
-            .handle_propose_shard(ProposeShard {
-                shard_id: Uuid::new_v4(),
-            })
+            .create_shard(Uuid::new_v4(), 2)
             .await
             .expect("a shard under the cap starts");
         assert_eq!(placement.load().live.len(), created);
         assert_eq!(orchestrator.shard_count(), created);
     }
+}
+
+/// A first boot budgets every shard as one of the shards it creates. A shard's share of the
+/// node's cache and open-index cap is fixed when its store opens, and the first shard used to be
+/// budgeted as the only one — the whole node's cache and cap — until a restart.
+#[tokio::test]
+async fn a_first_boot_budgets_every_shard_as_one_of_all() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut orchestrator = NodeOrchestrator::new(
+        NodeConfig {
+            storage_path: dir.path().to_path_buf(),
+            storage_paths: vec![dir.path().to_path_buf()],
+            max_shards: 3,
+            ..NodeConfig::default()
+        },
+        NodeIdentity::new(),
+        10,
+        4,
+    )
+    .await
+    .expect("an orchestrator with no shards");
+
+    // Asked for more than the cap allows, it creates up to the cap and budgets for that many.
+    assert_eq!(orchestrator.create_initial_shards(5).await, 3);
+    let budgets: Vec<usize> = orchestrator
+        .shards
+        .values()
+        .map(|shard| shard.total_shards)
+        .collect();
+    assert_eq!(budgets, vec![3, 3, 3]);
+
+    // A restart under a lower cap opens only as many as it allows, and budgets for those.
+    orchestrator.shutdown_all_shards().await.expect("shutdown");
+    drop(orchestrator);
+    let restarted = NodeOrchestrator::new(
+        NodeConfig {
+            storage_path: dir.path().to_path_buf(),
+            storage_paths: vec![dir.path().to_path_buf()],
+            max_shards: 2,
+            ..NodeConfig::default()
+        },
+        NodeIdentity::new(),
+        10,
+        4,
+    )
+    .await
+    .expect("a restart");
+    let budgets: Vec<usize> = restarted
+        .shards
+        .values()
+        .map(|shard| shard.total_shards)
+        .collect();
+    assert_eq!(budgets, vec![2, 2]);
 }
 
 /// A shadow field as the schema records one: the caller's name for the key, carrying no
