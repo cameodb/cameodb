@@ -193,6 +193,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Declaring the schema an index already has keeps its version.** A `PUT /_config` repeating the
+  schema every node holds took the next version anyway, so a loader declaring its schema on every
+  run moved the index's version each time with nothing changed. It now writes nothing and answers
+  `"unchanged": true` at the version it has, as a `PATCH /_schema` that changes nothing does.
 - **The load summary counts `repeated_ids`, not `replaced`.** The count was of rows whose id an
   earlier row of the same load had; a reload that replaced every document reported
   `replaced=0`. The report also says when a text column's missing markers (`NA`, `None`) are kept

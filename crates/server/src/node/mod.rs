@@ -1330,6 +1330,10 @@ pub struct SchemaReadiness {
     pub unbuilt: Vec<String>,
     /// Why this node would refuse the index as a new one for the calling tenant, if it would.
     pub quota_exceeded: Option<String>,
+    /// The declaration would leave this node's schema as it is: the same thumbprint once the
+    /// fields this node learned from writes are merged in, as phase two merges them.
+    #[serde(default)]
+    pub unchanged: bool,
     /// Another change to this index was prepared here and has not been applied or released.
     ///
     /// Two changes prepared at once would each pick the same next version, and both be told

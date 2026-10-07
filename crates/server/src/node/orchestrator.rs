@@ -3858,7 +3858,7 @@ impl NodeOrchestrator {
     /// — and because the schema it is handed has just been through
     /// `normalize_after_deserialization`, which inserts `_seq`. Without this, creating an index
     /// answers with a field that every other endpoint hides.
-    pub(super) fn sorted_field_names(schema: &IndexSchema) -> Vec<String> {
+    pub(crate) fn sorted_field_names(schema: &IndexSchema) -> Vec<String> {
         let mut names: Vec<String> = schema
             .fields
             .keys()
@@ -5922,7 +5922,13 @@ impl NodeOrchestrator {
             Some(held) if documents > 0 => self.unbuilt_promotions(index, held, &schema).await?,
             _ => Vec::new(),
         };
+        let unchanged = held.is_some_and(|held| {
+            let mut applied = schema.clone();
+            crate::cluster_coordinator::merge_learned(&mut applied, held);
+            applied.calculate_fingerprint() == held.calculate_fingerprint()
+        });
         let readiness = SchemaReadiness {
+            unchanged,
             current: current.map(|current| (*current).clone()),
             documents,
             conflicts: changes
