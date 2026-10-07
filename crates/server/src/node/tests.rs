@@ -4012,3 +4012,37 @@ fn a_dropped_record_answer_gives_its_version() {
     );
     assert_eq!(dropped_version(&JsonValue::Null), 0);
 }
+
+/// A store error keeps its verdict on the way out: copied to every caller of a failed batch, and
+/// carried out of the blocking pool. Both used to become a message under an I/O or serialization
+/// error, which answers 500 whatever the store said.
+#[tokio::test]
+async fn a_store_error_keeps_its_verdict() {
+    let errors = || {
+        vec![
+            StoreError::IndexNotFound("docs".to_string()),
+            StoreError::WriterClosed("docs".to_string()),
+            StoreError::WriterPanicked("docs".to_string()),
+            StoreError::InvalidIndexName("a b".to_string()),
+            StoreError::InvalidFieldValue {
+                field: "bytes".to_string(),
+                reason: "999 is not a byte".to_string(),
+            },
+        ]
+    };
+    for error in errors() {
+        let original = OrchestratorError::Storage(error.duplicate()).verdict();
+        assert_eq!(
+            OrchestratorError::Storage(error.duplicate()).verdict(),
+            OrchestratorError::Storage(error).verdict()
+        );
+        assert_ne!(original, RemoteVerdict::ServerFault, "{original:?}");
+    }
+    for error in errors() {
+        let expected = OrchestratorError::Storage(error.duplicate()).verdict();
+        let carried = super::orchestrator::blocking(move || Err::<(), _>(error))
+            .await
+            .expect_err("the store's error");
+        assert_eq!(carried.verdict(), expected);
+    }
+}

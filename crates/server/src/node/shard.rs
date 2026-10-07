@@ -867,9 +867,9 @@ pub(super) fn spawn_writer_thread(
                             writer_store.apply_batch(&index, merged_ops)
                         });
 
-                        let fail_all = |segments: Vec<MergedWriteReply>, reason: String| {
+                        let fail_all = |segments: Vec<MergedWriteReply>, error: &StoreError| {
                             for segment in segments {
-                                let err = Err(StoreError::Serialization(reason.clone()));
+                                let err = Err(error.duplicate());
                                 match segment {
                                     MergedWriteReply::Single(reply) => {
                                         let _ = reply.send(err.map(|_: Vec<u64>| 0));
@@ -896,8 +896,10 @@ pub(super) fn spawn_writer_thread(
                                     );
                                     fail_all(
                                         segments,
-                                        "merged write returned the wrong number of sequence ids"
-                                            .to_string(),
+                                        &StoreError::Serialization(
+                                            "merged write returned the wrong number of sequence ids"
+                                                .to_string(),
+                                        ),
                                     );
                                     continue;
                                 };
@@ -921,13 +923,12 @@ pub(super) fn spawn_writer_thread(
                                 }
                             }
                             Err(e) => {
-                                let reason = e.to_string();
                                 tracing::error!(
                                     index = %index,
-                                    error = %reason,
+                                    error = %e,
                                     "Writer: merged single and batch write failed"
                                 );
-                                fail_all(segments, reason);
+                                fail_all(segments, &e);
                             }
                         }
                     }
@@ -986,7 +987,7 @@ pub(super) fn spawn_writer_thread(
                                         "Writer: coalesced batch write failed"
                                     );
                                     for reply in replies {
-                                        let _ = reply.send(Err(StoreError::Serialization(err_msg.clone())));
+                                        let _ = reply.send(Err(e.duplicate()));
                                     }
                                 }
                             }
@@ -1055,7 +1056,7 @@ pub(super) fn spawn_writer_thread(
                                         "Writer: coalesced batch write failed"
                                     );
                                     for (_op_count, reply) in reply_segments {
-                                        let _ = reply.send(Err(StoreError::Serialization(err_msg.clone())));
+                                        let _ = reply.send(Err(e.duplicate()));
                                     }
                                 }
                             }

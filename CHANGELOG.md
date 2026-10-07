@@ -65,6 +65,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A storage error answers with its own status.** Several paths turned a storage error into a
+  generic one: reading or storing a schema, applying a schema change, and every write that the
+  writer merged with others. So an index that did not exist, a writer closed under a write, and a
+  value the field refuses all answered 500. They answer 404, 503 and 400 again.
 - **A streamed search through a clustered node merges every node's hits.** With
   `enable_streaming_search` off, a streamed search broadcast answered with the hits of one node
   — on two nodes holding 94 and 106 documents, 94 — because only a plain search was merged. A

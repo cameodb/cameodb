@@ -5828,7 +5828,17 @@ making the per-index state one thing.
 
 ### N10 — Storage errors are flattened, and lose their HTTP status
 
-**Defect.** 📋 **Planned.** **Reported.** `OrchestratorError::Storage(#[from] StoreError)` has
+**Defect.** ✅ **Done** 2026-10-07. `orchestrator::blocking` runs a store call on the blocking pool
+and keeps its error as `OrchestratorError::Storage`, so its verdict reaches the caller; the schema
+reads, the schema persists, the apply, the record and document counts, the unbuilt-field check and
+`validate_query` all go through it, and the persists and the apply run their shards with
+`try_join_all` as before. The writer thread answers every caller of a failed batch with
+`StoreError::duplicate`, which copies the variants that decide a status — not found, closed or
+panicked writer, invalid name, refused value — and keeps the message of the library errors, all of
+them faults of the node. Covered by `a_store_error_keeps_its_verdict`. The typed `NotSortable`
+variant and typed validator errors are left to N14, since both answer correctly today.
+
+**Original entry.** **Reported.** `OrchestratorError::Storage(#[from] StoreError)` has
 verdicts — `IndexNotFound` is 404, a closed or panicked writer 503, `InvalidIndexName` and
 `InvalidFieldValue` 400 — and these paths turn the error into `Io`, which is always 500:
 `schema_from_store` (`orchestrator.rs:1017`, on every `load_schema`), `persist_schema_to_stores`
