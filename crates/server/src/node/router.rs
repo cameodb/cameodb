@@ -714,59 +714,32 @@ impl RouterActor {
 
     /// Streaming variant of `route_and_handle` for NDJSON search responses.
     ///
-    /// Returns a bounded `mpsc::Receiver` that yields `Result<Bytes, io::Error>` items.
-    /// Each item is a single NDJSON line: individual hit objects followed by a
-    /// `_footer` metadata line. A background task performs the actual search and
-    /// streams results into the channel, providing:
-    /// - Incremental flushing (each hit serialized and sent individually)
-    /// - Bounded backpressure via channel capacity
-    /// - Early client disconnect detection
-    pub(crate) fn route_and_handle_stream(
+    /// The search runs first, here, and only an answer is streamed: a bounded `mpsc::Receiver`
+    /// yielding one NDJSON line per hit and a `_footer` metadata line, filled by a background
+    /// task with backpressure and early disconnect detection. A refusal — an index that does
+    /// not exist, a sort the index cannot answer, a node too busy — comes back as the error,
+    /// before any byte is written, so the caller answers it with its own status. Run after the
+    /// headers, as it once was, every refusal was a `200` carrying an `_error` line.
+    pub(crate) async fn route_and_handle_stream(
         &self,
         op: ClientOp,
         routing_key: Option<String>,
         operation_type: OperationType,
-    ) -> mpsc::Receiver<Result<bytes::Bytes, std::io::Error>> {
+    ) -> Result<mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>, OrchestratorError> {
         pub(super) const STREAM_CHANNEL_CAPACITY: usize = 64;
+
+        let result = self
+            .route_and_handle(op, routing_key, operation_type)
+            .await?;
 
         let (tx, rx) =
             mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(STREAM_CHANNEL_CAPACITY);
-        let router = self.clone();
-
-        // Carried across the spawn by hand. A task-local is not inherited by `tokio::spawn`, so
-        // inside the task `request_started_at()` would read the moment it ran rather than the
-        // moment the request arrived, and every deadline check downstream would grant this
-        // search a fresh budget however long it had already waited.
-        let started = super::request_started_at();
-        tokio::spawn(super::REQUEST_STARTED_AT.scope(started, async move {
-            let result = router
-                .route_and_handle(op, routing_key, operation_type)
-                .await;
-
-            match result {
-                Ok(val) => {
-                    Self::stream_search_result_as_ndjson(&tx, val).await;
-                }
-                Err(e) => {
-                    let error_line = serde_json::json!({
-                        "_error": true,
-                        "message": e.to_string(),
-                    });
-                    if let Ok(mut bytes) = serde_json::to_vec(&error_line) {
-                        bytes.push(b'\n');
-                        let _ = Self::send_or_abandon(
-                            &tx,
-                            bytes::Bytes::from(bytes),
-                            STREAM_STALL_TIMEOUT,
-                        )
-                        .await;
-                    }
-                }
-            }
+        tokio::spawn(async move {
+            Self::stream_search_result_as_ndjson(&tx, result).await;
             // tx dropped here → channel closes → stream ends
-        }));
+        });
 
-        rx
+        Ok(rx)
     }
 
     /// Send one line of a streamed result, or give up on a client that has stopped reading.
@@ -992,12 +965,15 @@ impl RouterActor {
 
             // The local node is rank 0, then each peer in the order it was dispatched to.
             let mut blocks: Vec<Vec<JsonValue>> = Vec::new();
+            let sources = 1 + remote_results.len();
+            let mut absent = 0usize;
 
             match local_result {
                 Ok(mut val) => {
                     searched.extend(searched_schema(&val));
                     push_hits(&mut val, &mut blocks, &mut stats)
                 }
+                Err(e) if holds_no_such_index(&e) => absent += 1,
                 Err(e) => {
                     error_count += 1;
                     warn!(error = %e, "Broadcast: local search failed");
@@ -1010,6 +986,7 @@ impl RouterActor {
                         searched.extend(searched_schema(&val));
                         push_hits(&mut val, &mut blocks, &mut stats)
                     }
+                    Ok(Err(e)) if holds_no_such_index(&e) => absent += 1,
                     Ok(Err(e)) => {
                         error_count += 1;
                         warn!(error = %e, "Broadcast: remote search failed");
@@ -1019,6 +996,12 @@ impl RouterActor {
                         warn!(error = %elapsed, "Broadcast: remote search timed out");
                     }
                 }
+            }
+
+            if absent == sources {
+                return Err(OrchestratorError::Storage(StoreError::IndexNotFound(
+                    index.clone(),
+                )));
             }
 
             // Track failures
@@ -1388,6 +1371,8 @@ impl RouterActor {
                 // The local block carries no shard identity — one nil stands in.
                 let mut unique_shard_ids = std::collections::HashSet::new();
                 let mut errors = Vec::new();
+                let sources = 1 + remote.len();
+                let mut absent = 0usize;
 
                 match local {
                     Ok(mut val) => {
@@ -1407,7 +1392,10 @@ impl RouterActor {
                         unique_shard_ids.insert(Uuid::nil());
                         nodes_contacted += 1;
                     }
-                    Err(_) => {
+                    Err(e) => {
+                        if holds_no_such_index(&e) {
+                            absent += 1;
+                        }
                         // A failed local answer still holds this node's place in the merge —
                         // an empty block, no error note. That was the streaming merge's
                         // answer before the fan-out was shared, and it stands.
@@ -1444,6 +1432,7 @@ impl RouterActor {
                                 shards_queried += responded as usize;
                             }
                         }
+                        Ok(Err(e)) if holds_no_such_index(&e) => absent += 1,
                         Ok(Err(e)) => {
                             errors.push(format!("Remote node {} search failed: {}", node_id, e));
                         }
@@ -1466,6 +1455,10 @@ impl RouterActor {
                 // rather than of the network. Every source contributes: the caveat that used to
                 // stand here, that early termination could change *which* of them did, went
                 // with the early exit itself.
+                if absent == sources {
+                    return Err(OrchestratorError::Storage(StoreError::IndexNotFound(index)));
+                }
+
                 blocks.sort_by_key(|(source, _)| *source);
                 let all_hits = order_hit_blocks(
                     blocks.into_iter().map(|(_, block)| block).collect(),

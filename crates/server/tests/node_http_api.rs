@@ -417,15 +417,19 @@ async fn writing_creates_an_index_that_the_listing_reports() {
     );
 }
 
-/// Searching an index that was never created returns an empty result rather than failing,
-/// and leaves the node serving. The distinction matters: this is the shape of request an
-/// agent sends constantly, often before anything has been written.
+/// Searching an index that does not exist is a 404 naming it — on the paged route and the
+/// streamed one, for an index never created and for one deleted with its schema — and the node
+/// keeps serving. An empty 200 let a misspelled name read as a query that matched nothing.
+///
+/// An index deleted without its schema still exists, emptied, and searching it is an empty
+/// success; writing to a deleted name creates the index again.
 #[tokio::test]
-async fn searching_an_unknown_index_is_empty_and_leaves_the_node_serving() {
+async fn searching_an_index_that_does_not_exist_is_a_not_found() {
     let node = TestNode::start("").await;
     let client = node.client();
+    let query = json!({"query": "title:anything"});
 
-    let found = client
+    let refused = client
         .search(
             "no_such_index",
             "title:anything",
@@ -435,22 +439,88 @@ async fn searching_an_unknown_index_is_empty_and_leaves_the_node_serving() {
             None,
         )
         .await
-        .expect("querying an unknown index is answered, not refused");
+        .expect_err("an unknown index must be refused");
+    assert_eq!(client::failure_status(&refused), Some(404), "{refused}");
+    for path in [
+        "/api/no_such_index/search",
+        "/api/no_such_index/search/stream",
+    ] {
+        let (status, body) = post_json(&node, path, query.clone()).await;
+        assert_eq!(status.as_u16(), 404, "{path}: {body}");
+        assert_eq!(body["code"], "index_not_found", "{path}: {body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no_such_index"),
+            "{path}: the refusal must name the index: {body}"
+        );
+    }
 
-    // Answered as an empty result rather than an error. Pinned because it is a contract an
-    // agent depends on: a query against an index that does not exist yet is a normal thing
-    // to do, and getting back zero hits is easier to handle than a failure.
+    // Emptied, not deleted: the schema stays, and the index with it.
+    client
+        .write_document("books", "b1", &json!({"title": "Dune"}), None)
+        .await
+        .expect("write");
+    client
+        .delete_index("books", false)
+        .await
+        .expect("empty the index");
+    let (status, body) = post_json(&node, "/api/books/search", query.clone()).await;
     assert_eq!(
-        found["hits"].as_array().map(|h| h.len()),
-        Some(0),
-        "an unknown index should match nothing, got {found}"
+        status.as_u16(),
+        200,
+        "an emptied index still exists: {body}"
     );
 
-    // The point of the test: the node is still serving afterwards.
+    // Deleted with its schema: gone, on both routes.
+    client
+        .delete_index("books", true)
+        .await
+        .expect("delete the index");
+    for path in ["/api/books/search", "/api/books/search/stream"] {
+        let (status, body) = post_json(&node, path, query.clone()).await;
+        assert_eq!(status.as_u16(), 404, "{path}: {body}");
+        assert_eq!(body["code"], "index_not_found", "{path}: {body}");
+    }
+
+    // A write brings the name back.
+    client
+        .write_document("books", "b2", &json!({"title": "Emma"}), None)
+        .await
+        .expect("write after the delete");
+    let (status, body) = post_json(&node, "/api/books/search", query).await;
+    assert_eq!(status.as_u16(), 200, "a written index exists again: {body}");
+
     client
         .health()
         .await
         .expect("the node should survive a query for a missing index");
+}
+
+/// A streamed search the index refuses answers with the refusal's status before any line is
+/// written — a `400` here — rather than a `200` whose body carries the error.
+#[tokio::test]
+async fn a_refused_streamed_search_answers_with_its_status() {
+    let node = TestNode::start("").await;
+    node.client()
+        .write_document("books", "b1", &json!({"title": "Dune"}), None)
+        .await
+        .expect("write");
+    let (status, body) = post_json(
+        &node,
+        "/api/books/search/stream",
+        json!({"query": "title:dune", "sort": {"field": "no_such_column"}}),
+    )
+    .await;
+    assert_eq!(status.as_u16(), 400, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no_such_column"),
+        "{body}"
+    );
 }
 
 /// A body does not have to repeat the id it was written under, and may not contradict it.

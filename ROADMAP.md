@@ -5853,6 +5853,23 @@ sortable" travels as `StoreError::Io(InvalidInput)` and is decoded by error kind
 through `?`); `StoreError` made shareable (`Arc<StoreError>` fanned out from the writer, read
 through by `verdict()`); a `NotSortable { field, reason }` variant; typed validator errors.
 
+### N10a — A search of an index that does not exist answers 404
+
+**Defect.** ✅ **Done** 2026-10-08, added to the 0.3.6 cut. A search of a name no node held — never
+created, or deleted with its schema — answered `200`, no hits and `shards: 4 of 4 responded`, so a
+misspelled index read as a query that matched nothing; `GET /_config` and `DELETE` already said
+404. `ScatterCtx::gather` refuses an index its node holds no live schema for
+(`StoreError::IndexNotFound`), and the broadcast merges — plain and streaming — count a source that
+holds none as absent rather than failed: the answer is a 404 only when every source is absent, so
+a node that has not yet heard of a new index neither fails the search nor hides the nodes that
+have. The streamed route runs the search before the response starts (`route_and_handle_stream` is
+`async` and returns the refusal), so a refusal there is its status, not a `200` with an `_error`
+line — which also fixes the unsortable-field and overload refusals on that route. The 404 body
+carries `"code": "index_not_found"`, which a path no route serves does not. Covered by
+`searching_an_index_that_does_not_exist_is_a_not_found`, `a_refused_streamed_search_answers_with_its_status`,
+the unit tests of the merge rule, and `probe missing` in the cluster suite (every node, before the
+write, just after it through each node, and after the delete).
+
 ### N11 — One way to reach a peer
 
 **Planned.** Peers are reached four ways, with different deadlines and different rules for a lost

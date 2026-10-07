@@ -571,7 +571,10 @@ async fn a_head_request_is_authorized_as_the_get_it_runs() {
 async fn query_text_is_kept_only_when_configured() {
     let secret = "patient_zero_identifier";
 
+    // `docs` has to exist: a search of an index that does not is refused, and so is not the
+    // search this test records.
     let quiet = TestNode::start("").await;
+    quiet.write("docs", "d1").await;
     quiet.search("docs", secret, &quiet.reader_key).await;
     // Wait for the search's own record, so the absence of the query text is evidence rather
     // than a trail that had not been written yet.
@@ -585,6 +588,7 @@ async fn query_text_is_kept_only_when_configured() {
     );
 
     let loud = TestNode::start("record_query_text = true").await;
+    loud.write("docs", "d1").await;
     loud.search("docs", secret, &loud.reader_key).await;
     let recorded = loud
         .trail_until(|t| t.iter().any(|r| r["query"].as_str() == Some(secret)))

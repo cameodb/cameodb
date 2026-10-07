@@ -6,7 +6,7 @@
 
 use serde_json::Value as JsonValue;
 
-use crate::node::ClientOp;
+use crate::node::{ClientOp, RemoteVerdict};
 use crate::state::AppState;
 
 /// An index's field definitions, or `Null` if they cannot be read.
@@ -27,17 +27,13 @@ pub(super) async fn index_schema(state: &AppState, index: &str) -> JsonValue {
         .unwrap_or(JsonValue::Null)
 }
 
-/// `Some(reason)` when the node has no such index, asked of a search that returned nothing.
+/// `Some(reason)` when the node has no such index, for the tools that read a schema rather than
+/// search: `validate_query` and the discovery tools, whose answer for a missing index would
+/// otherwise be a description of no fields.
 ///
-/// The engine answers a search on an index it does not have with an empty result, which reads
-/// to a caller exactly like a query that matched nothing — while `describe_index` on the same name
-/// says the index is not there. This is what lets the two MCP tools give the same answer about
-/// whether an index exists, in the one place where the difference is invisible.
-///
-/// Asked only where the result is empty, because that is the one answer in which "no such index"
-/// and "nothing matched" are indistinguishable. A search that found something has already proved
-/// the index exists and pays nothing for this. `GetConfig` names the index rather than scanning
-/// the catalogue, so the check that is paid for is a single-index lookup.
+/// A search needs no such check: the engine refuses an index it does not have, and
+/// [`tool_error`](super::diagnostics::tool_error) carries that refusal to the caller. `GetConfig`
+/// names the index rather than scanning the catalogue, so this is a single-index lookup.
 pub(super) async fn absent_index_reason(state: &AppState, index: &str) -> Option<String> {
     match state
         .router
@@ -48,7 +44,7 @@ pub(super) async fn absent_index_reason(state: &AppState, index: &str) -> Option
     {
         Ok(_) => None,
         // Worded as `describe_index` words it, since agreeing with that tool is the point.
-        Err(err) if err.to_string().contains("not found") => {
+        Err(err) if err.verdict() == RemoteVerdict::NotFound => {
             Some(format!("Index '{index}' not found"))
         }
         // Any other failure to read a schema is not evidence that the index is absent, and

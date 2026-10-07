@@ -11,7 +11,6 @@ use crate::mcp::diagnostics::{
     refuse_if_clauses_discarded, short_page_note, tool_error, with_valid_fields,
     zero_results_advice,
 };
-use crate::mcp::schema::absent_index_reason;
 use crate::node::{
     APPROXIMATE_SORT_FIELD, ClientOp, NARROWED_DEFAULT_FIELDS, SearchWindow, order_hit_blocks,
 };
@@ -268,14 +267,6 @@ pub(super) fn search_index(
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
 
-                // Nothing matched, which is also what a search on an index that does not
-                // exist looks like. Settle which one it was before describing the result.
-                if total_hits == 0
-                    && let Some(reason) = absent_index_reason(&state, &index_name).await
-                {
-                    return Err(ToolError::caller(reason));
-                }
-
                 annotate_search_response(&mut response, &query, window, total_hits as usize);
                 cap_response_bytes(&mut response, state.max_response_bytes);
                 Ok(response)
@@ -450,14 +441,6 @@ pub(super) fn search_across_indexes(
                 .get("total_hits")
                 .and_then(|value| value.as_u64())
                 .unwrap_or(0);
-
-            // An index that answered with nothing may not be an index at all.
-            if index_hits == 0
-                && let Some(reason) = absent_index_reason(&state, &index_name).await
-            {
-                errors.push(serde_json::json!({"index": index_name, "error": reason}));
-                continue;
-            }
 
             total_hits += index_hits;
             // One index sorting approximately makes the merged order approximate, since these

@@ -808,7 +808,7 @@ pub enum StoreError {
     #[error("query parser error: {0}")]
     QueryParser(#[from] QueryParserError),
 
-    #[error("index not found: {0}")]
+    #[error("index '{0}' does not exist")]
     IndexNotFound(String),
 }
 ```

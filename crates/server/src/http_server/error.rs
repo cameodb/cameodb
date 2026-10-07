@@ -9,6 +9,9 @@ use tracing::{error, warn};
 
 use crate::node::{OrchestratorError, RemoteVerdict};
 
+/// The `code` of a 404 answered for an index that does not exist. A wire value: clients match it.
+pub const INDEX_NOT_FOUND: &str = "index_not_found";
+
 /// Application error wrapper for consistent error handling.
 ///
 /// `status` short-circuits the string-sniffing classification below. Handlers
@@ -72,8 +75,10 @@ impl AppError {
         }
     }
 
-    /// 404 with an explicit, client-safe message.
-    pub fn not_found(msg: impl Into<String>) -> Self {
+    /// 404 for an index that does not exist — never created, or deleted. The one thing a
+    /// handler answers 404 for, so the body carries [`INDEX_NOT_FOUND`]: a client tells a
+    /// missing index from a path no route serves (the fallback's 404) without reading prose.
+    pub fn index_not_found(msg: impl Into<String>) -> Self {
         Self {
             error: anyhow::anyhow!("{}", msg.into()),
             status: Some(StatusCode::NOT_FOUND),
@@ -131,7 +136,7 @@ impl AppError {
         );
         let quiet = matches!(err, OrchestratorError::PeerUnreachable { .. });
         let mut app = match err.verdict() {
-            RemoteVerdict::NotFound => Self::not_found(err.to_string()),
+            RemoteVerdict::NotFound => Self::index_not_found(err.caller_message()),
             RemoteVerdict::BadRequest => Self::bad_request(err.to_string()),
             RemoteVerdict::Unavailable => Self::service_unavailable(err.to_string()),
             // Addressed to the node that forwarded the write, not to a client, and that node
@@ -200,6 +205,8 @@ impl IntoResponse for AppError {
         // above, which is where an operator reads it and a caller does not.
         let body = if status.is_server_error() {
             serde_json::json!({ "error": message })
+        } else if status == StatusCode::NOT_FOUND {
+            serde_json::json!({ "error": message, "details": error_msg, "code": INDEX_NOT_FOUND })
         } else {
             serde_json::json!({ "error": message, "details": error_msg })
         };

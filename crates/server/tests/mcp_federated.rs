@@ -743,13 +743,10 @@ async fn a_query_matching_nothing_in_a_real_index_is_still_a_success() {
     );
 }
 
-/// The HTTP search API keeps its contract: a missing index answers 200 with no hits.
-///
-/// The refusal above is scoped to the MCP tools, where the caller is an agent that cannot tell
-/// an empty index from an absent one. An HTTP client that already handles 200-with-no-hits is
-/// not broken to give the agent a better answer.
+/// The HTTP search API agrees with the tools: a missing index is a 404 naming it, not a 200 with
+/// no hits. An empty answer let a misspelled index read as a query that matched nothing.
 #[tokio::test]
-async fn the_http_search_api_still_answers_empty_for_a_missing_index() {
+async fn the_http_search_api_refuses_a_missing_index_as_the_tools_do() {
     let node = two_seeded_indexes().await;
 
     let resp = http()
@@ -758,11 +755,17 @@ async fn the_http_search_api_still_answers_empty_for_a_missing_index() {
         .send()
         .await
         .expect("http search");
-    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(resp.status().as_u16(), 404);
 
-    let body: Value = resp.json().await.expect("search json");
-    assert_eq!(body["total_hits"].as_u64(), Some(0));
-    assert_eq!(body["hits"].as_array().map(Vec::len), Some(0));
+    let body: Value = resp.json().await.expect("error json");
+    assert_eq!(body["code"].as_str(), Some("index_not_found"), "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no-such-index"),
+        "the refusal must name the index: {body}"
+    );
 }
 
 /// The catalogue aggregate has to be measured, not structurally zero.

@@ -263,7 +263,14 @@ async fn a_panic_at_every_surface_is_contained_and_a_dead_writer_is_respawned() 
     let mut node = Node::start(&binary).await;
     let client = reqwest::Client::new();
 
-    // A search runs on the read pool; a panic there comes back a 500 and the node serves on.
+    // A search runs on the read pool; a panic there comes back a 500 and the node serves on. The
+    // index has to exist: a search of one that does not is refused before it reaches a shard.
+    client
+        .put(node.url("/api/probe/document"))
+        .json(&serde_json::json!({ "id": "a", "doc": { "title": "x" } }))
+        .send()
+        .await
+        .expect("seed write");
     let status = client
         .post(node.url("/api/probe/search"))
         .json(&serde_json::json!({ "query": READ_TRAP_QUERY, "limit": 5 }))
