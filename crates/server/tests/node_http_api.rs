@@ -1426,6 +1426,36 @@ async fn a_declaration_that_leaves_a_field_out_removes_it() {
     assert!(!names.contains(&"extra"), "{names:?}");
 }
 
+/// Declaring the schema an index already has changes nothing: the version stays, and the answer
+/// says so. A declaration that does change it still moves the version.
+#[tokio::test]
+async fn declaring_the_same_schema_again_keeps_the_version() {
+    let node = TestNode::start("").await;
+    let declaration = json!({
+        "description": "Shelf of books.",
+        "fields": {"title": {"field_type": "text", "indexed": true}}
+    });
+    let (status, first) = put_config(&node, "shelf", &declaration).await;
+    assert_eq!(status, 200, "{first}");
+    let version = first["version"].as_u64().expect("a version");
+
+    let (status, again) = put_config(&node, "shelf", &declaration).await;
+    assert_eq!(status, 200, "{again}");
+    assert_eq!(again["version"].as_u64(), Some(version), "{again}");
+    assert_eq!(again["unchanged"], json!(true), "{again}");
+    let config = get_json(&node, "/api/shelf/_config").await;
+    assert_eq!(config["version"].as_u64(), Some(version), "{config}");
+
+    let changed = json!({
+        "description": "Shelf of books, by title.",
+        "fields": {"title": {"field_type": "text", "indexed": true}}
+    });
+    let (status, moved) = put_config(&node, "shelf", &changed).await;
+    assert_eq!(status, 200, "{moved}");
+    assert_eq!(moved["version"].as_u64(), Some(version + 1), "{moved}");
+    assert!(moved.get("unchanged").is_none(), "{moved}");
+}
+
 /// A field that first arrives after the index exists takes every value written to it: its type
 /// widens to hold them — `i64`, then `f64`, then `text` — instead of refusing the documents whose
 /// value did not fit the first one.

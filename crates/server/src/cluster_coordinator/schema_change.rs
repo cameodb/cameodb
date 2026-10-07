@@ -190,10 +190,19 @@ pub(crate) async fn change_schema_cluster(
             "nodes": done.nodes,
             "field_names": done.field_names,
         })),
+        Step::Unchanged {
+            version,
+            field_names,
+        } => Ok(serde_json::json!({
+            "acknowledged": true,
+            "index": index,
+            "version": version,
+            "nodes": reach.nodes.len(),
+            "field_names": field_names,
+            "unchanged": true,
+        })),
         Step::Refused(body) => Ok(body),
-        Step::Moved { .. } | Step::Unchanged { .. } => {
-            unreachable!("only an edit moves or stands")
-        }
+        Step::Moved { .. } => unreachable!("only an edit moves"),
     }
 }
 
@@ -256,8 +265,12 @@ enum Step {
         held: Box<IndexSchema>,
         proposal: Box<IndexSchema>,
     },
-    /// Every node already holds the edit's schema, at this version; nothing was written.
-    Unchanged { version: u64 },
+    /// Every node already holds the schema the change asks for, at this version; nothing was
+    /// written.
+    Unchanged {
+        version: u64,
+        field_names: Vec<String>,
+    },
 }
 
 /// A change every node stored.
@@ -437,6 +450,7 @@ async fn run_change(
             reach.release(&index, change).await;
             return Ok(Step::Unchanged {
                 version: view.version,
+                field_names: NodeOrchestrator::sorted_field_names(&view),
             });
         }
         // Every node holding the index holds it already, and the rest hold none yet — an index
@@ -450,6 +464,22 @@ async fn run_change(
         }) {
             schema.version = view.version;
         }
+    } else if let Some(held) = held.as_ref()
+        && readiness.iter().all(|(_, ready)| {
+            ready.unchanged
+                && ready
+                    .current
+                    .as_ref()
+                    .is_some_and(|current| current.version == held.version)
+        })
+    {
+        // A declaration every node already holds, at one version — the same schema declared
+        // again. Nothing is written, and no version is spent on it.
+        reach.release(&index, change).await;
+        return Ok(Step::Unchanged {
+            version: held.version,
+            field_names: NodeOrchestrator::sorted_field_names(held),
+        });
     }
     // The owner is recorded once, by whoever created the index. A re-declaration keeps it, so
     // updating with an admin key (which carries no tenant) cannot unstamp an index and hand its
@@ -811,7 +841,7 @@ async fn run_edit(
                     nodes: done.nodes,
                 });
             }
-            Step::Unchanged { version } => {
+            Step::Unchanged { version, .. } => {
                 // Already held everywhere: whatever this request asked is already so.
                 outcome.unchanged.append(&mut outcome.applied);
                 outcome.unchanged.sort();
