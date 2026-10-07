@@ -65,6 +65,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `HEAD` request is authorized as the `GET` it runs.** The route table had no `HEAD` rows,
+  so any valid key passed the gate, and axum answered with the route's `GET` handler: a reader
+  could run `/_admin/*` handlers and tell from the status whether an index outside its scope
+  existed. A `HEAD` now needs what its `GET` needs.
 - **Range queries on text and string fields, and on the id, answer what they say.** The query
   grammar reads a range bound as a bare word, so on a field kept whole a quoted bound compared
   against its quote characters: `label:>"S"` matched every document and `label:["A" TO "M"]` none,

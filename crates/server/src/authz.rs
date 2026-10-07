@@ -166,7 +166,11 @@ fn normalize(path: &str) -> &str {
 /// Match a request against the route table.
 ///
 /// `None` means no route claims it, which is a deny, not a pass.
+///
+/// A `HEAD` is classified as the `GET` it is: axum serves it with the route's `GET` handler and
+/// drops only the body, so the status and the headers still answer what that handler did.
 pub fn classify<'a>(method: &str, path: &'a str) -> Option<Classified<'a>> {
+    let method = if method == "HEAD" { "GET" } else { method };
     let path = normalize(path);
     for rule in ROUTES {
         if rule.method != method {
@@ -1623,6 +1627,28 @@ mod tests {
             Some(Access::Needs(Capability::IndexAdmin))
         );
         assert!(classify("PATCH", "/api/docs/_config").is_none());
+    }
+
+    /// axum serves `HEAD` with the `GET` handler, so a `HEAD` needs what that `GET` needs.
+    /// Unclassified, it would pass any valid key to the handler as "a 404 from the router".
+    #[test]
+    fn a_head_needs_what_its_get_needs() {
+        for path in ["/_admin/memory", "/api/docs/_config", "/_indexes", "/mcp"] {
+            assert_eq!(classify("HEAD", path), classify("GET", path), "{path}");
+        }
+
+        let (key, config) = key_for(Role::Reader, Some(vec!["docs"]));
+        let ring = ring(vec![config]);
+        let headers = headers_with(Some(&key));
+        assert_eq!(
+            status_of(&decide(&ring, "HEAD", "/_admin/memory", &headers)),
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            status_of(&decide(&ring, "HEAD", "/api/other/_config", &headers)),
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert!(decide(&ring, "HEAD", "/api/docs/_config", &headers).is_ok());
     }
 
     /// An [`Authz`] holding a key scoped to `indexes`.

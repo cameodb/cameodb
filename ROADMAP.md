@@ -5594,7 +5594,12 @@ handlers, the client and `bench` read them back by key name.
 
 ### N1 — `HEAD` requests skip authorization
 
-**Defect.** 📋 **Planned.** **Checked.** `authz::ROUTES` has no `HEAD` rows, so `classify("HEAD",
+**Defect.** ✅ **Done** 2026-10-07. `classify` takes a `HEAD` as the `GET` axum serves it
+with, so the gate asks of it what it asks of the `GET`. Covered by `a_head_needs_what_its_get_needs`
+(unit, against `decide`) and `a_head_request_is_authorized_as_the_get_it_runs` (the binary: a
+reader's `HEAD /_admin/audit` answered 200 before the change and 403 after).
+
+**Original entry.** **Checked.** `authz::ROUTES` has no `HEAD` rows, so `classify("HEAD",
 …)` is `None`, and `decide` lets any valid key through on an unclassified path to "a 404 from the
 router" (`authz.rs:169`, `:607`). axum serves `HEAD` with the `get()` handler, so the router
 runs the `GET` handler. A reader key scoped to one index can therefore reach `/_admin/memory`,

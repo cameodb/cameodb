@@ -525,6 +525,45 @@ async fn reading_the_trail_needs_node_admin_and_is_itself_recorded() {
     );
 }
 
+/// axum answers `HEAD` with a route's `GET` handler, so a `HEAD` is that `GET` with the body
+/// dropped — the status and the headers still say what the handler did. The gate has to ask
+/// of it what it asks of the `GET`: a reader may not run an admin handler, nor learn from a
+/// status whether an index outside its scope exists.
+#[tokio::test]
+async fn a_head_request_is_authorized_as_the_get_it_runs() {
+    let node = TestNode::start("").await;
+    let head = |path: &str, key: &str| {
+        http()
+            .head(format!("{}{path}", node.url))
+            .bearer_auth(key.to_string())
+            .send()
+    };
+
+    let status = head("/_admin/audit", &node.reader_key)
+        .await
+        .expect("head")
+        .status();
+    assert_eq!(
+        status, 403,
+        "a reader must not run an admin handler by HEAD"
+    );
+
+    let status = head("/api/secret/_config", &node.reader_key)
+        .await
+        .expect("head")
+        .status();
+    assert_eq!(
+        status, 403,
+        "a reader scoped to docs must not probe another index by HEAD"
+    );
+
+    let status = head("/_admin/audit", &node.admin_key)
+        .await
+        .expect("head")
+        .status();
+    assert_eq!(status, 200, "a HEAD the GET would allow is still answered");
+}
+
 /// A search for a person's name is a record of that name. Off by default, and the flag has
 /// to actually change what is kept — a setting that silently does nothing is worse than one
 /// that does not exist, because the operator believes they have the detail.
