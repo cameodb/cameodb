@@ -65,6 +65,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A streamed search through a clustered node merges every node's hits.** With
+  `enable_streaming_search` off, a streamed search broadcast answered with the hits of one node
+  — on two nodes holding 94 and 106 documents, 94 — because only a plain search was merged. A
+  stream is now read as the search it names wherever an op enters a node.
 - **Two nodes on one host form a cluster.** The check that keeps a node from dialing itself
   compared only the IP of each seed address, so on one host — where every node shares the IP —
   each node skipped the other as its own and neither dialed. A seed is now this node only at its

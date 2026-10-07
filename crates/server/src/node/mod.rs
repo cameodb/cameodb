@@ -1064,7 +1064,10 @@ pub enum ClientOp {
         /// Optional sort specification
         sort: Option<SortSpec>,
     },
-    /// Streaming search operation across shards of an index
+    /// The search an earlier build sent for a streamed request: the first `limit` hits, no
+    /// offset. Never built here — the stream route builds a `Search` — and kept on the wire only
+    /// so a peer on that build is answered; [`ClientOp::normalized`] reads it as the `Search` it
+    /// names wherever an op enters a node.
     Stream {
         index: String,
         query: String,
@@ -1285,6 +1288,33 @@ pub enum ClientOp {
     ListClusterIndexes { include_data_size: bool },
     /// Delete an index and all its data
     DeleteIndex { index: String, delete_schema: bool },
+}
+
+impl ClientOp {
+    /// The op as a node acts on it: a [`ClientOp::Stream`] is the `Search` it names — the same
+    /// window from the front of every source's order — and everything else is itself. Applied
+    /// where an op enters a node, the router for this node's requests and the orchestrator's
+    /// handler for a peer's, so nothing past them handles a `Stream`. The plain broadcast used to
+    /// merge only a `Search`, and answered a broadcast `Stream` with one node's hits.
+    pub(crate) fn normalized(self) -> Self {
+        match self {
+            ClientOp::Stream {
+                index,
+                query,
+                limit,
+                fields,
+                sort,
+            } => ClientOp::Search {
+                index,
+                query,
+                limit,
+                offset: None,
+                fields,
+                sort,
+            },
+            other => other,
+        }
+    }
 }
 
 /// Message to update the global routing topology (consistent ring).

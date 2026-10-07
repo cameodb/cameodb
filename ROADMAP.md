@@ -5782,8 +5782,17 @@ filter against `max_shards` before anything is spawned.
 
 ### N8 — A streaming search broadcast returns local hits only
 
-**Defect.** 📋 **Planned.** **Reported**, from reading `router.rs`; to be confirmed with the
-streaming flag off before it is fixed. `handle_broadcast` returns early for `Search`
+**Defect.** ✅ **Done** 2026-10-07, confirmed first: on two clustered nodes with
+`enable_streaming_search = false`, a streamed search of 200 documents answered 94 hits — what the
+receiving node held — and 200 after the change. `ClientOp::normalized` reads a `Stream` as the
+`Search` it names where an op enters a node (the router for this node's requests, the
+orchestrator's handler for a peer's); the stream route builds a `Search`, and `Stream` stays on
+the wire only for a peer on an earlier build. The `Stream` arms past entry, the unreachable search
+and write merges in `handle_broadcast` and the fan-out field only they read are gone. Confirming it
+found a second defect, filed and fixed on its own: two nodes on one host could not form a cluster,
+because a seed was taken for this node on its IP alone.
+
+**Original entry.** **Reported**, from reading `router.rs`. `handle_broadcast` returns early for `Search`
 (`router.rs:983`), and a broadcast `Stream` falls to `_ => first result` (`:1406`), so with
 `enable_streaming_search = false` the answer is the first node's rows. Beside it are arms that
 cannot run: the Search merge arm marked "Unreachable" (`:1100–1167`), the Write and BulkWrite arm
