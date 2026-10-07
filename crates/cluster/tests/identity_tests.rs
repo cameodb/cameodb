@@ -3,68 +3,18 @@ use cluster::NodeIdentity;
 mod common;
 use common::{cleanup_test_data_dir, create_test_identity_path};
 
+/// The identity is the peer id's: the same bytes give the same UUID, name and tokens, which is
+/// what lets a node that reloads its key come back as itself.
 #[test]
-fn test_node_identity_load_or_create() {
-    // Create test identity file path using centralized test data
-    let identity_path = create_test_identity_path("identity_persistence", "test_node");
-
-    // First call should create new identity
-    let identity1 =
-        NodeIdentity::load_or_create(identity_path.clone()).expect("Failed to create identity");
-
-    // Verify identity was created properly
-    assert_eq!(identity1.vnode_tokens.len(), 256);
-    assert!(identity1.name.len() >= 3);
-
-    // File should exist now
-    assert!(identity_path.exists(), "Identity file should be created");
-
-    // Second call should load the same identity
-    let identity2 =
-        NodeIdentity::load_or_create(identity_path.clone()).expect("Failed to load identity");
-
-    // Should be identical
-    assert_eq!(identity1.uuid, identity2.uuid);
-    assert_eq!(identity1.name, identity2.name);
-    assert_eq!(identity1.vnode_tokens, identity2.vnode_tokens);
-
-    // Cleanup test data
-    cleanup_test_data_dir(&identity_path.parent().unwrap().to_path_buf());
-
-    // Verify cleanup worked
-    assert!(
-        !identity_path.exists(),
-        "Identity file should be cleaned up"
+fn an_identity_derived_from_a_peer_id_is_the_same_every_time() {
+    let first = NodeIdentity::from_peer_id_bytes(b"a peer id");
+    let again = NodeIdentity::from_peer_id_bytes(b"a peer id");
+    assert_eq!(first, again);
+    assert_eq!(first.vnode_tokens.len(), 256);
+    assert_ne!(
+        first.uuid,
+        NodeIdentity::from_peer_id_bytes(b"another").uuid
     );
-}
-
-#[test]
-fn test_node_identity_vnode_regeneration() {
-    // Create test identity file path
-    let identity_path = create_test_identity_path("vnode_regeneration", "test_node");
-
-    // Create identity with correct vnode count
-    let mut identity = NodeIdentity::new();
-
-    // Simulate old identity with wrong vnode count
-    identity.vnode_tokens = vec![1, 2, 3]; // Wrong count (should be 256)
-
-    // Save the corrupted identity
-    std::fs::create_dir_all(identity_path.parent().unwrap()).expect("Failed to create directory");
-    let file = std::fs::File::create(&identity_path).expect("Failed to create identity file");
-    serde_json::to_writer_pretty(file, &identity).expect("Failed to write identity");
-
-    // Load identity - should regenerate tokens
-    let loaded_identity =
-        NodeIdentity::load_or_create(identity_path.clone()).expect("Failed to load identity");
-
-    // Should have correct vnode count now
-    assert_eq!(loaded_identity.vnode_tokens.len(), 256);
-    assert_eq!(loaded_identity.uuid, identity.uuid);
-    assert_eq!(loaded_identity.name, identity.name);
-
-    // Cleanup
-    cleanup_test_data_dir(&identity_path.parent().unwrap().to_path_buf());
 }
 
 /// The saved file holds a private key, so it must not be left at whatever the umask allows.

@@ -7,7 +7,6 @@
 use anyhow::Result;
 use kameo::Reply;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -20,8 +19,8 @@ use crate::swarm::{self, CoordinatorEvent, SwarmRuntimeHandle, SwarmStartup};
 pub struct DistributedCluster {
     /// Local node configuration
     pub cluster_config: ClusterConfig,
-    /// Path for persistent storage (keys, etc.)
-    pub storage_path: PathBuf,
+    /// The node's libp2p key, loaded once at startup with the identity derived from it.
+    keypair: libp2p::identity::Keypair,
     /// Map of known remote nodes
     pub peer_nodes: HashMap<Uuid, NodeInfo>,
     /// Local node identity
@@ -82,13 +81,13 @@ impl DistributedCluster {
         cluster_config: ClusterConfig,
         local_node_id: Uuid,
         local_node_name: String,
-        storage_path: PathBuf,
+        keypair: libp2p::identity::Keypair,
         remote_message_size_bytes: usize,
         remote_timeout_secs: u64,
     ) -> Self {
         Self {
             cluster_config,
-            storage_path,
+            keypair,
             peer_nodes: HashMap::new(),
             local_node_id,
             local_node_name,
@@ -133,7 +132,7 @@ impl DistributedCluster {
             &self.cluster_config,
             self.local_node_id,
             self.local_node_name.clone(),
-            &self.storage_path,
+            self.keypair.clone(),
             self.remote_message_size_bytes,
             self.remote_timeout_secs,
         )

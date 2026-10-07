@@ -4499,3 +4499,56 @@ async fn default_fields_are_capped_declared_and_reported() {
     assert_eq!(hits(&node, "wa").await, 1);
     assert_eq!(hits(&node, "wc").await, 0);
 }
+
+/// A node whose identity file is damaged does not start. Its id is derived from the key in that
+/// file, so a node that made a new key would come up as another node over the same data.
+#[tokio::test]
+async fn a_node_with_a_damaged_identity_does_not_start() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).expect("data dir");
+    std::fs::write(data.join("node_identity.json"), "{ truncated").expect("identity");
+    let config = format!(
+        r#"
+[node]
+label = "test-node"
+profile = "local"
+
+[network.http]
+bind_address = "127.0.0.1"
+port = {port}
+
+[network.cluster]
+enabled = false
+
+[storage]
+data_paths = ["{data}"]
+num_shards_init = 1
+max_shards_per_node = 1
+"#,
+        port = common::reserve_port(),
+        data = data.display().to_string().replace('\\', "/"),
+    );
+    let config_path = dir.path().join("cameodb.toml");
+    std::fs::write(&config_path, config).expect("config");
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(60),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_cameodb"))
+            .arg("-c")
+            .arg(&config_path)
+            .env("RUST_LOG", "warn")
+            .output(),
+    )
+    .await
+    .expect("the node must stop, not run")
+    .expect("run cameodb");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("node_identity.json"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(data.join("node_identity.json")).expect("read"),
+        "{ truncated",
+        "the file is left for the operator"
+    );
+}

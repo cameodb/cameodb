@@ -355,7 +355,7 @@ pub async fn init_distributed_swarm(
     config: &ClusterConfig,
     node_uuid: Uuid,
     node_name: String,
-    storage_path: &Path,
+    keypair: Keypair,
     remote_message_size_bytes: usize,
     remote_timeout_secs: u64,
 ) -> Result<SwarmStartup> {
@@ -377,7 +377,7 @@ pub async fn init_distributed_swarm(
         config,
         node_uuid,
         node_name,
-        storage_path,
+        keypair,
         remote_message_size_bytes,
         remote_timeout_secs,
     )
@@ -398,12 +398,10 @@ async fn create_production_swarm(
     config: &ClusterConfig,
     node_uuid: Uuid,
     node_name: String,
-    storage_path: &Path,
+    keypair: Keypair,
     remote_message_size_bytes: usize,
     remote_timeout_secs: u64,
 ) -> Result<SwarmStartup> {
-    // Load or generate cryptographic identity for this node
-    let (keypair, _identity) = load_or_generate_keypair(storage_path)?;
     let peer_id = PeerId::from(keypair.public());
 
     info!("Node identity: {}", peer_id);
@@ -623,77 +621,68 @@ fn identity_file_is_owner_only(_path: &Path) -> bool {
     true
 }
 
-/// Load existing keypair from node_identity.json or generate a new one
-pub fn load_or_generate_keypair(storage_path: &Path) -> Result<(Keypair, NodeIdentity)> {
+/// The node's libp2p keypair and the identity derived from it, read from `node_identity.json`
+/// under `storage_path`, and generated and saved on a first boot.
+///
+/// The node's UUID is derived from the key, and the persisted shard assignments, the ring and
+/// every peer name the node by it. So a file that is there but cannot be read, or holds a key
+/// that does not decode, stops the start with the file named: generating a key in its place
+/// brought the node up as a different node over the same data, with nothing but a warning to
+/// say so. A file from an earlier build, which kept a random UUID and no key, is the one file
+/// given a new key — its UUID was never derived from anything to keep. A save that fails stops
+/// the start too, since the next boot would otherwise generate yet another key.
+pub fn load_node_identity(storage_path: &Path) -> Result<(Keypair, NodeIdentity)> {
     let identity_path = storage_path.join("node_identity.json");
-
-    // 1. Try to load existing identity to get the keypair
-    let existing_identity = if identity_path.exists() {
-        match NodeIdentity::load(identity_path.clone()) {
-            Ok(id) => Some(id),
-            Err(e) => {
-                warn!("Failed to load existing identity: {}. Will recreate.", e);
-                None
-            }
-        }
-    } else {
-        None
+    let unusable = |reason: String| {
+        anyhow::anyhow!(
+            "the node identity at {} cannot be used: {reason}. It holds this node's private key, \
+             and the node's id is derived from it: restore it from a backup, or remove it to \
+             bring the node up as a new node",
+            identity_path.display()
+        )
     };
 
-    // 2. Get or generate the keypair
-    let keypair = if let Some(ref identity) = existing_identity {
-        if let Some(key_bytes) = &identity.keypair {
-            info!("Loading existing libp2p keypair from node_identity.json");
-            match Keypair::from_protobuf_encoding(key_bytes) {
-                Ok(kp) => kp,
-                Err(e) => {
-                    warn!(
-                        "Failed to decode existing keypair: {}. Generating new one.",
-                        e
-                    );
-                    Keypair::generate_ed25519()
-                }
-            }
-        } else {
-            info!("Generating new Ed25519 keypair (no keypair in identity)");
+    let stored = match NodeIdentity::load(identity_path.clone()) {
+        Ok(stored) => Some(stored),
+        Err(cluster::IdentityError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(unusable(e.to_string())),
+    };
+    let keypair = match stored.as_ref().and_then(|stored| stored.keypair.as_deref()) {
+        Some(bytes) => Keypair::from_protobuf_encoding(bytes)
+            .map_err(|e| unusable(format!("its key does not decode ({e})")))?,
+        None if stored.is_some() => {
+            info!("Node identity from an earlier build holds no key; generating one");
             Keypair::generate_ed25519()
         }
-    } else {
-        info!("Generating new Ed25519 keypair for libp2p");
-        Keypair::generate_ed25519()
+        None => {
+            info!("No node identity yet; generating one");
+            Keypair::generate_ed25519()
+        }
     };
 
-    // 3. Derive deterministic node identity from PeerId
-    let peer_id = libp2p::PeerId::from(keypair.public());
+    let peer_id = PeerId::from(keypair.public());
     let mut identity = NodeIdentity::from_peer_id_bytes(&peer_id.to_bytes());
+    identity.keypair = Some(
+        keypair
+            .to_protobuf_encoding()
+            .map_err(|e| anyhow::anyhow!("the node's key cannot be encoded to be saved: {e}"))?,
+    );
 
-    // 4. Attach the keypair bytes to identity for persistence
-    if let Ok(bytes) = keypair.to_protobuf_encoding() {
-        identity.keypair = Some(bytes);
+    // Saved only when it differs from what is on disk. Everything above is derived from the
+    // key, so a boot that loaded a good file rebuilds it byte for byte, and replacing the only
+    // copy of the node's private key to write back what is already there is risk bought for
+    // nothing. The mode counts as a difference: a file from an earlier build carries the
+    // umask's `0644`, and one rewrite settles it.
+    if !(identity.matches_stored(&identity_path) && identity_file_is_owner_only(&identity_path)) {
+        identity.save(&identity_path).map_err(|e| {
+            anyhow::anyhow!(
+                "the node identity could not be saved to {}: {e}",
+                identity_path.display()
+            )
+        })?;
+        info!("Node identity saved to {:?}", identity_path);
     }
-
-    // 5. Save the consolidated identity — but only when it differs from what is on disk
-    //    (this also overwrites an old random UUID, if one existed).
-    //
-    //    Everything above is derived from the keypair, so a boot that loaded a good file
-    //    rebuilds it byte for byte. Replacing the only copy of the node's private key to
-    //    write back what is already there is risk bought for nothing.
-    //
-    //    The mode counts as a difference: a file from an earlier build carries the umask's
-    //    `0644`, and skipping on content alone would leave it that way for good. One rewrite
-    //    settles it and later boots skip.
-    if identity.matches_stored(&identity_path) && identity_file_is_owner_only(&identity_path) {
-        info!("Node identity unchanged on disk, leaving it alone");
-        info!("Node UUID (deterministic): {}", identity.uuid);
-    } else if let Err(e) = identity.save(&identity_path) {
-        warn!(
-            "Failed to save consolidated identity to node_identity.json: {}",
-            e
-        );
-    } else {
-        info!("Consolidated node identity saved to {:?}", identity_path);
-        info!("Node UUID (deterministic): {}", identity.uuid);
-    }
+    info!("Node UUID (deterministic): {}", identity.uuid);
 
     Ok((keypair, identity))
 }
@@ -1507,6 +1496,59 @@ fn handle_identify_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A first boot generates and saves the key; every later boot reads the same one back, and
+    /// so comes up as the same node.
+    #[test]
+    fn a_node_identity_is_generated_once_and_then_kept() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (first_key, first) = load_node_identity(dir.path()).expect("first boot");
+        let (again_key, again) = load_node_identity(dir.path()).expect("second boot");
+        assert_eq!(first.uuid, again.uuid);
+        assert_eq!(first_key.public(), again_key.public());
+    }
+
+    /// A file that is there and cannot be used stops the start, and is left as it was for an
+    /// operator to restore: a new key would bring the node up as another node over this data.
+    #[test]
+    fn a_damaged_node_identity_stops_the_start() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("node_identity.json");
+        load_node_identity(dir.path()).expect("first boot");
+        let mut stored: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+
+        for damaged in ["{ truncated".to_string(), {
+            stored["keypair"] = serde_json::json!([1, 2, 3]);
+            stored.to_string()
+        }] {
+            std::fs::write(&path, &damaged).expect("damage the file");
+            let refusal = load_node_identity(dir.path())
+                .expect_err("a damaged identity must stop the start")
+                .to_string();
+            assert!(refusal.contains("node_identity.json"), "{refusal}");
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("read"),
+                damaged,
+                "the file is left for the operator"
+            );
+        }
+    }
+
+    /// An earlier build kept a random UUID and no key; that file is given a key, since its UUID
+    /// was never derived from anything to keep.
+    #[test]
+    fn a_node_identity_without_a_key_is_given_one() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let earlier = NodeIdentity::new();
+        earlier
+            .save(&dir.path().join("node_identity.json"))
+            .expect("save");
+        let (key, identity) = load_node_identity(dir.path()).expect("boot");
+        assert_ne!(identity.uuid, earlier.uuid);
+        let (again, _) = load_node_identity(dir.path()).expect("next boot");
+        assert_eq!(key.public(), again.public(), "and keeps it from then on");
+    }
 
     #[test]
     fn test_convert_seed_nodes() {

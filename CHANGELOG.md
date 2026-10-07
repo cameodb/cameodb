@@ -65,6 +65,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A node whose identity file is damaged refuses to start, instead of becoming another node.**
+  `node_identity.json` holds the node's private key, and its id is derived from that key. A file
+  that could not be read, or a key that did not decode, was replaced by a new key with a warning,
+  so the node came up under a new id over the same data, which the ring and the persisted shard
+  assignments no longer named. It now stops with the file named and left as it was; remove the
+  file to start the node as a new one. A failed save of a new identity stops the start too.
 - **A schema change a peer refuses answers 400, with the peer's reason.** A peer's error
   reaches the coordinating node in a form that keeps only its verdict, and the refusal check
   matched the variant — so a tokenizer an older node cannot build came back as 503, "retry once

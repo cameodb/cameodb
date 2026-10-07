@@ -371,8 +371,7 @@ async fn main() -> Result<()> {
         .cloned()
         .expect("storage.data_paths must contain at least one entry");
 
-    let (_keypair, identity) =
-        swarm::load_or_generate_keypair(&primary_path).expect("Failed to establish node identity");
+    let (keypair, identity) = swarm::load_node_identity(&primary_path)?;
 
     // Create node configuration from loaded config
     let node_config = NodeConfig {
@@ -433,7 +432,7 @@ async fn main() -> Result<()> {
         cameodb_config.network.cluster.clone(),
         node_id,
         orchestrator.identity().name.clone(),
-        primary_path.clone(),
+        keypair,
         cameodb_config.effective_remote_message_size_bytes(),
         cameodb_config.effective_remote_timeout_secs(),
     );
