@@ -387,6 +387,8 @@ pub(crate) struct ColumnProfile {
     over_i64: bool,
     /// Which way round its numeric dates were written, where only one reading is a date.
     date_evidence: Vec<(char, DateOrder)>,
+    /// It held a numeric date that reads as a date either way round, `03/04/2024`.
+    ambiguous_dates: bool,
     /// The values inside its lists.
     elements: Option<Box<ColumnProfile>>,
     key: KeyTrack,
@@ -408,6 +410,7 @@ impl ColumnProfile {
             negative: false,
             over_i64: false,
             date_evidence: Vec::new(),
+            ambiguous_dates: false,
             elements: None,
             key: KeyTrack::new(),
             equals_id: true,
@@ -472,13 +475,14 @@ impl ColumnProfile {
                 self.negative |= digits.starts_with('-');
                 self.over_i64 |= digits.parse::<i64>().is_err();
             }
-            Shape::Date => {
-                if let Some(evidence) = numeric_date_order(&text)
-                    && !self.date_evidence.contains(&evidence)
-                {
-                    self.date_evidence.push(evidence);
+            Shape::Date => match numeric_date_order(&text) {
+                Some(evidence) => {
+                    if !self.date_evidence.contains(&evidence) {
+                        self.date_evidence.push(evidence);
+                    }
                 }
-            }
+                None => self.ambiguous_dates |= is_numeric_date(&text),
+            },
             Shape::List => {
                 let items = match value {
                     JsonValue::Array(items) => Some(items.clone()),
@@ -510,6 +514,12 @@ impl ColumnProfile {
         };
         *entries += self.key.observe(hash, key_shape, &text, at);
         hash
+    }
+
+    /// It wrote numeric dates that read either way round and none that say which: the order
+    /// is a guess until more of the source is read.
+    pub(crate) fn date_order_unsettled(&self) -> bool {
+        self.ambiguous_dates && self.date_evidence.is_empty()
     }
 
     /// The date order this column writes in, or `None` when its sample writes both ways.

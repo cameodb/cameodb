@@ -311,7 +311,7 @@ pub struct FieldDef {
     /// Added by a write rather than declared. While it is not indexed it has no column, so its
     /// type is only what its values have been — widened to hold each new one
     /// ([`TantivyFieldType::widened`]) rather than refusing it. A declared field keeps the type it
-    /// was given. Not part of the fingerprint: it says how the type was reached, not what it is.
+    /// was given. In the fingerprint when set, since it changes which values a write may carry.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub learned: bool,
 }
@@ -1300,6 +1300,12 @@ impl IndexSchema {
             push_opt(&mut combined, field.description.as_deref());
             push_opt(&mut combined, field.tokenizer.as_deref());
             push_opt(&mut combined, field.index_record_option.as_deref());
+            // Only when set, so every schema without one keeps the thumbprint it had. A learned
+            // field widens to take a value a declared one refuses, so two nodes differing here
+            // differ in what they accept.
+            if field.learned {
+                combined.push(0x4C);
+            }
         }
 
         // Index-level properties. The routing field earns its place here more than any type

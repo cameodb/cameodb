@@ -5971,6 +5971,16 @@ impl NodeOrchestrator {
                 .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))
         };
         let current = self.durable_schema(index).await?;
+        // A field a write taught this node after phase one read it is kept, not overwritten by a
+        // schema that never heard of it; the cluster is then asked to agree on it. Merged before
+        // the checks below, so a change already applied here still reads as the same one.
+        if let Some(held) = current
+            .as_deref()
+            .filter(|current| current.state != storage::SchemaState::Dropped)
+            && crate::cluster_coordinator::merge_learned(&mut schema, held)
+        {
+            self.request_schema_reconcile(index);
+        }
         if let Some(current) = current.as_deref() {
             let same = current.version == schema.version
                 && current.calculate_fingerprint() == schema.calculate_fingerprint();
@@ -5995,14 +6005,6 @@ impl NodeOrchestrator {
         let held = current
             .as_deref()
             .filter(|current| current.state != storage::SchemaState::Dropped);
-        // A field a write taught this node after phase one read it is kept, not overwritten by a
-        // schema that never heard of it; the cluster is then asked to agree on it.
-        if let Some(held) = held
-            && crate::cluster_coordinator::merge_learned(&mut schema, held)
-        {
-            self.request_schema_reconcile(index);
-        }
-
         // The explicit mint counts against `max_indexes` exactly as the implicit one does. Both
         // run on this mailbox, so the count cannot race.
         if check_quota

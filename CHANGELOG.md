@@ -152,7 +152,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the index records the id, so the loader now reads one batch of rows ahead, for the date order
   and lists a schema does not hold, and the same load finishes about 23% sooner. An index
   recording no id, loaded from a source without an `id` column, is sampled instead, since its id
-  is chosen by its values; a new index, or `--id` naming another id, is scanned as before.
+  is chosen by its values; a new index, or `--id` naming another id, is scanned as before. When
+  that batch leaves a guess — numeric dates that read either way round, a column with no value yet,
+  a declared JSON field it never showed — the source is sampled instead, and a JSON field the
+  schema declares is fitted to its type even where no scan met it. `--recreate` deletes the
+  documents only once the source is read and its id settled.
 - **Schema detection reads a source across its length, and types a column by every value it
   saw.** It used to type each column from the first 200 rows, one value at a time: a file sorted
   by hour showed one hour, and `no data` then `true` made a boolean column whose `no data` rows

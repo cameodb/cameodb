@@ -1350,6 +1350,37 @@ async fn a_declared_tokenizer_must_be_one_the_node_has() {
     assert_eq!(tokenizer("testo"), Some(json!("it_stem")), "{config}");
 }
 
+/// A declaration replaces the one before it: a field it leaves out is gone, not brought back
+/// from the schema the node held.
+#[tokio::test]
+async fn a_declaration_that_leaves_a_field_out_removes_it() {
+    let node = TestNode::start("").await;
+    let declare = |fields: serde_json::Value| json!({ "fields": fields });
+    let (status, body) = put_config(
+        &node,
+        "shelf",
+        &declare(json!({
+            "title": {"field_type": "text", "indexed": true},
+            "extra": {"field_type": "text", "indexed": true}
+        })),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = put_config(
+        &node,
+        "shelf",
+        &declare(json!({"title": {"field_type": "text", "indexed": true}})),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let config = get_json(&node, "/api/shelf/_config").await;
+    let names: Vec<&str> = config["fields"]
+        .as_array()
+        .map(|fields| fields.iter().filter_map(|f| f["name"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(!names.contains(&"extra"), "{names:?}");
+}
+
 /// A field that first arrives after the index exists takes every value written to it: its type
 /// widens to hold them — `i64`, then `f64`, then `text` — instead of refusing the documents whose
 /// value did not fit the first one.
