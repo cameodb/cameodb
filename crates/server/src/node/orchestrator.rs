@@ -3198,6 +3198,9 @@ pub(crate) struct NodeOrchestrator {
     /// `ApplySchema` or `ReleaseSchemaChange` — or [`SCHEMA_CHANGE_RESERVATION`], should the
     /// node coordinating it stop before either.
     pub(super) schema_changes: HashMap<String, (Uuid, Instant)>,
+    /// Rounds agreeing across the cluster on fields this node learned from writes — see
+    /// [`crate::cluster_coordinator::SchemaReconciler`].
+    pub(super) schema_reconciler: Arc<crate::cluster_coordinator::SchemaReconciler>,
     /// Map of shard UUIDs to their microshard actors.
     ///
     /// `pub(crate)` rather than `pub(super)`, and the only field of this actor that is: the
@@ -3753,58 +3756,60 @@ impl NodeOrchestrator {
         shards: &HashMap<Uuid, MicroshardActor>,
         is_initial_creation: bool,
     ) -> Result<(), OrchestratorError> {
-        // Only fields the schema does not already describe.
-        let fields_to_add: Vec<_> = new_fields
-            .iter()
-            .filter(|(field_name, _)| !schema_cache.fields.contains_key(field_name))
-            .collect();
-
-        if fields_to_add.is_empty() {
-            return Ok(());
+        // One type per name: every value's type joined, so the batch's order does not decide it.
+        let mut wanted: BTreeMap<&str, TantivyFieldType> = BTreeMap::new();
+        for (name, field_type) in new_fields {
+            wanted
+                .entry(name.as_str())
+                .and_modify(|joined| *joined = joined.widened(field_type))
+                .or_insert_with(|| field_type.clone());
         }
 
-        tracing::debug!(
-            index = %index,
-            fields_count = fields_to_add.len(),
-            is_initial_creation = is_initial_creation,
-            "Batch adding new fields to schema"
-        );
-
-        for (field_name, field_type) in &fields_to_add {
-            // `FieldDef::new` already applies the storage rule — only `id` is stored in
-            // tantivy, everything else is reconstructed from redb.
-            let mut new_field = FieldDef::new(field_name.clone(), field_type.clone());
-            new_field.indexed = is_initial_creation;
-            schema_cache.fields.insert(field_name.clone(), new_field);
-        }
-
-        tracing::info!(
-            index = %index,
-            fields_count = fields_to_add.len(),
-            is_initial_creation = is_initial_creation,
-            "Schema evolution completed - batch added fields"
-        );
-
-        // Persist updated schema to storage if changed
-        if !new_fields.is_empty() {
-            Self::persist_schema_to_stores(index, schema_cache, shards).await?;
-
-            if is_initial_creation {
-                tracing::info!(
-                    index = %index,
-                    field_count = schema_cache.fields.len(),
-                    "Initial schema created with all fields indexed=true"
-                );
-            } else {
-                tracing::info!(
-                    index = %index,
-                    total_fields = schema_cache.fields.len(),
-                    new_fields_count = new_fields.len(),
-                    "Schema evolved with new fields"
-                );
+        let mut added = 0usize;
+        let mut widened = 0usize;
+        for (name, field_type) in wanted {
+            match schema_cache.fields.get_mut(name) {
+                None => {
+                    // `FieldDef::new` already applies the storage rule — only `id` is stored in
+                    // tantivy, everything else is reconstructed from redb.
+                    let field = if is_initial_creation {
+                        FieldDef::new(name.to_string(), field_type)
+                    } else {
+                        FieldDef::new_learned(name.to_string(), field_type)
+                    };
+                    schema_cache.fields.insert(name.to_string(), field);
+                    added += 1;
+                }
+                // Validation asks for a wider type only for a learned field without a column.
+                Some(field) if field.learned && !field.indexed => {
+                    let joined = field.field_type.widened(&field_type);
+                    if joined != field.field_type {
+                        field.retype_learned(joined);
+                        widened += 1;
+                    }
+                }
+                Some(_) => {}
             }
         }
 
+        if added == 0 && widened == 0 {
+            return Ok(());
+        }
+
+        Self::persist_schema_to_stores(index, schema_cache, shards).await?;
+        tracing::info!(
+            index = %index,
+            added,
+            widened,
+            is_initial_creation,
+            total_fields = schema_cache.fields.len(),
+            "Schema evolved from written documents"
+        );
+        // What this node learned alone, the cluster is asked to agree on: the same field may
+        // have reached another node first with other values.
+        if !is_initial_creation {
+            self.request_schema_reconcile(index);
+        }
         Ok(())
     }
 
@@ -4177,6 +4182,7 @@ impl NodeOrchestrator {
             peer_lane: None,
             mint_rivals: HashMap::new(),
             schema_changes: HashMap::new(),
+            schema_reconciler: Arc::default(),
             shards: HashMap::new(),
             writer_liveness: Arc::new(WriterLiveness::default()),
             identity,
@@ -5779,6 +5785,16 @@ impl NodeOrchestrator {
         .await
     }
 
+    /// Ask the cluster to agree on the fields this node learned for `index`. A standalone node
+    /// has nobody to agree with: what it learned is the index's schema.
+    pub(super) fn request_schema_reconcile(&self, index: &str) {
+        if self.config.clustered
+            && let Some(coordinator) = self.coordinator.clone()
+        {
+            self.schema_reconciler.request(index, coordinator);
+        }
+    }
+
     /// End `change`'s reservation of `index`, if it still holds it.
     fn release_schema_change(&mut self, index: &str, change: Uuid) {
         if self
@@ -5945,7 +5961,7 @@ impl NodeOrchestrator {
         schema: IndexSchema,
         check_quota: bool,
     ) -> Result<JsonValue, OrchestratorError> {
-        let schema = Self::checked_declaration(schema)?;
+        let mut schema = Self::checked_declaration(schema)?;
         let answer = |outcome: SchemaApplied| {
             serde_json::to_value(outcome)
                 .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))
@@ -5975,6 +5991,13 @@ impl NodeOrchestrator {
         let held = current
             .as_deref()
             .filter(|current| current.state != storage::SchemaState::Dropped);
+        // A field a write taught this node after phase one read it is kept, not overwritten by a
+        // schema that never heard of it; the cluster is then asked to agree on it.
+        if let Some(held) = held
+            && crate::cluster_coordinator::merge_learned(&mut schema, held)
+        {
+            self.request_schema_reconcile(index);
+        }
 
         // The explicit mint counts against `max_indexes` exactly as the implicit one does. Both
         // run on this mailbox, so the count cannot race.

@@ -592,13 +592,33 @@ fn held_view(readiness: &[(Node, SchemaReadiness)]) -> Option<IndexSchema> {
         .map(|current| (*current).clone())
         .reduce(NodeOrchestrator::preferred_schema)?;
     for current in held {
-        for (name, field) in &current.fields {
-            view.fields
-                .entry(name.clone())
-                .or_insert_with(|| field.clone());
-        }
+        merge_learned(&mut view, current);
     }
     Some(view)
+}
+
+/// Bring into `into` what `from` learned from writes: a field `into` lacks, and a wider type for
+/// a learned field both hold without a column. A field `into` declared is left as declared.
+/// Whether anything changed.
+pub(crate) fn merge_learned(into: &mut IndexSchema, from: &IndexSchema) -> bool {
+    let mut changed = false;
+    for (name, field) in &from.fields {
+        match into.fields.get_mut(name) {
+            None => {
+                into.fields.insert(name.clone(), field.clone());
+                changed = true;
+            }
+            Some(held) if held.learned && !held.indexed && field.learned && !field.indexed => {
+                let joined = held.field_type.widened(&field.field_type);
+                if joined != held.field_type {
+                    held.retype_learned(joined);
+                    changed = true;
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    changed
 }
 
 /// A `PATCH /_schema`: `indexed` flags, and the fields an unqualified term searches.
@@ -655,6 +675,86 @@ impl FieldEdit {
     }
 }
 
+/// What an edit came to across the cluster.
+enum EditOutcome {
+    /// Every node holds the edited schema, at `version`, stored by `nodes` of them — or held it
+    /// already, in which case nothing was written. `outcome` is what the edit changed.
+    Done {
+        outcome: SchemaFieldUpdate,
+        version: u64,
+        nodes: usize,
+    },
+    /// Refused with nothing changed; the body says why.
+    Refused(JsonValue),
+}
+
+/// Make `edit` to the schema the cluster holds, starting from `base`, and apply it on every node;
+/// made again on whatever landed first, up to [`MOVED_ATTEMPTS`] times.
+async fn run_edit(
+    reach: &Reach,
+    index: &str,
+    base: IndexSchema,
+    edit: &FieldEdit,
+) -> Result<EditOutcome, OrchestratorError> {
+    let mut proposal = match edit.apply(&base)? {
+        Edited::Proposal(proposal, _) => proposal,
+        Edited::Unknown(outcome) => {
+            return Ok(EditOutcome::Refused(
+                NodeOrchestrator::schema_update_response(index, &outcome),
+            ));
+        }
+    };
+    let mut held = base;
+    for _ in 0..MOVED_ATTEMPTS {
+        // What the edit changes, against the schema it was last made to.
+        let Edited::Proposal(_, mut outcome) = edit.apply(&held)? else {
+            unreachable!("made to this schema already");
+        };
+        match run_change(reach, index, (*proposal).clone(), Some(edit)).await? {
+            Step::Applied(done) => {
+                outcome.pending_reindex = done
+                    .unbuilt
+                    .into_iter()
+                    .filter(|name| outcome.applied.contains(name))
+                    .collect();
+                return Ok(EditOutcome::Done {
+                    outcome,
+                    version: done.version,
+                    nodes: done.nodes,
+                });
+            }
+            Step::Unchanged { version } => {
+                // Already held everywhere: whatever this request asked is already so.
+                outcome.unchanged.append(&mut outcome.applied);
+                outcome.unchanged.sort();
+                return Ok(EditOutcome::Done {
+                    outcome,
+                    version,
+                    nodes: reach.nodes.len(),
+                });
+            }
+            Step::Refused(body) => return Ok(EditOutcome::Refused(body)),
+            Step::Moved {
+                held: now,
+                proposal: next,
+            } => {
+                held = *now;
+                proposal = next;
+            }
+        }
+    }
+    Ok(EditOutcome::Refused(refused(
+        index,
+        0,
+        &[],
+        format!(
+            "index '{index}' kept changing while this edit was being applied; nothing was \
+             changed. Read the schema again (GET /api/{index}/_config) and send the edit again \
+             if it is still wanted"
+        ),
+    )))
+}
+
 /// Apply `edit` to `index` on every node of the cluster. See the module documentation.
 ///
 /// `base` is the schema the cluster held when the request arrived, which the first round edits.
@@ -669,64 +769,154 @@ pub(crate) async fn patch_schema_cluster(
     edit: FieldEdit,
 ) -> Result<JsonValue, OrchestratorError> {
     let reach = reach_whole_cluster(&targets, status.as_ref(), &index)?;
-    let mut proposal = match edit.apply(&base)? {
-        Edited::Proposal(proposal, _) => proposal,
-        Edited::Unknown(outcome) => {
-            return Ok(NodeOrchestrator::schema_update_response(&index, &outcome));
+    match run_edit(&reach, &index, base, &edit).await? {
+        EditOutcome::Refused(body) => Ok(body),
+        EditOutcome::Done {
+            outcome,
+            version,
+            nodes,
+        } => {
+            let mut response = NodeOrchestrator::schema_update_response(&index, &outcome);
+            if let Some(list) = &edit.default_fields {
+                response["default_fields"] = if list.is_empty() {
+                    JsonValue::Null
+                } else {
+                    serde_json::json!(list)
+                };
+            }
+            response["version"] = serde_json::json!(version);
+            response["nodes"] = serde_json::json!(nodes);
+            Ok(response)
         }
-    };
-    let mut held = base;
-    for _ in 0..MOVED_ATTEMPTS {
-        // What the edit changes, against the schema it was last made to.
-        let Edited::Proposal(_, mut outcome) = edit.apply(&held)? else {
-            unreachable!("made to this schema already");
-        };
-        let (version, nodes) =
-            match run_change(&reach, &index, (*proposal).clone(), Some(&edit)).await? {
-                Step::Applied(done) => {
-                    outcome.pending_reindex = done
-                        .unbuilt
-                        .into_iter()
-                        .filter(|name| outcome.applied.contains(name))
-                        .collect();
-                    (done.version, done.nodes)
-                }
-                Step::Unchanged { version } => {
-                    // Already held everywhere: whatever this request asked is already so.
-                    outcome.unchanged.append(&mut outcome.applied);
-                    outcome.unchanged.sort();
-                    (version, reach.nodes.len())
-                }
-                Step::Refused(body) => return Ok(body),
-                Step::Moved {
-                    held: now,
-                    proposal: next,
-                } => {
-                    held = *now;
-                    proposal = next;
+    }
+}
+
+/// How long a reconcile waits before its first round, so a burst of writes teaching the same
+/// fields is agreed in one round rather than one per batch.
+const RECONCILE_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+/// The longest wait between rounds that could not finish, and how many rounds are tried before
+/// the next learned field asks again.
+const RECONCILE_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+const RECONCILE_ATTEMPTS: u32 = 30;
+
+/// Agreement on what writes taught the nodes, one index at a time.
+///
+/// A field that first arrives after an index exists is learned by whichever node receives it,
+/// typed by the values that node saw. Each node that learns one asks for a round here: the
+/// schema every node holds, merged — every learned field, at the type joining what each node
+/// saw — is applied on every node as an empty edit, at one new version. Requests for an index
+/// already in a round mark it to run once more after, so a burst of writes costs one or two
+/// rounds, not one per batch. Run on a spawned task, never in an orchestrator's mailbox: a round
+/// asks every orchestrator, this node's included.
+#[derive(Debug, Default)]
+pub(crate) struct SchemaReconciler {
+    /// Indexes with a round running, and whether another was asked for meanwhile.
+    pending: std::sync::Mutex<std::collections::HashMap<String, bool>>,
+}
+
+impl SchemaReconciler {
+    /// Ask for a round for `index`; one is started unless one is running.
+    pub(crate) fn request(
+        self: &std::sync::Arc<Self>,
+        index: &str,
+        coordinator: kameo::actor::ActorRef<super::ClusterCoordinator>,
+    ) {
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(again) = pending.get_mut(index) {
+                *again = true;
+                return;
+            }
+            pending.insert(index.to_string(), false);
+        }
+        let reconciler = std::sync::Arc::clone(self);
+        let index = index.to_string();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(RECONCILE_SETTLE).await;
+                reconcile_until_agreed(&coordinator, &index).await;
+                let mut pending = reconciler.pending.lock().unwrap_or_else(|p| p.into_inner());
+                if pending.get(&index) == Some(&true) {
+                    pending.insert(index.clone(), false);
                     continue;
                 }
-            };
-        let mut response = NodeOrchestrator::schema_update_response(&index, &outcome);
-        if let Some(list) = &edit.default_fields {
-            response["default_fields"] = if list.is_empty() {
-                JsonValue::Null
-            } else {
-                serde_json::json!(list)
-            };
-        }
-        response["version"] = serde_json::json!(version);
-        response["nodes"] = serde_json::json!(nodes);
-        return Ok(response);
+                pending.remove(&index);
+                break;
+            }
+        });
     }
-    Ok(refused(
-        &index,
-        0,
-        &[],
-        format!(
-            "index '{index}' kept changing while this edit was being applied; nothing was \
-             changed. Read the schema again (GET /api/{index}/_config) and send the edit again \
-             if it is still wanted"
-        ),
-    ))
+}
+
+/// Rounds until one finishes, waiting longer after each that could not.
+async fn reconcile_until_agreed(
+    coordinator: &kameo::actor::ActorRef<super::ClusterCoordinator>,
+    index: &str,
+) {
+    let mut wait = std::time::Duration::from_secs(1);
+    for attempt in 1..=RECONCILE_ATTEMPTS {
+        match reconcile_once(coordinator, index).await {
+            Ok(Some(version)) => {
+                info!(index = %index, version, "Learned fields agreed across the cluster");
+                return;
+            }
+            Ok(None) => return,
+            Err(reason) => {
+                warn!(
+                    index = %index,
+                    attempt,
+                    reason = %reason,
+                    "Learned fields not agreed yet; trying again"
+                );
+            }
+        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(RECONCILE_BACKOFF_MAX);
+    }
+    warn!(
+        index = %index,
+        "Learned fields still not agreed across the cluster; the next one learned asks again"
+    );
+}
+
+/// One round: `Some(version)` when every node holds the merged schema, `None` when there is no
+/// index to agree on, and why it could not finish otherwise.
+async fn reconcile_once(
+    coordinator: &kameo::actor::ActorRef<super::ClusterCoordinator>,
+    index: &str,
+) -> Result<Option<u64>, String> {
+    let targets = coordinator
+        .ask(super::GetDeleteTargets)
+        .await
+        .map_err(|e| format!("the cluster coordinator did not answer: {e}"))?;
+    let status = coordinator.ask(super::GetStatus).await.ok();
+    let reach = reach_whole_cluster(&targets, status.as_ref(), index).map_err(|e| e.to_string())?;
+    let local = reach.nodes[0].clone();
+    let held = reach
+        .ask(
+            &local,
+            ClientOp::GetRawSchema {
+                index: index.to_string(),
+                minting_by: None,
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    if held.is_null() {
+        return Ok(None);
+    }
+    let base: IndexSchema = decode(&local, held).map_err(|e| e.to_string())?;
+    if base.state == storage::SchemaState::Dropped {
+        return Ok(None);
+    }
+    let unchanged = FieldEdit {
+        field_updates: BTreeMap::new(),
+        default_fields: None,
+    };
+    match run_edit(&reach, index, base, &unchanged)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        EditOutcome::Done { version, .. } => Ok(Some(version)),
+        EditOutcome::Refused(body) => Err(body["reason"].as_str().unwrap_or("refused").to_string()),
+    }
 }

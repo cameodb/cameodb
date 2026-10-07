@@ -812,6 +812,16 @@ or the request is refused `400` and nothing changes — as is a `field_updates` 
 the list names. A list longer than the node's `max_default_fields` is accepted and searched up to
 the cap, first entries first.
 
+**A field added by a write.** A field that first appears after the index exists is recorded
+non-indexed and *learned*: its type is what its values have been. A value that does not fit
+widens it — `i64` and `f64` to `f64`, anything mixed with text to `text` — rather than refusing
+the document; its values are kept as sent. In a cluster each node learns from the writes it
+receives, and then asks every node to agree, so within a moment every node holds the field at
+the type joining what each saw, at one new version (or retries until a missing node is back). A
+field declared with `PUT /_config` keeps its declared type and refuses values that do not fit it,
+and a field marked indexed is pinned to its column. A `PUT /_config` that leaves out a learned
+field keeps it: the documents hold its values.
+
 **Declaring a field that the index cannot search yet.** A field is only searchable if the
 Tantivy index has a column for it, and that is fixed when the index is built. Fields present on
 the **first** write are indexed then; a field that first appears in a **later** document is

@@ -117,6 +117,23 @@ pub enum TantivyFieldType {
     Facet,
 }
 
+impl TantivyFieldType {
+    /// The narrowest type that holds the values of both: the type itself when they agree, `f64`
+    /// for two numeric types, and `text`, which holds any value, otherwise.
+    ///
+    /// The join a [learned](FieldDef::learned) field's type is reached by. It depends only on the
+    /// two types, never on which came first, so nodes that saw the same values in any order —
+    /// or different values, joined afterwards — settle on the same type.
+    pub fn widened(&self, other: &TantivyFieldType) -> TantivyFieldType {
+        use TantivyFieldType::{F64, I64, U64};
+        match (self, other) {
+            (a, b) if a == b => a.clone(),
+            (I64 | U64 | F64, I64 | U64 | F64) => F64,
+            _ => TantivyFieldType::Text,
+        }
+    }
+}
+
 /// Serialized as the same lowercase name every other surface uses.
 ///
 /// The derived implementation emitted the variant name — `Date`, `Boolean` — while
@@ -291,6 +308,12 @@ pub struct FieldDef {
     // Additional options for Text fields
     pub tokenizer: Option<String>,
     pub index_record_option: Option<String>, // "Basic", "WithFreqs", "WithFreqsAndPositions"
+    /// Added by a write rather than declared. While it is not indexed it has no column, so its
+    /// type is only what its values have been — widened to hold each new one
+    /// ([`TantivyFieldType::widened`]) rather than refusing it. A declared field keeps the type it
+    /// was given. Not part of the fingerprint: it says how the type was reached, not what it is.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub learned: bool,
 }
 
 impl FieldDef {
@@ -313,6 +336,7 @@ impl FieldDef {
             description: None,         // Nothing infers a description; an operator writes it
             tokenizer: None,           // Will be set when creating from actual Tantivy schema
             index_record_option: None, // Will be set when creating from actual Tantivy schema
+            learned: false,
         }
     }
 
@@ -377,6 +401,22 @@ impl FieldDef {
         Self::new(name, field_type)
     }
 
+    /// A field a write added, typed by the values it has seen: non-indexed, so no column is
+    /// built for it until it is promoted.
+    pub fn new_learned(name: String, field_type: TantivyFieldType) -> Self {
+        let mut field = Self::new(name, field_type);
+        field.indexed = false;
+        field.learned = true;
+        field
+    }
+
+    /// Give a [learned](Self::learned) field a wider type, with the `fast` default that type has.
+    pub fn retype_learned(&mut self, field_type: TantivyFieldType) {
+        let fresh = Self::new(self.name.clone(), field_type);
+        self.field_type = fresh.field_type;
+        self.fast = fresh.fast;
+    }
+
     /// Create a non-indexed field definition for background schema evolution
     /// New fields discovered during writes are marked as non-indexed to avoid
     /// requiring Tantivy schema rebuilds. They can be stored in redb and later
@@ -397,6 +437,7 @@ impl FieldDef {
             description: None,
             tokenizer: None,
             index_record_option: None,
+            learned: false,
         }
     }
 
@@ -413,6 +454,7 @@ impl FieldDef {
             description: None,
             tokenizer: None,
             index_record_option: None,
+            learned: false,
         }
     }
 
@@ -1635,6 +1677,21 @@ impl IndexSchema {
                 // a rebuild instead; the inline path never performs one.
                 if current_def.indexed {
                     return false;
+                }
+
+                // A field a write added has no column and no declared type: it widens to hold
+                // the value, and never narrows — `text` refined to `i64` here would refuse the
+                // text values that made it text.
+                if current_def.learned {
+                    let widened = current_def.field_type.widened(&inferred_type);
+                    if widened == current_def.field_type {
+                        return false;
+                    }
+                    let mut new_def = current_def.clone();
+                    new_def.retype_learned(widened);
+                    entry.insert(new_def);
+                    self.mark_modified();
+                    return true;
                 }
 
                 // Only evolve if the inferred type is "more specific" or compatible

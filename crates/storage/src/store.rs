@@ -1614,6 +1614,7 @@ impl HybridStore {
                     description: None,
                     tokenizer,
                     index_record_option,
+                    learned: false,
                 },
             );
         }
@@ -1811,6 +1812,7 @@ impl HybridStore {
                         description: None,
                         tokenizer: Some("raw".to_string()),
                         index_record_option: Some("Basic".to_string()),
+                        learned: false,
                     }
                 });
 
