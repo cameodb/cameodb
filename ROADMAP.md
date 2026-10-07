@@ -5619,7 +5619,23 @@ banner) and makes this class of gap impossible.
 
 ### N2 — A batched write never learns a new field
 
-**Defect.** 📋 **Planned.** **Checked.** `HybridStore::apply_write` evolves the schema from the
+**Defect.** ✅ **Done** 2026-10-07, and smaller than first filed. Through the server, every write —
+single, coalesced or `_bulk` — has its fields learned upstream by `staged_schema_validation`
+before it reaches storage (`a_field_learned_from_writes_widens_instead_of_refusing` covers
+`_bulk`), so storage finds them described. Storage's own learning is the guard for a write that
+reaches it otherwise — a recreation racing a drop (`concurrency_chaos.rs`), a caller of the
+crate — and on that path only the single write learned. The review read storage alone and missed
+the orchestrator above it.
+
+Fixed as proposed: `apply_write` is `apply_batch` of one; the batch learns in its prepare step,
+under the schema lock, and commits the evolved schema in its own transaction (durably, whatever
+`wal_sync` says), caching it once durable; `SchemaFields::document` is the one Tantivy document
+builder for the write and the WAL replay, which now reads its columns through
+`load_fields_from_existing_index`; `add_operations(index, n)` is the one counter bump. Covered by
+`a_batch_learns_what_single_writes_learn` (failed before the change: the batch learned nothing)
+and `a_refused_batch_leaves_the_schema_alone`.
+
+**Original entry.** **Checked**, in storage only. `HybridStore::apply_write` evolves the schema from the
 document (`store.rs:2632`, `evolve_from_document`); `apply_batch` does not. The only call to
 `evolve_from_document` is the single-write path. The server sends one write through `apply_write`
 and two or more coalesced writes through `apply_batch` (`shard.rs:944–963`), and a `_bulk` goes

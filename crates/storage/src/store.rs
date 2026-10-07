@@ -16,7 +16,7 @@ use redb::{
 use tantivy::collector::TopDocs;
 use tantivy::query::AllQuery;
 use tantivy::schema::{FAST, INDEXED, STORED, STRING, Schema, TEXT, Value as TantivyValue};
-use tantivy::{Index, IndexReader, IndexWriter, Order, doc};
+use tantivy::{Index, IndexReader, IndexWriter, Order};
 use tracing::trace;
 
 /// Schema metadata table: maps index names to their schema definitions.
@@ -1195,21 +1195,8 @@ impl HybridStore {
             .get_schema_cached(index)?
             .unwrap_or_else(|| Arc::new(IndexSchema::default()));
 
-        let schema = tantivy_index.schema();
-        let id_field = schema
-            .get_field("id")
-            .map_err(|_| StoreError::FieldNotFound("id".to_string()))?;
-        // Absent on any index built without it. See `SchemaFields::seq`.
-        let seq_field = schema.get_field("_seq").ok();
-
-        // Build indexed fields map
-        let mut indexed_fields = HashMap::new();
-        for (field, field_entry) in schema.fields() {
-            let name = field_entry.name();
-            if name != "id" && name != "_seq" {
-                indexed_fields.insert(name.to_string(), field);
-            }
-        }
+        // The columns as this index built them, read the way every open reads them.
+        let fields = Self::load_fields_from_existing_index(tantivy_index)?;
 
         // Replay commits are checkpoints, not throughput throttles: size them well above the
         // steady-state write threshold so a large WAL produces a handful of big segments
@@ -1257,48 +1244,22 @@ impl HybridStore {
                     let stored_doc: StoredDocOwned = serde_json::from_slice(doc_guard.value())
                         .map_err(|e| StoreError::Serialization(e.to_string()))?;
 
-                    let mut tantivy_doc = tantivy::TantivyDocument::default();
-                    tantivy_doc.add_text(id_field, &id);
-                    if let Some(seq_field) = seq_field {
-                        tantivy_doc.add_u64(seq_field, seq_id);
-                    }
+                    // Built as the write built it; a value its column cannot take is skipped
+                    // rather than refused, because this body is durable already.
+                    let tantivy_doc = fields.document(
+                        &index_schema,
+                        &id,
+                        seq_id,
+                        stored_doc.json_blob.as_ref(),
+                        BadValue::SkipAndWarn,
+                    )?;
 
-                    if let Some(json_obj) =
-                        stored_doc.json_blob.as_ref().and_then(|v| v.as_object())
-                    {
-                        for (field_name, field_def) in &index_schema.fields {
-                            if !field_def.indexed || field_def.is_shadow || field_name == "id" {
-                                continue;
-                            }
-
-                            if let Some(tantivy_field) = indexed_fields.get(field_name)
-                                && let Some(field_value) = json_obj.get(field_name)
-                            {
-                                // By the column, as the write path adds: replaying a value
-                                // under a declaration its column cannot take kills this writer
-                                // exactly as it killed the one being recovered from.
-                                let built = schema
-                                    .get_field_entry(*tantivy_field)
-                                    .field_type()
-                                    .value_type();
-                                add_json_value_to_doc(
-                                    &mut tantivy_doc,
-                                    *tantivy_field,
-                                    field_name,
-                                    &writable_type(&field_def.field_type, built),
-                                    field_value,
-                                    BadValue::SkipAndWarn,
-                                )?;
-                            }
-                        }
-                    }
-
-                    let term = tantivy::Term::from_field_text(id_field, &id);
+                    let term = tantivy::Term::from_field_text(fields.id, &id);
                     writer.delete_term(term);
                     writer.add_document(tantivy_doc)?;
                 }
                 None => {
-                    let term = tantivy::Term::from_field_text(id_field, &id);
+                    let term = tantivy::Term::from_field_text(fields.id, &id);
                     writer.delete_term(term);
                 }
             }
@@ -1343,11 +1304,7 @@ impl HybridStore {
         // or supervisor idle timeout) flushes them; otherwise the no-op guard in commit_index
         // would leave them buffered until unrelated traffic arrives for this index.
         if replayed_since_commit > 0 {
-            self.operations_counter
-                .entry(index.to_string())
-                .or_insert_with(|| AtomicU64::new(0))
-                .value()
-                .fetch_add(replayed_since_commit, Ordering::SeqCst);
+            self.add_operations(index, replayed_since_commit);
         }
 
         tracing::info!(
@@ -2111,14 +2068,13 @@ impl HybridStore {
             .unwrap_or(0)
     }
 
-    /// Increment operation count and return new count
-    pub(crate) fn increment_operations(&self, index: &str) -> u64 {
+    /// Count `operations` toward the index's next commit.
+    pub(crate) fn add_operations(&self, index: &str, operations: u64) {
         self.operations_counter
             .entry(index.to_string())
             .or_insert_with(|| AtomicU64::new(0))
             .value()
-            .fetch_add(1, Ordering::SeqCst)
-            + 1
+            .fetch_add(operations, Ordering::SeqCst);
     }
 
     /// Reset operation counter after commit
@@ -2395,9 +2351,12 @@ impl HybridStore {
         }
     }
 
-    /// Multi-tenant apply_write method
+    /// Apply one write: a batch of one, so a single write and a batch cannot differ in what
+    /// they check, learn or index. Returns the write's sequence.
     pub fn apply_write(&self, index: &str, op: WalOp) -> Result<u64, StoreError> {
-        self.apply_write_attempt(index, op, 1)
+        let (seq_ids, _) = self.apply_batch(index, vec![op])?;
+        // A batch of one reserves exactly one sequence.
+        Ok(seq_ids[0])
     }
 
     /// Lock `writer_arc`, and hand the guard back only if it is still the writer this shard
@@ -2535,285 +2494,6 @@ impl HybridStore {
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .value()
             .clone()
-    }
-
-    fn apply_write_attempt(
-        &self,
-        index: &str,
-        op: WalOp,
-        attempt: usize,
-    ) -> Result<u64, StoreError> {
-        // A delete must not bring an index into existence. `get_or_create_index` below creates
-        // one when it is absent, which is what a put wants and the opposite of what removing a
-        // document that cannot be there wants — an empty index and a Tantivy directory would be
-        // the trace left by deleting nothing. A put is unaffected: it is the caller that
-        // legitimately creates.
-        if matches!(op, WalOp::Delete { .. }) && !self.index_exists(index) {
-            return Err(StoreError::IndexNotFound(index.to_string()));
-        }
-
-        // A put creates the index it names, but not one whose schema has been dropped. The
-        // caller settles a schema before dispatching, replacing the record of the deletion, so
-        // a write that still finds that record raced the drop and has no settled schema to be
-        // indexed under.
-        if self.index_was_dropped(index) {
-            return Err(StoreError::IndexNotFound(index.to_string()));
-        }
-
-        // Get or create the index, and hold its writer for the rest of the write. The init
-        // lock is held from the open through the writer lock — `close_index` takes the same
-        // lock before it detaches anything, so a close can no longer land between the two.
-        // What is left for the live check is a dead writer being retired or a forced removal;
-        // those keep the retry.
-        let init_lock = self.index_init_lock(index);
-        let init_guard = init_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let (writer_arc, fields) = self.get_or_create_index_locked(index)?;
-        let Some(writer) = self.lock_live_writer(index, &writer_arc) else {
-            drop(init_guard);
-            if attempt >= LIVE_WRITER_ATTEMPTS {
-                return Err(StoreError::WriterClosed(index.to_string()));
-            }
-            // Let go of the detached writer before reopening. Tantivy's lockfile is released
-            // when the `IndexWriter` is dropped, which is when its last `Arc` goes; held
-            // through the retry, it made the reopen below fail with `LockBusy` — a write that
-            // lost its race with a close answered 500 instead of reopening the index.
-            drop(writer_arc);
-            return self.apply_write_attempt(index, op, attempt + 1);
-        };
-        drop(init_guard);
-
-        // Get sequence ID for this index
-        let seq_id = {
-            let counter = self.current_seq.get(index).ok_or_else(|| {
-                StoreError::IndexNotFound(format!(
-                    "Sequence counter not found for index: {}",
-                    index
-                ))
-            })?;
-            counter.fetch_add(1, Ordering::SeqCst) + 1
-        };
-
-        // Create dynamic table definitions
-        let data_table_name = format!("data_{}", index);
-        let wal_table_name = format!("wal_{}", index);
-        let data_table_def = TableDefinition::<&str, &[u8]>::new(&data_table_name);
-        let wal_table_def = TableDefinition::<u64, &[u8]>::new(&wal_table_name);
-
-        // The WAL records which document changed, not what it changed to: the `data_<index>`
-        // row written in this same transaction is the document, and recovery reads it there.
-        let wal_data = encode_wal_entry(match &op {
-            WalOp::Put { id, .. } => id,
-            WalOp::Delete { id } => id,
-        });
-
-        match op {
-            WalOp::Put { id, json_blob } => {
-                // Get the schema before the transaction: evolution, shadow filtering and the
-                // Tantivy document all read it, and none of them needs the txn.
-                let schema = if let Some(schema) = self.get_schema_cached(index)? {
-                    schema
-                } else {
-                    tracing::debug!(index = %index, "Loading schema from metadata store");
-                    self.get_schema(index)?
-                        .map(Arc::new)
-                        .unwrap_or_else(|| Arc::new(IndexSchema::default()))
-                };
-
-                // Evolve only when the document carries a field the schema has not seen. Cloning
-                // the whole schema on every write was the hot-path cost this removes; an indexed
-                // field's type is never changed here (see `evolve_field`).
-                let mut evolved_schema = None;
-                // Held from re-reading the schema below until the evolved one is in the cache,
-                // so an admin edit cannot land between this write's read and its write-back.
-                let schema_lock;
-                let mut _schema_guard = None;
-                if let Some(blob) = &json_blob {
-                    let has_new_field = blob.as_object().is_some_and(|obj| {
-                        obj.keys().any(|name| !schema.fields.contains_key(name))
-                    });
-                    if has_new_field {
-                        schema_lock = self.lock_schema(index);
-                        _schema_guard = Some(schema_lock.lock().unwrap_or_else(|p| p.into_inner()));
-                        // Evolve the schema as it stands now, not the snapshot read before the
-                        // lock: an edit that committed in between is part of what gets written.
-                        let current = self
-                            .get_schema_cached(index)?
-                            .unwrap_or(Arc::clone(&schema));
-                        let mut schema_mut = (*current).clone();
-                        let evolved_fields = schema_mut.evolve_from_document(blob);
-                        if !evolved_fields.is_empty() {
-                            tracing::debug!(
-                                index = %index,
-                                evolved_fields = ?evolved_fields,
-                                "Evolved schema with new non-indexed fields (persists in the data transaction)"
-                            );
-                            evolved_schema = Some(schema_mut);
-                        }
-                    }
-                }
-
-                // Build the Tantivy document outside the redb transaction: it needs the schema
-                // and the field handles, not the txn, and doing it here keeps the transaction —
-                // and therefore the time the writer lock and the data row are held — short.
-                let mut tantivy_doc = doc!(fields.id => id.as_str());
-                if let Some(seq_field) = fields.seq {
-                    tantivy_doc.add_u64(seq_field, seq_id);
-                }
-                if let Some(json_obj) = json_blob.as_ref().and_then(|v| v.as_object()) {
-                    for (field_name, field_value) in json_obj {
-                        // O(1) shadow field skip via pre-computed HashSet
-                        if schema.is_shadow_field(field_name) {
-                            continue;
-                        }
-
-                        let field_def = match schema.fields.get(field_name) {
-                            Some(fd) if fd.indexed => fd,
-                            _ => continue,
-                        };
-                        let tantivy_field = match fields.indexed_fields.get(field_name) {
-                            Some(tf) => tf,
-                            None => continue,
-                        };
-
-                        add_json_value_to_doc(
-                            &mut tantivy_doc,
-                            *tantivy_field,
-                            field_name,
-                            &fields.write_type(field_name, &field_def.field_type),
-                            field_value,
-                            BadValue::Refuse,
-                        )?;
-                    }
-                }
-
-                // The stored body, shadow fields stripped. Moved rather than cloned — the clone
-                // on the no-shadow case was the other hot-path cost this removes.
-                let filtered_json_blob = if schema.has_shadow_fields() {
-                    json_blob.map(|blob| filter_shadow_fields_owned(blob, &schema))
-                } else {
-                    json_blob
-                };
-                let doc_bytes = serde_json::to_vec(&StoredDoc {
-                    json_blob: filtered_json_blob.as_ref(),
-                })
-                .map_err(|e| StoreError::Serialization(e.to_string()))?;
-
-                // Serialised out here for the same reason `doc_bytes` is: it walks the field map
-                // and touches no table, so it does not belong inside the transaction.
-                let evolved_schema_bytes = evolved_schema
-                    .as_ref()
-                    .map(serde_json::to_vec)
-                    .transpose()
-                    .map_err(|e| StoreError::Serialization(e.to_string()))?;
-
-                // redb commits the WAL entry, the document row, and any schema the document
-                // evolved, before Tantivy sees any of them. Two invariants come out of that.
-                //
-                // The search index cannot run ahead of the document store: a failed commit can
-                // never leave a document buffered in the writer that redb does not have.
-                //
-                // And a document that introduces a field cannot become durable without the
-                // schema that names it. This used to be two transactions — the data commit, then
-                // `persist_schema_evolution` — with a window between them the code could only
-                // acknowledge, logging `CRITICAL: Schema evolution failed after data commit` and
-                // returning an error that said the data was already saved. A stream teaching an
-                // index its own shape is the workload this engine exists for, so that window sat
-                // on the hot path of the differentiating feature and cost it a second fsync
-                // besides. One transaction removes both: redb makes the pair atomic, so there is
-                // nothing left to reconcile, and a failure now writes nothing at all.
-                let is_new_document = {
-                    let mut write_txn = self.kv.begin_write()?;
-                    let is_new = {
-                        // A schema row is metadata and was always written with `Immediate`;
-                        // folding it in must not quietly downgrade that. An evolving write
-                        // therefore commits durably whatever `wal_sync` says — which is the one
-                        // fsync the separate schema transaction was already paying, now covering
-                        // the document as well rather than in addition to it.
-                        let durability = if self.config.wal_sync || evolved_schema_bytes.is_some() {
-                            Durability::Immediate
-                        } else {
-                            Durability::None
-                        };
-                        write_txn.set_durability(durability)?;
-                        tracing::trace!(index = %index, durability = ?durability, "Data transaction durability set (user data)");
-
-                        let mut wal_table = write_txn.open_table(wal_table_def)?;
-                        wal_table.insert(seq_id, wal_data.as_slice())?;
-
-                        let mut data_table = write_txn.open_table(data_table_def)?;
-                        let is_new = data_table
-                            .insert(id.as_str(), doc_bytes.as_slice())?
-                            .is_none();
-
-                        if let Some(schema_bytes) = &evolved_schema_bytes {
-                            let mut schema_table = write_txn.open_table(TABLE_SCHEMA)?;
-                            schema_table.insert(index, schema_bytes.as_slice())?;
-                        }
-
-                        is_new
-                    };
-                    write_txn.commit()?;
-                    is_new
-                };
-
-                // The schema cache moves only once the row it describes is durable. It used to
-                // be written optimistically before the transaction and again after it, so a
-                // failure anywhere in between left the cache ahead of the store.
-                if let Some(evolved) = evolved_schema {
-                    tracing::debug!(index = %index, "Schema evolution committed with the document");
-                    self.schema_cache
-                        .insert(index.to_string(), Arc::new(evolved));
-                }
-
-                // Tantivy, after redb is durable.
-                if !is_new_document {
-                    let term = tantivy::Term::from_field_text(fields.id, &id);
-                    writer.delete_term(term);
-                }
-                if let Err(died) = writer.add_document(tantivy_doc) {
-                    // The document is durable above, so it is written: reopening the index
-                    // replays it along with everything else the dead writer held.
-                    drop(writer);
-                    self.reopen_after_dead_writer(index, writer_arc, &died)?;
-                    return Ok(seq_id);
-                }
-
-                // Counted before the writer is released, so a commit never sees the document
-                // without the count that makes it commit it.
-                self.increment_operations(index);
-                drop(writer);
-                Ok(seq_id)
-            }
-            WalOp::Delete { id } => {
-                let mut write_txn = self.kv.begin_write()?;
-                {
-                    let durability = if self.config.wal_sync {
-                        Durability::Immediate
-                    } else {
-                        Durability::None
-                    };
-                    write_txn.set_durability(durability)?;
-                    tracing::trace!(index = %index, durability = ?durability, "Data transaction durability set (user data)");
-
-                    let mut wal_table = write_txn.open_table(wal_table_def)?;
-                    wal_table.insert(seq_id, wal_data.as_slice())?;
-
-                    let mut data_table = write_txn.open_table(data_table_def)?;
-                    data_table.remove(id.as_str())?;
-                }
-                write_txn.commit()?;
-
-                // Tantivy delete, after redb committed the removal.
-                let term = tantivy::Term::from_field_text(fields.id, &id);
-                writer.delete_term(term);
-
-                self.increment_operations(index);
-                drop(writer);
-                Ok(seq_id)
-            }
-        }
     }
 
     /// Delete all data for an index using redb's efficient delete_table() function
@@ -3333,22 +3013,27 @@ impl HybridStore {
             "HybridStore: Starting apply_batch"
         );
 
-        // See the guard in `apply_write`. A batch carrying even one put may create the index,
-        // because that put is a caller asking for it; a batch of nothing but deletes may not.
+        // A delete must not bring an index into existence: `get_or_create_index` below creates
+        // one when it is absent, which is what a put wants and the opposite of what removing a
+        // document that cannot be there wants. A batch carrying even one put may create the
+        // index, because that put is a caller asking for it; a batch of nothing but deletes may
+        // not.
         if ops.iter().all(|op| matches!(op, WalOp::Delete { .. })) && !self.index_exists(index) {
             return Err(StoreError::IndexNotFound(index.to_string()));
         }
 
-        // See the second guard in `apply_write`.
+        // Nor may a put recreate an index whose schema has been dropped. The caller settles a
+        // schema before dispatching, replacing the record of the deletion, so a write that
+        // still finds that record raced the drop and has no settled schema to be indexed under.
         if self.index_was_dropped(index) {
             return Err(StoreError::IndexNotFound(index.to_string()));
         }
 
         // Get or create the index, and hold its writer for the rest of the batch — see
         // `lock_live_writer` for what a close landing mid-batch used to do. The init lock is
-        // held from the open through the writer lock, as in `apply_write_attempt`, so a close
-        // cannot land between them; the retry is for a dead writer's retirement and the
-        // last-resort forced removal.
+        // held from the open through the writer lock — `close_index` takes the same lock before
+        // it detaches anything, so a close cannot land between them; the retry is for a dead
+        // writer's retirement and the last-resort forced removal.
         let init_lock = self.index_init_lock(index);
         let init_guard = init_lock
             .lock()
@@ -3368,7 +3053,8 @@ impl HybridStore {
         };
         drop(init_guard);
 
-        // Get schema for shadow field filtering
+        // Read before the transaction: evolution, shadow filtering and the Tantivy documents all
+        // need it, and none of them needs the txn.
         let schema = if let Some(schema) = self.get_schema_cached(index)? {
             schema
         } else {
@@ -3376,6 +3062,65 @@ impl HybridStore {
                 .map(Arc::new)
                 .unwrap_or_else(|| Arc::new(IndexSchema::default()))
         };
+
+        // A put bringing a field the schema has not seen evolves it — learned, not indexed (see
+        // `IndexSchema::evolve_from_document`) — and the evolved schema commits in this batch's
+        // transaction. The server learns a batch's fields before it dispatches, so there this
+        // finds them described; it is what keeps a write reaching the store any other way — a
+        // recreation racing a drop, a caller of this crate — from making a document durable
+        // under a schema that does not name its fields.
+        //
+        // The schema lock is held from the re-read below until the evolved schema is cached, so
+        // an admin edit cannot land between this batch's read and its write-back. Ordering: the
+        // writer is held, then this lock, then the redb write slot — see `lock_schema`.
+        let brings_new_field = ops.iter().any(|op| match op {
+            WalOp::Put {
+                json_blob: Some(blob),
+                ..
+            } => blob
+                .as_object()
+                .is_some_and(|obj| obj.keys().any(|name| !schema.fields.contains_key(name))),
+            _ => false,
+        });
+        let schema_lock = brings_new_field.then(|| self.lock_schema(index));
+        let _schema_guard = schema_lock
+            .as_ref()
+            .map(|lock| lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+        let evolved_schema = if brings_new_field {
+            // Evolve the schema as it stands now, not the snapshot read before the lock: an edit
+            // that committed in between is part of what gets written.
+            let mut evolving = (*self
+                .get_schema_cached(index)?
+                .unwrap_or_else(|| Arc::clone(&schema)))
+            .clone();
+            let mut evolved_fields = Vec::new();
+            for op in &ops {
+                if let WalOp::Put {
+                    json_blob: Some(blob),
+                    ..
+                } = op
+                {
+                    evolved_fields.extend(evolving.evolve_from_document(blob));
+                }
+            }
+            (!evolved_fields.is_empty()).then(|| {
+                tracing::debug!(
+                    index = %index,
+                    evolved_fields = ?evolved_fields,
+                    "Evolved schema with new non-indexed fields (persists in the data transaction)"
+                );
+                evolving
+            })
+        } else {
+            None
+        };
+        // Serialised out here for the same reason the documents are: it walks the field map
+        // and touches no table.
+        let evolved_schema_bytes = evolved_schema
+            .as_ref()
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(|e| StoreError::Serialization(e.to_string()))?;
 
         // Reserve a contiguous block of sequence IDs atomically.
         // fetch_add returns the previous value; +1 gives the first usable seq.
@@ -3444,40 +3189,13 @@ impl HybridStore {
                     })
                     .map_err(|e| StoreError::Serialization(e.to_string()))?;
 
-                    // Build the Tantivy document with ONLY indexed fields: a single-pass JSON
-                    // traversal that skips shadows and extracts the fields the schema indexes.
-                    let mut tantivy_doc = doc!(fields.id => id.as_str());
-                    if let Some(seq_field) = fields.seq {
-                        tantivy_doc.add_u64(seq_field, seq_id);
-                    }
-                    if let Some(json_obj) = filtered_json_blob.as_ref().and_then(|v| v.as_object())
-                    {
-                        for (field_name, field_value) in json_obj {
-                            // O(1) shadow field skip via pre-computed HashSet
-                            if has_shadow_fields && schema.is_shadow_field(field_name) {
-                                continue;
-                            }
-
-                            // Look up schema field def + Tantivy field in one go
-                            let field_def = match schema.fields.get(field_name) {
-                                Some(fd) if fd.indexed => fd,
-                                _ => continue,
-                            };
-                            let tantivy_field = match fields.indexed_fields.get(field_name) {
-                                Some(tf) => tf,
-                                None => continue,
-                            };
-
-                            add_json_value_to_doc(
-                                &mut tantivy_doc,
-                                *tantivy_field,
-                                field_name,
-                                &fields.write_type(field_name, &field_def.field_type),
-                                field_value,
-                                BadValue::Refuse,
-                            )?;
-                        }
-                    }
+                    let tantivy_doc = fields.document(
+                        &schema,
+                        &id,
+                        seq_id,
+                        filtered_json_blob.as_ref(),
+                        BadValue::Refuse,
+                    )?;
 
                     prepared_ops.push(PreparedOp {
                         wal_bytes,
@@ -3561,14 +3279,25 @@ impl HybridStore {
         let mut seq_ids = Vec::with_capacity(ops_len);
 
         {
-            // Set durability based on config for bulk operations
-            let durability = if self.config.wal_sync {
+            // A schema row is metadata and is always written with `Immediate`; folding it into
+            // this transaction must not quietly downgrade that. A batch that evolves the schema
+            // therefore commits durably whatever `wal_sync` says.
+            let durability = if self.config.wal_sync || evolved_schema_bytes.is_some() {
                 Durability::Immediate
             } else {
                 Durability::None
             };
             write_txn.set_durability(durability)?;
-            tracing::trace!(index = %index, batch_size = batch_size, durability = ?durability, "Bulk data transaction durability set (user data)");
+            tracing::trace!(index = %index, batch_size = batch_size, durability = ?durability, "Data transaction durability set (user data)");
+
+            // redb commits the WAL entries, the document rows and any schema the batch evolved
+            // together, before Tantivy sees any of them: the search index cannot run ahead of
+            // the store, and a document that introduces a field cannot become durable without
+            // the schema that names it.
+            if let Some(schema_bytes) = &evolved_schema_bytes {
+                let mut schema_table = write_txn.open_table(TABLE_SCHEMA)?;
+                schema_table.insert(index, schema_bytes.as_slice())?;
+            }
 
             let mut wal_table = write_txn.open_table(wal_table_def)?;
             let mut data_table = write_txn.open_table(data_table_def)?;
@@ -3628,6 +3357,12 @@ impl HybridStore {
 
         write_txn.commit()?;
 
+        // The schema cache moves only once the row it describes is durable.
+        if let Some(evolved) = evolved_schema {
+            self.schema_cache
+                .insert(index.to_string(), Arc::new(evolved));
+        }
+
         // Apply the final Tantivy operation per id, in the order redb committed: the prior
         // version removed where there was one, then the batch's last put or delete for that id.
         //
@@ -3683,14 +3418,9 @@ impl HybridStore {
                 return Ok((seq_ids, new_documents_count));
             }
 
-            // Increment operations counter by batch size for threshold tracking.
-            // The actual commit decision is made by apply_batch_and_maybe_commit()
-            // which calls maybe_commit_writer() after this function returns.
-            self.operations_counter
-                .entry(index.to_string())
-                .or_insert_with(|| AtomicU64::new(0))
-                .value()
-                .fetch_add(batch_size, Ordering::SeqCst);
+            // Counted before the writer is released, so a commit never sees the documents
+            // without the count that makes it commit them.
+            self.add_operations(index, batch_size);
 
             tracing::debug!(
                 index = %index,
