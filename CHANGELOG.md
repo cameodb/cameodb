@@ -59,6 +59,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The batch that creates an index types each field by all its values.** An index created by
+  a write was typed from its first 200 documents by a rule that could narrow: `"hello"` then `5`
+  made an indexed `i64`, and the first document was refused — which one depended on the order.
+  The minting batch is now typed whole, each field by the join of every value's type, so no
+  document in it is refused for one before it; the minted schema lists `id` as a declared one
+  does. A shard's own evolution follows the same rules — a field it adds is learned, a declared
+  field keeps its type, the version is left to the cluster — and the narrowing rule is gone.
+- **An index created again after it was dropped no longer looks dropped on some nodes.** A node
+  still holding the dropped index's record answered a peer's canvass with nothing, so the peer
+  minted below the record; the node adopting the new schema moved its version backwards and
+  kept reporting the index as dropped until restarted. Peers now report the record's version and
+  the mint goes above it. Creating an index's tantivy files also adds `id` to the schema as it
+  stands under the schema lock, instead of writing back a snapshot taken before.
+- **A load that fails says how far it got.** A failing batch let the batches in flight finish and
+  counted them, and the error names the rows loaded and refused; a JSON load reports the send
+  that failed rather than the reader stopping behind it; the shell prints an error's cause.
 - **A field added by writes is typed the same on every node, and no longer refuses documents.**
   A field first arriving after an index existed was typed by the first value each node saw and
   never reconciled: one field written through three nodes became `i64`, `f64` and `text` at the

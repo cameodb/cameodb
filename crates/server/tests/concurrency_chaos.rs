@@ -275,7 +275,7 @@ async fn deleting_an_index_under_load_leaves_the_node_serving() {
     let _ = serde_json::to_string(&listing).expect("listing serializes");
     // Answered, or refused with a reason the caller can act on — never a 5xx and never a
     // hang. Success is deliberately not asserted: a write that recreates an index
-    // concurrently with its deletion can miss the enhanced-sampling path that gives a first
+    // concurrently with its deletion can miss the minting path that gives a first
     // write an indexed schema and fall back to `evolve_from_document`, which records
     // discovered fields as *not* indexed. The index then answers no content query until it
     // is reindexed. That is a separate defect from the race this test covers, and about one

@@ -2195,7 +2195,9 @@ mod tests {
         );
     }
 
-    /// A local edit advances the version, whichever path made it.
+    /// A local edit advances the version, whichever path made it — but what a write teaches does
+    /// not: a field one shard or one node learned is agreed, at one new version, by the cluster
+    /// round that follows, and a local bump would let that node's copy outrank the agreed one.
     ///
     /// `version` shipped as dead metadata — set to 1 at construction and never incremented — so
     /// a schema could be edited repeatedly and still call itself version 1. A cluster ordering
@@ -2205,25 +2207,14 @@ mod tests {
         let mut schema = IndexSchema::default();
         let start = schema.version;
 
-        // A field the schema has never seen — the ordinary write-driven evolution.
+        // What a write teaches: a new field, then a wider type for it.
         assert!(schema.evolve_field("discovered".to_string(), &serde_json::json!(7)));
-        let after_discovery = schema.version;
-        assert!(
-            after_discovery > start,
-            "discovering a field left the version at {start}"
+        assert!(schema.evolve_field("discovered".to_string(), &serde_json::json!("seven")));
+        assert_eq!(
+            schema.version, start,
+            "learning is versioned by the cluster"
         );
-
-        // Retyping an existing field. Only a non-indexed one can be retyped inline: an indexed
-        // field's type is pinned to the column the index already built for it.
-        let mut pending = FieldDef::new("pending".into(), TantivyFieldType::Text);
-        pending.indexed = false;
-        schema.fields.insert("pending".into(), pending);
-        assert!(schema.evolve_field("pending".to_string(), &serde_json::json!(7)));
         let after_evolution = schema.version;
-        assert!(
-            after_evolution > after_discovery,
-            "evolving a type left the version at {after_discovery}"
-        );
 
         assert!(schema.add_shadow_field("shadow".into(), TantivyFieldType::Text));
         let after_shadow = schema.version;
@@ -2255,7 +2246,7 @@ mod tests {
             "fields": {
                 "title": {"field_type": "text", "description": "Filing headline"},
                 "year": {"field_type": "i64", "description": "   "},
-                "notes": {"field_type": "text", "indexed": false},
+                "notes": {"field_type": "i64", "indexed": false, "learned": true},
             }
         }))
         .expect("schema with descriptions");
@@ -2286,7 +2277,7 @@ mod tests {
             (schema.description.clone(), named)
         };
         let before = descriptions(&schema);
-        assert!(schema.evolve_field("notes".to_string(), &serde_json::json!(7)));
+        assert!(schema.evolve_field("notes".to_string(), &serde_json::json!("seven")));
         assert_eq!(
             schema.fields["title"].description.as_deref(),
             Some("Filing headline")
@@ -3012,6 +3003,24 @@ mod learned_field_tests {
         assert!(!schema.evolve_field("level".to_string(), &json!(3)));
         assert_eq!(schema.fields["level"].field_type, TantivyFieldType::Text);
         assert!(!schema.fields["level"].indexed);
+    }
+
+    /// A field the storage layer discovers is learned like one the node discovers, and a
+    /// declared field it already holds keeps its type whatever is written to it.
+    #[test]
+    fn storage_evolution_learns_and_leaves_declared_types_alone() {
+        let mut schema = IndexSchema::default();
+        let mut declared = FieldDef::new("note".to_string(), TantivyFieldType::Text);
+        declared.indexed = false;
+        schema.fields.insert("note".to_string(), declared);
+        let version = schema.version;
+
+        assert!(schema.evolve_field("fresh".to_string(), &json!(3)));
+        assert!(schema.fields["fresh"].learned);
+        assert!(!schema.fields["fresh"].indexed);
+        assert!(!schema.evolve_field("note".to_string(), &json!(42)));
+        assert_eq!(schema.fields["note"].field_type, TantivyFieldType::Text);
+        assert_eq!(schema.version, version, "the cluster advances the version");
     }
 
     /// A learned field takes values a declared one refuses, so the two fingerprint apart — and a

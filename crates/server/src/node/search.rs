@@ -681,14 +681,13 @@ pub(super) fn disagreeing_shadow_field(
     schema: &IndexSchema,
     id: &str,
 ) -> Option<String> {
-    if schema.shadow_fields.is_empty() {
+    if !schema.has_shadow_fields() {
         return None;
     }
     let obj = doc.as_object()?;
 
     // Sorted, so a document disagreeing under two names names the same one every time.
-    let mut names: Vec<&String> = schema.shadow_fields.iter().collect();
-    names.sort_unstable();
+    let names = schema.shadow_names();
 
     names.into_iter().find_map(|name| {
         let value = obj.get(name)?;

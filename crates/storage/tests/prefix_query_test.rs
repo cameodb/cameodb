@@ -59,11 +59,10 @@ fn store_with_policy(temp: &TempDir, index: &str, policy: storage::QueryPolicy) 
     fields.insert("title".into(), field(TantivyFieldType::Text));
     fields.insert("tag".into(), field(TantivyFieldType::String));
 
-    let mut schema = IndexSchema {
+    let schema = IndexSchema {
         fields,
         ..Default::default()
     };
-    schema.rebuild_shadow_fields_cache();
     store.store_schema_and_cache(index, &schema).unwrap();
 
     for (id, title, tag) in [

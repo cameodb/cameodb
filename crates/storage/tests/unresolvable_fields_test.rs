@@ -61,11 +61,10 @@ fn store(temp: &TempDir, index: &str) -> HybridStore {
     fields.insert("url".into(), field(TantivyFieldType::Text, true));
     fields.insert("hidden".into(), field(TantivyFieldType::Text, false));
 
-    let mut schema = IndexSchema {
+    let schema = IndexSchema {
         fields,
         ..Default::default()
     };
-    schema.rebuild_shadow_fields_cache();
     store.store_schema_and_cache(index, &schema).unwrap();
 
     for (id, tag) in [("d1", "active"), ("d2", "archived")] {
@@ -160,11 +159,10 @@ fn a_field_is_reported_once_when_both_the_parser_and_the_schema_check_see_it() {
     let mut fields = HashMap::new();
     fields.insert("title".into(), field(TantivyFieldType::Text, true));
     fields.insert("tag".into(), field(TantivyFieldType::String, true));
-    let mut schema = IndexSchema {
+    let schema = IndexSchema {
         fields,
         ..Default::default()
     };
-    schema.rebuild_shadow_fields_cache();
     store.store_schema_and_cache("no_json", &schema).unwrap();
     store
         .apply_write(
@@ -256,11 +254,10 @@ fn a_field_name_containing_a_dot_resolves_unescaped() {
 
     let mut fields = HashMap::new();
     fields.insert("k8s.node".into(), field(TantivyFieldType::Text, true));
-    let mut schema = IndexSchema {
+    let schema = IndexSchema {
         fields,
         ..Default::default()
     };
-    schema.rebuild_shadow_fields_cache();
     store.store_schema_and_cache("dotted", &schema).unwrap();
     store
         .apply_write(

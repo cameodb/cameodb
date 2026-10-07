@@ -50,7 +50,6 @@ fn five_fields() -> IndexSchema {
         ..Default::default()
     };
     schema.normalize_after_deserialization();
-    schema.rebuild_shadow_fields_cache();
     schema
 }
 

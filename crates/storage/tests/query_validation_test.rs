@@ -45,11 +45,10 @@ fn store_with_docs(temp: &TempDir, index: &str) -> HybridStore {
     fields.insert("year".into(), field(TantivyFieldType::I64, true));
     fields.insert("notes".into(), field(TantivyFieldType::Text, false));
 
-    let mut schema = IndexSchema {
+    let schema = IndexSchema {
         fields,
         ..Default::default()
     };
-    schema.rebuild_shadow_fields_cache();
     store.store_schema_and_cache(index, &schema).unwrap();
 
     store
@@ -214,11 +213,10 @@ fn an_index_that_was_never_written_to_cannot_be_validated_against() {
 
     let mut fields = HashMap::new();
     fields.insert("title".into(), field(TantivyFieldType::Text, true));
-    let mut schema = IndexSchema {
+    let schema = IndexSchema {
         fields,
         ..Default::default()
     };
-    schema.rebuild_shadow_fields_cache();
     store.store_schema_and_cache("empty", &schema).unwrap();
 
     assert!(
@@ -243,11 +241,10 @@ fn store_with_shadow(temp: &TempDir, index: &str) -> HybridStore {
     shadow.is_shadow = true;
     fields.insert("sha1".into(), shadow);
 
-    let mut schema = IndexSchema {
+    let schema = IndexSchema {
         fields,
         ..Default::default()
     };
-    schema.rebuild_shadow_fields_cache();
     store.store_schema_and_cache(index, &schema).unwrap();
 
     store

@@ -1350,6 +1350,51 @@ async fn a_declared_tokenizer_must_be_one_the_node_has() {
     assert_eq!(tokenizer("testo"), Some(json!("it_stem")), "{config}");
 }
 
+/// The batch that creates an index types each field by every value it carries, whatever their
+/// order: a field written as text and then as a number is text, and both documents are kept,
+/// searchable. The minted schema lists `id` as a declared one does.
+#[tokio::test]
+async fn a_minting_batch_types_each_field_by_all_its_values() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+    client
+        .bulk_index(
+            "mixed",
+            &[
+                json!({"id": "a", "doc": {"code": "hello", "n": 1}}),
+                json!({"id": "b", "doc": {"code": 5, "n": 2.5}}),
+            ],
+        )
+        .await
+        .expect("bulk");
+
+    let config = get_json(&node, "/api/mixed/_config").await;
+    let field = |name: &str| {
+        config["fields"]
+            .as_array()
+            .and_then(|fields| fields.iter().find(|f| f["name"] == name))
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} in {config}"))
+    };
+    assert_eq!(field("code")["type"], json!("text"), "{config}");
+    assert_eq!(field("code")["indexed"], json!(true), "{config}");
+    assert_eq!(field("n")["type"], json!("f64"), "{config}");
+    assert_eq!(field("id")["type"], json!("text"), "{config}");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let hits = loop {
+        let hits = client
+            .search("mixed", "code:hello OR code:5", Some(10), None, None, None)
+            .await
+            .expect("search");
+        if hits["total_hits"] == json!(2) || Instant::now() > deadline {
+            break hits;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(hits["total_hits"], json!(2), "both documents kept: {hits}");
+}
+
 /// A declaration replaces the one before it: a field it leaves out is gone, not brought back
 /// from the schema the node held.
 #[tokio::test]

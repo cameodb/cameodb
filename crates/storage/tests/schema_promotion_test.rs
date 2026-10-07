@@ -49,11 +49,10 @@ fn store_with_a_discovered_field(temp: &TempDir, index: &str) -> HybridStore {
     let mut fields = HashMap::new();
     fields.insert("title".to_string(), indexed_text("title"));
 
-    let mut schema = IndexSchema {
+    let schema = IndexSchema {
         fields,
         ..Default::default()
     };
-    schema.rebuild_shadow_fields_cache();
     store.store_schema_and_cache(index, &schema).unwrap();
 
     store
@@ -203,11 +202,10 @@ fn promotion_is_allowed_while_the_index_is_still_unmaterialised() {
     author.indexed = false;
     fields.insert("author".to_string(), author);
 
-    let mut schema = IndexSchema {
+    let schema = IndexSchema {
         fields,
         ..Default::default()
     };
-    schema.rebuild_shadow_fields_cache();
     store.store_schema_and_cache("docs", &schema).unwrap();
 
     let updates = BTreeMap::from([("author".to_string(), true)]);
@@ -392,11 +390,10 @@ fn an_unbuilt_index_reports_nothing_searchable() {
 
     let mut fields = HashMap::new();
     fields.insert("title".to_string(), indexed_text("title"));
-    let mut schema = IndexSchema {
+    let schema = IndexSchema {
         fields,
         ..Default::default()
     };
-    schema.rebuild_shadow_fields_cache();
     store.store_schema_and_cache("empty", &schema).unwrap();
 
     assert!(

@@ -1652,7 +1652,6 @@ impl HybridStore {
             // Nothing in tantivy says how ids were made; the stored schema does.
             id_fields: Vec::new(),
             routing_field_name: "id".to_string(),
-            shadow_fields: HashSet::new(),
         }
     }
 
@@ -1792,16 +1791,18 @@ impl HybridStore {
         // IMPORTANT: Only sync schema when we actually created a new index
         // This ensures we don't overwrite persisted schema when index was deleted
         if sync_schema {
-            // Use the original schema as the source of truth
-            // The index_schema contains the complete field definitions including indexed=false fields
-            let mut tantivy_schema = (*index_schema).clone();
-
-            // Ensure 'id' field exists with correct Tantivy-derived attributes
-            // This handles cases where the original schema didn't specify 'id' field
-            tantivy_schema
-                .fields
-                .entry("id".to_string())
-                .or_insert_with(|| {
+            // Only `id` is added, to the schema as it stands now: under the schema lock and read
+            // again, so a schema stored while this index was being built — a cluster change
+            // applied on another thread — is not overwritten by the snapshot taken above.
+            let schema_lock = self.lock_schema(index);
+            let _schema_guard = schema_lock.lock().unwrap_or_else(|p| p.into_inner());
+            let current = self
+                .get_schema_cached(index)?
+                .unwrap_or_else(|| Arc::clone(&index_schema));
+            if !current.fields.contains_key("id") {
+                let mut synced = (*current).clone();
+                synced.fields.insert(
+                    "id".to_string(),
                     FieldDef {
                         name: "id".to_string(),
                         field_type: TantivyFieldType::Text,
@@ -1813,15 +1814,12 @@ impl HybridStore {
                         tokenizer: Some("raw".to_string()),
                         index_record_option: Some("Basic".to_string()),
                         learned: false,
-                    }
-                });
-
-            // IMPORTANT: Cache should reflect merged schema (Tantivy + stored metadata)
-            self.schema_cache
-                .insert(index.to_string(), Arc::new(tantivy_schema.clone()));
-
-            // Persist the merged schema to redb for future reference
-            self.store_schema(index, &tantivy_schema)?;
+                    },
+                );
+                self.store_schema(index, &synced)?;
+                self.schema_cache
+                    .insert(index.to_string(), Arc::new(synced));
+            }
 
             // CRITICAL: Clear reader cache to ensure search sees latest commits
             // This prevents searches from using stale readers that don't see newly written documents
@@ -2670,7 +2668,7 @@ impl HybridStore {
                 if let Some(json_obj) = json_blob.as_ref().and_then(|v| v.as_object()) {
                     for (field_name, field_value) in json_obj {
                         // O(1) shadow field skip via pre-computed HashSet
-                        if schema.shadow_fields.contains(field_name) {
+                        if schema.is_shadow_field(field_name) {
                             continue;
                         }
 
@@ -2984,9 +2982,8 @@ impl HybridStore {
         match read_txn.open_table(TABLE_SCHEMA) {
             Ok(schema_table) => match schema_table.get(index_name)? {
                 Some(value) => {
-                    let mut schema: IndexSchema = serde_json::from_slice(value.value())
+                    let schema: IndexSchema = serde_json::from_slice(value.value())
                         .map_err(|e| StoreError::Serialization(e.to_string()))?;
-                    schema.rebuild_shadow_fields_cache();
                     Ok(Some(schema))
                 }
                 None => Ok(None),
@@ -3662,7 +3659,7 @@ impl HybridStore {
                     {
                         for (field_name, field_value) in json_obj {
                             // O(1) shadow field skip via pre-computed HashSet
-                            if has_shadow_fields && schema.shadow_fields.contains(field_name) {
+                            if has_shadow_fields && schema.is_shadow_field(field_name) {
                                 continue;
                             }
 

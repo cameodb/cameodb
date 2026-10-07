@@ -1240,83 +1240,6 @@ pub(super) fn is_write_operation(op: &ClientOp) -> bool {
 // Enhanced Schema Sampling for Initial Creation
 // ============================================================================
 
-/// Enhanced schema sampling for initial schema creation
-///
-/// This function implements Proposal 2: Improve Sampling Strategy by using multiple documents
-/// to improve type detection accuracy during initial schema creation.
-///
-/// Key Benefits:
-/// - Reduces false positives/negatives in type detection
-/// - Handles edge cases where first document has unusual data
-/// - Provides confidence scoring through majority voting
-/// - Matches client crate behavior for consistency
-///
-/// Algorithm:
-/// 1. Sample up to SCHEMA_SAMPLE_LIMIT documents (200, same as client)
-/// 2. Evolve schema incrementally using storage layer's evolve_from_document
-/// 3. Storage layer handles type compatibility and evolution rules
-/// 4. Mark what came out of it indexed — see [`mark_initial_fields_indexed`]
-///
-/// Usage:
-/// - Only used during initial schema creation (empty schema)
-/// - Existing schema evolution continues to use current logic
-pub(super) fn enhanced_schema_sampling(docs: &[DocPayload], sample_limit: usize) -> IndexSchema {
-    let mut schema = IndexSchema::default();
-    let mut sampled = 0usize;
-
-    // Sample documents for better type detection
-    for doc_payload in docs.iter() {
-        if sampled >= sample_limit {
-            break;
-        }
-
-        // Evolve schema based on this document
-        schema.evolve_from_document(&doc_payload.doc);
-        sampled += 1;
-    }
-
-    // `evolve_from_document` builds fields through `FieldDef::new_non_indexed`, which is the
-    // right default for its usual caller but not here: this schema is about to *create* the
-    // tantivy index, so it is the one moment fields can still be made searchable.
-    mark_initial_fields_indexed(&mut schema);
-
-    tracing::info!(
-        sampled_docs = sampled,
-        total_docs = docs.len(),
-        sample_limit = sample_limit,
-        "Enhanced schema sampling completed for initial schema creation"
-    );
-
-    schema
-}
-
-/// Make every non-shadow field of a not-yet-created index searchable.
-///
-/// The split between creation and evolution is forced by tantivy, not chosen: a tantivy
-/// `Schema` is fixed at `Index::create_in_dir`, and the storage layer builds it from
-/// whatever `IndexSchema` is persisted at that moment. A field marked `indexed` after the
-/// index exists gets no field handle, so the write path skips it and the field is searchable
-/// only by rebuilding the index. Fields discovered *later* are therefore deliberately
-/// non-indexed: they exist to keep the redb and tantivy views of a document consistent.
-///
-/// Fields discovered *now* have no such excuse — this is the last moment they can be indexed
-/// at all, so they are. `stored` stays off for everything but `id`: hits are reconstructed
-/// from redb, and storing field values in tantivy as well would duplicate the corpus.
-///
-/// This is the same rule the bundled client applies before it PUTs a detected schema, which
-/// is why `cameodb data load` produces searchable indexes and a plain HTTP write did not.
-pub(super) fn mark_initial_fields_indexed(schema: &mut IndexSchema) {
-    for (name, field_def) in schema.fields.iter_mut() {
-        // Shadow fields preserve an original field name for query mapping and are never
-        // indexed or stored — leave them exactly as they are.
-        if field_def.is_shadow {
-            continue;
-        }
-        field_def.indexed = true;
-        field_def.stored = name == "id";
-    }
-}
-
 /// Type alias for shard hydration task results
 pub(super) type ShardTaskResult = Result<(Uuid, Option<MicroshardActor>), OrchestratorError>;
 
@@ -1443,7 +1366,11 @@ pub(super) enum PeerSchemaLookup {
     /// A peer holds a schema for this index, and this is the one to adopt.
     Found(Box<IndexSchema>),
     /// Every peer answered and none holds a schema, so this index is genuinely new.
-    NoneHeld,
+    ///
+    /// `dropped_at` is the highest version of a dropped index's record any of them holds, `0`
+    /// when none does. A mint goes above it, so a peer still holding the record adopts the new
+    /// index as newer rather than keeping the record over it.
+    NoneHeld { dropped_at: u64 },
     /// The cluster could not be asked, so nothing can be concluded from the silence.
     Unreachable { reason: String },
     /// No peer holds a schema, and these peers are minting one for the same index right now.
@@ -1492,11 +1419,11 @@ impl SchemaCanvass {
         // the same fact out of `GetStatus`, which meant a mailbox hop on the first write to
         // every new index on a node that has no peers by construction.
         if !self.clustered {
-            return PeerSchemaLookup::NoneHeld;
+            return PeerSchemaLookup::NoneHeld { dropped_at: 0 };
         }
 
         let Some(coordinator) = self.coordinator.as_ref() else {
-            return PeerSchemaLookup::NoneHeld;
+            return PeerSchemaLookup::NoneHeld { dropped_at: 0 };
         };
         let Ok(status): Result<crate::distributed::ClusterStatus, _> =
             coordinator.ask(GetStatus).await
@@ -1530,7 +1457,7 @@ impl SchemaCanvass {
             None => Vec::new(),
         };
         if peers.is_empty() {
-            return PeerSchemaLookup::NoneHeld;
+            return PeerSchemaLookup::NoneHeld { dropped_at: 0 };
         }
 
         let Some(pool) = self.pool.clone() else {
@@ -1576,18 +1503,19 @@ impl SchemaCanvass {
         let mut best: Option<IndexSchema> = None;
         let mut unreachable = Vec::new();
         let mut rivals = Vec::new();
+        let mut dropped_at = 0u64;
         for answer in answers {
             match answer {
                 Err(PeerAnswer::Failed(why)) => unreachable.push(why),
                 Err(PeerAnswer::Minting(node)) => rivals.push(node),
-                Ok(value) => match held_schema(value) {
+                Ok(value) => match held_schema(value.clone()) {
                     Ok(Some(schema)) => {
                         best = Some(match best.take() {
                             None => schema,
                             Some(current) => NodeOrchestrator::preferred_schema(current, schema),
                         });
                     }
-                    Ok(None) => {}
+                    Ok(None) => dropped_at = dropped_at.max(dropped_version(&value)),
                     Err(why) => unreachable.push(why),
                 },
             }
@@ -1606,8 +1534,20 @@ impl SchemaCanvass {
         if !rivals.is_empty() {
             return PeerSchemaLookup::Contested { rivals };
         }
-        PeerSchemaLookup::NoneHeld
+        PeerSchemaLookup::NoneHeld { dropped_at }
     }
+}
+
+/// The version of a dropped index's record a peer answered with, `0` for any other answer.
+pub(super) fn dropped_version(answer: &JsonValue) -> u64 {
+    let dropped = answer.get("state").and_then(JsonValue::as_str) == Some("dropped");
+    if !dropped {
+        return 0;
+    }
+    answer
+        .get("version")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0)
 }
 
 /// One peer's answer to a canvass, when it is not a schema or `null`.
@@ -1638,7 +1578,7 @@ pub(super) async fn find_schema_in_cluster(
     }
     match canvass.peer_schema_for(&index, None).await {
         PeerSchemaLookup::Found(schema) => to_json(&schema),
-        PeerSchemaLookup::NoneHeld => Ok(JsonValue::Null),
+        PeerSchemaLookup::NoneHeld { .. } => Ok(JsonValue::Null),
         // Being created, so not absent — and not yet there to report either.
         PeerSchemaLookup::Contested { rivals } => Err(OrchestratorError::SchemaUnconfirmed {
             index,
@@ -1664,7 +1604,7 @@ pub(super) async fn peer_config_response(
 ) -> Result<JsonValue, OrchestratorError> {
     let schema = match canvass.peer_schema_for(&index, None).await {
         PeerSchemaLookup::Found(schema) => schema,
-        PeerSchemaLookup::NoneHeld => {
+        PeerSchemaLookup::NoneHeld { .. } => {
             return Err(OrchestratorError::Storage(StoreError::IndexNotFound(index)));
         }
         PeerSchemaLookup::Contested { rivals } => {
@@ -3456,6 +3396,8 @@ impl NodeOrchestrator {
         // means "no schema for this index exists anywhere I can see", not merely "none here".
         // A record of a deletion counts as no schema: its fields are gone, so there is nothing
         // to evolve and this write is the one creating the index.
+        // The highest dropped record a canvass found on a peer, which a mint goes above.
+        let mut peer_dropped_at = 0u64;
         let mut is_initial_creation =
             schema_cache.fields.is_empty() || schema_cache.state == storage::SchemaState::Dropped;
 
@@ -3497,8 +3439,9 @@ impl NodeOrchestrator {
                 None => self.peer_schema_for(index).await,
             };
             match lookup {
-                // Nobody holds one, so this index really is new and sampling is the right answer.
-                PeerSchemaLookup::NoneHeld => {}
+                // Nobody holds one, so this index really is new: the batch types it, minted above
+                // any dropped record a peer still keeps.
+                PeerSchemaLookup::NoneHeld { dropped_at } => peer_dropped_at = dropped_at,
                 PeerSchemaLookup::Found(declared) => {
                     // Adopted verbatim, version included: this node is applying a declaration
                     // that already exists, not making a change, so `mark_modified` must not run
@@ -3562,57 +3505,42 @@ impl NodeOrchestrator {
                 let owned = owned_index_count(&self.shards, tenant).await?;
                 self.quotas.check_mint(tenant, owned)?;
             }
-            let sampled_schema = enhanced_schema_sampling(&docs, SCHEMA_SAMPLE_LIMIT);
-            let sampled_field_count = sampled_schema.fields.len();
-
-            // Whatever this settles on describes a live index. Set before the merge so the
-            // schema persisted below never carries a deletion it has just undone.
-            //
-            // Over a dropped index's record this is a new index, not the old one resumed: it
-            // takes a version above the record's — so neither a write still carrying the
-            // dropped schema nor the record itself can be installed over it — and it starts
-            // its own clock.
+            // Whatever this settles on describes a live index. Over a dropped index's record
+            // this is a new index, not the old one resumed: it takes a version above the
+            // record's — so neither a write still carrying the dropped schema nor the record
+            // itself can be installed over it — and it starts its own clock.
             let minted = Arc::make_mut(schema_cache);
-            if minted.state == storage::SchemaState::Dropped {
-                minted.version = minted.version.saturating_add(1);
+            let local_dropped_at = if minted.state == storage::SchemaState::Dropped {
+                minted.version
+            } else {
+                0
+            };
+            let dropped_at = local_dropped_at.max(peer_dropped_at);
+            if dropped_at > 0 {
+                minted.version = dropped_at.saturating_add(1);
                 let now = chrono::Utc::now().timestamp();
                 minted.created_at = now;
                 minted.updated_at = now;
             }
             minted.state = storage::SchemaState::Active;
+            // The key, as a declaration records it, so a minted schema and a declared one
+            // describe `id` alike and a write carrying it finds nothing new to learn.
+            minted
+                .fields
+                .entry("id".to_string())
+                .or_insert_with(|| FieldDef::new("id".to_string(), TantivyFieldType::Text));
 
             // The index's mint is the one moment ownership is decided, so it is the one place
             // the stamp is written. Not refreshed on later writes: whoever created the index
             // owns it, and a stamp that followed the last writer would let a tenant shed their
             // own usage by having another key write once.
             if let Some(tenant) = tenant {
-                Arc::make_mut(schema_cache).tenant = Some(tenant.to_string());
+                minted.tenant = Some(tenant.to_string());
             }
-
-            // Merge sampled schema into cache for better type detection
-            for (field_name, field_def) in &sampled_schema.fields {
-                if !schema_cache.fields.contains_key(field_name) {
-                    Arc::make_mut(schema_cache)
-                        .fields
-                        .insert(field_name.clone(), field_def.clone());
-                }
-            }
-
-            // Persist before the write reaches a shard. Sampling has already put these
-            // fields into `schema_cache`, so validation below finds nothing new and the
-            // evolution stage — which is the only other thing that persists — never runs.
-            // Left in memory, this schema would die here and the storage layer would derive
-            // its own from the document, as non-indexed fields, permanently: the tantivy
-            // schema is fixed when the first write creates the index.
-            if sampled_field_count > 0 {
-                Self::persist_schema_to_stores(index, schema_cache, &self.shards).await?;
-            }
-
-            tracing::info!(
-                index = %index,
-                sampled_fields = sampled_field_count,
-                "Enhanced sampling merged and persisted for initial schema creation"
-            );
+            // Its fields come from the whole batch below: validation reports every field of
+            // every document, and evolution types each by the join of all its values and
+            // persists them indexed before any write reaches a shard — the tantivy schema is
+            // fixed when the first write creates the index.
         }
 
         // Stage 1: Parallel validation (read-only). The batch goes in by value and comes back
@@ -3661,6 +3589,9 @@ impl NodeOrchestrator {
                 is_initial_creation,
             )
             .await?;
+        } else if is_initial_creation {
+            // A mint whose documents carry nothing but their key: the index exists all the same.
+            Self::persist_schema_to_stores(index, schema_cache, &self.shards).await?;
         }
 
         tracing::debug!(
@@ -3744,10 +3675,14 @@ impl NodeOrchestrator {
     ///
     /// Add the fields validation discovered to the schema.
     ///
-    /// `is_initial_creation` decides whether they are searchable, and comes from the caller
-    /// rather than from `schema_cache.fields.is_empty()` — by the time this runs, sampling
-    /// may already have populated the cache. See [`mark_initial_fields_indexed`] for why the
-    /// two cases differ.
+    /// `is_initial_creation` decides whether they are searchable. A tantivy schema is fixed when
+    /// the index is created, so the batch that mints an index is the one chance to give its
+    /// fields columns: they are added indexed (stored only for `id`; hits are rebuilt from
+    /// redb). A field first seen once the index exists has no column to write into, so it is
+    /// added learned and non-indexed, to keep the redb and tantivy views of a document
+    /// consistent until a schema edit promotes it. Either way each field takes the join of every
+    /// value's type ([`TantivyFieldType::widened`]), so no value in the batch is refused for one
+    /// that came before it.
     pub(super) async fn evolve_schema_sequential(
         &self,
         index: &str,
@@ -6211,7 +6146,7 @@ impl NodeOrchestrator {
         //
         // Shards normally agree, and the two paths that create a schema both make sure of it: a
         // schema declared through `PUT /_config` is fanned out by `orch_create_config`, and one
-        // inferred from a bulk load is sampled from up to `SCHEMA_SAMPLE_LIMIT` documents and
+        // inferred from a bulk load is typed from the whole minting batch and
         // persisted to every shard before the first write lands. Uniform input therefore gives
         // every shard the same schema.
         //
@@ -6644,12 +6579,15 @@ impl NodeOrchestrator {
         index: String,
         minting_by: Option<Uuid>,
     ) -> Result<JsonValue, OrchestratorError> {
-        // A dropped index's record is answered as no schema: see `held_schema`, which judges
-        // the same answer on the asking side for peers that still send the record.
-        let held = self
-            .durable_schema(&index)
-            .await?
-            .filter(|schema| schema.state != storage::SchemaState::Dropped);
+        // A dropped index's record is sent as it is, and the asker reads it as no schema (see
+        // `held_schema`) — but learns its version, which a mint has to go above. Minting here
+        // answers first: a record is not a reason to let a second node mint.
+        let durable = self.durable_schema(&index).await?;
+        let dropped = durable
+            .as_ref()
+            .filter(|schema| schema.state == storage::SchemaState::Dropped)
+            .cloned();
+        let held = durable.filter(|schema| schema.state != storage::SchemaState::Dropped);
         match held {
             Some(schema) => serde_json::to_value(&*schema)
                 .map_err(|e| OrchestratorError::Io(std::io::Error::other(e))),
@@ -6672,7 +6610,11 @@ impl NodeOrchestrator {
                     node: self.identity.uuid,
                 })
             }
-            None => Ok(JsonValue::Null),
+            None => match dropped {
+                Some(record) => serde_json::to_value(&*record)
+                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e))),
+                None => Ok(JsonValue::Null),
+            },
         }
     }
 
@@ -7002,14 +6944,20 @@ impl Message<MintAfterCanvass> for NodeOrchestrator {
         // this one message, so no peer can ask in between and hear anything but "minting" or
         // the saved schema.
         let lookup = match lookup {
-            PeerSchemaLookup::NoneHeld | PeerSchemaLookup::Contested { .. } if counted && !held => {
+            PeerSchemaLookup::NoneHeld { .. } | PeerSchemaLookup::Contested { .. }
+                if counted && !held =>
+            {
+                let dropped_at = match &lookup {
+                    PeerSchemaLookup::NoneHeld { dropped_at } => *dropped_at,
+                    _ => 0,
+                };
                 let heard = match &lookup {
                     PeerSchemaLookup::Contested { rivals } => rivals.clone(),
                     _ => Vec::new(),
                 };
                 let asked = self.mint_rivals.get(&minted).cloned().unwrap_or_default();
                 match mint_winner(self.identity.uuid, heard.into_iter().chain(asked)) {
-                    None => PeerSchemaLookup::NoneHeld,
+                    None => PeerSchemaLookup::NoneHeld { dropped_at },
                     Some(winner) => {
                         info!(
                             index = %minted,

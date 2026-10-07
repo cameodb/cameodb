@@ -108,9 +108,6 @@ pub(crate) use search::{
 };
 pub(crate) use shard::{ReadPoolHealth, WriterLiveness};
 
-/// Sample limit for enhanced schema detection during initial creation
-pub(crate) const SCHEMA_SAMPLE_LIMIT: usize = 200;
-
 /// Channel capacity for per-shard dedicated writer threads.
 /// Each MicroshardActor sends StorageCommands through this bounded channel.
 pub(crate) const SHARD_WRITER_CHANNEL_CAPACITY: usize = 1024;

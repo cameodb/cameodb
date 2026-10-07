@@ -417,28 +417,11 @@ impl FieldDef {
         self.fast = fresh.fast;
     }
 
-    /// Create a non-indexed field definition for background schema evolution
-    /// New fields discovered during writes are marked as non-indexed to avoid
-    /// requiring Tantivy schema rebuilds. They can be stored in redb and later
-    /// promoted to indexed fields through explicit schema updates.
+    /// A field a write discovered, typed by its first value: [learned](Self::learned), so later
+    /// values widen it, and non-indexed, since the index's columns were fixed when it was built.
+    /// It can be promoted to indexed through a schema edit.
     pub fn new_non_indexed(name: String, value: &JsonValue) -> Self {
-        let field_type = Self::infer_type_from_value(value);
-        // Only ID field should be stored in Tantivy
-        let stored = name == "id";
-        let fast = Some(Self::fast_by_default(&field_type));
-
-        Self {
-            name,
-            field_type,
-            indexed: false, // Non-indexed by default for background evolution
-            stored,
-            fast,
-            is_shadow: false, // Default: not a shadow field
-            description: None,
-            tokenizer: None,
-            index_record_option: None,
-            learned: false,
-        }
+        Self::new_learned(name, Self::infer_type_from_value(value))
     }
 
     /// Create a shadow field definition for preserving original field names
@@ -519,30 +502,11 @@ impl FieldDef {
             let inferred = Self::infer_type_from_value(item);
             agreed = match agreed {
                 None => Some(inferred),
-                Some(current) => Some(Self::wider_of(current, inferred)?),
+                Some(current) => Some(current.widened(&inferred)),
             };
         }
 
         agreed
-    }
-
-    /// The type that holds both of these, if one does.
-    ///
-    /// The same widening a declared field gets: `4` and `4.5` in one list is a source being
-    /// loose about a number, not a list that cannot be stored as one.
-    pub(crate) fn wider_of(a: TantivyFieldType, b: TantivyFieldType) -> Option<TantivyFieldType> {
-        if a == b {
-            return Some(a);
-        }
-        match (&a, &b) {
-            (TantivyFieldType::String, TantivyFieldType::Text)
-            | (TantivyFieldType::Text, TantivyFieldType::String) => Some(TantivyFieldType::Text),
-            (TantivyFieldType::I64 | TantivyFieldType::U64, TantivyFieldType::F64)
-            | (TantivyFieldType::F64, TantivyFieldType::I64 | TantivyFieldType::U64) => {
-                Some(TantivyFieldType::F64)
-            }
-            _ => None,
-        }
     }
 }
 
@@ -1074,10 +1038,6 @@ pub struct IndexSchema {
     /// that does not say, which is every schema written before this field existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub id_fields: Vec<String>,
-    /// Pre-computed set of shadow field names for O(1) lookup.
-    /// Rebuilt from fields on deserialization via rebuild_shadow_fields_cache().
-    #[serde(skip)]
-    pub shadow_fields: HashSet<String>,
 }
 
 impl Default for IndexSchema {
@@ -1094,7 +1054,6 @@ impl Default for IndexSchema {
             default_fields: None,
             routing_field_name: "id".to_string(),
             id_fields: Vec::new(),
-            shadow_fields: HashSet::new(),
         }
     }
 }
@@ -1181,8 +1140,6 @@ impl IndexSchema {
         // payload made that scan a fallback, so new indices no longer declare the field. A
         // schema loaded from an index that already has it keeps it — it arrives in `fields`
         // from disk and nothing here removes it.
-
-        self.rebuild_shadow_fields_cache();
     }
 
     /// Record that this schema just changed: advance the version and stamp the time.
@@ -1565,20 +1522,23 @@ impl IndexSchema {
         Ok(())
     }
 
-    /// Rebuild shadow_fields cache from fields HashMap.
-    /// Must be called after deserialization (shadow_fields is #[serde(skip)]).
-    pub fn rebuild_shadow_fields_cache(&mut self) {
-        self.shadow_fields = self
-            .fields
-            .iter()
-            .filter(|(_, def)| def.is_shadow)
-            .map(|(name, _)| name.clone())
-            .collect();
+    /// Whether any field is a shadow field. Read from the fields themselves: a set kept beside
+    /// them had to be rebuilt after every deserialization, and a schema adopted from a peer
+    /// skipped that and filtered nothing.
+    pub fn has_shadow_fields(&self) -> bool {
+        self.fields.values().any(|field| field.is_shadow)
     }
 
-    /// Check if there are any shadow fields — zero-cost early exit
-    pub fn has_shadow_fields(&self) -> bool {
-        !self.shadow_fields.is_empty()
+    /// The shadow fields' names, sorted, so anything walking them does so in one order.
+    pub fn shadow_names(&self) -> Vec<&String> {
+        let mut names: Vec<&String> = self
+            .fields
+            .iter()
+            .filter(|(_, field)| field.is_shadow)
+            .map(|(name, _)| name)
+            .collect();
+        names.sort_unstable();
+        names
     }
 
     /// Get the routing field name (defaults to "id")
@@ -1633,19 +1593,14 @@ impl IndexSchema {
             .unwrap_or_else(|| "id".to_string());
     }
 
-    /// Add or evolve a field based on JSON value (schema evolution)
-    /// New fields are added as non-indexed to avoid Tantivy schema rebuilds.
-    /// Existing non-indexed fields can have their types evolved if compatible; an indexed field's
-    /// type is pinned to the column the index built for it and never evolves here.
+    /// Record what a written value says about its field, by the same rules the node's write
+    /// path follows: a field the schema lacks is added [learned](FieldDef::learned) and
+    /// non-indexed; a learned field without a column widens to hold the value
+    /// ([`TantivyFieldType::widened`]); a declared field keeps its type, and an indexed one is
+    /// pinned to the column built for it. The version is left alone. Whether anything changed.
     ///
-    /// **Where the evolution half is actually reached.** Adding a field is what every write
-    /// path uses this for. Evolving one is reached only from initial schema sampling
-    /// (`enhanced_schema_sampling`, which walks up to 200 documents into an empty schema, so
-    /// document 2 can widen what document 1 declared). A write to an *existing* field never
-    /// gets here: `unstorable_value` refuses a value the declared type cannot hold before the
-    /// document is accepted, so by the time a write reaches storage every known field already
-    /// fits and there is nothing to widen. That is also why `apply_write` may skip this call
-    /// entirely when the document carries no unknown field.
+    /// The storage-level net: the node persists what a write teaches before the write reaches a
+    /// shard, so on a node this adds only what that path did not, and agrees with it.
     pub fn evolve_field(&mut self, name: String, value: &JsonValue) -> bool {
         use std::collections::hash_map::Entry;
 
@@ -1687,35 +1642,23 @@ impl IndexSchema {
 
                 // A field a write added has no column and no declared type: it widens to hold
                 // the value, and never narrows — `text` refined to `i64` here would refuse the
-                // text values that made it text.
-                if current_def.learned {
-                    let widened = current_def.field_type.widened(&inferred_type);
-                    if widened == current_def.field_type {
-                        return false;
-                    }
-                    let mut new_def = current_def.clone();
-                    new_def.retype_learned(widened);
-                    entry.insert(new_def);
-                    self.mark_modified();
-                    return true;
+                // text values that made it text. A declared field keeps the type it was given.
+                if !current_def.learned {
+                    return false;
                 }
-
-                // Only evolve if the inferred type is "more specific" or compatible
-                if Self::should_evolve_field_static(current_def, inferred_type.clone()) {
-                    let mut new_def = current_def.clone();
-                    new_def.field_type = inferred_type;
-                    entry.insert(new_def);
-                    true
-                } else {
-                    false
+                let widened = current_def.field_type.widened(&inferred_type);
+                if widened == current_def.field_type {
+                    return false;
                 }
+                let mut new_def = current_def.clone();
+                new_def.retype_learned(widened);
+                entry.insert(new_def);
+                true
             }
         };
 
-        if changed {
-            self.mark_modified();
-        }
-
+        // The version is the cluster's to advance: a field one shard or one node learned is
+        // agreed, at one new version, by the round that follows it.
         changed
     }
 
@@ -1729,7 +1672,6 @@ impl IndexSchema {
         }
 
         let field_def = FieldDef::new_shadow(name.clone(), field_type);
-        self.shadow_fields.insert(name.clone());
         self.fields.insert(name, field_def);
         self.mark_modified();
         true
@@ -1737,44 +1679,9 @@ impl IndexSchema {
 
     /// Check if a field is a shadow field — O(1) via pre-computed set
     pub fn is_shadow_field(&self, field_name: &str) -> bool {
-        self.shadow_fields.contains(field_name)
-    }
-
-    /// Determine if a field should evolve to a new type (static version to avoid borrowing issues)
-    /// Whether a field already in the schema should take a wider type.
-    ///
-    /// Consulted during initial schema sampling and, in principle, by any caller evolving a
-    /// schema from a document — not by a write to a field the schema already knows, which
-    /// `unstorable_value` refuses upstream rather than widening. See [`Self::evolve_field`].
-    pub(crate) fn should_evolve_field_static(
-        current: &FieldDef,
-        new_type: TantivyFieldType,
-    ) -> bool {
-        // Don't evolve if types are the same
-        if current.field_type == new_type {
-            return false;
-        }
-
-        // Evolution rules - only allow certain upgrades
-        match (&current.field_type, new_type) {
-            // Text can be refined to more specific types
-            (TantivyFieldType::Text, TantivyFieldType::Date) => true,
-            (TantivyFieldType::Text, TantivyFieldType::Ip) => true,
-            (TantivyFieldType::Text, TantivyFieldType::I64) => true,
-            (TantivyFieldType::Text, TantivyFieldType::U64) => true,
-            (TantivyFieldType::Text, TantivyFieldType::F64) => true,
-            (TantivyFieldType::Text, TantivyFieldType::Boolean) => true,
-            (TantivyFieldType::Text, TantivyFieldType::Json) => true,
-
-            // Numeric types can be upgraded to more general types
-            (TantivyFieldType::I64, TantivyFieldType::F64) => true,
-            (TantivyFieldType::U64, TantivyFieldType::F64) => true,
-
-            // String can be upgraded to Text (for tokenization)
-            (TantivyFieldType::String, TantivyFieldType::Text) => true,
-
-            _ => false, // Prevent downgrades or incompatible changes
-        }
+        self.fields
+            .get(field_name)
+            .is_some_and(|field| field.is_shadow)
     }
 
     /// Evolve schema based on a JSON document
@@ -1930,10 +1837,9 @@ pub(crate) struct StoredDocOwned {
 /// same as another's.
 pub fn document_key_field(schema: &IndexSchema) -> String {
     schema
-        .shadow_fields
-        .iter()
-        .min()
-        .cloned()
+        .shadow_names()
+        .first()
+        .map(|name| name.to_string())
         .unwrap_or_else(|| "id".to_string())
 }
 
@@ -1960,7 +1866,7 @@ pub(crate) fn reconstruct_shadow_fields_owned(
     };
 
     // CASE 1: No Shadow Fields -> Strict ID Ordering
-    if schema.shadow_fields.is_empty() {
+    if !schema.has_shadow_fields() {
         // Fast Path: Check if 'id' is already first (O(1) check)
         if let Some(first_key) = obj.keys().next()
             && first_key == "id"
@@ -1986,8 +1892,7 @@ pub(crate) fn reconstruct_shadow_fields_owned(
         .unwrap_or_else(|| serde_json::Value::String(doc_id.to_string()));
 
     // Sorted, so a hit's field order does not depend on set iteration order.
-    let mut shadow_names: Vec<&String> = schema.shadow_fields.iter().collect();
-    shadow_names.sort_unstable();
+    let shadow_names = schema.shadow_names();
 
     let mut out = JsonMap::with_capacity(obj.len() + shadow_names.len());
     for name in shadow_names {

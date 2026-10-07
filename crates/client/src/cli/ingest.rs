@@ -838,17 +838,40 @@ impl BatchSender {
     /// not take at all stops the load, as it did one batch at a time; the batches still in
     /// flight are dropped with the sender.
     async fn settle_one(&mut self) -> Result<()> {
-        if let Some(joined) = self.in_flight.join_next().await {
-            let (response, lines) =
-                joined.map_err(|e| anyhow!("Sending a batch failed: {e}"))??;
-            record_ingest_response(
-                &response,
-                &lines,
-                &mut self.total_sent,
-                &mut self.total_failed,
-            );
+        let Some(joined) = self.in_flight.join_next().await else {
+            return Ok(());
+        };
+        match joined
+            .map_err(|e| anyhow!("Sending a batch failed: {e}"))
+            .and_then(|sent| sent)
+        {
+            Ok((response, lines)) => {
+                self.record(&response, &lines);
+                Ok(())
+            }
+            Err(err) => {
+                // The batches still in flight may already be written: let them finish and count
+                // them, so the totals said with the error are the index's, not a guess.
+                while let Some(joined) = self.in_flight.join_next().await {
+                    if let Ok(Ok((response, lines))) = joined {
+                        self.record(&response, &lines);
+                    }
+                }
+                Err(err.context(format!(
+                    "the load stopped after {} rows were loaded and {} refused",
+                    self.total_sent, self.total_failed
+                )))
+            }
         }
-        Ok(())
+    }
+
+    fn record(&mut self, response: &JsonValue, lines: &SourceLines) {
+        record_ingest_response(
+            response,
+            lines,
+            &mut self.total_sent,
+            &mut self.total_failed,
+        );
     }
 
     /// Wait for every batch in flight.
@@ -2072,10 +2095,11 @@ pub(crate) async fn load_data_from_reader_json_source_single_pass(
     .await;
 
     drop(rx);
-    let ledger = producer
-        .await
-        .map_err(|err| anyhow!("Local JSON batch producer failed: {}", err))??;
+    let produced = producer.await;
+    // A failed send is the cause, and the reader stopping because nobody was listening any more
+    // only its echo, so the send's error is the one reported.
     send_result?;
+    let ledger = produced.map_err(|err| anyhow!("Local JSON batch producer failed: {}", err))??;
     Ok(LoadTotals {
         sent: sender.total_sent,
         failed: sender.total_failed,
