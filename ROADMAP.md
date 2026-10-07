@@ -11,7 +11,8 @@ C3–C6, CH8–CH12 and OB3–OB9 — and a re-read on the same day is recorded 
 [Reconciliation](#reconciliation-2026-09-01). The 2026-09-08 review of the 0.3.3 and 0.3.4
 changesets is filed as its own activity group under
 [L. Post-0.3.4 review](#l-post-034-review--preparing-the-next-cycle--planned), held until the
-release has settled.
+release has settled. The 2026-10-07 whole-code review, taken at the 0.3.6 cut, is filed as
+[N. Pre-0.3.6 whole-code review](#n-pre-036-whole-code-review--planned).
 
 ## How to read this file
 
@@ -53,6 +54,7 @@ on one.
 | Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8–CH12 done, CH2's server half absorbed by the split, CH2's storage half closed out by L12 |
 | L — Post-0.3.4 review: the refactor cycle | ✅ Done | All twenty closed — four defects, six security remainder items, three decompositions, six simplifications, and the retrospective (L20, run 2026-09-19) |
 | M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed; M1, M2, M3, M4, M5 and M7 done — the blocker is cleared, the surface is metered, and tenants are bounded and isolated per index. No feature build remains; M8 closed with the prefix floor and default-field cap, the clause cap deferred. M6 done: the open-loop arms show goodput degrading rather than collapsing on the bulk, single-write and read lanes, after fixing the two defects its arms found — [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) and [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput), and its confirmation run on 2026-09-27 found OB22 costs a single node nothing measurable. What is left is the release cut |
+| N — Pre-0.3.6 whole-code review | 📋 Planned | N1–N10 before the 0.3.6 cut: a `HEAD` authorization gap, batched writes that never learn a field, a peer's 400 answered as 503, node identity replaced silently, query rewrites by substring, three client errors, the first shard's memory budget, streaming broadcast, a storage shutdown race, flattened storage errors. N11–N17 after it: one way to reach a peer, dead surface, `run_change`, typed boundaries, single owners, the orchestrator split |
 
 ## Reconciliation, 2026-08-26
 
@@ -189,6 +191,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [K3](#k3--the-surface) | The surface: a `metrics` block, the SDK, and the MCP reference | 19 | 2026-08-27 | 📋 |
 | [L1](#l1--size-cache-invalidation-by-substring-evicts-neighbouring-indexes) … [L20](#l20--the-retrospective-and-the-sequence-into-the-next-cycle) | Post-0.3.4 review group — all twenty closed; the retrospective's output is [M](#m-the-035-goal-set--multi-tenant-exposure--planned) | — | 2026-09-19 | ✅ |
 | [M0](#m0--the-architecture-review-and-the-order-of-work) … [M8](#m8--re-decide-the-query-complexity-caps) | The 0.3.5 goal set — a node exposed on the internet serving several tenants from one process; M0 closed, the M1 blocker cleared, and M2–M8 done; M6's open-loop arms found and fixed [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) and [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput), and were confirmed on the cut binary 2026-09-27. The release cut remains | — | 2026-09-27 | ◐ |
+| [N1](#n1--head-requests-skip-authorization) … [N17](#n17--smaller-items-filed-so-they-are-not-lost) | Pre-0.3.6 whole-code review — ten defects (N1–N10) to close before the cut, then the duplication and structure behind them: one way to reach a peer, dead surface, `run_change`, typed boundaries, single owners, the `orchestrator.rs` split | — | 2026-10-07 | 📋 |
 
 ---
 
@@ -5543,6 +5546,472 @@ valid (M0-i); `node/` exports the ~18 names it is used for rather than 144 (M0 s
 `get_bulk_operation_budget` is either wired to the bulk path or deleted with its test, and not
 both documented and dead (M0-h); and `scripts/validate/all.sh` runs clean at the cut, with
 `cargo-audit` and `cargo-deny` installed and no `skip` line in its output.
+
+## N. Pre-0.3.6 whole-code review 📋 Planned
+
+Reviewed 2026-10-07, at `ee3db6d`, on the question *what is interconnected, and what in it is
+not idiomatic Rust or not a coordinated design*. Five read-only passes ran in parallel — `storage`;
+the server's `node/`; the coordinator, swarm, `main.rs` and config; the request-facing layers
+(`http_server/`, `auth`, `authz`, `audit`, `posture`, `ratelimit`); and `client`, `mcp` and
+`bench` — and the claims that would change behaviour were then re-read by hand. Where an item
+says **checked**, the code was read and the described path exists as written; where it says
+**reported**, it rests on a pass's reading alone and is to be confirmed before it is fixed. Nothing
+was built or run for this review.
+
+**The standard it was measured against, set 2026-10-05:** operations that are *coordinated and
+correlated* — one function per thing the system does, each with a reason to exist — and not code
+added to carry one scenario (a special-case branch, a side channel, a near-copy of a helper, a
+flag threaded through for one caller).
+
+**What the review found, in one paragraph.** Ten defects (seven checked by hand, three
+reported), the worst in behaviour that shipped (a security gap, a schema that depends on write batching, a first-boot memory budget),
+and one pattern behind most of the rest: *one operation written two or more times, the copies
+having drifted*. The single and batch write paths, bulk write and bulk delete, the actor's and
+the engine's `orch_*`/`engine_*` pairs, five ways to sync the shard map, four ways to reach a
+peer, a REPL that re-parses the CLI grammar — each pair is where a defect sits (N2, N3, N6, N8
+are all drift between copies). What is sound: no `unwrap` or `expect` that a request or the
+network can reach, no lock held across an `.await`, key handling (constant-time compare,
+zeroized keys, only key ids logged), `storage::count_drops` as the one primitive under drops,
+the sweep and the reconcile, and a `cluster` and `mcp` crate that are cleanly layered.
+
+**How the crates connect.** `server` depends on `storage`, on `client` (for the CLI) and on `mcp`
+(behind the `McpBackend` and `McpAuthz` traits); `client` depends on `storage` for its schema
+types and date rules; `bench` on `client` alone; `mcp` on no workspace crate. Inside the server,
+`node` and `cluster_coordinator` hold each other's `ActorRef`s, and `schema_change.rs`, which
+lives in the coordinator, mostly calls node code while the node owns the coordinator's
+`SchemaReconciler`. Every HTTP route runs one stack — trace, panic catch, CORS, authz and audit,
+timeout, concurrency, body limits, handler — and then reaches the backend three ways: the
+router's `ClientOp`, the `admin_*` methods, or the coordinator directly (the catalogue routes).
+No crate holds the wire types: the server writes its answers as `JsonValue`, and the router, the
+handlers, the client and `bench` read them back by key name.
+
+**The order, agreed here for the release and after it:**
+
+1. **Before the 0.3.6 cut — N1–N10**, the defects, one commit each (N9 and N10 may share one).
+2. **After the cut, in this order — N11, N12, N13, N14, N15, N16; N17 as each file is next touched.** N12 and N11 first because they
+   delete code and remove the copies N2–N8 grew in; N16 last, because the engine as single owner
+   removes most of what the split would otherwise move.
+
+### N1 — `HEAD` requests skip authorization
+
+**Defect.** 📋 **Planned.** **Checked.** `authz::ROUTES` has no `HEAD` rows, so `classify("HEAD",
+…)` is `None`, and `decide` lets any valid key through on an unclassified path to "a 404 from the
+router" (`authz.rs:169`, `:607`). axum serves `HEAD` with the `get()` handler, so the router
+runs the `GET` handler. A reader key scoped to one index can therefore reach `/_admin/memory`,
+`/_admin/workers` and `/_admin/audit` (the body is stripped, the status and `Content-Length` are
+not), and can probe an index outside its scope with `HEAD /api/{other}/_config` and read the
+200-or-404. That request also skips `validate_index_name`, and its audit record carries no index.
+`HEAD /mcp` reaches the MCP route with no `McpAuthzRef`, which the MCP transport covers with
+`unrestricted()` and a warning on every request (`mcp/src/transport.rs:102`; whether session
+ownership refuses it was not followed through). The guard test
+`every_mounted_route_is_classified` parses `.route(` calls and cannot see the implicit `HEAD`.
+
+**Change.** Fold `HEAD` into `GET` in `classify`, before the match. Test that a reader key is
+refused `HEAD /_admin/memory` with 403, and that `HEAD /api/{index}/_config` answers as the
+`GET` does for the same key. Longer term (N14): one declarative route table — method, path,
+access, handler — replaces the three hand-kept lists (`routes.rs`, `authz::ROUTES`, the startup
+banner) and makes this class of gap impossible.
+
+### N2 — A batched write never learns a new field
+
+**Defect.** 📋 **Planned.** **Checked.** `HybridStore::apply_write` evolves the schema from the
+document (`store.rs:2632`, `evolve_from_document`); `apply_batch` does not. The only call to
+`evolve_from_document` is the single-write path. The server sends one write through `apply_write`
+and two or more coalesced writes through `apply_batch` (`shard.rs:944–963`), and a `_bulk` goes
+through `apply_batch` always. So whether a field a document introduces appears in the schema —
+which `merge_learned`, the thumbprint and the readiness check all depend on — is decided by whether
+the writer thread happened to coalesce it. WAL replay (`store.rs:1260`) builds the Tantivy
+document a third way, rebuilding `indexed_fields` by hand (a copy of
+`load_fields_from_existing_index`, `:1491`) and calling `writable_type` directly.
+
+The two paths copy the existence and dropped-index checks, the init-lock and live-writer retry
+block, the schema load, the sequence reservation, the table definitions, the durability choice
+and the document loop (`:2660–2689` ≈ `:3449–3480`); only `apply_write` evolves, only
+`apply_batch` invalidates the size cache.
+
+**Change.** `apply_write(op)` becomes `apply_batch(vec![op])` and returns its one result;
+evolution moves into the batch's prepare step so a batch evolves once, under the schema lock, and
+persists in its data transaction. One `build_tantivy_doc(fields, schema, id, seq, blob, bad_value)`
+serves both writes and the replay. A test writes the same new field through a single write, a
+two-write batch and a `_bulk`, and asserts one schema.
+
+### N3 — A peer's 400 during a schema change is answered as a 503
+
+**Defect.** 📋 **Planned.** **Checked.** In `run_change`'s prepare loop the arm
+`Err(err @ OrchestratorError::Validation(_))` (`schema_change.rs:321`) can never match for a peer:
+every error a peer sends deserializes to `OrchestratorError::Remote { verdict, .. }`
+(`node/mod.rs:741–765`). A peer refusing a tokenizer an older build cannot build therefore falls
+to the arm below, is counted as "not every node could be asked", and returns 503 — advice to retry
+a change that no retry will make. The comment on the arm describes what it was meant to do.
+
+**Change.** Match on `err.verdict()`: `BadRequest` and `QuotaExceeded` are the caller's answer,
+with the peer's text. A test with a peer that refuses (the cluster suite already has the older-build
+tokenizer case) asserts a 400.
+
+### N4 — Node identity is loaded twice, and a broken file is silently replaced
+
+**Defect.** 📋 **Planned.** **Checked.** `main.rs:375` calls `load_or_generate_keypair` and throws
+the keypair away (`_keypair`); `swarm/mod.rs:406` calls it again. Inside it, a corrupt
+`node_identity.json`, or a keypair that does not decode, makes a new key with a `warn!` and goes
+on (`:631–663`) — and since the node's UUID is derived from the key, the node becomes a different
+node, which is exactly the harm `NodeIdentity::save`'s own doc describes. A failed save only warns
+(`:690`), after which the second call can generate a *different* key from the first.
+
+**Change.** Load once in `main` and pass the `Keypair` into `DistributedCluster`. An unparseable
+file, an undecodable key, or a failed save is a refusal to start, with the path named; only a
+missing file generates. Delete `cluster::NodeIdentity::load_or_create` (`cluster/src/lib.rs:289`),
+which production does not call and which writes non-atomically where `save` does not.
+
+### N5 — The query rewrites find a field name by substring
+
+**Defect.** 📋 **Planned.** **Checked** for the mechanism; the example below is **reported**, not
+run. `normalize_date_ranges`, `_in_sets`, `_comparisons` and `_literals` (`query.rs:57–263`),
+`normalize_facet_query` (`:2072`) and `normalize_prefix_query` (`:1728`) each `find("{field}:")`
+with no token boundary and no awareness of quoted phrases. With a date field `date`, the clause
+`update:2024` contains `date:` and is rewritten; text inside a phrase is rewritten too.
+`field_references` (`:1209`) was written to be the one shared scanner, and only
+`rewrite_shadow_fields` uses it.
+
+**Change.** One pass driven by `field_references` spans — which already know the boundary and
+the quoting — dispatching on the field's type, in place of four passes per date field and one per
+string field. Tests: `update:2024` beside a `date` field, a field name inside a quoted phrase, a
+field name that is the suffix of another.
+
+### N6 — Three client errors that lose or mislabel data
+
+**Defect.** 📋 **Planned.** **Checked** (all three).
+
+- **Dotted headers collapse.** `parse_header_with_hint` (`client/src/cli/ingest.rs:100`) splits at
+  the first `.`, so `geo.lat` and `geo.lon` both become the column `geo`, and the second value
+  overwrites the first. Nothing tests it.
+- **The type aliases have drifted from storage.** `map_type_hint` (`:107`) maps `u64` to `I64`
+  where storage's `U64` is unsigned, and `string` to `Text` where storage's `String` is
+  untokenized; it lacks `unsigned`, `datetime`, `bytes`, `facet` and others storage accepts
+  (`storage/src/schema.rs:186–220`).
+- **The `--recreate` hint cannot appear.** `put_index_config` (`sdk.rs:480`) returns a plain
+  `bail!`, so `failure_status(&err) == Some(409)` in `load_data_from_source`
+  (`ingest.rs:2363`) is never true, though the server answers 409 (`catalogue.rs:159`). Only
+  `search`, `write_document` and `bulk_index` return the typed `HttpFailure`.
+
+**Change.** `impl FromStr for TantivyFieldType` in storage, used by its `Deserialize` and by the
+header hint, and the split taken at the last `.` and only when the suffix is a known type. One
+private `send(RequestBuilder, what) -> Result<Response>` in the SDK that always yields
+`HttpFailure` with `refusal_text` and the hint, so each of the 17 request methods is three lines
+and the 409 reaches the loader.
+
+### N7 — The first shard's memory budget is the whole node's
+
+**Defect.** 📋 **Planned.** **Checked.** On a first boot `main.rs:476` calls `handle_propose_shard`
+once per shard, and each call passes `total_shards = self.shards.len() + 1`
+(`orchestrator.rs:4776`), so shard *k* of *N* is built with `HybridStore::new(cfg, k)`, which
+divides the cache budget by *k* (`storage/src/store.rs:406`): the first shard budgets the node's
+whole cache for itself, the last a *N*th of it. A restart's hydrate passes *N* and gets the
+division right, so a node's memory behaviour differs between its first boot and every later one.
+Hydrate also starts shards beyond `max_shards` and then drops them without a shutdown (`:4604`).
+
+**Change.** One `create_shards(n)` that passes `n` to every shard, sharing a `shard_runtime(total,
+pin)` with hydrate — the construction is written twice today (`:4547–4583`, `:4772–4790`) — and a
+filter against `max_shards` before anything is spawned.
+
+### N8 — A streaming search broadcast returns local hits only
+
+**Defect.** 📋 **Planned.** **Reported**, from reading `router.rs`; to be confirmed with the
+streaming flag off before it is fixed. `handle_broadcast` returns early for `Search`
+(`router.rs:983`), and a broadcast `Stream` falls to `_ => first result` (`:1406`), so with
+`enable_streaming_search = false` the answer is the first node's rows. Beside it are arms that
+cannot run: the Search merge arm marked "Unreachable" (`:1100–1167`), the Write and BulkWrite arm
+(`:1168`, since writes are refused at `:673`), and the `handle_broadcast_request` pass-through
+(`:1650`).
+
+**Change.** Convert `Stream` to `Search` at the router's entry, and delete the `Stream` arms in
+`handle_client_op` and `execute` and the dead arms above.
+
+### N9 — Storage `shutdown` is a fourth commit path, with the race fixed elsewhere
+
+**Defect.** 📋 **Planned.** **Reported.** `HybridStore::shutdown` (`store.rs:584–643`) reads
+`current_seq` before it locks the writer — the order `commit_locked_writer`'s doc (`:2211`)
+describes as the bug it fixed — and its comment at `:588` says the opposite. It iterates
+`self.writers` while spinning up to five seconds on a `try_lock`, holding a map shard guard while
+it waits on a mutex, which is the shape OB14 deadlocked on. It clears a different subset of the
+per-index maps than `drop_index_caches` does.
+
+**Change.** Collect the `Arc`s first, then lock with the timeout and call `commit_locked_writer`
+and `checkpoint_after_commit` as `close_index` does; N15 removes the "different subset" by
+making the per-index state one thing.
+
+### N10 — Storage errors are flattened, and lose their HTTP status
+
+**Defect.** 📋 **Planned.** **Reported.** `OrchestratorError::Storage(#[from] StoreError)` has
+verdicts — `IndexNotFound` is 404, a closed or panicked writer 503, `InvalidIndexName` and
+`InvalidFieldValue` 400 — and these paths turn the error into `Io`, which is always 500:
+`schema_from_store` (`orchestrator.rs:1017`, on every `load_schema`), `persist_schema_to_stores`
+(`:3833`), `orch_apply_schema` (`:6145`). The writer thread rewrites every failure as
+`StoreError::Serialization` (`shard.rs:870`, `:989`, `:1058`), so a 400-class
+`InvalidFieldValue` reaches every caller of a coalesced batch as an internal error. "Not
+sortable" travels as `StoreError::Io(InvalidInput)` and is decoded by error kind
+(`search.rs:627`, `node/mod.rs:907`); the schema validators return `Result<(), String>`
+(`schema.rs:1499`, `:1540`, `:1577`, `:1651`) and `IndexNotFound` carries sentences.
+
+**Change.** One `blocking(store, f)` helper (a `JoinError` to `Io`, a `StoreError` to `Storage`
+through `?`); `StoreError` made shareable (`Arc<StoreError>` fanned out from the writer, read
+through by `verdict()`); a `NotSortable { field, reason }` variant; typed validator errors.
+
+### N11 — One way to reach a peer
+
+**Planned.** Peers are reached four ways, with different deadlines and different rules for a lost
+peer. `Reach::ask` goes through `pool.converse` (the remote timeout, the lost-peer short circuit,
+ref invalidation). `SchemaCanvass::peer_schema_for` (`orchestrator.rs:1474`) uses `get_orchestrator`
+with its own 5 s timeout and skips both the lost check and the invalidation. `finish_drop_on`
+(`:1557`) re-implements `Reach::ask`. `delete_index_cluster` (`coordinator.rs:1737`) uses
+`get_orchestrator` with no deadline at all, plus a `RemoteActorRef::lookup` fallback. "Is the
+whole cluster here" is `connected < total || any lost` in `reach_whole_cluster`
+(`schema_change.rs:231`) and `connected < total` in the canvass (`orchestrator.rs:1438`). The
+`SchemaRequired` resend is written in `forward_write` (`:754`) and in `forward_later` (`:5616`);
+the `converse` + lookup + `remote_answer` sequence appears at five sites; and there is
+`remote_answer` for a peer's failure but no `local_answer` for the local one, so the same failed
+`ask` is Io/500 at `router.rs:481`, NotReady/503 at `orchestrator.rs:6775`, and something else at
+`coordinator.rs:1715` and `schema_change.rs:70`.
+
+**Change.** One `PeerReach` in `remote_peer_pool` with `ask`, `ask_all` and `require_whole_cluster`
+— the deadline, the lost-peer rule and the invalidation in one place — used by the canvass, the
+delete, the schema change, the sweep and the forwards, and `RemotePeerPool::ask_orchestrator(node,
+&op, carry)` for the resend. `local_answer()` beside `remote_answer()`. This subsumes
+`peer_addr` in the bulk fan-out, which is fetched through `GetKnownPeers` and only logged.
+
+### N12 — Dead surface, and the comments that no longer match
+
+**Planned.** Code that nothing reaches, and the doc comments that moved off their items.
+
+- **Shards.** `MicroshardActor` derives `Actor` and `RemoteActor` and has five `Message` impls,
+  four registered as `remote_message` (`shard.rs:105`, `:2081–2190`), and is never spawned: shards
+  live in a `HashMap` and are called directly. Dead with it are `RemoteError` and both `From`
+  impls (`node/mod.rs:883–1013`), `WriteReply`, `BatchWriteReply` (its `errors` is always empty),
+  `ShutdownShard` (a handler that duplicates and diverges from `shutdown_all_shards`),
+  `WriteRequest.routing_key` (never read) and its "older peer" `serde(default)` and body-id
+  fallback, and a `HashMap` in `handle_batch_write` that holds one key.
+- **Coordinator.** `RouteShard` (a deprecated stub), `TrackPushFailure`, `ResetPushFailure` and
+  `push_failure_count`, `MarkBootstrapComplete`, `GetClusterSnapshot` and `ClusterSnapshot`
+  (`#[allow(dead_code)]`), the empty loop in `sync_expected_nodes`, `decide_route`'s unused
+  `operation_type`, `existing_shard_ids` computed for one debug line, `CachedCoordinatorRef.cached_at`.
+- **Storage.** No callers: `commit_writer`, `apply_batch_and_maybe_commit`,
+  `reset_operations_counter_to`, `get_index_field_names`, `IndexStats`. Tests only:
+  `apply_write_and_maybe_commit`, `promote_field_to_indexed`, `get_non_indexed_fields`,
+  `set_routing_field`, `pending_wal_entries`, `has_open_writer`, `is_index_open`,
+  `invalidate_schema_cache`, `get_by_key`. `tantivy_ms` and `tantivy_scan_ms` are always 0
+  (`search.rs:1164`) and the server sums them. `SchemaFields` is public only because
+  `get_or_create_index` returns it and both server callers drop the result: add
+  `open_index(&str) -> Result<()>` and make the other `pub(crate)`.
+- **Client.** `sdk.rs:697` `http()` hands out the client that carries the API key — the one thing
+  the separate `source_http` client exists to prevent — and has no caller; `get_index_config` and
+  `base_url` are unused.
+- **Comments.** Doc comments left on the wrong item: `WARMUP_BUDGET` on `LIVE_WRITER_ATTEMPTS`
+  and `delete_index_data` on `document_count` (`store.rs:129`, `:2819`), `handle_panic` on
+  `StreamedBody` (`routes.rs:340`), `worst_status` fused into `degrade_status`
+  (`health.rs:400`), `decide` on a `static` (`authz.rs:532`), `read_key_hash_file` on
+  `write_new_secret_file` (`auth.rs:614`), `publish_lost_peers` (`coordinator.rs:460`). Stale:
+  "Stage C3 still missing" (`auth.rs:20`, per-index overrides are done), "O(1) via pre-computed
+  set" (the set was removed), the `Drop` and `ShutdownReadRuntime` pair on who holds the read
+  runtime (`orchestrator.rs:7133`, `:7181`), a doc linking `forward_op_to_owner`, which no longer
+  exists.
+
+**Change.** Delete, shard methods taking `(index, id, doc)` and `(index, Vec<WalOp>)` directly;
+move each doc comment to its item; confirm each coordinator message has no sender before it goes
+(`grep` for the constructor, not the type).
+
+### N13 — `run_change` is four functions in one
+
+**Planned.** `run_change` is about 400 lines (`schema_change.rs:288–684`), calls `reach.release`
+by hand 13 times, threads `edit: Option<&FieldEdit>` through for one caller, applies the edit
+three times per round (`:414`, `:817`, `:828`), and the other caller reaches `Step::Moved` through
+an `unreachable!` (`:205`). `sweep_schemas` builds a `Reach` of peers only (`:1108`), against
+`Reach`'s own rule that this node comes first, and reaches `SchemaReconciler` through a
+`ClientOp::ReconcileSchema` round trip to the local orchestrator that hands it back to coordinator
+code. Peer schema state is read three ways: `SchemaRecords` with a thumbprint (the sweep),
+`GetRawSchema` decoded to `IndexSchema` (the reconcile), and `GetRawSchema` probed as JSON for
+`"state" == "dropped"` (`dropped_version`, `held_schema`, `orchestrator.rs:1289`, `:1575`).
+
+**Change.** `prepare(reach) -> Round`, with the release on every non-apply exit in one place;
+`decide_declaration` and `decide_edit` separately; `apply(round, schema) -> Step`; `run_edit`
+composes prepare, `decide_edit` and apply, and `Moved` leaves `Step`. Decode drop records once
+(through `records_drop`); give the sweep the `Arc<SchemaReconciler>` directly; one `schema_cluster`
+module that owns the change, the reconciler and the sweep, so the coordinator and the node stop
+holding each other's halves.
+
+### N14 — Typed boundaries: the wire, the errors, the index name
+
+**Planned.** Three places where a type is missing and a key name, a string or a copy stands in.
+
+- **The wire.** `route_and_handle` returns `JsonValue`, and callers read `"acknowledged"`,
+  `"reason"`, `"errors"`, `"items_written"`, `"total_indexes"`, `"name"` or `"index"` by key
+  (`catalogue.rs`, `write.rs:287`, `health.rs:106`, `authz.rs:409`). The field description is a
+  `JsonMap` built at `orchestrator.rs:3966` and read back by hand in five places (client
+  `ingest.rs:1766`, `:589`, `mod.rs:393`, `shell.rs:130`, server `mcp/schema.rs:116`); the ingest
+  reply is built with `json!` three times (`write.rs:528`, `:552`, `:614`) and parsed by hand at
+  `ingest.rs:1850`; `SearchPayload`, `DocPayload`, the health and admin responses are defined on
+  both sides, and a server-side rename already broke `admin workers` once. `mcp` keeps its own
+  `SortSpec`.
+- **The name.** `validate_index_name` lives in `http_server/catalogue.rs:26` and returns the
+  HTTP `AppError`, which `authz.rs` imports, against the direction of dependency; storage enforces
+  a second, looser rule (`store.rs:268`); the MCP tools apply neither.
+- **The schema record.** `index_record_option: Option<String>` takes any string; the `id` field is
+  defined three times (`schema.rs:1200`, `store.rs:1800`, `:1378`); "default", "raw" and
+  "WithFreqsAndPositions" are spelled in five places.
+
+**Change.** A serde-only module or crate without tantivy, used by `server`, `client` and `mcp`,
+holding `FieldDescription`, `IngestReport`, `SearchPayload`, `DocPayload`, `IndexInfo`, `Health`,
+the admin reports and `SortSpec`; the SDK returns typed reports and `search` takes a struct, not
+six positional arguments. `IndexName` in storage, used by the gate, storage and MCP. A serde enum
+for the record option and `FieldDef::document_key()`.
+
+Also here, because they come from the same missing types: the router's four error body shapes
+(`{error, details}`, `{error, message}`, `{error, path}`, the stream's `{status, error}`) and the
+axum extractor rejections that come back as plain text, `Health` status as a `String` where an
+ordered enum would replace `degrade_status` and `worst_status`, and the caller's identity carried
+as two extensions (`Caller` and `Authz`) where one extractor would do.
+
+### N15 — Per-index state, and node state, each with one owner
+
+**Planned.**
+
+- **Storage.** `HybridStore` keeps 13 maps keyed by index name (`store.rs:324–389`).
+  `drop_index_caches` lists them by hand, `shutdown` clears a different subset (it misses
+  `fields_cache`, `warmed_generations`, `warmup_states` and `open_indexes`), and
+  `index_init_locks` and `schema_locks` are never removed, so they grow with every index name ever
+  used — and tenants choose index names. **Change:** one `DashMap<String, IndexState>`.
+- **Node.** The actor owns `shards` and `routing_ring` and republishes clones into the engine's
+  `ArcSwap`s (`publish_engine_state`, `orchestrator.rs:4468`); the engine duplicates eight fields,
+  is `Option` until `spawn_worker_pool`, and falls back to an empty peer pool while the actor's is
+  `None` (`:4235`). That is the root of `orch_write`/`engine_write`, `orch_delete`/`engine_delete`,
+  `orch_search`/`engine_search` (identical bodies), `orch_bulk_*`/`engine_bulk_*`, and the borrowed
+  and owned `WriteCtx`, `BulkCtx` and `OwnedBulkView`. **Change:** `Arc<OrchestratorEngine>` built
+  in `new()` as the single owner; the actor keeps `minting`, `mint_rivals`, `schema_changes` and
+  the pool handles; its fast paths call the engine and take the slow path on `NeedsActor`.
+- **The writer thread.** `spawn_writer_thread` (`shard.rs:707`, 494 lines) has Phase 3 (single
+  writes), Phase 3a (mixed) and Phase 4 (batches), which are one algorithm; Phase 4 slices
+  `seq_ids` unchecked (`:1042`), the panic 3a's `merged_reply_ranges` was written to prevent.
+  **Change:** one `apply_segments(index, Vec<MergedWriteReply>)`.
+- **Bulk.** `apply_bulk_write` (`orchestrator.rs:94–371`) and `apply_bulk_delete` (`:372–591`) are
+  one pipeline written twice — route, one-hop refusal, assignments, peers, fan-out, the accounting
+  assert — and have drifted: delete refuses forwarded items *after* `GetShardAssignments`, write
+  before; the refusal keys differ (`document N:` and `{id}:`); `forward_write` fails when
+  `items_written` is missing, `forward_delete` defaults it to 0. **Change:** `partition_by_owner`
+  and `forward_share`.
+- **Shard map sync.** Five mechanisms: the DHT publish at bootstrap, the stability push
+  (`coordinator.rs:538–583`), `RegisterLocalShards` into `ExchangeShardsWithPeer` into a query
+  and a push and a fallback push (`:806–857`, `:2261–2320`), the `PeerDiscovered` push and pull
+  with a hand-rolled 5× backoff (`:1417–1510`), and the periodic `SyncShardMaps` pull (`:2379`).
+  The pull, added for OB20, makes the pushes redundant. **Change:** keep the pull and a "pull now"
+  trigger; delete the rest and every `RemoteActorRef::lookup` fallback (the pool is always set,
+  `main.rs:458`).
+- **Smaller owners.** The ring is built from shards twice by forging a `NodeIdentity`
+  (`coordinator.rs:222`, `:883`, `orchestrator.rs:5001`): `ConsistentRing::insert(id, &tokens)`;
+  the health rules are written three times: `ClusterState::from_counts`; the "settled" predicate
+  (`!fields.is_empty() && state != Dropped`) has six copies and the "live" filter eight:
+  `IndexSchema::is_settled()` and `is_live()`.
+
+### N16 — The split of `orchestrator.rs`
+
+**Planned**, last in the order, after N15's engine change. `orchestrator.rs` is 7,196 lines and
+its `impl NodeOrchestrator` is one block of about 3,100 lines (`:3250–6385`) mixing lifecycle,
+schema, catalogue and writes, under one section banner. The rule agreed for L11–L13 holds: few
+files, grouped by feature and architectural meaning, no per-function fragmentation. The cut the
+pass proposed, by responsibility:
+
+| Module | Holds | ~Lines |
+|---|---|---|
+| `orchestrator.rs` | the struct, `Answer`, `Message<ClientOp>`, `OnActor`, `run_on_actor`, `handle_client_op`, `UpdateTopology` | 600 |
+| `engine.rs` | `OrchestratorEngine`, `execute`, `engine_*`, `worker_eligible` | 550 |
+| `worker_pool.rs` | outcomes, the job and slot types, the worker loop, spawn, shutdown, publish | 1,150 |
+| `placement.rs` | `CoreLayout`, `ShardPlacement`, `WriterPin` | 250 |
+| `write_path.rs` | `Placed`, the write and bulk contexts, forwarding, `orch_write`, `orch_delete`, `orch_bulk_*`, `forward_later` | 1,700, about 1,000 after N15 |
+| `schema_cache.rs` | `SchemaCache`, `schema_from_*` | 150 |
+| `canvass.rs` | carry and held helpers, `SchemaCanvass`, `find_schema_in_cluster`, the mint race | 900 |
+| `schema_authority.rs` | staged validation and evolution, persist, prepare, apply, rebuild, reservations | 1,100 |
+| `catalog.rs` | `describe_fields`, `schema_response`, get_config, `validate_query`, `list_indexes` | 700 |
+| `lifecycle.rs` | `new`, setters, directories, hydrate, shard creation, registration, shutdown, `Drop` | 1,100 |
+
+The same pass names the functions over 150 lines and where they split: `staged_schema_validation`
+(264 lines, into `resolve_origin()` returning `SchemaOrigin { Existing, Adopted, Mint { dropped_at
+} }`, then validate, then evolve — which also replaces the mutable `is_initial_creation`),
+`handle_broadcast` (483, into `merge_search` and `merge_cluster_indexes`), `list_indexes` (210),
+`spawn_worker_pool` (204), `search_documents` in storage (about 650, into `parse_and_report`,
+`collect`, `resolve_ids`, `fetch_documents`, `post_sort`), `main()` (about 1,000, into
+`build_node`, `start_cluster`, `serve`, `shutdown`), `posture::evaluate` (420, one function per
+rule), `write_stream_handler` (290), `dispatch_interactive_command` and `complete_tokens` in the
+client REPL (which N17 replaces).
+
+### N17 — Smaller items, filed so they are not lost
+
+**Planned.** None of these blocks a release; each is a place the next change will cost more than
+it should, or a defect with a small reach.
+
+- **Shutdown.** The second signal's "force" does nothing: `SHUTDOWN_IN_PROGRESS` is checked only
+  inside the first `select!` (`main.rs:877–924`), so "Press Ctrl+C again to force" is false; the
+  emergency checks between phases cannot fire, since the phase caps sum to 100 s under a 120 s
+  limit; and the post-connect sweep, the periodic sweep, the shard-map timer and
+  `RegisterLocalShards` run as plain `task::spawn` outside the `peer_tasks` cancellation token that
+  `spawn_peer_task` exists for (`coordinator.rs:911`, `:1366`, `:2339`, `:2363`, `:837`).
+  **Change:** a watchdog (second signal or deadline, then `exit`), and leave the cluster before
+  Phase 3.
+- **Persistence.** `persist_snapshot` (`coordinator.rs:414`) is an unordered `spawn_blocking` per
+  call and sets `last_persisted_generation` before success, so an older snapshot can commit after
+  a newer one: one persister task on a `watch`, as topology already does. The shard checksum
+  (`:293`) uses `DefaultHasher`, whose output is not stable across Rust releases, and is compared
+  across nodes, so a mixed-build cluster always sees a difference: use `xxh3`, already a
+  dependency. `GetStatus` mutates state and logs at `info!` on every call (`:1241`).
+- **Swarm.** The event forwarder is a 160-line closure inside `InitSwarm` over an unbounded
+  channel with one `ask` per event (`swarm/mod.rs:597`, `coordinator.rs:998–1160`): extract
+  `forward_swarm_events`, use `tell`, bound or coalesce. The yamux and swarm config are copied in
+  the PSK and non-PSK branches (`:446–492`).
+- **Streaming search** logs the caller's query at `info!` (`search.rs:174`) where the plain search
+  deliberately uses `debug!`, and attaches no `AuditedQuery`, so with `record_query_text` on,
+  streamed queries are missing from the audit trail; the rate check, keyword parse and merge are
+  copied between the two handlers. A request the limiter or quota refused (429, 403) is audited as
+  `outcome: "allowed"` (`authz.rs:778`), against `Outcome`'s own doc. `classify` runs up to three
+  times per request and the same `AuditRecord` is built three times (`authz.rs:737–802`).
+- **Storage.** `gather_index_stats(false)` opens readers through `get_reader` and
+  `admit_open_index`, which can close and evict an index, so a plain `ListIndexes` churns the
+  open-index cap (`search.rs:250`): use `document_count()`; `searchable_fields` and
+  `sortable_fields` open each index from disk on every call (`:1219`, `:1254`): one
+  `built_schema(index)` that prefers the cached reader or writer. `derive_index_schema_from_tantivy`
+  decides String against Text by `is_stored && !is_indexed` (`store.rs:1537`), which never matches
+  the indexed, unstored column the builder makes, so a string field reads back as text — check the
+  tokenizer instead (**reported**). `parse_date_str_to_tantivy` (`schema.rs:781–882`) repeats the
+  clamp, `from_timestamp_secs` and the tuple six times.
+- **Client.** Two complete JSON reading paths — the push chunk parsers (`ingest.rs:1178–1503`)
+  and the serde reader (`:1512–1640`) — where a blocking `Read` over the response stream would
+  serve both and remove about 400 lines. A compressed remote source is downloaded twice, once to
+  sniff it (`:1893`) and again to open it; `detect_schema_from_source` loads a JSON document twice
+  (`:2227`); format sniffing runs `from_utf8` on the 64 KiB prefix, so a cut inside a multibyte
+  character skips the JSONL check and the file is read as one JSON document (**reported**);
+  `SourceAnalysis` allows impossible states (format, `Option<data>`, `Option<delimiter>` vary
+  independently, hence the `expect`s in `load_csv`). A column the existing index lacks is read by
+  `parse_csv_cell`, which turns `007` into the number 7 while the profiler calls it text, and the
+  server then creates an `i64` field (**reported**). The REPL re-parses the CLI grammar and has
+  drifted from it: no `--limit` or `--offset` on its `search`, `-e` only there, a literal `1..=16`
+  against `MAX_PARALLEL`, and `split_whitespace` collapses spacing inside a quoted phrase. **Change:**
+  parse the REPL line with `try_parse_from` on a clap enum that wraps `ClientCommand`, with one
+  `execute(&client, cmd)` for `run_cli` and the REPL.
+- **Config.** `config.rs` is cohesive in scope but 1,800 lines, and `validate_network` mixes HTTP,
+  TLS, CORS and PSK in about 170: split into `config/{model,load,validate,psk}.rs`, as
+  `overrides.rs` already is. The `default_search_limit` clamp in `apply_overrides` (`:1077`) changes
+  a bad value where `max_search_limit = 0` is refused.
+- **Small.** `TantivyFieldType::to_string` returns `&'static str` and shadows `ToString` (rename
+  `as_str`, add `Display`, make it `Copy`); `parse_exact_id_query` returns `(String, bool)` with the
+  bool always `true`; `sort_by_key` reads a directory on every comparison (`store.rs:3911`,
+  `sort_by_cached_key`); `budget - min_budget` can underflow and divide by zero when min equals max
+  (`:2020`); the cluster crate's doc says the node UUID is v4 where production derives v5 from the
+  `PeerId`; `Retry-After` is built in three places; `spawn_worker_pool` uses `expect`; the
+  `forwarded` flag threads through about a dozen functions where a `Hop` enum would say it; the
+  swarm's `connected_peers` counts dials started.
+
+**Exit criteria for the 0.3.6 cut.** N1–N10 each closed with a test that fails before the change
+and passes after it (N1 by a reader key refused `HEAD /_admin/memory`; N2 by one schema from a
+single write, a two-write batch and a `_bulk`; N3 by a 400 from a peer; N4 by a node that refuses
+to start on a corrupt identity file; N7 by the first shard of *N* receiving the same budget as the
+last); `scripts/validate/all.sh` and the 38-check cluster suite green on the cut binary; the
+CHANGELOG entry for each that changes behaviour (N1, N2, N3, N4, N6, N7). N11–N17 are not 0.3.6
+work, and the release is not held for them.
 
 ---
 
