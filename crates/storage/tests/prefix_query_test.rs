@@ -465,3 +465,14 @@ fn the_floor_applies_to_an_unqualified_prefix() {
     );
     assert_eq!(matched(&store, "barefloor", "qu*"), ["d1", "d2"]);
 }
+
+/// A field name inside a phrase is text, not a clause: nothing in it is expanded or noted.
+#[test]
+fn a_field_name_inside_a_phrase_is_not_a_prefix_clause() {
+    let temp = TempDir::new().unwrap();
+    let store = store_with_floor(&temp, "phrase", 5);
+    assert_eq!(
+        notes(&store, "phrase", r#"title:"tag:ab* fox""#),
+        Vec::<String>::new()
+    );
+}

@@ -2474,45 +2474,47 @@ mod tests {
 
     #[test]
     fn test_normalize_date_comparisons() {
+        let mut schema = IndexSchema::default();
+        schema.fields.insert(
+            "created".to_string(),
+            FieldDef::new("created".to_string(), TantivyFieldType::Date),
+        );
         // Single-char operators should normalize the date
         assert_eq!(
-            normalize_date_comparisons("created:>2026-01-14", "created"),
+            normalize_date_query("created:>2026-01-14", &schema),
             "created:>2026-01-14T00:00:00Z"
         );
         assert_eq!(
-            normalize_date_comparisons("created:<2026-01-14", "created"),
+            normalize_date_query("created:<2026-01-14", &schema),
             "created:<2026-01-14T00:00:00Z"
         );
 
         // Compound operators >= and <= must also normalize the date
         assert_eq!(
-            normalize_date_comparisons("created:>=2026-01-14", "created"),
+            normalize_date_query("created:>=2026-01-14", &schema),
             "created:>=2026-01-14T00:00:00Z"
         );
         assert_eq!(
-            normalize_date_comparisons("created:<=2026-01-14", "created"),
+            normalize_date_query("created:<=2026-01-14", &schema),
             "created:<=2026-01-14T00:00:00Z"
         );
 
         // Already RFC3339 should pass through unchanged
         assert_eq!(
-            normalize_date_comparisons("created:>2026-01-14T00:00:00Z", "created"),
+            normalize_date_query("created:>2026-01-14T00:00:00Z", &schema),
             "created:>2026-01-14T00:00:00Z"
         );
         assert_eq!(
-            normalize_date_comparisons("created:>=2026-01-14T00:00:00Z", "created"),
+            normalize_date_query("created:>=2026-01-14T00:00:00Z", &schema),
             "created:>=2026-01-14T00:00:00Z"
         );
 
         // Non-date field should not be touched
-        assert_eq!(
-            normalize_date_comparisons("count:>20", "created"),
-            "count:>20"
-        );
+        assert_eq!(normalize_date_query("count:>20", &schema), "count:>20");
 
         // Mixed query with date comparison and other terms
         assert_eq!(
-            normalize_date_comparisons("created:>=2026-01-14 AND status:active", "created"),
+            normalize_date_query("created:>=2026-01-14 AND status:active", &schema),
             "created:>=2026-01-14T00:00:00Z AND status:active"
         );
     }
