@@ -19,6 +19,8 @@ show the evidence. Nodes come from CLUSTER_NODES, a comma-separated list of base
   searches <seconds> <writers> <index>     searches through every node, each a cluster-wide fan-out
   bulkmints <seconds> <writers>            each bulk write creates its own index, through every node
   samemint <rounds> <writers>              every node writes to one new index at the same moment
+  missing                                  a missing index is a 404 through every node; one just
+                                           written through any node is found through every node
   fault <seconds> <from> <to> <index>      node1's health, searches and writes while a peer is
                                            faulted between <from> and <to>; prints METRIC lines
 """
@@ -386,6 +388,41 @@ def cmd_count(index, count):
     return 0 if ok else 1
 
 
+def cmd_missing():
+    """A search is a 404 only when no node holds the index: never created, or deleted with its
+    schema. One written a moment ago through another node is found, however many nodes have not
+    yet heard of it."""
+    ok = True
+    stamp = int(time.time() * 1000) % 10**9
+    query = {"query": "title:probe", "limit": 1}
+
+    def expect(node, idx, want, what):
+        nonlocal ok
+        for route in ("search", "search/stream"):
+            status, _, body = call("POST", f"{node}/api/{idx}/{route}", query)
+            code = body.get("code") if isinstance(body, dict) else None
+            good = status == want and (want != 404 or code == "index_not_found")
+            ok &= good
+            if not good:
+                print(f"  {node} {route} {what}: {status} {code}   <-- expected {want}")
+
+    for k, writer in enumerate(NODES):
+        idx = f"missing{k}x{stamp}"
+        for node in NODES:
+            expect(node, idx, 404, "before any write")
+        w, _, _ = call("PUT", f"{writer}/api/{idx}/document", {"id": "p", "doc": {"title": "probe"}})
+        ok &= w in (200, 201)
+        for node in NODES:
+            expect(node, idx, 200, f"just written through {writer}")
+        d, _, _ = call("DELETE", f"{writer}/api/{idx}?delete_schema=true")
+        ok &= d == 200
+        for node in NODES:
+            expect(node, idx, 404, "after the delete")
+        print(f"  written through {writer}: write {w}, delete {d}")
+    print("every node agrees on what exists" if ok else "a node answered against what exists")
+    return 0 if ok else 1
+
+
 def cmd_stats():
     """The swarm counters each node keeps, as METRIC lines. Always exits 0."""
     for node in NODES:
@@ -603,6 +640,8 @@ def main():
         return cmd_bulkmints(int(args[0]), int(args[1]))
     if cmd == "samemint":
         return cmd_samemint(int(args[0]), int(args[1]))
+    if cmd == "missing":
+        return cmd_missing()
     if cmd == "fault":
         return cmd_fault(int(args[0]), int(args[1]), int(args[2]), args[3])
     sys.exit(f"unknown subcommand: {cmd}")

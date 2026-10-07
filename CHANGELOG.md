@@ -245,6 +245,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Searching an index that does not exist is a `404`.** `POST /api/{index}/search` and its
+  streamed form answered a name no node held — never created, or deleted with its schema — with
+  `200` and no hits, and stats saying every shard had answered, so a misspelled index read as a
+  query that matched nothing. Both now answer `404` with `"code": "index_not_found"`, as `GET
+  /_config` and `DELETE` already did. On a cluster the answer is a `404` only when every node
+  answered and none holds the index; a node that has not yet heard of a new one is not counted as
+  a failure. Writes still create an index, and an index emptied with its schema kept still exists.
+- **The MCP search tools no longer look an index up after an empty result.** They asked the
+  catalogue whether the index existed whenever a search matched nothing, to tell "no such index"
+  from "no hits". The search says so itself now, so an empty result costs no second lookup.
+- **A refused streamed search answers with its status.** The search ran after the response had
+  started, so every refusal — a missing index, an unsortable field, a busy node — was a `200`
+  whose body was one `_error` line. It runs first now, and a refusal is the same status and body
+  as on `POST /api/{index}/search`.
 - **Declaring the schema an index already has keeps its version.** A `PUT /_config` repeating the
   schema every node holds took the next version anyway, so a loader declaring its schema on every
   run moved the index's version each time with nothing changed. It now writes nothing and answers

@@ -132,6 +132,14 @@ curl -s -X POST http://localhost:9480/api/books/search \
   }'
 ```
 
+> **An index that does not exist is a `404`.** Searching a name no node holds — never created, or
+> deleted with `delete_schema=true` — answers
+> `{"error": "index 'books' does not exist", "details": …, "code": "index_not_found"}`, on this
+> route and on the streamed one. Match on `code`: a path no route serves is also a `404`, without
+> it. An index emptied by a delete that kept its schema still exists and answers an empty result.
+> On a cluster the answer is a `404` only when every node answered and none holds the index, so a
+> name written a moment ago through another node is found rather than refused.
+
 > **Return fields list:** You can ask CameoDB to return only a subset of document fields by either:
 >
 > 1. Supplying an explicit list in the payload: `"fields": ["title", "author", "year"]`
@@ -326,6 +334,10 @@ curl -s -X POST http://localhost:9480/api/books/search/stream \
 ```
 
 **Response:** NDJSON stream (one hit per line). If no `hits` array is present, falls back to a single JSON body.
+
+> **A refusal answers with its status.** The search runs before the response starts, so an index
+> that does not exist is a `404`, a sort the index cannot answer a `400`, a busy node a `503` —
+> the same statuses and bodies as `POST /api/{index}/search` — and a `200` always carries hits.
 
 > **No `offset` here.** A stream carries the whole result as it is produced, so there is no page to
 > skip to, and a non-zero `offset` on this route is refused with `400` rather than ignored — a

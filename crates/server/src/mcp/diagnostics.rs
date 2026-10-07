@@ -22,7 +22,8 @@ use crate::query::parse_query_keywords;
 /// the audit record and the log receive.
 pub(super) fn tool_error(err: OrchestratorError) -> ToolError {
     match err.verdict() {
-        RemoteVerdict::BadRequest | RemoteVerdict::NotFound | RemoteVerdict::QuotaExceeded => {
+        RemoteVerdict::NotFound => ToolError::caller(err.caller_message()),
+        RemoteVerdict::BadRequest | RemoteVerdict::QuotaExceeded => {
             ToolError::caller(err.to_string())
         }
         RemoteVerdict::Unavailable

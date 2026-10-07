@@ -229,8 +229,11 @@ else
     h2status() { curl -s -o /dev/null -w '%{http_version} %{http_code}' -m 30 --http2-prior-knowledge "$@"; }
 
     check_eq "liveness answers over h2c" "2 200" "$(h2status "$BASE/_cluster/health")"
+    # An index that exists: a search of one that does not is a 404, which is not this check.
+    curl -s -o /dev/null -m 30 -X PUT "$BASE/api/h2probe/document" -H "$json" \
+        -d '{"id":"a","doc":{"title":"x"}}'
     check_eq "an API route answers over h2c" "2 200" \
-        "$(h2status -X POST "$BASE/api/probe/search" -H "$json" -d '{"query":"x"}')"
+        "$(h2status -X POST "$BASE/api/h2probe/search" -H "$json" -d '{"query":"x"}')"
 
     # The wire-level body limit is a layer, not a handler, so it should not care which
     # protocol carried the bytes. Asserted rather than assumed, because this is the very

@@ -4046,3 +4046,44 @@ async fn a_store_error_keeps_its_verdict() {
         assert_eq!(carried.verdict(), expected);
     }
 }
+
+/// A node holds no index when it has no schema for it or only the record of its drop; a schema
+/// with fields is an index, however empty of documents.
+#[test]
+fn no_schema_and_a_dropped_one_are_no_index() {
+    use super::search::holds_no_index;
+    assert!(holds_no_index(&IndexSchema::default()));
+
+    let mut held = IndexSchema::default();
+    held.fields.insert(
+        "title".to_string(),
+        FieldDef::new("title".to_string(), TantivyFieldType::Text),
+    );
+    assert!(!holds_no_index(&held));
+
+    held.state = storage::SchemaState::Dropped;
+    assert!(holds_no_index(&held));
+}
+
+/// A broadcast source that holds no such index is told apart from one that failed, whether it
+/// answered here or across the wire — the merge answers 404 only when every source says so,
+/// and counts no failure for a node that has not heard of the index yet.
+#[test]
+fn a_missing_index_is_told_apart_from_a_failure_across_the_wire() {
+    use super::search::holds_no_such_index;
+    let over_the_wire = |err: OrchestratorError| -> OrchestratorError {
+        serde_json::from_value(serde_json::to_value(&err).expect("serialize")).expect("deserialize")
+    };
+
+    let missing = || OrchestratorError::Storage(StoreError::IndexNotFound("docs".to_string()));
+    assert!(holds_no_such_index(&missing()));
+    assert!(holds_no_such_index(&over_the_wire(missing())));
+    assert_eq!(missing().caller_message(), "index 'docs' does not exist");
+
+    let failed = || OrchestratorError::Storage(StoreError::WriterClosed("docs".to_string()));
+    assert!(!holds_no_such_index(&failed()));
+    assert!(!holds_no_such_index(&over_the_wire(failed())));
+    assert!(!holds_no_such_index(&OrchestratorError::PeerUnreachable {
+        message: "gone".to_string()
+    }));
+}

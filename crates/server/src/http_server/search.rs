@@ -122,9 +122,9 @@ pub(super) async fn search_handler(
 ///
 /// Uses `route_and_handle_stream` to obtain a bounded `mpsc::Receiver` that
 /// yields individual NDJSON lines (one per hit, plus a `_footer` metadata line).
-/// The receiver is wrapped into an axum `Body` stream so the HTTP response
-/// starts as soon as the first hit is ready, and each subsequent hit is flushed
-/// incrementally. This avoids buffering the entire result set in memory.
+/// The search runs before the response starts, so a refusal — an index that does not exist
+/// among them — answers with its own status rather than a `200` that carries it. The answer
+/// is then written one line at a time, each flushed as the client reads.
 ///
 /// An `offset` is refused rather than ignored. A stream delivers the whole result as it is
 /// produced, so there is no page to take — and a caller that paged over this route would
@@ -186,10 +186,12 @@ pub(super) async fn search_stream_handler(
         sort: final_sort,
     };
 
-    // Obtain a streaming channel — the search runs in a background task
+    // The search runs here, so a refusal answers with its own status; only the answer streams.
     let rx = state
         .router
-        .route_and_handle_stream(client_op, None, OperationType::Read);
+        .route_and_handle_stream(client_op, None, OperationType::Read)
+        .await
+        .map_err(AppError::from_route)?;
 
     // Wrap the receiver into a Stream that axum can serve as a response body
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -200,8 +202,8 @@ pub(super) async fn search_stream_handler(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/x-ndjson"),
     );
-    // The search runs after this returns, so the request's concurrency permit has to outlive
-    // the handler: see `hold_permit_for_streamed_body`.
+    // The hits are written after this returns, so the request's concurrency permit has to
+    // outlive the handler: see `hold_permit_for_streamed_body`.
     resp.extensions_mut().insert(super::routes::StreamedBody);
     Ok(resp)
 }

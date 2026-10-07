@@ -635,6 +635,16 @@ impl RemoteVerdict {
 }
 
 impl OrchestratorError {
+    /// The error as a caller is shown it: a store's error as the store words it, without the
+    /// `storage error:` this wrapper puts in front for the log. A caller is told which index does
+    /// not exist, not which layer noticed.
+    pub fn caller_message(&self) -> String {
+        match self {
+            Self::Storage(error) => error.to_string(),
+            other => other.to_string(),
+        }
+    }
+
     /// How this error should be answered, wherever it is answered.
     ///
     /// Every judgement is on the error's *type*. Reading the message text is what this replaced,

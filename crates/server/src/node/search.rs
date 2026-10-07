@@ -215,6 +215,15 @@ impl ScatterCtx<'_> {
         let start = std::time::Instant::now();
         let schema = self.schema;
 
+        // An index this node holds no schema for — never created, or dropped — is not one that
+        // matched nothing. Answered empty, a misspelled name read as a query with no hits, and
+        // the stats said every shard had answered.
+        if holds_no_index(schema) {
+            return Err(OrchestratorError::Storage(StoreError::IndexNotFound(
+                index.to_string(),
+            )));
+        }
+
         // The identifier travels under the shadow name on the way out, so the projection is
         // rewritten before it is checked or applied.
         let fields = fields.map(|list| normalize_projection_fields(schema, list));
@@ -1337,6 +1346,18 @@ pub(crate) fn order_hit_blocks(
 /// A `Stream` has no offset to read. It hands the caller the whole result as it is produced, so
 /// there is no page to take, and the HTTP stream route refuses an `offset` rather than accepting
 /// one it would not honour. Its limit is still its own.
+/// No schema, or only the record of a drop: the index does not exist on this node.
+pub(super) fn holds_no_index(schema: &IndexSchema) -> bool {
+    schema.fields.is_empty() || schema.state == storage::SchemaState::Dropped
+}
+
+/// A source of a broadcast search that holds no such index. Not a failure of the search: a
+/// node that has not yet heard of a new index answers this too. The search is a `404` only
+/// when every source says so.
+pub(super) fn holds_no_such_index(err: &OrchestratorError) -> bool {
+    matches!(err.verdict(), RemoteVerdict::NotFound)
+}
+
 pub(super) fn search_window_for(op: &ClientOp, default_limit: usize) -> SearchWindow {
     match op {
         ClientOp::Search { limit, offset, .. } => SearchWindow {

@@ -248,7 +248,7 @@ pub(super) async fn update_schema_handler(
         .await
         .map_err(AppError::from_route)?;
     if found.is_null() {
-        return Err(AppError::not_found(format!(
+        return Err(AppError::index_not_found(format!(
             "index '{}' does not exist",
             index
         )));
@@ -360,7 +360,7 @@ pub(super) async fn delete_index_handler(
     // and the reassurance it was carrying — that the whole cluster was canvassed, not just this
     // node — is already given by this not being a 503.
     if found.is_null() {
-        return Err(AppError::not_found(format!(
+        return Err(AppError::index_not_found(format!(
             "index '{}' does not exist",
             index
         )));
