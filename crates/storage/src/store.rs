@@ -173,6 +173,28 @@ fn lock_writer<'w>(writer: &'w Mutex<IndexWriter>, index: &str) -> MutexGuard<'w
     })
 }
 
+/// [`lock_writer`], waiting at most `timeout`: `None` if the writer stays held that long.
+fn lock_writer_within<'w>(
+    writer: &'w Mutex<IndexWriter>,
+    index: &str,
+    timeout: Duration,
+) -> Option<MutexGuard<'w, IndexWriter>> {
+    let start = Instant::now();
+    loop {
+        match writer.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                tracing::error!(index = %index, "Writer mutex was poisoned, recovering");
+                return Some(poisoned.into_inner());
+            }
+            Err(std::sync::TryLockError::WouldBlock) if start.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        }
+    }
+}
+
 /// `pending_since` holds this while an index has nothing waiting for a commit.
 pub(crate) const NOTHING_PENDING: u64 = 0;
 
@@ -580,65 +602,37 @@ impl HybridStore {
             );
         }
 
-        // Commit only writers with pending operations
-        for entry in self.writers.iter() {
-            let index = entry.key();
-            let writer_arc = entry.value();
-            if indices_with_pending_ops.contains(index) {
-                // Capture the sequence before committing — see commit_index for why the
-                // checkpoint must never claim a sequence allocated after the commit started.
-                let committed_seq = self
-                    .current_seq
-                    .get(index)
-                    .map(|counter| counter.load(Ordering::SeqCst));
+        // The writers to commit, collected before any is locked: waiting on a writer while
+        // iterating the map held one of its shards against every open and close of an index in
+        // it, for as long as the wait lasted.
+        let pending: Vec<(String, Arc<Mutex<IndexWriter>>)> = self
+            .writers
+            .iter()
+            .filter(|entry| indices_with_pending_ops.contains(entry.key()))
+            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+            .collect();
 
-                // Retry with 5s timeout to handle slow writer thread lock release
-                let writer = {
-                    let start = std::time::Instant::now();
-                    let timeout = std::time::Duration::from_secs(5);
-                    loop {
-                        match writer_arc.try_lock() {
-                            Ok(guard) => break Some(guard),
-                            Err(_) if start.elapsed() < timeout => {
-                                std::thread::sleep(std::time::Duration::from_millis(10));
-                            }
-                            Err(_) => {
-                                tracing::error!(index = %index, "Writer lock timeout during shutdown, skipping commit — data may be lost");
-                                break None;
-                            }
-                        }
-                    }
-                };
-                if let Some(mut w) = writer {
-                    tracing::debug!(index = %index, "Committing index during shutdown");
-                    let outcome = match committed_seq {
-                        Some(seq) => commit_writer_at(&mut w, seq).map(|()| 0),
-                        None => w.commit().map_err(StoreError::from),
-                    };
-                    match outcome {
-                        Ok(_) => {
-                            // Release the writer lock before touching redb.
-                            drop(w);
-                            // Checkpoint what we just made durable. Without this the next
-                            // startup sees a stale recovery sequence and replays the entire
-                            // tail of the WAL even though it is all already in Tantivy.
-                            if let Some(seq) = committed_seq
-                                && let Err(e) = self.checkpoint_committed(index, seq)
-                            {
-                                tracing::warn!(
-                                    index = %index,
-                                    error = %e,
-                                    "Failed to checkpoint on shutdown; next startup will replay the WAL tail"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(index = %index, error = %e, "Failed to commit index during shutdown");
-                        }
-                    }
-                }
-            } else {
-                tracing::debug!(index = %index, "No pending operations, skipping commit during shutdown");
+        for (index, writer_arc) in pending {
+            let Some(mut writer) = lock_writer_within(&writer_arc, &index, Duration::from_secs(5))
+            else {
+                tracing::error!(
+                    index = %index,
+                    "Writer lock timeout during shutdown, skipping commit; the WAL still holds \
+                     what it buffered, and the next open replays it"
+                );
+                continue;
+            };
+            // Committed and checkpointed as a close commits it, the sequence read under the lock.
+            let committed = self
+                .commit_locked_writer(&index, &mut writer)
+                .and_then(|seq| self.checkpoint_after_commit(&index, seq));
+            drop(writer);
+            if let Err(e) = committed {
+                tracing::warn!(
+                    index = %index,
+                    error = %e,
+                    "Failed to commit index during shutdown; the next open replays the WAL tail"
+                );
             }
         }
 
