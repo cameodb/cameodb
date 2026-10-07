@@ -167,3 +167,100 @@ fn a_failed_evolving_write_leaves_the_schema_cache_alone() {
         "cache and store must not disagree about whether a field exists"
     );
 }
+
+/// A batch learns what the same documents written one at a time learn, and in its own
+/// transaction. A single write and a batch were two paths, and only the single one evolved the
+/// schema — so whether a field a document brought was named depended on whether the writer
+/// coalesced it with another.
+#[test]
+fn a_batch_learns_what_single_writes_learn() {
+    let dir = TempDir::new().unwrap();
+    let store = open_store(dir.path());
+    let documents = [
+        json!({ "payload": [1], "note": "first", "level": 3 }),
+        json!({ "payload": [2], "note": "second", "level": 2.5, "origin": "lab" }),
+    ];
+    let put = |n: usize| WalOp::Put {
+        id: format!("doc-{n}"),
+        json_blob: Some(documents[n].clone()),
+    };
+
+    for index in ["singles", "batched"] {
+        store
+            .store_schema_and_cache(index, &payload_schema())
+            .expect("store schema");
+    }
+    for n in 0..documents.len() {
+        store.apply_write("singles", put(n)).expect("single write");
+    }
+    store
+        .apply_batch("batched", (0..documents.len()).map(put).collect())
+        .expect("batch");
+
+    let learned = |index: &str| {
+        let stored = store
+            .get_schema(index)
+            .expect("read schema")
+            .expect("schema row must exist");
+        let mut fields: Vec<_> = stored
+            .fields
+            .values()
+            .map(|field| (field.name.clone(), field.field_type.clone(), field.indexed))
+            .collect();
+        fields.sort_by(|a, b| a.0.cmp(&b.0));
+        fields
+    };
+    assert_eq!(learned("batched"), learned("singles"));
+    assert!(
+        learned("batched")
+            .iter()
+            .any(|(name, _, indexed)| name == "origin" && !indexed),
+        "a field only the second document brings is learned, not indexed: {:?}",
+        learned("batched")
+    );
+
+    let cached = store
+        .get_schema_cached("batched")
+        .expect("read cached schema")
+        .expect("cached schema must exist");
+    assert!(
+        cached.fields.contains_key("origin"),
+        "the cache moves with the row once it is durable"
+    );
+}
+
+/// A batch refused for one value writes nothing — the schema it would have evolved included.
+#[test]
+fn a_refused_batch_leaves_the_schema_alone() {
+    let dir = TempDir::new().unwrap();
+    let store = open_store(dir.path());
+    let index = "stream";
+    store
+        .store_schema_and_cache(index, &payload_schema())
+        .expect("store schema");
+
+    store
+        .apply_batch(
+            index,
+            vec![
+                WalOp::Put {
+                    id: "doc-1".to_string(),
+                    json_blob: Some(json!({ "payload": [1], "note": "fine" })),
+                },
+                WalOp::Put {
+                    id: "doc-2".to_string(),
+                    json_blob: Some(json!({ "payload": [999] })),
+                },
+            ],
+        )
+        .expect_err("a value that is not a byte refuses the batch");
+
+    let stored = store.get_schema(index).expect("read").expect("row");
+    let cached = store
+        .get_schema_cached(index)
+        .expect("read")
+        .expect("cached");
+    assert!(!stored.fields.contains_key("note"));
+    assert!(!cached.fields.contains_key("note"));
+    assert!(store.get_by_key(index, "doc-1").expect("read").is_none());
+}

@@ -2032,6 +2032,49 @@ impl SchemaFields {
             })
             .collect()
     }
+
+    /// The Tantivy document for one body: its id, its sequence where the index has that column,
+    /// and every value of an indexed field the index built a column for, added by the column's
+    /// own kind ([`Self::write_type`]). Shadow fields are never indexed.
+    ///
+    /// One builder for the write and for the WAL replay, so a document indexes on recovery
+    /// exactly as it did when it was written. `bad_value` is the one thing they differ in: a
+    /// write refuses a value its column cannot take, a replay skips it — the body is durable
+    /// already, and refusing it would make the index unopenable.
+    pub(crate) fn document(
+        &self,
+        schema: &IndexSchema,
+        id: &str,
+        seq: u64,
+        body: Option<&JsonValue>,
+        bad_value: BadValue,
+    ) -> Result<tantivy::TantivyDocument, StoreError> {
+        let mut document = doc!(self.id => id);
+        if let Some(seq_field) = self.seq {
+            document.add_u64(seq_field, seq);
+        }
+        for (name, value) in body.and_then(JsonValue::as_object).into_iter().flatten() {
+            let Some(declared) = schema
+                .fields
+                .get(name)
+                .filter(|field| field.indexed && !field.is_shadow)
+            else {
+                continue;
+            };
+            let Some(column) = self.indexed_fields.get(name) else {
+                continue;
+            };
+            add_json_value_to_doc(
+                &mut document,
+                *column,
+                name,
+                &self.write_type(name, &declared.field_type),
+                value,
+                bad_value,
+            )?;
+        }
+        Ok(document)
+    }
 }
 
 /// The type to add a value under, given the kind of value its column was built to take.

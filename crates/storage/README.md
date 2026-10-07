@@ -86,7 +86,7 @@ All write operations follow a strict sequence to ensure atomicity across both st
    └─ Durability checkpoint
 
 7. Increment Operations
-   ├─ increment_operations(index) - Track operation count
+   ├─ add_operations(index, n) - Track operation count
    └─ Tantivy commit deferred (see "Commit policy"):
       ├─ Interval: once the oldest uncommitted write has waited commit_interval_ms
       │   (2 s on a node), checked by the writer thread after each drain, after replying
@@ -255,7 +255,7 @@ pub fn apply_write(&self, index: &str, op: WalOp) -> Result<u64, StoreError> {
     write_txn.commit()?;
 
     // Supervised Smart Commits: may or may not commit Tantivy immediately
-    self.increment_operations(index);
+    self.add_operations(index, 1);
     self.maybe_commit_writer(index)?;
 
     Ok(seq_id)

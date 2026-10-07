@@ -65,6 +65,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A batch of writes learns the fields its documents bring, as a single write does.** The
+  server learns them before a write reaches storage, so this mattered only for a write reaching
+  the store another way — a recreation racing a drop — where only a lone write named its new
+  fields. A single write is now a batch of one, and the WAL replay builds documents with the
+  same code as the write.
 - **A `HEAD` request is authorized as the `GET` it runs.** The route table had no `HEAD` rows,
   so any valid key passed the gate, and axum answered with the route's `GET` handler: a reader
   could run `/_admin/*` handlers and tell from the status whether an index outside its scope
