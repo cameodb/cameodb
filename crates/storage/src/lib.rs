@@ -515,6 +515,31 @@ pub enum StoreError {
     InvalidFieldValue { field: String, reason: String },
 }
 
+impl StoreError {
+    /// This error again, for each caller of a write that failed for all of them — a coalesced
+    /// batch answers every caller it merged.
+    ///
+    /// What a caller acts on survives the copy: the variants that decide an answer's status —
+    /// what is missing, what to retry, what was refused and why — are plain data and are copied
+    /// whole. The rest wrap a library error that cannot be copied, and every one of those is a
+    /// fault of the node, so its message is all that was ever going to reach the caller.
+    pub fn duplicate(&self) -> StoreError {
+        match self {
+            StoreError::IndexNotFound(index) => StoreError::IndexNotFound(index.clone()),
+            StoreError::WriterPanicked(index) => StoreError::WriterPanicked(index.clone()),
+            StoreError::WriterClosed(index) => StoreError::WriterClosed(index.clone()),
+            StoreError::InvalidIndexName(name) => StoreError::InvalidIndexName(name.clone()),
+            StoreError::InvalidFieldValue { field, reason } => StoreError::InvalidFieldValue {
+                field: field.clone(),
+                reason: reason.clone(),
+            },
+            StoreError::CorruptIndex(reason) => StoreError::CorruptIndex(reason.clone()),
+            StoreError::FieldNotFound(field) => StoreError::FieldNotFound(field.clone()),
+            other => StoreError::Serialization(other.to_string()),
+        }
+    }
+}
+
 /// Where an index sits in the startup warmup lifecycle.
 ///
 /// Queries are served in every state — a cold index just pays the open-and-fault cost on

@@ -1013,10 +1013,23 @@ pub(super) async fn schema_from_store(
 ) -> Result<Option<Arc<IndexSchema>>, OrchestratorError> {
     let sc = Arc::clone(store);
     let idx = index.to_string();
-    tokio::task::spawn_blocking(move || sc.get_schema_cached(&idx))
+    blocking(move || sc.get_schema_cached(&idx)).await
+}
+
+/// Run a store call on the blocking pool, its error kept as the store's
+/// ([`OrchestratorError::Storage`]) so the answer keeps its verdict: an index that is not there
+/// is a 404, a writer closed under a write a 503, a refused value a 400. Turned into an I/O error,
+/// as most of these calls once were, every one of them was a 500. Only a task that could not run
+/// to its end is an I/O error.
+pub(super) async fn blocking<T, F>(call: F) -> Result<T, OrchestratorError>
+where
+    F: FnOnce() -> Result<T, StoreError> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(call)
         .await
-        .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-        .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))
+        .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?
+        .map_err(OrchestratorError::Storage)
 }
 
 /// What the write gate settled. `Routed` carries what dispatch needs; `Grow` means the schema
@@ -3799,33 +3812,13 @@ impl NodeOrchestrator {
         }
 
         let index_name = index.to_string();
-        let handles: Vec<_> = stores
-            .into_iter()
-            .map(|store| {
-                let idx = index_name.clone();
-                let sch = schema.clone();
-                tokio::task::spawn_blocking(move || store.store_schema_and_cache(&idx, &sch))
-            })
-            .collect();
-
-        for handle in handles {
-            handle
-                .await
-                .map_err(|e| {
-                    OrchestratorError::Io(std::io::Error::other(format!(
-                        "Failed to spawn schema update task: {}",
-                        e
-                    )))
-                })?
-                .map_err(|e| {
-                    OrchestratorError::Io(std::io::Error::other(format!(
-                        "Failed to store schema: {}",
-                        e
-                    )))
-                })?;
-        }
-
-        Ok(())
+        futures::future::try_join_all(stores.into_iter().map(|store| {
+            let idx = index_name.clone();
+            let sch = schema.clone();
+            blocking(move || store.store_schema_and_cache(&idx, &sch))
+        }))
+        .await
+        .map(drop)
     }
 
     /// Produce sorted field names with "id" first (if present), others alphabetical.
@@ -5171,9 +5164,7 @@ impl NodeOrchestrator {
         let Some(store) = self.shards.values().find_map(|shard| shard.store.clone()) else {
             return Ok(JsonValue::Array(Vec::new()));
         };
-        let records = tokio::task::spawn_blocking(move || store.schema_records())
-            .await
-            .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))??;
+        let records = blocking(move || store.schema_records()).await?;
         serde_json::to_value(records).map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))
     }
 
@@ -5807,9 +5798,7 @@ impl NodeOrchestrator {
         {
             let store = Arc::clone(store);
             let idx = index.to_string();
-            documents += tokio::task::spawn_blocking(move || store.document_count(&idx))
-                .await
-                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))??;
+            documents += blocking(move || store.document_count(&idx)).await?;
         }
         Ok(documents)
     }
@@ -5906,16 +5895,13 @@ impl NodeOrchestrator {
             .filter_map(|shard| shard.store.as_ref().map(Arc::clone))
             .map(|store| {
                 let (index, promoted) = (index.to_string(), promoted.clone());
-                tokio::task::spawn_blocking(move || store.unbuilt_fields(&index, &promoted))
+                blocking(move || store.unbuilt_fields(&index, &promoted))
             });
-        let mut unbuilt = Vec::new();
-        for check in futures::future::join_all(checks).await {
-            unbuilt.extend(
-                check
-                    .map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))?
-                    .map_err(OrchestratorError::Storage)?,
-            );
-        }
+        let mut unbuilt: Vec<_> = futures::future::try_join_all(checks)
+            .await?
+            .into_iter()
+            .flatten()
+            .collect();
         unbuilt.sort();
         unbuilt.dedup();
         Ok(unbuilt)
@@ -6064,24 +6050,16 @@ impl NodeOrchestrator {
             num_fields = schema.fields.len(),
             "Storing schema and pre-creating Tantivy indexes on all shards"
         );
-        let handles: Vec<_> = stores
-            .into_iter()
-            .map(|store| {
-                let idx = index.to_string();
-                let sch = schema.clone();
-                tokio::task::spawn_blocking(move || {
-                    store.store_schema_and_cache(&idx, &sch)?;
-                    drop(store.get_or_create_index(&idx)?);
-                    Ok::<_, storage::StoreError>(())
-                })
+        futures::future::try_join_all(stores.into_iter().map(|store| {
+            let idx = index.to_string();
+            let sch = schema.clone();
+            blocking(move || {
+                store.store_schema_and_cache(&idx, &sch)?;
+                drop(store.get_or_create_index(&idx)?);
+                Ok(())
             })
-            .collect();
-        for handle in handles {
-            handle
-                .await
-                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?;
-        }
+        }))
+        .await?;
         self.schema_cache.put(index, &schema);
 
         answer(SchemaApplied {
@@ -6261,10 +6239,7 @@ impl NodeOrchestrator {
             let idx = index.to_string();
             let q = engine_query.clone();
 
-            let outcome = tokio::task::spawn_blocking(move || store.validate_query(&idx, &q))
-                .await
-                .map_err(|e| OrchestratorError::Io(std::io::Error::other(e.to_string())))?
-                .map_err(OrchestratorError::Storage)?;
+            let outcome = blocking(move || store.validate_query(&idx, &q)).await?;
 
             if let Some(outcome) = outcome {
                 return Ok(serde_json::json!({
