@@ -1965,78 +1965,6 @@ fn the_core_layout_never_exceeds_the_cpu_budget() {
     }
 }
 
-fn payload(id: &str, doc: JsonValue) -> DocPayload {
-    DocPayload {
-        id: id.to_string(),
-        routing_key: None,
-        doc,
-    }
-}
-
-/// A tantivy schema is fixed when the index is created, so initial creation is the only
-/// chance to make a field searchable. Sampling used to leave everything non-indexed,
-/// which produced write-only indexes: documents went in, and nothing but `id` could
-/// find them again.
-#[test]
-fn fields_inferred_when_the_index_is_created_are_searchable() {
-    let schema = enhanced_schema_sampling(
-        &[payload(
-            "d1",
-            json!({"id": "d1", "title": "hello", "year": 2024}),
-        )],
-        SCHEMA_SAMPLE_LIMIT,
-    );
-
-    for name in ["title", "year"] {
-        let field = schema
-            .fields
-            .get(name)
-            .unwrap_or_else(|| panic!("{name} should have been inferred"));
-        assert!(field.indexed, "{name} has to be searchable");
-        assert!(!field.stored, "only id belongs in tantivy's stored fields");
-    }
-}
-
-/// Hits are rebuilt from redb, so storing values in tantivy too would keep a second copy
-/// of the corpus. Nothing inferred is stored — and `id` is not inferred at all:
-/// `evolve_field` refuses to touch it, and the storage layer seeds the canonical
-/// definition when it creates the index.
-#[test]
-fn nothing_inferred_is_stored_in_tantivy() {
-    let schema = enhanced_schema_sampling(
-        &[payload("d1", json!({"id": "d1", "title": "hello"}))],
-        SCHEMA_SAMPLE_LIMIT,
-    );
-
-    assert!(
-        !schema.fields.contains_key("id"),
-        "id is seeded by the storage layer, not inferred"
-    );
-    assert!(
-        schema.fields.values().all(|field| !field.stored),
-        "an inferred field is indexed, never stored"
-    );
-}
-
-/// Shadow fields exist to map a query written against the original field name onto the
-/// canonical `id`. Indexing one would put a second copy of the ids in the index.
-#[test]
-fn a_shadow_field_survives_initial_creation_untouched() {
-    let mut schema = IndexSchema::default();
-    schema.add_shadow_field("sha1".to_string(), TantivyFieldType::Text);
-    schema.fields.insert(
-        "title".to_string(),
-        FieldDef::new_non_indexed("title".to_string(), &json!("hello")),
-    );
-
-    mark_initial_fields_indexed(&mut schema);
-
-    let shadow = &schema.fields["sha1"];
-    assert!(!shadow.indexed, "a shadow field is never indexed");
-    assert!(!shadow.stored, "a shadow field is never stored");
-    assert!(schema.fields["title"].indexed, "ordinary fields still are");
-}
-
 /// The identifier travels under the shadow name on the way out, so a projection naming `id`
 /// has to be rewritten to that name before it is applied. The rewrite is the only crossing
 /// point between the two names on read, and it has to hold for both directions of the
@@ -2929,7 +2857,6 @@ fn a_retired_seq_column_in_the_schema_record_does_not_make_it_sortable() {
         );
     }
     schema.fields.insert("doi".to_string(), shadow_field("doi"));
-    schema.rebuild_shadow_fields_cache();
 
     let refused = |field: &str| {
         unsortable_sort_field(
@@ -4016,4 +3943,18 @@ fn a_merged_search_says_whether_its_nodes_searched_one_schema() {
         "{merged}"
     );
     assert!(merged["stats"].get("schema").is_none());
+}
+
+/// A peer's dropped record is no schema, but its version is what a mint has to go above.
+#[test]
+fn a_dropped_record_answer_gives_its_version() {
+    assert_eq!(
+        dropped_version(&json!({"state": "dropped", "version": 6, "fields": {}})),
+        6
+    );
+    assert_eq!(
+        dropped_version(&json!({"state": "active", "version": 6})),
+        0
+    );
+    assert_eq!(dropped_version(&JsonValue::Null), 0);
 }

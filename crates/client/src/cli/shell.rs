@@ -1289,7 +1289,9 @@ fn interactive_loop(
             &mut editor,
             &input,
         )) {
-            eprintln!("⚠️  {}", err);
+            // The whole chain: a context added on the way up says where it failed, the cause
+            // underneath what failed.
+            eprintln!("⚠️  {:#}", err);
         }
     }
 

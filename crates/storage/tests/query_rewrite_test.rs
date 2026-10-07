@@ -45,11 +45,10 @@ fn store_with_one_doc(temp: &TempDir, index: &str) -> HybridStore {
     fields.insert("created".into(), field(TantivyFieldType::Date, true));
     fields.insert("cat".into(), field(TantivyFieldType::Facet, false));
 
-    let mut schema = IndexSchema {
+    let schema = IndexSchema {
         fields,
         ..Default::default()
     };
-    schema.rebuild_shadow_fields_cache();
     store.store_schema_and_cache(index, &schema).unwrap();
 
     store
@@ -205,11 +204,10 @@ fn an_index_without_date_or_facet_fields_is_unaffected() {
 
     let mut fields = HashMap::new();
     fields.insert("title".into(), field(TantivyFieldType::Text, false));
-    let mut schema = IndexSchema {
+    let schema = IndexSchema {
         fields,
         ..Default::default()
     };
-    schema.rebuild_shadow_fields_cache();
     store.store_schema_and_cache("plain", &schema).unwrap();
     store
         .apply_write(
@@ -241,11 +239,10 @@ fn store_with_shadow(temp: &TempDir, index: &str) -> HybridStore {
     shadow.is_shadow = true;
     fields.insert("sha1".into(), shadow);
 
-    let mut schema = IndexSchema {
+    let schema = IndexSchema {
         fields,
         ..Default::default()
     };
-    schema.rebuild_shadow_fields_cache();
     store.store_schema_and_cache(index, &schema).unwrap();
 
     store
@@ -363,11 +360,10 @@ fn store_with_shadow_keyed(temp: &TempDir, index: &str, id: &str) -> HybridStore
     shadow.is_shadow = true;
     fields.insert("sha1".into(), shadow);
 
-    let mut schema = IndexSchema {
+    let schema = IndexSchema {
         fields,
         ..Default::default()
     };
-    schema.rebuild_shadow_fields_cache();
     store.store_schema_and_cache(index, &schema).unwrap();
 
     store

@@ -1220,7 +1220,7 @@ pub(crate) fn unescape_query_value(value: &str) -> String {
 /// a shadow name inside a phrase or a range stays the value it is. The replacement is spliced
 /// by byte range, leaving the rest of the query — whitespace, quoting, escapes — untouched.
 pub(crate) fn rewrite_shadow_fields(query: &str, schema: &IndexSchema) -> String {
-    if schema.shadow_fields.is_empty() {
+    if !schema.has_shadow_fields() {
         return query.to_string();
     }
 

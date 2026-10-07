@@ -57,11 +57,10 @@ fn store_with_two_docs(temp: &TempDir, index: &str) -> HybridStore {
     fields.insert("flag".into(), field(TantivyFieldType::Boolean, false, true));
     fields.insert("hidden".into(), field(TantivyFieldType::Text, false, false));
 
-    let mut schema = IndexSchema {
+    let schema = IndexSchema {
         fields,
         ..Default::default()
     };
-    schema.rebuild_shadow_fields_cache();
     store.store_schema_and_cache(index, &schema).unwrap();
 
     for (id, tag) in [("d1", "active"), ("d2", "archived")] {

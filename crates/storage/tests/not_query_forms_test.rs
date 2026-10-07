@@ -41,11 +41,10 @@ fn store_with_docs(temp: &TempDir, index: &str) -> HybridStore {
         fields.insert(name.to_string(), def);
     }
 
-    let mut schema = IndexSchema {
+    let schema = IndexSchema {
         fields,
         ..Default::default()
     };
-    schema.rebuild_shadow_fields_cache();
     store.store_schema_and_cache(index, &schema).unwrap();
 
     for (id, title, tag) in [
