@@ -5938,9 +5938,17 @@ as two extensions (`Caller` and `Authz`) where one extractor would do.
   (`coordinator.rs:538–583`), `RegisterLocalShards` into `ExchangeShardsWithPeer` into a query
   and a push and a fallback push (`:806–857`, `:2261–2320`), the `PeerDiscovered` push and pull
   with a hand-rolled 5× backoff (`:1417–1510`), and the periodic `SyncShardMaps` pull (`:2379`).
-  The pull, added for OB20, makes the pushes redundant. **Change:** keep the pull and a "pull now"
-  trigger; delete the rest and every `RemoteActorRef::lookup` fallback (the pool is always set,
-  `main.rs:458`).
+  **Change:** one exchange, run on the events that change a shard map — a peer connecting
+  (`PeerDiscovered`), this node's shards registered or moved, a topology change — each answered
+  by one pull-and-push with the peer concerned, retried on that peer's own failure rather than
+  on a clock. The four push paths and the 5× backoff fold into it, and every
+  `RemoteActorRef::lookup` fallback goes (the pool is always set, `main.rs:458`). The periodic
+  `SyncShardMaps` pull, added for OB20 because a partial ring had no event that repaired it, is
+  replaced by the event that should have: a node that finds a connected peer's shards missing
+  from its ring asks that peer, as the canvass already does for a schema. Kept, if at all, only
+  as a rare safety net, not the mechanism. The architecture prefers event-triggered coordination
+  to ticking pull or push tasks (2026-10-07); the 30 s schema sweep (`spawn_schema_sweep`, N13)
+  is held to the same rule.
 - **Smaller owners.** The ring is built from shards twice by forging a `NodeIdentity`
   (`coordinator.rs:222`, `:883`, `orchestrator.rs:5001`): `ConsistentRing::insert(id, &tokens)`;
   the health rules are written three times: `ClusterState::from_counts`; the "settled" predicate
