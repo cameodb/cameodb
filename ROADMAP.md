@@ -5702,7 +5702,16 @@ which production does not call and which writes non-atomically where `save` does
 
 ### N5 — The query rewrites find a field name by substring
 
-**Defect.** 📋 **Planned.** **Checked** for the mechanism; the example below is **reported**, not
+**Defect.** ✅ **Done** 2026-10-07. `rewrite_clause_values` walks `field_references` and splices
+each claimed clause's value; the date rewrite (four value readers — range, set, comparison,
+literal — in one pass), the facet quoting and the prefix rewrite all run on it. An unquoted value
+ends at whitespace or at the `)` closing its group, for every rewrite. Covered by
+`a_date_rewrite_touches_only_its_own_clauses`, `a_facet_rewrite_touches_only_its_own_clauses` and
+`a_field_name_inside_a_phrase_is_not_a_prefix_clause`, all three failing before the change:
+`update:2024` was rewritten as a date beside a field named `date`, `subcat:/a/b` was quoted as a
+facet, and a prefix inside a phrase was noted.
+
+**Original entry.** **Checked** for the mechanism; the example below is **reported**, not
 run. `normalize_date_ranges`, `_in_sets`, `_comparisons` and `_literals` (`query.rs:57–263`),
 `normalize_facet_query` (`:2072`) and `normalize_prefix_query` (`:1728`) each `find("{field}:")`
 with no token boundary and no awareness of quoted phrases. With a date field `date`, the clause

@@ -50,216 +50,108 @@ pub(crate) fn normalize_date_literal(lit: &str) -> Option<String> {
     Some(dt.to_rfc3339_opts(SecondsFormat::Secs, true))
 }
 
-/// Rewrite both bounds of a date range to RFC3339.
+/// Rewrite the value of every clause whose field `rewrite` claims.
 ///
-/// Accepts either delimiter on either side — `[a TO b]`, `{a TO b}`, and the mixed pairs — and
-/// preserves them, since they carry the inclusive/exclusive meaning.
-pub(crate) fn normalize_date_ranges(input: &str, field: &str) -> String {
-    let prefix = format!("{}:", field);
-    let mut out = String::with_capacity(input.len());
-    let mut idx = 0usize;
-
-    while let Some(rel) = input[idx..].find(&prefix) {
-        let start = idx + rel;
-        out.push_str(&input[idx..start]);
-        let after_colon = start + prefix.len();
-
-        // The opening delimiter decides whether this is a range at all.
-        let open = input[after_colon..].chars().next();
-        let Some(open) = open.filter(|ch| *ch == '[' || *ch == '{') else {
-            out.push_str(&input[start..after_colon]);
-            idx = after_colon;
+/// Clauses are found by [`field_references`], so a name is a clause's only where the grammar
+/// reads one: at the start of a clause, never inside a phrase, a range or a set, and never as the
+/// tail of a longer name — `update:2024` is not a clause of a field named `date`. `rewrite` is
+/// given the field's name and the query from just after its colon, and answers the replacement
+/// for the value it reads there with the bytes that value took, or `None` to leave the clause as
+/// written. Everything outside a replaced value is copied as it was.
+fn rewrite_clause_values(
+    query: &str,
+    mut rewrite: impl FnMut(&str, &str) -> Option<(String, usize)>,
+) -> String {
+    let mut out = String::with_capacity(query.len());
+    let mut cursor = 0;
+    for reference in field_references(query) {
+        // A name inside a value an earlier clause's rewrite consumed is part of that value.
+        if reference.span.start < cursor {
             continue;
-        };
-
-        let inner_start = after_colon + open.len_utf8();
-        // Either closing form may terminate the range, so take whichever comes first.
-        let close_rel = input[inner_start..]
-            .find([']', '}'])
-            .map(|rel| (rel, input[inner_start + rel..].chars().next().unwrap()));
-
-        if let Some((end_rel, close)) = close_rel {
-            let end = inner_start + end_rel;
-            let inner = &input[inner_start..end];
-
-            if let Some((lower, upper)) = inner.split_once(" TO ") {
-                let lower_norm = normalize_date_literal(lower).unwrap_or_else(|| lower.to_string());
-                let upper_norm = normalize_date_literal(upper).unwrap_or_else(|| upper.to_string());
-                out.push_str(&format!(
-                    "{}:{}{} TO {}{}",
-                    field, open, lower_norm, upper_norm, close
-                ));
-                idx = end + close.len_utf8();
-                continue;
-            }
         }
-
-        // No closing delimiter, or no ` TO ` inside it: not a range we can rewrite. Copy the
-        // field prefix and the opening delimiter and carry on from there.
-        out.push_str(&input[start..inner_start]);
-        idx = inner_start;
+        let value_start = reference.span.end + ':'.len_utf8();
+        if let Some((replacement, consumed)) = rewrite(&reference.name, &query[value_start..]) {
+            out.push_str(&query[cursor..value_start]);
+            out.push_str(&replacement);
+            cursor = value_start + consumed;
+        }
     }
-
-    out.push_str(&input[idx..]);
+    out.push_str(&query[cursor..]);
     out
 }
 
-/// Rewrite every element of a date set query — `field: IN [a b c]` — to RFC3339.
-///
-/// Whitespace is allowed around `IN` and after the colon, so this shape is not reachable by the
-/// single-literal pass, which reads a value up to the next whitespace.
-pub(crate) fn normalize_date_in_sets(input: &str, field: &str) -> String {
-    let prefix = format!("{}:", field);
-    let mut out = String::with_capacity(input.len());
-    let mut idx = 0usize;
-
-    /// Bytes of leading whitespace at `from`, so the cursor can step over it.
-    pub(crate) fn space_at(input: &str, from: usize) -> usize {
-        input[from..].len() - input[from..].trim_start().len()
+/// Bytes of the value `rest` opens with: a quoted value to its closing quote, an unquoted one to
+/// the next whitespace or to the `)` that closes the group it sits in.
+fn clause_value_len(rest: &str) -> usize {
+    if let Some(inner) = rest.strip_prefix('"') {
+        return inner.find('"').map_or(rest.len(), |close| close + 2);
     }
-
-    while let Some(rel) = input[idx..].find(&prefix) {
-        let start = idx + rel;
-        out.push_str(&input[idx..start]);
-        let after_colon = start + prefix.len();
-
-        // Walk forward from the colon with one cursor: optional space, `IN`, optional space,
-        // `[`, elements, `]`. Anything else is not a set query and is copied through.
-        let mut cursor = after_colon + space_at(input, after_colon);
-        if !input[cursor..].starts_with("IN") {
-            out.push_str(&input[start..after_colon]);
-            idx = after_colon;
-            continue;
-        }
-        cursor += "IN".len();
-        cursor += space_at(input, cursor);
-        if !input[cursor..].starts_with('[') {
-            out.push_str(&input[start..after_colon]);
-            idx = after_colon;
-            continue;
-        }
-        cursor += '['.len_utf8();
-
-        let Some(close_rel) = input[cursor..].find(']') else {
-            out.push_str(&input[start..after_colon]);
-            idx = after_colon;
-            continue;
-        };
-
-        // Quoted for the same reason as a bare literal: RFC3339 carries colons, which the
-        // grammar would otherwise read as a field separator inside the set.
-        let normalized: Vec<String> = input[cursor..cursor + close_rel]
-            .split_whitespace()
-            .map(|element| match normalize_date_literal(element) {
-                Some(norm) => format!("\"{norm}\""),
-                None => element.to_string(),
-            })
-            .collect();
-        out.push_str(&format!("{}: IN [{}]", field, normalized.join(" ")));
-        idx = cursor + close_rel + ']'.len_utf8();
-    }
-
-    out.push_str(&input[idx..]);
-    out
+    rest.find(|ch: char| ch.is_whitespace() || ch == ')')
+        .unwrap_or(rest.len())
 }
 
-pub(crate) fn normalize_date_comparisons(input: &str, field: &str) -> String {
-    let prefix = format!("{}:", field);
-    let mut out = String::with_capacity(input.len());
-    let mut idx = 0usize;
-
-    while let Some(rel) = input[idx..].find(&prefix) {
-        let start = idx + rel;
-        out.push_str(&input[idx..start]);
-
-        let op_idx = start + prefix.len();
-        let rest = &input[op_idx..];
-        let mut chars = rest.chars();
-        if let Some(op) = chars.next()
-            && (op == '<' || op == '>')
-        {
-            // Check for compound operators >= and <=
-            let (full_op, op_len) = if chars.next() == Some('=') {
-                (format!("{}=", op), op.len_utf8() + 1)
-            } else {
-                (op.to_string(), op.len_utf8())
-            };
-            let value_start = op_idx + op_len;
-            // If the value is quoted, find the closing quote as the boundary.
-            // Otherwise, use whitespace as the boundary.
-            let value_end = if input[value_start..].starts_with('"') {
-                input[value_start + 1..]
-                    .find('"')
-                    .map(|r| value_start + 1 + r + 1)
-                    .unwrap_or(input.len())
-            } else {
-                input[value_start..]
-                    .find(char::is_whitespace)
-                    .map(|r| value_start + r)
-                    .unwrap_or(input.len())
-            };
-            let value = &input[value_start..value_end];
-            let norm = normalize_date_literal(value).unwrap_or_else(|| value.to_string());
-            out.push_str(&format!("{}{}{}", prefix, full_op, norm));
-            idx = value_end;
-            continue;
-        }
-
-        // Not a comparison; copy current char and advance
-        out.push_str(&input[start..start + prefix.len()]);
-        idx = start + prefix.len();
-    }
-
-    out.push_str(&input[idx..]);
-    out
+/// A date range value — `[a TO b]`, `{a TO b}` or a mixed pair — with both bounds in RFC3339.
+/// The delimiters are kept, since they carry the inclusive and exclusive meaning.
+fn date_range_value(rest: &str) -> Option<(String, usize)> {
+    let open = rest.chars().next().filter(|ch| matches!(ch, '[' | '{'))?;
+    let inner_start = open.len_utf8();
+    // Either closing form may end the range, so whichever comes first.
+    let end = inner_start + rest[inner_start..].find([']', '}'])?;
+    let close = rest[end..].chars().next()?;
+    let (lower, upper) = rest[inner_start..end].split_once(" TO ")?;
+    let bound =
+        |literal: &str| normalize_date_literal(literal).unwrap_or_else(|| literal.to_string());
+    Some((
+        format!("{open}{} TO {}{close}", bound(lower), bound(upper)),
+        end + close.len_utf8(),
+    ))
 }
 
-pub(crate) fn normalize_date_literals(input: &str, field: &str) -> String {
-    let prefix = format!("{}:", field);
-    let mut out = String::with_capacity(input.len());
-    let mut idx = 0usize;
-
-    while let Some(rel) = input[idx..].find(&prefix) {
-        let start = idx + rel;
-        out.push_str(&input[idx..start]);
-
-        let value_start = start + prefix.len();
-        // If the value is quoted, find the closing quote as the boundary.
-        // Otherwise, use whitespace as the boundary.
-        let value_end = if input[value_start..].starts_with('"') {
-            input[value_start + 1..]
-                .find('"')
-                .map(|r| value_start + 1 + r + 1)
-                .unwrap_or(input.len())
-        } else {
-            input[value_start..]
-                .find(char::is_whitespace)
-                .map(|r| value_start + r)
-                .unwrap_or(input.len())
-        };
-        let value = &input[value_start..value_end];
-
-        // Leave the shapes the range, comparison and `IN` passes own; an empty value is a
-        // bare `field:` with nothing after it.
-        if value.starts_with(['[', '{', '<', '>']) || value.is_empty() {
-            out.push_str(&input[start..value_end]);
-            idx = value_end;
-            continue;
-        }
-
-        // Quoted, because RFC3339 contains colons and the grammar would otherwise read
-        // `2024-06-15T00` as a field name. Only on success: a failed normalisation returns
-        // `value` verbatim, which may already carry quotes.
-        let rendered = match normalize_date_literal(value) {
+/// A date set value — ` IN [a b c]`, space allowed around `IN` — with every element in RFC3339.
+fn date_set_value(rest: &str) -> Option<(String, usize)> {
+    let after_in = rest.trim_start().strip_prefix("IN")?;
+    let elements = after_in.trim_start().strip_prefix('[')?;
+    let elements_at = rest.len() - elements.len();
+    let close = elements_at + rest[elements_at..].find(']')?;
+    // Quoted, as a bare literal is: RFC3339 carries colons the grammar would read as a field.
+    let normalized: Vec<String> = rest[elements_at..close]
+        .split_whitespace()
+        .map(|element| match normalize_date_literal(element) {
             Some(norm) => format!("\"{norm}\""),
-            None => value.to_string(),
-        };
-        out.push_str(&format!("{}{}", prefix, rendered));
-        idx = value_end;
-    }
+            None => element.to_string(),
+        })
+        .collect();
+    Some((
+        format!(" IN [{}]", normalized.join(" ")),
+        close + ']'.len_utf8(),
+    ))
+}
 
-    out.push_str(&input[idx..]);
-    out
+/// A date comparison value — `>v`, `<v`, `>=v`, `<=v` — with `v` in RFC3339.
+fn date_comparison_value(rest: &str) -> Option<(String, usize)> {
+    let operator = if rest.starts_with(">=") || rest.starts_with("<=") {
+        2
+    } else if rest.starts_with(['>', '<']) {
+        1
+    } else {
+        return None;
+    };
+    let end = operator + clause_value_len(&rest[operator..]);
+    let value = &rest[operator..end];
+    let norm = normalize_date_literal(value).unwrap_or_else(|| value.to_string());
+    Some((format!("{}{norm}", &rest[..operator]), end))
+}
+
+/// A single date literal, in RFC3339 and quoted — RFC3339 contains colons, and the grammar would
+/// otherwise read `2024-06-15T00` as a field name. `None` for the shapes the range, set and
+/// comparison readers own, and for a literal that is not a date.
+fn date_literal_value(rest: &str) -> Option<(String, usize)> {
+    let end = clause_value_len(rest);
+    let value = &rest[..end];
+    if value.is_empty() || value.starts_with(['[', '{', '<', '>']) {
+        return None;
+    }
+    normalize_date_literal(value).map(|norm| (format!("\"{norm}\""), end))
 }
 
 /// The clause context a `NOT` keyword sits in, which decides the rewrite.
@@ -1712,86 +1604,47 @@ pub(crate) fn normalize_prefix_query(
     }
 
     let tantivy_schema = tantivy_index.schema();
-    let mut normalized = query.to_string();
     let mut notes = Vec::new();
-    // What the loop below has already accounted for, so the wildcard pass does not note it twice.
+    // What the rewrite below has already accounted for, so the wildcard pass does not note it
+    // twice.
     let mut noted: HashSet<(Option<String>, String)> = HashSet::new();
 
-    for (_, entry) in tantivy_schema.fields() {
-        let FieldType::Str(ref options) = *entry.field_type() else {
-            continue;
+    let mut normalized = rewrite_clause_values(query, |name, rest| {
+        let field = tantivy_schema.get_field(name).ok()?;
+        let FieldType::Str(ref options) = *tantivy_schema.get_field_entry(field).field_type()
+        else {
+            return None;
         };
-        let Some(indexing) = options.get_indexing_options() else {
-            continue;
-        };
-        let name = entry.name();
-        let prefix = format!("{name}:");
-        if !normalized.contains(&prefix) {
-            continue;
-        }
-        let Some(mut analyzer) = tantivy_index.tokenizers().get(indexing.tokenizer()) else {
-            continue;
-        };
+        let indexing = options.get_indexing_options()?;
+        let mut analyzer = tantivy_index.tokenizers().get(indexing.tokenizer())?;
 
-        let mut out = String::with_capacity(normalized.len());
-        let mut idx = 0usize;
-        while let Some(rel) = normalized[idx..].find(&prefix) {
-            let start = idx + rel;
-            out.push_str(&normalized[idx..start]);
-
-            // The value runs to the next whitespace or to a closing paren from a group.
-            let value_start = start + prefix.len();
-            let value_end = normalized[value_start..]
-                .find(|ch: char| ch.is_whitespace() || ch == ')')
-                .map(|r| value_start + r)
-                .unwrap_or(normalized.len());
-            let value = &normalized[value_start..value_end];
-
-            enum Prefix {
-                Range(String),
-                TooShort(String),
-                Unrewritable,
+        let end = clause_value_len(rest);
+        let value = &rest[..end];
+        let (term, boost) = single_term_prefix(value)?;
+        noted.insert((Some(name.to_string()), format!("{term}*")));
+        match single_token(&mut analyzer, term) {
+            // Counted after analysis, in characters: what the range walks is terms.
+            Some(lower) if min_prefix_length > 0 && lower.chars().count() < min_prefix_length => {
+                notes.push(short_prefix_note(
+                    Some(name),
+                    &format!("{term}*"),
+                    policy.min_prefix_length,
+                ));
+                None
             }
-            let prefix_clause = single_term_prefix(value).map(|(term, boost)| {
-                noted.insert((Some(name.to_string()), format!("{term}*")));
-                match single_token(&mut analyzer, term) {
-                    // Counted after analysis, in characters: what the range walks is terms.
-                    Some(lower)
-                        if min_prefix_length > 0 && lower.chars().count() < min_prefix_length =>
-                    {
-                        Prefix::TooShort(format!("{term}*"))
-                    }
-                    Some(lower) => match prefix_upper_bound(&lower, &mut analyzer) {
-                        Some(upper) => {
-                            Prefix::Range(format!("{name}:[{lower} TO {upper}}}{boost}"))
-                        }
-                        None => Prefix::Unrewritable,
-                    },
-                    None => Prefix::Unrewritable,
-                }
-            });
-
-            match prefix_clause {
-                Some(Prefix::Range(rewritten)) => out.push_str(&rewritten),
-                Some(Prefix::TooShort(prefix)) => {
-                    notes.push(short_prefix_note(
-                        Some(name),
-                        &prefix,
-                        policy.min_prefix_length,
-                    ));
-                    out.push_str(&normalized[start..value_end]);
-                }
-                Some(Prefix::Unrewritable) => {
+            Some(lower) => match prefix_upper_bound(&lower, &mut analyzer) {
+                Some(upper) => Some((format!("[{lower} TO {upper}}}{boost}"), end)),
+                None => {
                     notes.push(unrewritable_prefix_note(name, value));
-                    out.push_str(&normalized[start..value_end]);
+                    None
                 }
-                None => out.push_str(&normalized[start..value_end]),
+            },
+            None => {
+                notes.push(unrewritable_prefix_note(name, value));
+                None
             }
-            idx = value_end;
         }
-        out.push_str(&normalized[idx..]);
-        normalized = out;
-    }
+    });
 
     if policy.expand_unqualified_prefix {
         normalized = expand_unqualified_prefixes(
@@ -2056,49 +1909,22 @@ fn expand_unqualified_prefixes(
 /// already in the form the parser wants. Matching is hierarchical, so a parent path matches its
 /// descendants.
 pub(crate) fn normalize_facet_query(query: &str, schema: &IndexSchema) -> String {
-    let facet_fields: Vec<&str> = schema
-        .fields
-        .iter()
-        .filter(|(_, def)| matches!(def.field_type, TantivyFieldType::Facet))
-        .map(|(name, _)| name.as_str())
-        .collect();
-
-    if facet_fields.is_empty() {
+    let is_facet = |name: &str| {
+        schema
+            .fields
+            .get(name)
+            .is_some_and(|def| matches!(def.field_type, TantivyFieldType::Facet))
+    };
+    if !schema.fields.keys().any(|name| is_facet(name)) {
         return query.to_string();
     }
-
-    let mut normalized = query.to_string();
-    for field in facet_fields {
-        let prefix = format!("{}:/", field);
-        if !normalized.contains(&prefix) {
-            continue;
+    rewrite_clause_values(query, |field, rest| {
+        if !is_facet(field) || !rest.starts_with('/') {
+            return None;
         }
-
-        let mut out = String::with_capacity(normalized.len() + 2);
-        let mut idx = 0usize;
-        while let Some(rel) = normalized[idx..].find(&prefix) {
-            let start = idx + rel;
-            out.push_str(&normalized[idx..start]);
-
-            // The path runs to the next whitespace or to a closing paren from a group.
-            let value_start = start + field.len() + ':'.len_utf8();
-            let value_end = normalized[value_start..]
-                .find(|ch: char| ch.is_whitespace() || ch == ')')
-                .map(|r| value_start + r)
-                .unwrap_or(normalized.len());
-
-            out.push_str(&format!(
-                "{}:\"{}\"",
-                field,
-                &normalized[value_start..value_end]
-            ));
-            idx = value_end;
-        }
-        out.push_str(&normalized[idx..]);
-        normalized = out;
-    }
-
-    normalized
+        let end = clause_value_len(rest);
+        Some((format!("\"{}\"", &rest[..end]), end))
+    })
 }
 
 /// Rewrite every date literal in a query to RFC3339, the only form Tantivy's date parser
@@ -2112,28 +1938,25 @@ pub(crate) fn normalize_facet_query(query: &str, schema: &IndexSchema) -> String
 /// A shape no pass recognises reaches the parser unrewritten, which drops the clause rather
 /// than raising an error — so a gap here surfaces as a query that matches nothing.
 pub(crate) fn normalize_date_query(query: &str, schema: &IndexSchema) -> String {
-    let date_fields: HashSet<&str> = schema
-        .fields
-        .iter()
-        .filter(|(_, def)| matches!(def.field_type, TantivyFieldType::Date))
-        .map(|(name, _)| name.as_str())
-        .collect();
-
-    if date_fields.is_empty() {
+    let is_date = |name: &str| {
+        schema
+            .fields
+            .get(name)
+            .is_some_and(|def| matches!(def.field_type, TantivyFieldType::Date))
+    };
+    if !schema.fields.keys().any(|name| is_date(name)) {
         return query.to_string();
     }
-
-    let mut normalized = query.to_string();
-    for field in &date_fields {
-        // Each pass claims one shape; the single-literal pass takes whatever is left, so it
-        // runs last or it would rewrite a range bound as a whole value.
-        normalized = normalize_date_ranges(&normalized, field);
-        normalized = normalize_date_in_sets(&normalized, field);
-        normalized = normalize_date_comparisons(&normalized, field);
-        normalized = normalize_date_literals(&normalized, field);
-    }
-
-    normalized
+    rewrite_clause_values(query, |field, rest| {
+        if !is_date(field) {
+            return None;
+        }
+        // The single literal takes whatever the other shapes leave, so it is asked last.
+        date_range_value(rest)
+            .or_else(|| date_set_value(rest))
+            .or_else(|| date_comparison_value(rest))
+            .or_else(|| date_literal_value(rest))
+    })
 }
 
 #[cfg(test)]
@@ -2340,6 +2163,80 @@ mod not_clause_tests {
         assert_eq!(
             normalize_not_clauses("x AND NOT (a OR NOT (c AND NOT d))"),
             "x AND -(a OR (* -(c AND -d)))"
+        );
+    }
+}
+
+#[cfg(test)]
+mod clause_boundary_tests {
+    use super::*;
+
+    fn schema(fields: &[(&str, TantivyFieldType)]) -> IndexSchema {
+        let mut schema = IndexSchema::default();
+        for (name, field_type) in fields {
+            schema.fields.insert(
+                name.to_string(),
+                FieldDef::new(name.to_string(), field_type.clone()),
+            );
+        }
+        schema
+    }
+
+    /// A rewrite claims a clause by the field it names, as the grammar reads it: a name that only
+    /// ends with a date field's name, or one inside a phrase, is not that field's clause.
+    #[test]
+    fn a_date_rewrite_touches_only_its_own_clauses() {
+        let s = schema(&[
+            ("date", TantivyFieldType::Date),
+            ("update", TantivyFieldType::Text),
+        ]);
+        let rewritten = |query| normalize_date_query(query, &s);
+
+        assert_eq!(
+            rewritten("update:2024 AND date:2024-06-15"),
+            r#"update:2024 AND date:"2024-06-15T00:00:00Z""#
+        );
+        assert_eq!(
+            rewritten(r#"title:"date:2024-06-15""#),
+            r#"title:"date:2024-06-15""#
+        );
+        // A group's closing parenthesis ends the value, as it does for every other clause.
+        assert_eq!(
+            rewritten("(date:2024-06-15)"),
+            r#"(date:"2024-06-15T00:00:00Z")"#
+        );
+        assert_eq!(
+            rewritten("date:[2024-01-01 TO 2024-12-31}"),
+            "date:[2024-01-01T00:00:00Z TO 2024-12-31T00:00:00Z}"
+        );
+        assert_eq!(
+            rewritten("date: IN [2024-01-01 2024-02-01]"),
+            r#"date: IN ["2024-01-01T00:00:00Z" "2024-02-01T00:00:00Z"]"#
+        );
+        assert_eq!(
+            rewritten("-date:>=2024-01-01 AND update:x"),
+            "-date:>=2024-01-01T00:00:00Z AND update:x"
+        );
+        assert_eq!(
+            rewritten(r#"date:"2024-06-15 12:00:00""#),
+            r#"date:"2024-06-15T12:00:00Z""#
+        );
+    }
+
+    #[test]
+    fn a_facet_rewrite_touches_only_its_own_clauses() {
+        let s = schema(&[
+            ("cat", TantivyFieldType::Facet),
+            ("subcat", TantivyFieldType::Text),
+        ]);
+        assert_eq!(
+            normalize_facet_query("subcat:/a/b AND cat:/a/b", &s),
+            r#"subcat:/a/b AND cat:"/a/b""#
+        );
+        assert_eq!(normalize_facet_query("(cat:/a)", &s), r#"(cat:"/a")"#);
+        assert_eq!(
+            normalize_facet_query(r#"title:"cat:/a""#, &s),
+            r#"title:"cat:/a""#
         );
     }
 }

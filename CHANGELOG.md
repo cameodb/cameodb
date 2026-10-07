@@ -65,6 +65,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A query rewrite touches only the clauses of the field it is for.** Date, facet and prefix
+  clauses were found by searching the query for `field:`, so beside a date field named `date`
+  the clause `update:2024` was rewritten into a date and matched nothing, and a field name
+  inside a quoted phrase was rewritten as if it were a clause. A date in a group,
+  `(date:2024-06-15)`, is now rewritten as well.
 - **A node whose identity file is damaged refuses to start, instead of becoming another node.**
   `node_identity.json` holds the node's private key, and its id is derived from that key. A file
   that could not be read, or a key that did not decode, was replaced by a new key with a warning,
