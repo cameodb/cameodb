@@ -65,6 +65,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A schema change a peer refuses answers 400, with the peer's reason.** A peer's error
+  reaches the coordinating node in a form that keeps only its verdict, and the refusal check
+  matched the variant — so a tokenizer an older node cannot build came back as 503, "retry once
+  the cluster is whole", a retry that could never succeed.
 - **A batch of writes learns the fields its documents bring, as a single write does.** The
   server learns them before a write reaches storage, so this mattered only for a write reaching
   the store another way — a recreation racing a drop — where only a lone write named its new
