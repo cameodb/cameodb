@@ -65,6 +65,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Two nodes on one host form a cluster.** The check that keeps a node from dialing itself
+  compared only the IP of each seed address, so on one host — where every node shares the IP —
+  each node skipped the other as its own and neither dialed. A seed is now this node only at its
+  own port, whether written as an IP or a name. In containers, where each node has an IP of its
+  own, it never showed.
 - **A new node shares its memory evenly between its shards from the first boot.** Each shard's
   share of the node's cache and of its open-index cap is fixed when the shard opens, and a first
   boot gave each shard the share of one among the shards created so far: the first took the
