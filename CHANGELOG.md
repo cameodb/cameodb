@@ -65,6 +65,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A new node shares its memory evenly between its shards from the first boot.** Each shard's
+  share of the node's cache and of its open-index cap is fixed when the shard opens, and a first
+  boot gave each shard the share of one among the shards created so far: the first took the
+  whole cache and could hold the node's whole open-index cap, the second half of each. A
+  restart corrected it. A node that finds more shards on disk than `max_shards_per_node` now
+  leaves the rest unopened, instead of opening them and dropping them without a shutdown.
 - **CSV header type hints: dotted column names are kept, and hints mean what a schema means.**
   The hint was read at the first dot, so `geo.lat` and `geo.lon` both became a column `geo`, one
   value overwriting the other. It is now what follows the last dot, and only when it names a type.

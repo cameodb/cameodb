@@ -856,12 +856,6 @@ pub struct SearchRequest {
     pub sort: Option<SortSpec>,
 }
 
-/// Message to propose creating a new shard on this node.
-#[derive(Debug, Clone)]
-pub struct ProposeShard {
-    pub shard_id: Uuid,
-}
-
 /// Message to delete an index and all its data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShutdownShard;
