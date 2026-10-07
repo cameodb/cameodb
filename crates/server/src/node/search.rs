@@ -1389,6 +1389,19 @@ pub(super) fn validate_document(
             }
 
             match schema_cache.fields.get(key) {
+                // A field a write added, still without a column: its type is what its values
+                // have been, so one that does not fit widens it rather than being refused.
+                Some(existing_field) if existing_field.learned && !existing_field.indexed => {
+                    if unstorable_value(key, &existing_field.field_type, value).is_some() {
+                        let mut widened =
+                            existing_field.field_type.widened(&infer_field_type(value));
+                        if unstorable_value(key, &widened, value).is_some() {
+                            widened = TantivyFieldType::Text;
+                        }
+                        needs_evolution = true;
+                        new_fields.push((key.clone(), widened));
+                    }
+                }
                 Some(existing_field) => {
                     if let Some(why) = unstorable_value(key, &existing_field.field_type, value) {
                         return SchemaValidationResult {

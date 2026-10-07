@@ -2972,3 +2972,62 @@ mod rebuild_changes_tests {
         );
     }
 }
+
+mod learned_field_tests {
+    use crate::{FieldDef, IndexSchema, TantivyFieldType};
+    use serde_json::json;
+
+    /// The join is the same whichever way round it is taken, so nodes that saw the same values
+    /// in any order settle on one type.
+    #[test]
+    fn the_join_holds_both_and_does_not_depend_on_order() {
+        use TantivyFieldType::*;
+        for (a, b, joined) in [
+            (I64, I64, I64),
+            (I64, F64, F64),
+            (U64, I64, F64),
+            (I64, Text, Text),
+            (Date, I64, Text),
+            (Boolean, F64, Text),
+            (String, Text, Text),
+        ] {
+            assert_eq!(a.widened(&b), joined, "{a:?} with {b:?}");
+            assert_eq!(b.widened(&a), joined, "{b:?} with {a:?}");
+        }
+    }
+
+    /// A learned field widens as values arrive and never narrows back: `text` refined to a number
+    /// would refuse the values that made it text.
+    #[test]
+    fn a_learned_field_widens_and_never_narrows() {
+        let mut schema = IndexSchema::default();
+        schema.fields.insert(
+            "level".to_string(),
+            FieldDef::new_learned("level".to_string(), TantivyFieldType::I64),
+        );
+        assert!(schema.evolve_field("level".to_string(), &json!(2.5)));
+        assert_eq!(schema.fields["level"].field_type, TantivyFieldType::F64);
+        assert!(schema.evolve_field("level".to_string(), &json!("x7")));
+        assert_eq!(schema.fields["level"].field_type, TantivyFieldType::Text);
+        assert!(!schema.evolve_field("level".to_string(), &json!(3)));
+        assert_eq!(schema.fields["level"].field_type, TantivyFieldType::Text);
+        assert!(!schema.fields["level"].indexed);
+    }
+
+    /// How a type was reached is not part of what it is: a learned field and the same field
+    /// declared fingerprint alike.
+    #[test]
+    fn learned_is_not_in_the_fingerprint() {
+        let mut learned = IndexSchema::default();
+        learned.fields.insert(
+            "n".to_string(),
+            FieldDef::new_learned("n".to_string(), TantivyFieldType::F64),
+        );
+        let mut declared = learned.clone();
+        declared.fields.get_mut("n").expect("n").learned = false;
+        assert_eq!(
+            learned.calculate_fingerprint(),
+            declared.calculate_fingerprint()
+        );
+    }
+}

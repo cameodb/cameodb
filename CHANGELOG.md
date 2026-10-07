@@ -54,6 +54,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A field added by writes is typed the same on every node, and no longer refuses documents.**
+  A field first arriving after an index existed was typed by the first value each node saw and
+  never reconciled: one field written through three nodes became `i64`, `f64` and `text` at the
+  same version, and documents whose value did not fit a node's guess were refused — 18 of one
+  30-document batch in the reproduction, and on a single node any later value of another type.
+  Such a field is now marked learned and widens to hold each value (`i64`/`f64` to `f64`, mixed
+  with text to `text`) instead of refusing it; a declared field stays strict, an indexed one
+  pinned to its column. A node that learns or widens a field asks the cluster to agree in the
+  background — the same two-step change as `PUT /_config`, coalesced per index, retried until
+  every node is connected — so every node settles on the joined type at one version. A schema
+  applied over a node keeps the learned fields it does not list.
 - **`PATCH /api/{index}/_schema` changes the schema on every node of a cluster.** It set the
   `indexed` flags and default fields on the node that received it alone, so its peers kept the
   old flags and an unqualified term searched different fields depending on the node asked. The

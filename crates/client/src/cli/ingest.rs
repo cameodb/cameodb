@@ -493,6 +493,7 @@ pub(crate) fn schema_from_analysis(analysis: &SourceAnalysis) -> Result<JsonValu
             description: None,
             tokenizer: Some("raw".to_string()),
             index_record_option: Some("Basic".to_string()),
+            learned: false,
         },
     );
     schema.auto_detect_routing_field();
@@ -2105,7 +2106,8 @@ pub(crate) async fn detect_schema_from_source(
             explicit: id,
             recorded: None,
         };
-        let analysis = analyze_source(client, source, delimiter, ids, ScanLimits::default()).await?;
+        let analysis =
+            analyze_source(client, source, delimiter, ids, ScanLimits::default()).await?;
         analysis.profiler.warn_about_id(&analysis.id);
         schema_from_analysis(&analysis)
     }

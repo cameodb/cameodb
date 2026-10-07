@@ -3953,3 +3953,38 @@ fn a_canvass_reads_a_dropped_record_as_no_schema() {
         "an unreadable answer is not \"none\": it must not license sampling"
     );
 }
+
+/// A field a write added has no column: a value its type cannot hold widens it rather than
+/// refusing the document. A field someone declared still refuses it.
+#[test]
+fn a_learned_field_widens_where_a_declared_one_refuses() {
+    let mut schema = IndexSchema::default();
+    schema.fields.insert(
+        "reading".to_string(),
+        FieldDef::new_learned("reading".to_string(), TantivyFieldType::I64),
+    );
+    let mut declared = FieldDef::new("count".to_string(), TantivyFieldType::I64);
+    declared.indexed = false;
+    schema.fields.insert("count".to_string(), declared);
+
+    let widened = validate_document("d1", &json!({"reading": 2.5}), &schema);
+    assert!(widened.validation_error.is_none(), "{widened:?}");
+    assert_eq!(
+        widened.new_fields,
+        vec![("reading".to_string(), TantivyFieldType::F64)]
+    );
+    let text = validate_document("d2", &json!({"reading": "high"}), &schema);
+    assert!(text.validation_error.is_none(), "{text:?}");
+    assert_eq!(
+        text.new_fields,
+        vec![("reading".to_string(), TantivyFieldType::Text)]
+    );
+    let fits = validate_document("d3", &json!({"reading": 7}), &schema);
+    assert!(fits.validation_error.is_none() && fits.new_fields.is_empty());
+
+    let refused = validate_document("d4", &json!({"count": "many"}), &schema);
+    assert!(
+        refused.validation_error.is_some(),
+        "a declared type stays strict: {refused:?}"
+    );
+}

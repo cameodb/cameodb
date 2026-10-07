@@ -1350,6 +1350,60 @@ async fn a_declared_tokenizer_must_be_one_the_node_has() {
     assert_eq!(tokenizer("testo"), Some(json!("it_stem")), "{config}");
 }
 
+/// A field that first arrives after the index exists takes every value written to it: its type
+/// widens to hold them — `i64`, then `f64`, then `text` — instead of refusing the documents whose
+/// value did not fit the first one.
+#[tokio::test]
+async fn a_field_learned_from_writes_widens_instead_of_refusing() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+    let (status, body) = put_config(
+        &node,
+        "kpi",
+        &json!({"fields": {"title": {"field_type": "text", "indexed": true}}}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    for (id, reading) in [("a", json!(5)), ("b", json!(2.5)), ("c", json!("high"))] {
+        client
+            .bulk_index(
+                "kpi",
+                &[json!({"id": id, "doc": {"title": "t", "reading": reading}})],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{id} should be written: {e}"));
+    }
+
+    let config = get_json(&node, "/api/kpi/_config").await;
+    let reading = config["fields"]
+        .as_array()
+        .and_then(|fields| fields.iter().find(|f| f["name"] == "reading"))
+        .cloned()
+        .unwrap_or_else(|| panic!("reading should be learned: {config}"));
+    assert_eq!(
+        (reading["type"].as_str(), reading["indexed"].as_bool()),
+        (Some("text"), Some(false)),
+        "{reading}"
+    );
+    for id in ["a", "b", "c"] {
+        let hits = client
+            .search("kpi", &format!("id:{id}"), Some(1), None, None, None)
+            .await
+            .expect("search");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut hits = hits;
+        while hits["total_hits"] != json!(1) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            hits = client
+                .search("kpi", &format!("id:{id}"), Some(1), None, None, None)
+                .await
+                .expect("search");
+        }
+        assert_eq!(hits["total_hits"], json!(1), "{id} was kept: {hits}");
+    }
+}
+
 /// A flag edit is one schema change: every field it touches moves the version once, a field it
 /// marks indexed on an index with no documents is searchable at once — the index is built again
 /// with its column — and sending the same edit again changes nothing, the version included.
