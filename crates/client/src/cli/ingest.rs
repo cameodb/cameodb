@@ -2143,6 +2143,32 @@ pub(crate) async fn report_source(
     Ok(analysis?.report(source))
 }
 
+/// Whether one batch read ahead of a load into a typed index left something to guess: the id
+/// chosen by values (an index that records none, a source with no `id` column), a column of
+/// numeric dates none of which says which way round they are, a column with no value yet — so
+/// whether it holds lists is unknown — or, in a JSON source, a field the schema declares that the
+/// batch never showed.
+pub(crate) fn first_batch_inconclusive(
+    analysis: &SourceAnalysis,
+    field_types: &HashMap<String, TantivyFieldType>,
+) -> bool {
+    if matches!(analysis.id.reason, IdReason::Unique | IdReason::NameOnly) {
+        return true;
+    }
+    let columns = &analysis.profiler.columns;
+    if columns
+        .iter()
+        .any(|column| column.filled() == 0 || column.date_order_unsettled())
+    {
+        return true;
+    }
+    analysis.delimiter.is_none()
+        && field_types
+            .keys()
+            .filter(|name| name.as_str() != "id")
+            .any(|name| analysis.profiler.index_of(name).is_none())
+}
+
 /// Load a source into an index: scan it, apply the schema it describes when the index has none,
 /// then send every row.
 pub(crate) async fn load_data_from_source(
@@ -2161,15 +2187,6 @@ pub(crate) async fn load_data_from_source(
         return Err(anyhow!("Schema JSON object cannot be loaded as index data"));
     }
     let existing = existing_schema(client, index).await?;
-    // Asked for by name, since it is the one step here that cannot be undone: the documents go,
-    // the schema stays, and the load fills the index again.
-    if recreate && existing.is_some() {
-        client
-            .delete_index(index, false)
-            .await
-            .with_context(|| format!("Failed to delete the documents of index '{index}'"))?;
-        println!("Deleted the documents of index '{index}'; its schema is kept");
-    }
     let recorded = existing.as_ref().and_then(ExistingSchema::recorded_id);
     let new_id = id.is_some_and(|id| recorded.as_ref().is_none_or(|r| !same_id(id, r)));
     // An index with a schema has its fields typed and, usually, its id recorded: the load reads
@@ -2188,13 +2205,27 @@ pub(crate) async fn load_data_from_source(
             recorded: recorded.as_ref(),
         };
         let mut analysis = analyze_source(client, source, delimiter, ids, limits).await?;
-        if typed && matches!(analysis.id.reason, IdReason::Unique | IdReason::NameOnly) {
-            // An index that records no id, loaded from a source with no `id` column: the id is
-            // chosen by its values, and one batch is too few to judge them by.
-            analysis =
-                analyze_source(client, source, delimiter, ids, ScanLimits::sampled()).await?;
+        if typed {
+            let field_types = existing
+                .as_ref()
+                .map(|existing| existing.field_types.clone())
+                .unwrap_or_default();
+            if first_batch_inconclusive(&analysis, &field_types) {
+                analysis =
+                    analyze_source(client, source, delimiter, ids, ScanLimits::sampled()).await?;
+            }
         }
         analysis.profiler.warn_about_id(&analysis.id);
+        // Asked for by name, since it is the one step here that cannot be undone: the documents
+        // go, the schema stays, and the load fills the index again. Only once the source has
+        // been read and its id settled, so a load that cannot run leaves the index as it was.
+        if recreate && existing.is_some() {
+            client
+                .delete_index(index, false)
+                .await
+                .with_context(|| format!("Failed to delete the documents of index '{index}'"))?;
+            println!("Deleted the documents of index '{index}'; its schema is kept");
+        }
         let field_types = match &existing {
             // Another id than the index records: its schema has to say so before a row is sent.
             // The node rebuilds an index with no documents for it, and refuses one with some —
@@ -2205,6 +2236,12 @@ pub(crate) async fn load_data_from_source(
                     .put_index_config(index, &schema)
                     .await
                     .map_err(|err| {
+                        // The way through a refusal for documents in the way, unless it was
+                        // already taken; any other failure is said as it is.
+                        let in_the_way = crate::failure_status(&err) == Some(409);
+                        if recreate || !in_the_way {
+                            return err;
+                        }
                         anyhow!(
                             "{err}\nIndex '{index}' keys its documents by {}. To load it by {} \
                          instead, add --recreate: it deletes the documents, keeps the schema, and \
@@ -2241,16 +2278,25 @@ pub(crate) async fn load_data_from_source(
                 load_csv(client, index, &analysis, &field_types, batch_size, parallel).await?
             }
             format => {
+                let mut shapes: HashMap<String, ColumnShape> = analysis
+                    .profiler
+                    .columns
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .zip(analysis.shapes(&field_types))
+                    .collect();
+                // A field the schema declares fits its values whether or not the scan met it:
+                // a key first seen past what was read is still a count, a flag or a date.
+                for (name, field_type) in &field_types {
+                    shapes.entry(name.clone()).or_insert_with(|| ColumnShape {
+                        field_type: Some(field_type.clone()),
+                        ..Default::default()
+                    });
+                }
                 let plan = JsonLoadPlan {
                     id: analysis.id.spec.clone(),
                     explicit: matches!(analysis.id.reason, IdReason::Explicit | IdReason::Existing),
-                    shapes: analysis
-                        .profiler
-                        .columns
-                        .iter()
-                        .map(|c| c.name.clone())
-                        .zip(analysis.shapes(&field_types))
-                        .collect(),
+                    shapes,
                 };
                 match &analysis.data {
                     Some(data) => {
@@ -2494,6 +2540,11 @@ fn numeric_date_parts(cell: &str) -> Option<NumericDate<'_>> {
         year,
         time,
     })
+}
+
+/// Whether a cell is a numeric date at all, `03/04/2024` or `15.03.2024`.
+pub(crate) fn is_numeric_date(cell: &str) -> bool {
+    numeric_date_parts(cell).is_some()
 }
 
 /// What one numeric date says about its column's order, when only one reading of it is a date:

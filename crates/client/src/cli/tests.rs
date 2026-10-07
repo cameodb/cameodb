@@ -833,6 +833,26 @@ mod detect_tests {
         assert!(!analysis.choices[3].list);
     }
 
+    /// One batch read ahead of a load into a typed index is enough only when it settles what
+    /// the schema does not record: a date column whose dates all read either way round, or a
+    /// column with no value yet, sends the load to a wider sample.
+    #[test]
+    fn a_first_batch_that_leaves_a_guess_is_inconclusive() {
+        let typed = HashMap::new();
+        let settled = analysis("id,when,tags\na,15/03/2024,x\nb,03/04/2024,y\n", None);
+        assert!(!first_batch_inconclusive(&settled, &typed));
+        let either_way = analysis("id,when\na,03/04/2024\nb,05/06/2024\n", None);
+        assert!(first_batch_inconclusive(&either_way, &typed));
+        let empty_column = analysis("id,when,later\na,15/03/2024,\nb,03/04/2024,\n", None);
+        assert!(first_batch_inconclusive(&empty_column, &typed));
+        let no_id = analysis("code,when\nx1,15/03/2024\nx2,03/04/2024\n", None);
+        assert!(
+            first_batch_inconclusive(&no_id, &typed),
+            "an id chosen by values needs more than one batch: {:?}",
+            no_id.id.reason
+        );
+    }
+
     /// A slash column holding a date only day first can read is day first; one holding both
     /// kinds is no convention at all, and strictness makes it text rather than refuse half.
     #[test]

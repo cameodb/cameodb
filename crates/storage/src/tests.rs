@@ -3014,10 +3014,10 @@ mod learned_field_tests {
         assert!(!schema.fields["level"].indexed);
     }
 
-    /// How a type was reached is not part of what it is: a learned field and the same field
-    /// declared fingerprint alike.
+    /// A learned field takes values a declared one refuses, so the two fingerprint apart — and a
+    /// schema with no learned field keeps the fingerprint it had before the flag existed.
     #[test]
-    fn learned_is_not_in_the_fingerprint() {
+    fn learned_is_in_the_fingerprint_only_when_set() {
         let mut learned = IndexSchema::default();
         learned.fields.insert(
             "n".to_string(),
@@ -3025,9 +3025,11 @@ mod learned_field_tests {
         );
         let mut declared = learned.clone();
         declared.fields.get_mut("n").expect("n").learned = false;
-        assert_eq!(
+        assert_ne!(
             learned.calculate_fingerprint(),
             declared.calculate_fingerprint()
         );
+        let json = serde_json::to_value(&declared).expect("serialize");
+        assert!(json["fields"]["n"].get("learned").is_none(), "{json}");
     }
 }

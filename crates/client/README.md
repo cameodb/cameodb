@@ -101,12 +101,15 @@ becomes several values of one field, and a column with few distinct values repea
 a `string` category; other identifier-like columns become `text` with the `raw` tokenizer.
 `schema detect --report` shows all of it.
 
-A load into an index that already has a schema is not scanned: its fields are typed and its id is
-recorded, so the loader reads only the first batch of rows ahead, for what a schema does not hold
-— the order a column writes its numeric dates in, and whether it holds lists. An index that
-records no id, loaded from a source without an `id` column, is still sampled from the head and in
-spread blocks, since its id is chosen by its values. `--id` naming another id than the index
-records means a new schema, and a full scan.
+A load into an index that already has a schema reads only the first batch of rows ahead: its
+fields are typed and its id is recorded, and the batch settles what a schema does not hold — the
+order a column writes its numeric dates in, and whether it holds lists. When the batch leaves
+either a guess — dates that read either way round, a column with no value yet, a JSON field the
+schema declares but the batch never showed — or the id has to be chosen by its values (an index
+recording none, a source without an `id` column), the source is sampled from the head and in
+spread blocks instead. `--id` naming another id than the index records means a new schema, and a
+full scan. With `--recreate` the documents are deleted only after the source has been read and
+its id settled, so a load that cannot run leaves the index as it was.
 
 ### How CSV/TSV cells are read
 

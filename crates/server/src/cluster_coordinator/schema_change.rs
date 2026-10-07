@@ -281,6 +281,12 @@ async fn run_change(
                     reach.release(&index, change).await;
                     return Err(err);
                 }
+                // A peer's own refusal is the caller's answer too — a tokenizer an older build
+                // cannot build is a 400, which no retry once the cluster is whole would change.
+                Err(err @ OrchestratorError::Validation(_)) => {
+                    reach.release(&index, change).await;
+                    return Err(err);
+                }
                 Err(OrchestratorError::PeerUnreachable { message }) => unreachable.push(message),
                 Err(err) => unreachable.push(format!("{}: {err}", node.name())),
             }
@@ -366,10 +372,13 @@ async fn run_change(
                 proposal,
             });
         }
-        // Every node holds it already: nothing to write, and no version to spend.
+        // Every node holds it already, at one version: nothing to write, and no version to
+        // spend. The same schema at two versions is applied again, so the nodes agree on the
+        // version too — a search compares both.
         if readiness.iter().all(|(_, ready)| {
             ready.current.as_ref().is_some_and(|current| {
                 current.state != storage::SchemaState::Dropped
+                    && current.version == view.version
                     && current.calculate_fingerprint() == fingerprint
             })
         }) {
@@ -550,6 +559,9 @@ async fn run_change(
     }
 
     if !unconfirmed.is_empty() {
+        // A node that is alive but did not confirm still holds the reservation; let it go now
+        // rather than at its expiry, so the retry the message asks for is not answered busy.
+        reach.release(&index, change).await;
         return Err(OrchestratorError::PeerUnreachable {
             message: format!(
                 "index '{index}' schema version {} is stored on {} of {} nodes, and not \
@@ -582,9 +594,16 @@ async fn run_change(
 /// some node learned from a write and the preferred one lacks. Made to the preferred schema
 /// alone, an edit stored on every node would drop such a field from the nodes that hold it.
 fn held_view(readiness: &[(Node, SchemaReadiness)]) -> Option<IndexSchema> {
-    let held: Vec<&IndexSchema> = readiness
-        .iter()
-        .filter_map(|(_, ready)| ready.current.as_ref())
+    merged_view(
+        readiness
+            .iter()
+            .filter_map(|(_, ready)| ready.current.as_ref()),
+    )
+}
+
+/// [`held_view`] over the schemas themselves, a dropped index's record left out.
+fn merged_view<'a>(schemas: impl Iterator<Item = &'a IndexSchema>) -> Option<IndexSchema> {
+    let held: Vec<&IndexSchema> = schemas
         .filter(|current| current.state != storage::SchemaState::Dropped)
         .collect();
     let mut view = held
@@ -597,17 +616,19 @@ fn held_view(readiness: &[(Node, SchemaReadiness)]) -> Option<IndexSchema> {
     Some(view)
 }
 
-/// Bring into `into` what `from` learned from writes: a field `into` lacks, and a wider type for
-/// a learned field both hold without a column. A field `into` declared is left as declared.
-/// Whether anything changed.
+/// Bring into `into` what `from` learned from writes: a learned field `into` lacks, and a wider
+/// type for a learned field both hold without a column. A field `into` declared is left as
+/// declared, and a declared field it lacks stays absent. Whether anything changed.
 pub(crate) fn merge_learned(into: &mut IndexSchema, from: &IndexSchema) -> bool {
     let mut changed = false;
     for (name, field) in &from.fields {
         match into.fields.get_mut(name) {
-            None => {
+            // Only a learned one: a declared field `into` lacks was removed on purpose.
+            None if field.learned && !field.indexed => {
                 into.fields.insert(name.clone(), field.clone());
                 changed = true;
             }
+            None => {}
             Some(held) if held.learned && !held.indexed && field.learned && !field.indexed => {
                 let joined = held.field_type.widened(&field.field_type);
                 if joined != held.field_type {
@@ -649,6 +670,11 @@ impl FieldEdit {
                 Some(field) if field.indexed == *indexed => outcome.unchanged.push(name.clone()),
                 Some(field) => {
                     field.indexed = *indexed;
+                    // An indexed field is pinned to its column: no longer learned, so turning
+                    // it off again later does not let it widen over a column that exists.
+                    if *indexed {
+                        field.learned = false;
+                    }
                     outcome.applied.push(name.clone());
                 }
             }
@@ -878,8 +904,9 @@ async fn reconcile_until_agreed(
     );
 }
 
-/// One round: `Some(version)` when every node holds the merged schema, `None` when there is no
-/// index to agree on, and why it could not finish otherwise.
+/// One round: `Some(version)` when it stored the merged schema on every node, `None` when there
+/// was nothing to do — no index, or every node already agreeing — and why it could not finish
+/// otherwise.
 async fn reconcile_once(
     coordinator: &kameo::actor::ActorRef<super::ClusterCoordinator>,
     index: &str,
@@ -890,22 +917,29 @@ async fn reconcile_once(
         .map_err(|e| format!("the cluster coordinator did not answer: {e}"))?;
     let status = coordinator.ask(super::GetStatus).await.ok();
     let reach = reach_whole_cluster(&targets, status.as_ref(), index).map_err(|e| e.to_string())?;
-    let local = reach.nodes[0].clone();
-    let held = reach
-        .ask(
-            &local,
-            ClientOp::GetRawSchema {
-                index: index.to_string(),
-                minting_by: None,
-            },
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    if held.is_null() {
-        return Ok(None);
+    // Read every node's schema first, holding nothing. When they all agree — the round another
+    // node started already ran, or nothing was missing — there is nothing to do. Otherwise the
+    // edit starts from the schema they would merge to, so the first round normally finishes.
+    let held_op = ClientOp::GetRawSchema {
+        index: index.to_string(),
+        minting_by: None,
+    };
+    let mut held = Vec::new();
+    for (node, answer) in reach.ask_all(&held_op).await {
+        let value = answer.map_err(|e| e.to_string())?;
+        if !value.is_null() {
+            held.push(decode::<IndexSchema>(&node, value).map_err(|e| e.to_string())?);
+        }
     }
-    let base: IndexSchema = decode(&local, held).map_err(|e| e.to_string())?;
-    if base.state == storage::SchemaState::Dropped {
+    let Some(base) = merged_view(held.iter()) else {
+        return Ok(None);
+    };
+    let fingerprint = base.calculate_fingerprint();
+    let agreed = held.len() == reach.nodes.len()
+        && held.iter().all(|schema| {
+            schema.version == base.version && schema.calculate_fingerprint() == fingerprint
+        });
+    if agreed {
         return Ok(None);
     }
     let unchanged = FieldEdit {
@@ -918,5 +952,63 @@ async fn reconcile_once(
     {
         EditOutcome::Done { version, .. } => Ok(Some(version)),
         EditOutcome::Refused(body) => Err(body["reason"].as_str().unwrap_or("refused").to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use storage::{FieldDef, TantivyFieldType};
+
+    fn schema(fields: Vec<FieldDef>) -> IndexSchema {
+        let mut schema = IndexSchema::default();
+        for field in fields {
+            schema.fields.insert(field.name.clone(), field);
+        }
+        schema
+    }
+
+    /// What a node learned from writes is carried into a schema that lacks it, widened where
+    /// both hold it; a declared field the schema lacks was removed, and stays removed.
+    #[test]
+    fn only_learned_fields_are_merged_in() {
+        let mut into = schema(vec![
+            FieldDef::new("title".to_string(), TantivyFieldType::Text),
+            FieldDef::new_learned("level".to_string(), TantivyFieldType::I64),
+        ]);
+        let from = schema(vec![
+            FieldDef::new("removed".to_string(), TantivyFieldType::Text),
+            FieldDef::new_learned("reading".to_string(), TantivyFieldType::F64),
+            FieldDef::new_learned("level".to_string(), TantivyFieldType::Text),
+        ]);
+        assert!(merge_learned(&mut into, &from));
+        assert!(!into.fields.contains_key("removed"));
+        assert_eq!(
+            into.fields["reading"].field_type,
+            TantivyFieldType::F64,
+            "a learned field it lacked"
+        );
+        assert_eq!(into.fields["level"].field_type, TantivyFieldType::Text);
+        assert!(!merge_learned(&mut into, &from), "nothing more to bring");
+    }
+
+    /// Marking a learned field indexed pins it: it is declared from then on, so switching it off
+    /// again does not let it widen over the column built for it.
+    #[test]
+    fn promoting_a_learned_field_makes_it_declared() {
+        let held = schema(vec![FieldDef::new_learned(
+            "level".to_string(),
+            TantivyFieldType::I64,
+        )]);
+        let edit = FieldEdit {
+            field_updates: BTreeMap::from([("level".to_string(), true)]),
+            default_fields: None,
+        };
+        let Ok(Edited::Proposal(next, outcome)) = edit.apply(&held) else {
+            panic!("a known field is edited");
+        };
+        assert_eq!(outcome.applied, vec!["level".to_string()]);
+        assert!(next.fields["level"].indexed);
+        assert!(!next.fields["level"].learned);
     }
 }
