@@ -448,7 +448,7 @@ schema, and the table below, which is generated and checked against the tables b
 | `field:[low TO high]` | Range, bounds inclusive. | text, string, i64, u64, f64, date, ip |
 | `field:{low TO high}` | Range, bounds exclusive. | text, string, i64, u64, f64, date, ip |
 | `field:[low TO *]` | Range with one side unbounded. | text, string, i64, u64, f64, date, ip |
-| `field:>value` | Comparison: `>` `<` `>=` `<=`. | i64, u64, f64, date |
+| `field:>value` | Comparison: `>` `<` `>=` `<=`. | text, string, i64, u64, f64, date |
 | `field: IN [a b c]` | Match any of several values. | text, string, i64, u64, f64, date, boolean |
 | `field:/path/to/value` | Match a facet path. | facet |
 | `id:value` | Look up one document by id. Fastest retrieval path. | any |

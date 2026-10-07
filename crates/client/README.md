@@ -331,11 +331,10 @@ cargo test -p client
 
 ## 📚 Related Files
 
-- `crates/client/src/cli.rs` – REPL entry point & interactive session
+- `crates/client/src/cli/` – commands, the interactive shell, and the source scan and load
 - `crates/client/src/sdk.rs` – HTTP client wrapper for CameoDB API
 - `crates/client/Cargo.toml` – dependencies (`rustyline`, `dirs`, `reqwest`, `flate2`, `zip`, ...)
-- `examples/ingest_books.py` – book summaries loader (defaults to `examples/data/booksummaries.tsv`, tab-delimited, skips header row)
-- `examples/ingest_ted.py` – TED YouTube loader (defaults to `examples/data/youtube_ted_2024.csv`, semicolon-delimited, skips header row)
+- `examples/` – the book summaries and TED talks datasets, loaded with `data load` or with the Python scripts there, which reshape values by hand (see `examples/README.md`)
 
 ---
 The client is ready for cluster operators and developers to explore indexes, run searches, and inspect schemas with ergonomic completions and safe async runtime integration.

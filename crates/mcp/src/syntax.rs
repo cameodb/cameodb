@@ -175,8 +175,9 @@ pub const OPERATORS: &[Operator] = &[
             TYPE_IP,
         ],
         caveat: Some(
-            "Text and string ranges compare lexicographically. The `fast` flag is needed for \
-             sorting, not for ranges.",
+            "Text and string ranges compare lexicographically. A bound holding a space or \
+             punctuation is quoted — `category:[\"Film & Animation\" TO Music]` — in every \
+             range and comparison form. The `fast` flag is needed for sorting, not for ranges.",
         ),
     },
     Operator {
@@ -212,9 +213,16 @@ pub const OPERATORS: &[Operator] = &[
     Operator {
         syntax: "field:>value",
         summary: "Comparison: `>` `<` `>=` `<=`.",
-        examples: &["age:>=18", "score:<100", "created:>2024-01-01"],
-        types: &[TYPE_I64, TYPE_U64, TYPE_F64, TYPE_DATE],
-        caveat: None,
+        examples: &["age:>=18", "score:<100", "created:>2024-01-01", "id:>9000"],
+        types: &[
+            TYPE_TEXT,
+            TYPE_STRING,
+            TYPE_I64,
+            TYPE_U64,
+            TYPE_F64,
+            TYPE_DATE,
+        ],
+        caveat: Some("Text and string values compare lexicographically, as in a range."),
     },
     Operator {
         syntax: "field: IN [a b c]",

@@ -747,6 +747,23 @@ pub fn is_date_value(value: &JsonValue) -> bool {
     }
 }
 
+/// Whether a date field indexes `value` as another instant than it names: a date before
+/// 1677-09-21 or after 2262-04-11, which the index holds at the nearest of those — the range its
+/// nanosecond timestamps reach. The document keeps the value as written; searches and sorts see
+/// the nearest date. A list is out of range when any of its values is.
+pub fn date_out_of_range(value: &JsonValue) -> bool {
+    match value {
+        JsonValue::String(s) => {
+            parse_date_str_to_tantivy(s).is_some_and(|(_, secs, clamped)| secs != clamped)
+        }
+        JsonValue::Array(items) => items.iter().any(date_out_of_range),
+        _ => value.as_i64().is_some_and(|secs| {
+            let (_, secs, clamped) = epoch_seconds_to_tantivy(secs);
+            secs != clamped
+        }),
+    }
+}
+
 /// The epoch second a date field's fast column holds for this value, as the writer indexed it.
 ///
 /// For ordering a merge the way each shard's column is ordered, so it reads every shape the

@@ -9,6 +9,7 @@ use reqwest::Url;
 use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
@@ -702,6 +703,42 @@ impl IdLedger {
     }
 }
 
+/// Dates a load sends that a date field indexes as another instant — see
+/// [`storage::date_out_of_range`] — counted per field, with the first of each.
+#[derive(Debug, Default)]
+pub(crate) struct ClampedDates {
+    fields: BTreeMap<String, (u64, Location, String)>,
+}
+
+impl ClampedDates {
+    /// Count `value`, sent to date field `field` from `at`, if the field cannot hold it.
+    pub(crate) fn observe(&mut self, field: &str, value: &JsonValue, at: Location) {
+        if !storage::date_out_of_range(value) {
+            return;
+        }
+        let written = match value {
+            JsonValue::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        self.fields
+            .entry(field.to_string())
+            .or_insert((0, at, written))
+            .0 += 1;
+    }
+
+    /// Say which fields hold dates their index cannot place, and where the first one is.
+    pub(crate) fn report(&self) {
+        for (field, (count, at, value)) in &self.fields {
+            eprintln!(
+                "⚠️  {} dates in '{field}' lie outside 1677-09-21 … 2262-04-11, the first at {at} \
+                 ('{value}'). They are stored as written, but searched and sorted as the nearest \
+                 of those two dates.",
+                grouped(*count)
+            );
+        }
+    }
+}
+
 /// Serialize one CSV record as the NDJSON payload line the ingest stream accepts: the row, its
 /// id, and the id as its routing key.
 pub(crate) fn csv_ndjson_line(
@@ -744,6 +781,9 @@ pub(crate) struct CsvIngest {
     /// A row in this batch repeats an id sent before. See [`BatchSender::send`].
     batch_repeats: bool,
     pub(crate) ledger: IdLedger,
+    pub(crate) clamped: ClampedDates,
+    /// The columns typed as dates, the only ones [`ClampedDates`] has anything to count in.
+    date_columns: Vec<usize>,
 }
 
 impl CsvIngest {
@@ -753,6 +793,12 @@ impl CsvIngest {
         id_columns: Vec<usize>,
         batch_size: usize,
     ) -> Self {
+        let date_columns = columns
+            .iter()
+            .enumerate()
+            .filter(|(_, shape)| shape.field_type == Some(TantivyFieldType::Date))
+            .map(|(idx, _)| idx)
+            .collect();
         Self {
             headers: Arc::new(headers),
             columns: Arc::new(columns),
@@ -762,6 +808,8 @@ impl CsvIngest {
             batch_lines: Vec::new(),
             batch_repeats: false,
             ledger: IdLedger::default(),
+            clamped: ClampedDates::default(),
+            date_columns,
         }
     }
 
@@ -784,6 +832,12 @@ impl CsvIngest {
             return Ok(());
         };
         self.batch_repeats |= self.ledger.admit(&id, Location::Line(line));
+        for &idx in &self.date_columns {
+            if let (Some(cell), Some((name, _))) = (record.get(idx), self.headers.get(idx)) {
+                let value = csv_cell(cell, &self.columns[idx]);
+                self.clamped.observe(name, &value, Location::Line(line));
+            }
+        }
         self.rows.push((record.clone(), id));
         self.batch_lines.push(line);
         if self.rows.len() >= self.batch_size {
@@ -1975,6 +2029,7 @@ pub(crate) struct JsonIngestPipeline {
     /// A document in the batch being gathered repeats an id sent before.
     batch_repeats: bool,
     pub(crate) ledger: IdLedger,
+    pub(crate) clamped: ClampedDates,
 }
 
 impl JsonIngestPipeline {
@@ -1987,6 +2042,7 @@ impl JsonIngestPipeline {
             documents: 0,
             batch_repeats: false,
             ledger: IdLedger::default(),
+            clamped: ClampedDates::default(),
         }
     }
 
@@ -2002,6 +2058,13 @@ impl JsonIngestPipeline {
             return Ok(());
         };
         self.batch_repeats |= self.ledger.admit(&id, at);
+        for (field, shape) in &self.plan.shapes {
+            if shape.field_type == Some(TantivyFieldType::Date)
+                && let Some(value) = payload["doc"].get(field)
+            {
+                self.clamped.observe(field, value, at);
+            }
+        }
         let mut line = serde_json::to_vec(&payload).context("Failed to serialize JSON payload")?;
         line.push(b'\n');
         self.batch_body.extend_from_slice(&line);
@@ -2046,6 +2109,7 @@ pub(crate) struct LoadTotals {
     pub(crate) sent: usize,
     pub(crate) failed: usize,
     pub(crate) ledger: IdLedger,
+    pub(crate) clamped: ClampedDates,
 }
 
 pub(crate) async fn load_data_from_http_json_source_single_pass(
@@ -2087,6 +2151,7 @@ pub(crate) async fn load_data_from_http_json_source_single_pass(
         sent: sender.total_sent,
         failed: sender.total_failed,
         ledger: pipeline.ledger,
+        clamped: pipeline.clamped,
     })
 }
 
@@ -2103,7 +2168,7 @@ pub(crate) async fn load_data_from_reader_json_source_single_pass(
 
     // The reader is blocking, so the pipeline runs on a worker thread and reports
     // readiness as events; the async side delivers them in the order they arrive.
-    let producer = tokio::task::spawn_blocking(move || -> Result<IdLedger> {
+    let producer = tokio::task::spawn_blocking(move || -> Result<(IdLedger, ClampedDates)> {
         let mut pipeline = JsonIngestPipeline::new(batch_size, plan);
         let mut events = Vec::new();
         let send_err = || anyhow!("Failed to send message because receiver was dropped");
@@ -2120,7 +2185,7 @@ pub(crate) async fn load_data_from_reader_json_source_single_pass(
         })?;
         pipeline.finish(&mut events);
         drain(&mut events)?;
-        Ok(pipeline.ledger)
+        Ok((pipeline.ledger, pipeline.clamped))
     });
 
     let mut sender = BatchSender::new(client, index, parallel);
@@ -2137,11 +2202,13 @@ pub(crate) async fn load_data_from_reader_json_source_single_pass(
     // A failed send is the cause, and the reader stopping because nobody was listening any more
     // only its echo, so the send's error is the one reported.
     send_result?;
-    let ledger = produced.map_err(|err| anyhow!("Local JSON batch producer failed: {}", err))??;
+    let (ledger, clamped) =
+        produced.map_err(|err| anyhow!("Local JSON batch producer failed: {}", err))??;
     Ok(LoadTotals {
         sent: sender.total_sent,
         failed: sender.total_failed,
         ledger,
+        clamped,
     })
 }
 
@@ -2382,10 +2449,11 @@ pub(crate) async fn load_data_from_source(
     .await;
     spinner.stop();
     let (totals, id, explicit, candidate) = result?;
-    // `loaded` counts rows written; a row that replaced an earlier one with its id is among them,
-    // so the documents the index gained are `loaded - replaced`.
+    // `loaded` counts rows written. `repeated_ids` counts the rows among them whose id an earlier
+    // row of this load had, each replacing that row's document — not documents the index held
+    // before the load, which any row with their id replaces too.
     println!(
-        "Ingestion complete for index '{}': loaded={} replaced={} skipped={} failed={} (batch size {}, parallel {})",
+        "Ingestion complete for index '{}': loaded={} repeated_ids={} skipped={} failed={} (batch size {}, parallel {})",
         index,
         totals.sent,
         totals.ledger.repeats,
@@ -2395,6 +2463,7 @@ pub(crate) async fn load_data_from_source(
         parallel
     );
     totals.ledger.report(&id, explicit, candidate.as_deref());
+    totals.clamped.report();
     Ok(())
 }
 
@@ -2444,6 +2513,7 @@ async fn load_csv(
         sent: sender.total_sent,
         failed: sender.total_failed,
         ledger: ingest.ledger,
+        clamped: ingest.clamped,
     })
 }
 

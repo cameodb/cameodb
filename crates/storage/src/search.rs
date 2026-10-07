@@ -332,7 +332,7 @@ impl HybridStore {
 
         // A query refused before parsing — nested too deep — is a verdict here, not a failure:
         // the search it predicts would refuse it for the reason given.
-        let (normalized_query, prefix_notes, query_parser, _) = match prepare_query_parser(
+        let prepared = match prepare_query_parser(
             tantivy_index,
             &fields,
             &schema,
@@ -352,7 +352,7 @@ impl HybridStore {
 
         // The query itself is discarded: what is wanted is the error list, which is the half a
         // search throws away after deciding it can still run.
-        let (_parsed_query, parse_errors) = query_parser.parse_query_lenient(&normalized_query);
+        let (_parsed_query, parse_errors) = prepared.parse();
 
         let syntax_errors: Vec<String> = parse_errors
             .iter()
@@ -371,10 +371,10 @@ impl HybridStore {
             .collect();
 
         let mut discarded = describe_discarded_all(&semantic_errors, query, &schema);
-        discarded.extend(prefix_notes);
+        discarded.extend(prepared.notes.iter().cloned());
 
         Ok(Some(QueryValidation {
-            normalized_query,
+            normalized_query: prepared.shown(),
             syntax_errors,
             discarded,
         }))
@@ -420,11 +420,13 @@ impl HybridStore {
                 return Ok(SearchOutcome::counted(total_hits, Vec::new(), false));
             }
 
-            let (normalized_query, prefix_notes, query_parser, narrowed_default_fields) =
+            let prepared =
                 prepare_query_parser(tantivy_index, &fields, &schema, query, &self.config.query)?;
-            let (parsed_query, parse_errors) = query_parser.parse_query_lenient(&normalized_query);
+            let (parsed_query, parse_errors) = prepared.parse();
             let mut discarded = describe_discarded_all(&parse_errors, query, &schema);
-            discarded.extend(prefix_notes);
+            discarded.extend(prepared.notes.iter().cloned());
+            let normalized_query = prepared.shown();
+            let narrowed_default_fields = prepared.narrowed.clone();
 
             let emptied = !discarded.is_empty() && nothing_survived(parsed_query.as_ref());
 
@@ -535,14 +537,16 @@ impl HybridStore {
             });
         }
 
-        let (normalized_query, prefix_notes, query_parser, narrowed_default_fields) =
+        let prepared =
             prepare_query_parser(tantivy_index, &fields, &schema, query, &self.config.query)?;
 
         // Lenient, so one bad clause does not fail the whole query; what it drops is reported
         // through `SearchOutcome::discarded` rather than swallowed.
-        let (parsed_query, parse_errors) = query_parser.parse_query_lenient(&normalized_query);
+        let (parsed_query, parse_errors) = prepared.parse();
         let mut discarded = describe_discarded_all(&parse_errors, query, &schema);
-        discarded.extend(prefix_notes);
+        discarded.extend(prepared.notes.iter().cloned());
+        let normalized_query = prepared.shown();
+        let narrowed_default_fields = prepared.narrowed.clone();
 
         let emptied = !discarded.is_empty() && nothing_survived(parsed_query.as_ref());
 

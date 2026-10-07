@@ -662,6 +662,11 @@ is refused with `400` rather than guessed. A year must be written as four digits
 stored exactly as sent; only the indexed value is normalized. The same shapes are accepted in
 query literals.
 
+The index holds dates from 1677-09-21 to 2262-04-11, the range its nanosecond timestamps reach.
+A date outside it is accepted and stored as written, but indexed at the nearer end: `1605` is
+searched and sorted as 1677-09-21, so a range below that date does not find it and dates before it
+sort together. `data load` and `schema detect --report` count such values per field and say so.
+
 **Changing a schema.** A `PUT` over an index that already has a schema replaces it, and a
 change to a built column — a field's type, tokenizer, index record option, a column added or
 dropped, a fast column — or to `id_fields` needs the index built again. An index with no documents

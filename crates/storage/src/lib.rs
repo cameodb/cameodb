@@ -49,8 +49,8 @@ pub use query::{FieldReference, field_references};
 pub use schema::{
     DropsCounted, FieldDef, IndexSchema, SchemaChange, SchemaFieldUpdate, SchemaFields,
     SchemaRecord, SchemaState, SchemaVersion, TantivyFieldType, WalOp, byte_value_error,
-    count_drops, date_sort_secs, document_key_field, facet_path_error, is_date_value,
-    parse_date_to_timestamp_secs, select_default_fields,
+    count_drops, date_out_of_range, date_sort_secs, document_key_field, facet_path_error,
+    is_date_value, parse_date_to_timestamp_secs, select_default_fields,
 };
 pub use store::HybridStore;
 // `SchemaFields` is in the list because `HybridStore::get_or_create_index` returns it, not because
