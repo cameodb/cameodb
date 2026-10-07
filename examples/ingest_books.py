@@ -1,357 +1,132 @@
 #!/usr/bin/env python3
-"""Load Book Summaries data into CameoDB via HTTP API with batch processing."""
+"""Load the CMU Book Summaries into CameoDB, reshaping the genres on the way.
 
-import argparse
+The same file loads with no code at all:
+
+    cameodb client data load books examples/data/booksummaries.tsv
+
+That keeps every column as written. Its genres stay one JSON object per book, mapping Freebase
+ids to names — searchable by word, but not as a list of genres. This script is the hand-written
+alternative: it declares the schema itself and turns each object into the list of genre names,
+so each genre is a value of its own and the Freebase ids stay out of the searched text.
+
+The source is tab-separated with a typed header:
+book_id, freebase_id, title, author, publication_date, genres, summary.
+"""
+
+import csv
 import json
-from datetime import datetime, timezone
+import re
 import sys
-import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import requests
+from loader import BatchLoader, arguments, declare_schema, describe_cluster
 
-DEFAULT_BASE_URL = "http://localhost:9480"
 DEFAULT_INDEX = "books"
-DEFAULT_DATA_PATH = Path("examples/data/booksummaries.tsv")
+DEFAULT_DATA = Path("examples/data/booksummaries.tsv")
 DEFAULT_BATCH_SIZE = 2000
-DEFAULT_MAX_BATCH_BYTES = 16 * 1024 * 1024  # 16MB (safe under 64MB Kameo limit)
+
+# `book_id` makes the id and is kept as a shadow field: found by `book_id:620`, stored once in
+# the document key rather than indexed twice. `id_fields` records it, so a later
+# `cameodb client data load` into this index keys rows the same way.
+SCHEMA: Dict[str, Any] = {
+    "description": "CMU Book Summaries: one document per book, with its plot summary.",
+    "id_fields": ["book_id"],
+    "fields": {
+        "book_id": {"field_type": "text", "indexed": False, "is_shadow": True},
+        "freebase_id": {"field_type": "string", "description": "Freebase machine id, e.g. /m/0hhy."},
+        "title": {"field_type": "text"},
+        "author": {"field_type": "text"},
+        "publication_date": {
+            "field_type": "date",
+            "fast": True,
+            "description": "As the source writes it: a year, a year and month, or a full date.",
+        },
+        "genres": {"field_type": "text", "description": "Genre names, one value each."},
+        "summary": {"field_type": "text"},
+    },
+}
+
+# A date field holds 1677-09-21 to 2262-04-11; a book dated earlier is stored as written but
+# searched and sorted as 1677-09-21.
+EARLIEST_INDEXED_DATE = "1677-09-21"
 
 
-@dataclass
-class BatchBuffer:
-    docs: List[Dict[str, Any]]
-    bytes_used: int = 0
-
-    def append(self, doc: Dict[str, Any], size_bytes: int) -> None:
-        self.docs.append(doc)
-        self.bytes_used += size_bytes
-
-    def reset(self) -> List[Dict[str, Any]]:
-        payload = self.docs
-        self.docs = []
-        self.bytes_used = 0
-        return payload
-
-    def __bool__(self) -> bool:  # pragma: no cover - convenience helper
-        return bool(self.docs)
-
-
-def parse_genres(genres_json: str) -> List[str]:
-    """Parse the JSON genres field and extract genre names."""
-    if not genres_json or genres_json.strip() == "":
-        return []
-    
-    try:
-        genres_dict = json.loads(genres_json)
-        if isinstance(genres_dict, dict):
-            return list(genres_dict.values())
-        return []
-    except (json.JSONDecodeError, TypeError):
-        return []
-
-
-def parse_publication_date(date_str: str) -> Optional[str]:
-    """Parse publication date, handling various formats."""
-    date_str = (date_str or "").strip()
-    if not date_str:
-        return None
-
-    # Normalize to RFC3339 so storage infers Tantivy Date
-    # If YYYY-MM-DD provided, append midnight UTC
-    if len(date_str) == 10 and date_str.count("-") == 2:
-        return f"{date_str}T00:00:00Z"
-
-    # If year-only, pick Jan 1st midnight UTC
-    if len(date_str) == 4 and date_str.isdigit():
-        return f"{date_str}-01-01T00:00:00Z"
-
-    # Attempt to parse arbitrary ISO-like inputs; if parseable, normalize to Z
-    try:
-        dt = datetime.fromisoformat(date_str)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-    except ValueError:
-        return None  # Avoid downgrading schema by emitting non-date text
-
-
-def build_document(line: str) -> Optional[Dict[str, Any]]:
-    """Build a document payload for batch insertion from a tab-separated line."""
-    # Split by tabs - the format is:
-    # book_id \t freebase_id \t title \t author \t publication_date \t genres_json \t summary
-    parts = line.strip().split('\t')
-    
-    if len(parts) < 7:
-        return None
-    
-    book_id, freebase_id, title, author, pub_date, genres_json, summary = parts[:7]
-    
-    # Skip if missing essential fields
-    if not book_id or not title:
-        return None
-    
-    # Parse genres from JSON
-    genres = parse_genres(genres_json)
-    
-    # Build the document content - include book_id for auto shadow field detection
-    doc_content: Dict[str, Any] = {
-        "book_id": book_id.strip(),
-        "freebase_id": freebase_id.strip() if freebase_id else None,
-        "title": title.strip(),
-        "author": author.strip() if author else None,
-        "publication_date": parse_publication_date(pub_date),
-        "genres": genres,
-        "summary": summary.strip() if summary else "",
-    }
-    
-    # Use book_id as the document ID - auto schema will create book_id as shadow field
-    doc_content["id"] = book_id
-    
-    # Build the DocPayload format for bulk API
-    payload = {
-        "id": book_id,
-        "doc": {k: v for k, v in doc_content.items() if v is not None}
-    }
-
-    # Always include routing_key to leverage consistent hashing by default
-    payload["routing_key"] = book_id
-        
-    return payload
-
-
-def get_cluster_health(base_url: str) -> Optional[Dict[str, Any]]:
-    """Get cluster health information including active shard count."""
-    try:
-        url = f"{base_url.rstrip('/')}/_cluster/health"
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.RequestException:
-        return None
-
-
-def ensure_schema(base_url: str, index: str) -> bool:
-    """Ensure the index schema is created with correct field types before ingestion."""
-    schema = {
-        "fields": {
-            "id": {"field_type": "text", "indexed": True, "stored": True},
-            "book_id": {"field_type": "text", "indexed": False, "stored": False, "is_shadow": True},
-            "freebase_id": {"field_type": "text", "indexed": True, "stored": False},
-            "title": {"field_type": "text", "indexed": True, "stored": False},
-            "author": {"field_type": "text", "indexed": True, "stored": False},
-            "publication_date": {"field_type": "date", "indexed": True, "stored": False, "fast": True},
-            "genres": {"field_type": "text", "indexed": True, "stored": False},
-            "summary": {"field_type": "text", "indexed": True, "stored": False},
-        }
-    }
-    
-    url = f"{base_url.rstrip('/')}/api/{index}/_config"
-    try:
-        response = requests.put(url, json=schema, timeout=10)
-        response.raise_for_status()
-        print(f"Schema created/updated for index '{index}'")
-        return True
-    except requests.exceptions.RequestException as e:
-        print(f"Warning: Could not create schema: {e}")
+def before_indexed_range(date: str) -> bool:
+    """Whether a `YYYY`, `YYYY-MM` or `YYYY-MM-DD` date falls before what a date field holds,
+    read as the engine reads it: a year is its January 1st, a month its first day."""
+    if not re.fullmatch(r"\d{4}(-\d{2}(-\d{2})?)?", date):
         return False
+    # The range starts 12 minutes into that day, so the day itself is before it.
+    return (date + "-01-01"[len(date) - 4 :])[:10] <= EARLIEST_INDEXED_DATE
 
 
-def send_batch(base_url: str, index: str, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Send a batch of documents to CameoDB bulk API."""
-    url = f"{base_url.rstrip('/')}/api/{index}/_bulk"
-
+def genre_names(cell: str) -> List[str]:
+    """The genre names in a cell holding `{"/m/…": "Name", …}`; none for anything else."""
     try:
-        response = requests.post(url, json=batch, timeout=30)
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        raise SystemExit(f"Failed to send batch: {e}")
+        genres = json.loads(cell) if cell.strip() else {}
+    except json.JSONDecodeError:
+        return []
+    return [name for name in genres.values() if isinstance(name, str)] if isinstance(genres, dict) else []
 
 
-def ingest(
-    base_url: str,
-    index: str,
-    data_path: Path,
-    dry_run: bool = False,
-    batch_size: int = DEFAULT_BATCH_SIZE,
-    max_batch_bytes: int = DEFAULT_MAX_BATCH_BYTES,
-) -> None:
-    """Ingest book summaries data using batch processing for optimal performance."""
-    if not data_path.exists():
-        raise SystemExit(f"Data file not found: {data_path}")
-
-    # Optional: Pre-create schema with explicit field types before ingestion
-    # Uncomment to define schema upfront instead of relying on automatic evolution
-    # ensure_schema(base_url, index)
-
-    # Get cluster health to show actual shard count
-    health = get_cluster_health(base_url)
-    active_shards = health.get("active_shards", "unknown") if health else "unknown"
-    cluster_name = health.get("cluster_name", "unknown") if health else "unknown"
-    
-    print(
-        f"Starting batch ingestion with max batch size: "
-        f"{batch_size}, max bytes: {max_batch_bytes // 1024 // 1024}MB"
-    )
-    print(f"Target index: '{index}' (will use {active_shards} shards)")
-    print(f"Cluster: {cluster_name}")
-    if health:
-        print(f"Cluster status: {health.get('status', 'unknown')}")
-    print()
-
-    with data_path.open(encoding="utf-8") as handle:
-        buffer = BatchBuffer(docs=[])
-        total_processed = 0
-        total_indexed = 0
-        batch_count = 0
-        start_time = time.time()
-
-        def document_size_bytes(doc_payload: Dict[str, Any]) -> int:
-            return len(json.dumps(doc_payload, ensure_ascii=False).encode("utf-8"))
-
-        def flush_batch() -> None:
-            nonlocal batch_count, total_processed, total_indexed
-            if not buffer.docs:
-                return
-
-            docs_to_send = buffer.reset()
-            batch_count += 1
-            batch_start = time.time()
-
-            try:
-                if not dry_run:
-                    result = send_batch(base_url, index, docs_to_send)
-                    batch_indexed = result.get("items_written", 0)
-                    items_received = result.get("items_received", len(docs_to_send))
-                    errors = result.get("errors", [])
-                    total_operations = len(docs_to_send)
-                    failed_operations = len(errors)
-                    successful_operations = total_operations - failed_operations
-                else:
-                    batch_indexed = len(docs_to_send)
-                    items_received = len(docs_to_send)
-                    total_operations = len(docs_to_send)
-                    failed_operations = 0
-                    successful_operations = total_operations
-
-                batch_time = time.time() - batch_start
-                total_indexed += batch_indexed
-                total_processed += len(docs_to_send)
-
-                print(
-                    f"Batch {batch_count}: {batch_indexed}/{items_received} docs indexed "
-                    f"({successful_operations}/{total_operations} operations successful, {failed_operations} failed) "
-                    f"in {batch_time:.2f}s"
-                )
-
-                if failed_operations > 0:
-                    print(
-                        f"  Warning: {failed_operations} operations failed in batch {batch_count}"
-                    )
-            except Exception as exc:  # pragma: no cover - network failure path
-                print(f"Batch {batch_count} failed: {exc}")
-                total_processed += len(docs_to_send)
-
-        for line_num, line in enumerate(handle, 1):
-            # Skip header row if present
-            if line_num == 1:
-                continue
-
-            line = line.strip()
-            if not line:
-                continue
-
-            doc = build_document(line)
-            if not doc:
-                continue
-
-            if dry_run and line_num <= 5:  # Show first 5 docs in dry run
-                try:
-                    print(f"Document {line_num}:")
-                    print(json.dumps(doc, ensure_ascii=False, indent=2))
-                    print("-" * 50)
-                except BrokenPipeError:
-                    return
-
-            doc_size = document_size_bytes(doc)
-            buffer.append(doc, doc_size)
-
-            if len(buffer.docs) >= batch_size or (
-                max_batch_bytes and buffer.bytes_used > max_batch_bytes
-            ):
-                flush_batch()
-
-        # Send remaining documents in final batch
-        flush_batch()
-
-    total_time = time.time() - start_time
-
-    if dry_run:
-        print(f"Dry run completed: {total_processed} documents processed in {total_time:.2f}s")
-        if health:
-            print(f"  Index '{index}' will be created with {active_shards} shards")
-    else:
-        docs_per_sec = total_indexed / total_time if total_time > 0 else 0
-        print(f"\nIngestion completed:")
-        print(f"  Total processed: {total_processed} documents")
-        print(f"  Total indexed: {total_indexed} documents")
-        print(f"  Batches sent: {batch_count}")
-        print(f"  Total time: {total_time:.2f}s")
-        print(f"  Throughput: {docs_per_sec:.1f} docs/sec")
-        print(f"  Index: '{index}'")
-        if health:
-            print(f"  Index created with {active_shards} shards")
+def build_payload(row: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    """One book as a bulk payload, or `None` for a row with no id. Empty cells are left out."""
+    book_id = (row.get("book_id") or "").strip()
+    if not book_id:
+        return None
+    doc: Dict[str, Any] = {
+        "book_id": book_id,
+        "freebase_id": row.get("freebase_id", "").strip(),
+        "title": row.get("title", "").strip(),
+        "author": row.get("author", "").strip(),
+        # Every shape the source uses — `1962`, `1962-05`, `1962-05-17` — is one a date field
+        # reads, so the value is sent as written.
+        "publication_date": row.get("publication_date", "").strip(),
+        "genres": genre_names(row.get("genres", "")),
+        "summary": row.get("summary", "").strip(),
+    }
+    doc = {name: value for name, value in doc.items() if value not in ("", [])}
+    return {"id": book_id, "routing_key": book_id, "doc": doc}
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Load Book Summaries data into CameoDB with batch processing")
-    parser.add_argument(
-        "--base-url",
-        default=DEFAULT_BASE_URL,
-        help=f"CameoDB HTTP base URL (default: {DEFAULT_BASE_URL})",
-    )
-    parser.add_argument(
-        "--index",
-        default=DEFAULT_INDEX,
-        help=f"Target index name (default: {DEFAULT_INDEX})",
-    )
-    parser.add_argument(
-        "--data",
-        type=Path,
-        default=DEFAULT_DATA_PATH,
-        help=f"Path to book summaries data file (default: {DEFAULT_DATA_PATH})",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print sample documents instead of sending to CameoDB",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=DEFAULT_BATCH_SIZE,
-        help=f"Maximum documents per batch (default: {DEFAULT_BATCH_SIZE})",
-    )
-    parser.add_argument(
-        "--max-batch-mb",
-        type=int,
-        default=DEFAULT_MAX_BATCH_BYTES // 1024 // 1024,
-        help=f"Maximum batch size in MB (default: {DEFAULT_MAX_BATCH_BYTES // 1024 // 1024})",
-    )
+    args = arguments("Load the CMU Book Summaries into CameoDB.", DEFAULT_INDEX, DEFAULT_DATA, DEFAULT_BATCH_SIZE)
+    if not args.data.exists():
+        raise SystemExit(f"Data file not found: {args.data}")
 
-    args = parser.parse_args()
-    max_batch_bytes = args.max_batch_mb * 1024 * 1024
-    
-    ingest(
-        base_url=args.base_url,
-        index=args.index,
-        data_path=args.data,
-        dry_run=args.dry_run,
-        batch_size=args.batch_size,
-        max_batch_bytes=max_batch_bytes,
-    )
+    if args.dry_run:
+        print(json.dumps(SCHEMA, indent=2))
+    else:
+        describe_cluster(args.base_url)
+        declare_schema(args.base_url, args.index, SCHEMA)
+
+    loader = BatchLoader(args.base_url, args.index, args.batch_size, args.max_batch_mb, args.dry_run)
+    skipped = 0
+    early_dates = 0
+    # Summaries are long; the default field size limit would refuse some of them.
+    csv.field_size_limit(sys.maxsize)
+    with args.data.open(newline="", encoding="utf-8") as handle:
+        rows = csv.reader(handle, delimiter="\t")
+        # The header types its columns (`book_id.text`); the names are what precede the dot.
+        header = [name.split(".")[0] for name in next(rows)]
+        for values in rows:
+            payload = build_payload(dict(zip(header, values)))
+            if payload is None:
+                skipped += 1
+                continue
+            early_dates += before_indexed_range(payload["doc"].get("publication_date", ""))
+            loader.add(payload)
+
+    loader.finish(args.index)
+    if skipped:
+        print(f"  {skipped:,} rows had no book_id and were skipped.")
+    if early_dates:
+        print(
+            f"  {early_dates:,} books are dated before 1677-09-21: stored as written, but searched "
+            f"and sorted as that date."
+        )
 
 
 if __name__ == "__main__":
