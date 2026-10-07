@@ -2691,19 +2691,22 @@ fn a_fan_out_reads_the_page_off_the_operation() {
         "an unpaged search starts at the front"
     );
 
-    // A stream has no offset to read — the HTTP route refuses one — but its limit is still
-    // its own. The non-streaming fan-out used to fall through to the default here.
+    // A stream from a peer on an earlier build is the search it names: its own limit, from
+    // the front. Read as anything else, the plain broadcast answered it with one node's hits.
+    let streamed = ClientOp::Stream {
+        index: "books".to_string(),
+        query: "rust".to_string(),
+        limit: Some(50),
+        fields: None,
+        sort: None,
+    }
+    .normalized();
+    assert!(
+        matches!(streamed, ClientOp::Search { offset: None, .. }),
+        "{streamed:?}"
+    );
     assert_eq!(
-        search_window_for(
-            &ClientOp::Stream {
-                index: "books".to_string(),
-                query: "rust".to_string(),
-                limit: Some(50),
-                fields: None,
-                sort: None,
-            },
-            7
-        ),
+        search_window_for(&streamed, 7),
         SearchWindow::first(50),
         "a stream's limit is its own"
     );

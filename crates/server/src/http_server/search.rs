@@ -176,10 +176,12 @@ pub(super) async fn search_stream_handler(
         index, cleaned_query, window.limit, final_fields
     );
 
-    let client_op = ClientOp::Stream {
+    // The first `limit` hits: a stream has no page to take, and the route refuses an offset.
+    let client_op = ClientOp::Search {
         index,
         query: cleaned_query,
         limit: Some(window.limit),
+        offset: None,
         fields: final_fields,
         sort: final_sort,
     };

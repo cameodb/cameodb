@@ -1343,7 +1343,6 @@ pub(super) fn search_window_for(op: &ClientOp, default_limit: usize) -> SearchWi
             offset: offset.unwrap_or(0),
             limit: limit.unwrap_or(default_limit),
         },
-        ClientOp::Stream { limit, .. } => SearchWindow::first(limit.unwrap_or(default_limit)),
         // Nothing else is paged. The value is unused on those paths rather than wrong on them.
         _ => SearchWindow::first(default_limit),
     }

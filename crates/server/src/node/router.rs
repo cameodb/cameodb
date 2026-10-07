@@ -167,8 +167,6 @@ pub(super) struct BroadcastFanout {
     pub(super) remote: Vec<(Uuid, PeerAnswer)>,
     /// When the local + remote join started — the `took_ms` floor when no source says one.
     pub(super) started: Instant,
-    /// How many peers the fan-out asked, after `broadcast_fanout_limit`.
-    pub(super) peers_asked: usize,
 }
 
 /// One block per source, taken whole. Ordering across blocks is `order_hit_blocks`'s
@@ -605,6 +603,7 @@ impl RouterActor {
         operation_type: OperationType,
         strip_sort_keys_on_exit: bool,
     ) -> Result<JsonValue, OrchestratorError> {
+        let op = op.normalized();
         // Metadata operations (schema/config) always execute locally - no need to broadcast
         if matches!(
             op,
@@ -640,8 +639,7 @@ impl RouterActor {
         // single client-facing boundary for every routing decision (local, broadcast,
         // remote, streaming-buffered), so strip that metadata here before returning — unless
         // the caller is itself a merge and asked to keep it.
-        let is_search = strip_sort_keys_on_exit
-            && matches!(op, ClientOp::Search { .. } | ClientOp::Stream { .. });
+        let is_search = strip_sort_keys_on_exit && matches!(op, ClientOp::Search { .. });
 
         // Resolve locally before asking anyone. The ring and the shard placement are both
         // published lock-free and already in hand, and between them they answer the only
@@ -677,9 +675,7 @@ impl RouterActor {
                 }
 
                 // Use streaming for search operations if enabled
-                if self.streaming.enable_streaming_search
-                    && matches!(op, ClientOp::Search { .. } | ClientOp::Stream { .. })
-                {
+                if self.streaming.enable_streaming_search && matches!(op, ClientOp::Search { .. }) {
                     self.handle_broadcast_streaming(op).await
                 } else {
                     self.handle_broadcast(op).await
@@ -957,7 +953,6 @@ impl RouterActor {
                 .map(|(_, node_id, outcome)| (node_id, outcome))
                 .collect(),
             started,
-            peers_asked: peer_count,
         }
     }
 
@@ -976,7 +971,6 @@ impl RouterActor {
             local: local_result,
             remote: remote_results,
             started: t_start,
-            peers_asked: peer_count,
         } = fanout;
 
         // If this is a search, prefer fastest/local results and stop after hitting the limit.
@@ -1098,100 +1092,6 @@ impl RouterActor {
 
         // Merge results based on operation type
         match &op {
-            ClientOp::Search { sort, .. } => {
-                // Unreachable for a search today — the branch above returns for every
-                // `ClientOp::Search`. Kept in step with `window` regardless, so that it cannot
-                // come back to life paging incorrectly.
-                let limit = window.limit;
-                let nodes_contacted = all_results.len();
-
-                // For search operations, if we only have local results (no remote peers),
-                // return the local response directly to preserve shard-level details
-                if all_results.len() == 1 && peer_count == 0 {
-                    return Ok(all_results[0].clone());
-                }
-
-                // One block per node, in the order they were dispatched to.
-                let mut blocks: Vec<Vec<JsonValue>> = Vec::new();
-                let mut total_shards_queried = 0usize;
-                let mut total_hits_sum = 0usize;
-                // Read before the loop below consumes `all_results`.
-                let discarded = collect_discarded(&all_results);
-                let approximate_sort = collect_approximate_sort(&all_results);
-                let narrowed_default_fields = collect_narrowed_default_fields(&all_results);
-
-                for mut result in all_results {
-                    if let Some(hits) = result.get_mut("hits").and_then(|h| h.as_array_mut()) {
-                        blocks.push(std::mem::take(hits));
-                    }
-                    if let Some(stats) = result.get("stats").and_then(|s| s.as_object())
-                        && let Some(shards) = stats.get("shards").and_then(|s| s.as_object())
-                        && let Some(responded) = shards.get("responded").and_then(|r| r.as_u64())
-                    {
-                        total_shards_queried += responded as usize;
-                    } else if let Some(shards) =
-                        result.get("shards_responded").and_then(|s| s.as_u64())
-                    {
-                        total_shards_queried += shards as usize;
-                    }
-                    if let Some(total) = result.get("total_hits").and_then(|t| t.as_u64()) {
-                        total_hits_sum += total as usize;
-                    }
-                }
-
-                // Ordered by the requested sort when there is one. This branch previously
-                // merged by score whatever was asked for, so a sorted search that reached more
-                // than one node came back ranked by relevance instead.
-                let merged_hits = order_hit_blocks(blocks, sort.as_ref(), window);
-
-                let mut response = serde_json::json!({
-                    "hits": merged_hits,
-                    "hits_returned": merged_hits.len(),
-                    "total_hits": total_hits_sum,
-                    "limit": limit,
-                    "offset": window.offset,
-                    "stats": {
-                        "shards": {
-                            "total": total_shards_queried,
-                            "responded": total_shards_queried.saturating_sub(error_count as usize),
-                            "failed": error_count as usize
-                        },
-                        "nodes": {
-                            "contacted": nodes_contacted
-                        }
-                    }
-                });
-                attach_discarded(&mut response, discarded);
-                attach_approximate_sort(&mut response, approximate_sort);
-                attach_narrowed_default_fields(&mut response, narrowed_default_fields);
-                Ok(response)
-            }
-            ClientOp::Write { .. } | ClientOp::BulkWrite { .. } => {
-                // For writes, return aggregate success info
-                let total_nodes = all_results.len();
-
-                // Aggregate items_written and errors from all node responses
-                let mut items_written = 0u64;
-                let mut errors = Vec::new();
-
-                for result in &all_results {
-                    if let Some(n) = result.get("items_written").and_then(|v| v.as_u64()) {
-                        items_written += n;
-                    }
-                    if let Some(errs) = result.get("errors").and_then(|v| v.as_array()) {
-                        errors.extend(errs.clone());
-                    }
-                }
-
-                Ok(serde_json::json!({
-                    "success": error_count == 0 && errors.is_empty(),
-                    "nodes_contacted": total_nodes + error_count as usize,
-                    "nodes_succeeded": total_nodes,
-                    "nodes_failed": error_count,
-                    "items_written": items_written,
-                    "errors": errors
-                }))
-            }
             ClientOp::ListClusterIndexes { include_data_size } => {
                 // Merge index statistics from all nodes
                 let mut index_map: HashMap<String, IndexStats> = HashMap::new();
@@ -1456,32 +1356,13 @@ impl RouterActor {
 
         // Handle search operations with streaming
         match op {
-            ClientOp::Search { .. } | ClientOp::Stream { .. } => {
-                // A `Stream` is fanned out as the `Search` it names: both asks are the same
-                // window from the front of every source's order. `widen_broadcast_op` then
-                // gives it the fetch count — inside the shared fan-out, as the non-streaming
-                // path's own widening also is.
-                let op = match op {
-                    ClientOp::Stream {
-                        index,
-                        query,
-                        limit,
-                        fields,
-                        sort,
-                    } => ClientOp::Search {
-                        index,
-                        query,
-                        limit,
-                        offset: None,
-                        fields,
-                        sort,
-                    },
-                    other => other,
-                };
+            ClientOp::Search { .. } => {
+                // `widen_broadcast_op` gives every source the fetch count — inside the shared
+                // fan-out, as the non-streaming path's own widening also is.
                 let window = search_window_for(&op, self.default_search_limit);
                 let op = widen_broadcast_op(op, window);
                 let ClientOp::Search { index, sort, .. } = &op else {
-                    unreachable!("a stream was rewritten to a search above")
+                    unreachable!("matched as a search above")
                 };
                 let sort = sort.clone();
                 let index = index.clone();
@@ -1496,7 +1377,6 @@ impl RouterActor {
                     local,
                     remote,
                     started,
-                    peers_asked: _,
                 } = fanout;
 
                 // One block per source, keyed by that source's identity: this node's shards

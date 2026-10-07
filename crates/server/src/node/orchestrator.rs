@@ -1752,7 +1752,6 @@ pub(crate) fn worker_eligible(op: &ClientOp) -> bool {
         ClientOp::Write { .. }
             | ClientOp::Delete { .. }
             | ClientOp::Search { .. }
-            | ClientOp::Stream { .. }
             // Bulk ops fan out over the same snapshots the rest of the engine reads. What they
             // cannot do off the mailbox is *decide* a schema — a bulk write that needs one written
             // hands itself back as `UseActor`, which is the fast/slow split the single-write path
@@ -2780,27 +2779,6 @@ impl OrchestratorEngine {
                 )
                 .await,
             ),
-            // A stream carries the whole result to the caller as it is produced, so there is no
-            // page to ask for and no offset on this op.
-            ClientOp::Stream {
-                index,
-                query,
-                limit,
-                fields,
-                sort,
-            } => {
-                let search_limit = limit.unwrap_or(self.default_search_limit);
-                WorkerOutcome::Done(
-                    self.engine_search(
-                        &index,
-                        &query,
-                        SearchWindow::first(search_limit),
-                        fields.as_deref(),
-                        sort.as_ref(),
-                    )
-                    .await,
-                )
-            }
             ClientOp::Delete {
                 index,
                 id,
@@ -5020,7 +4998,8 @@ impl NodeOrchestrator {
     /// Writes and deletes may answer [`Answer::Later`]: the part that waits on a peer, for the
     /// handler to run off the mailbox. Everything else is answered here and now.
     pub(super) async fn handle_client_op(&mut self, op: ClientOp) -> Answer {
-        Answer::Now(match op {
+        Answer::Now(match op.normalized() {
+            ClientOp::Stream { .. } => unreachable!("normalized to a search above"),
             ClientOp::Search {
                 index,
                 query,
@@ -5036,24 +5015,6 @@ impl NodeOrchestrator {
                         offset: offset.unwrap_or(0),
                         limit: limit.unwrap_or(self.default_search_limit),
                     },
-                    fields.as_deref(),
-                    sort.as_ref(),
-                )
-                .await
-            }
-            ClientOp::Stream {
-                index,
-                query,
-                limit,
-                fields,
-                sort,
-            } => {
-                // Use streaming search with the same logic as Search but optimized for HTTP streaming
-                let search_limit = limit.unwrap_or(self.default_search_limit);
-                self.orch_search(
-                    &index,
-                    &query,
-                    SearchWindow::first(search_limit),
                     fields.as_deref(),
                     sort.as_ref(),
                 )
@@ -6691,6 +6652,7 @@ impl Message<ClientOp> for NodeOrchestrator {
     /// — two nodes whose workers were all waiting on each other could not otherwise serve the
     /// shares both were waiting for.
     async fn handle(&mut self, msg: ClientOp, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+        let msg = msg.normalized();
         if worker_eligible(&msg)
             && let (Some(engine), Some(lane)) = (self.engine.clone(), self.peer_lane.clone())
         {

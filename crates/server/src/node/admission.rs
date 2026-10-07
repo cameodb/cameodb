@@ -63,7 +63,7 @@ pub(crate) enum OpClass {
 impl OpClass {
     pub(super) fn of(op: &ClientOp) -> Self {
         match op {
-            ClientOp::Search { .. } | ClientOp::Stream { .. } => OpClass::Read,
+            ClientOp::Search { .. } => OpClass::Read,
             ClientOp::Write { .. } | ClientOp::Delete { .. } => OpClass::Write,
             ClientOp::BulkWrite { .. } | ClientOp::BulkDelete { .. } => OpClass::Bulk,
             _ => OpClass::Any,
