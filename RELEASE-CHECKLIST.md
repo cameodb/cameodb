@@ -84,8 +84,9 @@ These are accepted, not fixed. They belong in release notes as much as here.
 - **An MCP client authenticates with an HTTP header or not at all.** The key travels as
   `Authorization: Bearer`, so an MCP client that cannot set a header cannot reach an
   authenticated node. There is no OAuth flow and no per-client credential issuance.
-- **API keys are read at startup.** Adding or revoking one is add → restart → migrate
-  clients → remove → restart. No hot reload, and no lockout or throttle on failed
+- **API keys are read at startup and on request.** Adding or revoking one is add → reload
+  (`POST /_admin/keys/reload`, or SIGHUP) → migrate clients → remove → reload; a node holds the
+  ring it last read until one of those. There is no lockout or throttle on failed
   authentication (against a 256-bit key it buys nothing and is itself a DoS lever — refusals
   are counted and logged instead).
 - **Cluster peers are trusted by the PSK, not by API keys.** `allowed_indexes` is enforced at
@@ -129,6 +130,66 @@ Signed off by:
 ## History
 
 <!-- Newest first. Append a filled-in template per release. -->
+
+## v0.3.6 — in progress
+
+Commit: the `chore(release): 0.3.6` commit, which follows 2f358f3, the search 404 — the fix is
+ordered before the version bump. `MANIFEST.txt` records the hash when the release is built.
+
+Built targets: **not yet.** `dist/0.3.6/` holds an earlier build (macOS, musl + `.deb`/`.rpm`, both
+SBOMs) that predates 2f358f3 and the MCP change after it, so it is stale: rebuild with
+`release.sh --stage build,sbom`, re-run the suites against the rebuilt binary, then sign. The
+Windows build is not made.
+
+What the validation covered, and on what:
+
+- **Host suites, 2026-10-08 00:17:25 → 00:21:00,** `target/release/cameodb`: deps, unit, posture,
+  auth, tls, remote-sources and artifact all PASS. That release binary was built 23:51, before the
+  last edit (the MCP search tools no longer look an index up after an empty result, in
+  `mcp/search.rs`). After that edit `deps` and `unit` were re-run on the tree and PASS; `posture`,
+  `auth`, `tls`, `remote-sources` and `artifact` were not, and are re-run on the rebuilt binary.
+- **Cluster suite** (`all.sh cluster`, three nodes in Docker), 39/39 PASS, including the new
+  `probe missing` check: a missing index is a 404 through every node, and a new one is found
+  through every node. The image was built from the tree before the MCP edit above.
+  Metrics: storm new-index writes 73 ok/s; cross mints 163/s, bulks 709/s, searches 2,583/s,
+  single writes 3,441/s; samemint 120/120; restarts converged in 0 s; a frozen peer noticed in
+  38 s.
+- `check-config --allow-unauthenticated` on both shipped configs returns the same four accepted
+  `internal`-profile warnings as 0.3.5.
+
+Benchmark, single node, release build, Apple M5 Pro (15 cores, 24 GB), `cameodb-bench`, closed loop,
+15 s measured after a 5 s warmup, client on the same machine. Documents/s for bulk, operations/s
+otherwise. Taken on 2026-10-07 at a4e13b3, before the 404 change; search was re-measured against
+the shipped 0.3.5 binary on the same day.
+
+| Arm | Baseline (ROADMAP) | default, 4 shards | 1 shard | 1 shard, `wal_sync` off |
+|---|---|---|---|---|
+| single writes, concurrency 16 | 588 (F9) | 591, p50 25 ms | 1,863, p50 8 ms | 40,465 |
+| single writes, concurrency 64 | 1,836 (F9) | 2,011 | 1,883 | 55,989 |
+| bulk 500, concurrency 16 | 129,674 (F9) | 125,724 | 152,994 | 153,765 |
+| bulk 5,000, concurrency 32 | 327,691 (F9) | 340,402 | 191,476 | 194,733 |
+| search, concurrency 4 | 13,819 (F5) | 16,698, p99 344 µs | 23,266, p99 246 µs | 23,300 |
+| search, concurrency 12 | 26,916 (F5) | ~26,900, p99 ~790 µs | 34,093, p99 487 µs | 35,572 |
+
+No arm reported a refused or failed request. Search at concurrency 12 alternated with the shipped
+0.3.5: 0.3.5 at 26,957 and 27,370/s with p99 804 and 788 µs, 0.3.6 at 27,009 and 26,808/s with p99
+820 and 809 µs — no regression. F5's p99 of 617 µs was taken on an older build on another day; 0.3.5
+measures about 790 µs today, so the gap is the machine, not this release. A single shard trades
+away large-batch bulk (191k against 340k documents/s at batch 5,000) for faster small writes and
+search. Single writes near 2k/s at concurrency 64 are the macOS `F_FULLFSYNC` ceiling, not the
+node. The numbers predate the 404 change, which adds a check on a schema each search already
+loads; re-measure search on the rebuilt binary.
+
+Advisory exceptions reviewed: RUSTSEC-2026-0118, RUSTSEC-2026-0119 and RUSTSEC-2024-0436, all via
+libp2p 0.56.0, review-by 2026-11-01; none came due, none renewed.
+
+Still to do: rebuild `dist/0.3.6/`; re-run posture, auth, tls, remote-sources and artifact on it;
+`remote-sources` on musl and Windows; the Windows build; `release.sh --stage sign`; `publish.sh`
+and `--commit`; the web project commit; the Docker image.
+
+Known gaps acknowledged: pending — the standing list above is unchanged.
+
+Signed off by: pending
 
 ## v0.3.5 — 2026-09-28
 
