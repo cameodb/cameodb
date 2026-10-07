@@ -27,7 +27,9 @@ use uuid::Uuid;
 
 use super::DeleteTargets;
 use crate::distributed::ClusterStatus;
-use crate::node::{ClientOp, NodeOrchestrator, OrchestratorError, SchemaApplied, SchemaReadiness};
+use crate::node::{
+    ClientOp, NodeOrchestrator, OrchestratorError, RemoteVerdict, SchemaApplied, SchemaReadiness,
+};
 use storage::{IndexSchema, SchemaFieldUpdate, SchemaRecord, SchemaVersion, count_drops};
 
 /// How many times a change that finds its index held by another change asks again.
@@ -155,6 +157,19 @@ fn decode<T: serde::de::DeserializeOwned>(
             node.name()
         ),
     })
+}
+
+/// Whether a node's error answering a schema change is the caller's answer — a refusal no
+/// retry changes — rather than a sign the node could not be asked.
+///
+/// Read by verdict, because that is all a peer's error keeps: it crosses the wire as
+/// [`OrchestratorError::Remote`], whatever variant the peer raised, so matching the variant
+/// recognised only this node's own refusals and sent a peer's 400 back as a 503.
+fn refuses_the_change(err: &OrchestratorError) -> bool {
+    matches!(
+        err.verdict(),
+        RemoteVerdict::BadRequest | RemoteVerdict::QuotaExceeded
+    )
 }
 
 /// The answer to a change refused with nothing changed: the handler answers it `409`.
@@ -318,7 +333,7 @@ async fn run_change(
                 }
                 // A peer's own refusal is the caller's answer too — a tokenizer an older build
                 // cannot build is a 400, which no retry once the cluster is whole would change.
-                Err(err @ OrchestratorError::Validation(_)) => {
+                Err(err) if refuses_the_change(&err) => {
                     reach.release(&index, change).await;
                     return Err(err);
                 }
@@ -1204,6 +1219,26 @@ mod tests {
         assert_eq!(outcome.applied, vec!["level".to_string()]);
         assert!(next.fields["level"].indexed);
         assert!(!next.fields["level"].learned);
+    }
+
+    /// A peer's refusal arrives as `Remote`, whatever it raised, and is still the caller's
+    /// answer; a peer that could not answer, or answered in a form this node cannot read, is not.
+    #[test]
+    fn a_peer_refusal_is_read_by_its_verdict() {
+        let from_peer = |verdict| OrchestratorError::Remote {
+            verdict,
+            message: "tokenizer 'hr_stem' is not known to this node".to_string(),
+        };
+        assert!(refuses_the_change(&from_peer(RemoteVerdict::BadRequest)));
+        assert!(refuses_the_change(&from_peer(RemoteVerdict::QuotaExceeded)));
+        assert!(refuses_the_change(&OrchestratorError::Validation(
+            "a local refusal".to_string()
+        )));
+        assert!(!refuses_the_change(&from_peer(RemoteVerdict::Unavailable)));
+        assert!(!refuses_the_change(&from_peer(RemoteVerdict::ServerFault)));
+        assert!(!refuses_the_change(&OrchestratorError::PeerUnreachable {
+            message: "older build".to_string()
+        }));
     }
 
     /// A sweep judges this node's own records: a live schema at or below a peer's drop is a

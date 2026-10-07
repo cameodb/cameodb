@@ -5658,7 +5658,14 @@ two-write batch and a `_bulk`, and asserts one schema.
 
 ### N3 — A peer's 400 during a schema change is answered as a 503
 
-**Defect.** 📋 **Planned.** **Checked.** In `run_change`'s prepare loop the arm
+**Defect.** ✅ **Done** 2026-10-07. The prepare round reads a node's error by its verdict through
+`refuses_the_change` — `BadRequest` and `QuotaExceeded` are the caller's answer, returned with the
+peer's text — so a peer's refusal is a 400 again rather than "not every node could be asked".
+Covered by `a_peer_refusal_is_read_by_its_verdict`, which pins the classification for a peer's
+`Remote` refusal, a local `Validation`, and the unreachable and older-build cases that stay 503.
+No other arm in `schema_change.rs` or `orchestrator.rs` matches a peer's error by variant.
+
+**Original entry.** **Checked.** In `run_change`'s prepare loop the arm
 `Err(err @ OrchestratorError::Validation(_))` (`schema_change.rs:321`) can never match for a peer:
 every error a peer sends deserializes to `OrchestratorError::Remote { verdict, .. }`
 (`node/mod.rs:741–765`). A peer refusing a tokenizer an older build cannot build therefore falls
