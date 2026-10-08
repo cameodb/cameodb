@@ -9,7 +9,7 @@ use crate::authz::retain_visible_indexes;
 use crate::mcp::diagnostics::{analyze_query, cameodb_syntax_reference, tool_error};
 use crate::mcp::schema::{
     absent_index_reason, catalogue_entry, enrich_index_entry, enrich_index_entry_owned,
-    extract_field_info, extract_field_names, field_query_hint, index_schema,
+    extract_field_info, extract_field_names, index_schema,
 };
 use crate::node::ClientOp;
 use crate::state::AppState;
@@ -122,8 +122,6 @@ pub(super) fn validate_query(
             .map(extract_field_info)
             .unwrap_or_default();
 
-        let field_names: Vec<String> = field_infos.iter().map(|info| info.name.clone()).collect();
-
         // Field suggestions from partial input
         let field_suggestions = partial_field
             .as_ref()
@@ -152,50 +150,11 @@ pub(super) fn validate_query(
             })
             .unwrap_or_default();
 
-        // Field-type-aware schema summary. Shadow fields are listed rather than filtered
-        // out: the identifier's own name is the one field answered without the search
-        // index, so a field list that omits it hides the cheapest query in the index.
-        let fields_with_types: Vec<JsonValue> = field_infos
-            .iter()
-            .filter(|info| info.name != "_seq")
-            .map(|info| {
-                // `fast` belongs here as much as the other flags: it is what decides whether a
-                // field can be sorted on, and a caller choosing how to query has to know.
-                // Leaving it out was one of the spellings that differed between surfaces.
-                //
-                // `sortable` sits beside it for the reason `searchable` sits beside `indexed`:
-                // `fast` is the declaration and `sortable` is whether the built index carries
-                // the column. They differ for a field declared after the index was built, and a
-                // caller picking a field to sort on needs the second one.
-                let mut entry = serde_json::json!({
-                    "name": info.name,
-                    "type": info.field_type,
-                    "indexed": info.indexed,
-                    "fast": info.fast,
-                    "sortable": info.sortable,
-                    "shadow": info.is_shadow,
-                    "searchable": info.searchable,
-                    "queryable": info.is_queryable(),
-                    "default_search": info.default_search,
-                    "query_hint": field_query_hint(info),
-                });
-                if let Some(text) = &info.description
-                    && let Some(obj) = entry.as_object_mut()
-                {
-                    obj.insert("description".to_string(), JsonValue::String(text.clone()));
-                }
-                // Carried through for the same reason `describe_index` reports it: it is the
-                // only thing relating `id` to the shadow name beside it.
-                if let Some(name) = &info.returned_as
-                    && let Some(obj) = entry.as_object_mut()
-                {
-                    obj.insert("returned_as".to_string(), JsonValue::String(name.clone()));
-                }
-                entry
-            })
-            .collect();
-
-        // Query analysis with structural validation
+        // Query analysis with structural validation. The schema is read for the
+        // verdict — resolving field names, scoring corrections — and not echoed back:
+        // a field list here is a copy of `describe_index`'s answer, and on a wide
+        // index it is most of an agent's context bought for nothing the analysis did
+        // not already say.
         let mut query_analysis = query
             .as_ref()
             .map(|query_text| analyze_query(query_text, &field_infos));
@@ -219,14 +178,34 @@ pub(super) fn validate_query(
             merge_parser_verdict(analysis, &parsed);
         }
 
-        Ok(serde_json::json!({
+        let bare_call = index.is_none() && partial_field.is_none() && query.is_none();
+        let mut response = serde_json::json!({
             "index": index,
             "field_suggestions": field_suggestions,
             "query_analysis": query_analysis,
-            "syntax_reference": cameodb_syntax_reference(),
-            "available_fields": fields_with_types,
-            "searchable_field_names": field_names,
-        }))
+        });
+        // The reference is the answer to a bare call, not baggage on every validation —
+        // the same text is already resident in `search_index`'s description.
+        if bare_call && let Some(obj) = response.as_object_mut() {
+            obj.insert("syntax_reference".to_string(), cameodb_syntax_reference());
+        }
+        // An index named without a query is a schema read arriving at the wrong tool:
+        // answer it with the pointer rather than with a copy of the schema.
+        if index.is_some()
+            && query.is_none()
+            && partial_field.is_none()
+            && let Some(obj) = response.as_object_mut()
+        {
+            obj.insert(
+                "note".to_string(),
+                JsonValue::String(
+                    "No query to validate. `describe_index` lists this index's fields, types \
+                     and per-type query hints."
+                        .to_string(),
+                ),
+            );
+        }
+        Ok(response)
     })
 }
 

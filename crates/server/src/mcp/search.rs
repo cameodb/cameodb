@@ -8,9 +8,10 @@ use cameodb_mcp::{McpIndexSearchRequest, ToolError};
 use crate::cluster_coordinator::OperationType;
 use crate::mcp::diagnostics::{
     approximate_sort_note, names_a_missing_field, narrowed_default_fields_note, paged_past_the_end,
-    refuse_if_clauses_discarded, short_page_note, tool_error, with_valid_fields,
+    refuse_if_clauses_discarded, short_page_note, tool_error, with_field_suggestions,
     zero_results_advice,
 };
+use crate::mcp::schema::extract_field_info;
 use crate::node::{
     APPROXIMATE_SORT_FIELD, ClientOp, NARROWED_DEFAULT_FIELDS, SearchWindow, order_hit_blocks,
 };
@@ -274,6 +275,10 @@ pub(super) fn search_index(
             Err(err) => {
                 let err_str = err.to_string();
 
+                // A missing-field error gets the fields the mistyped name probably
+                // meant, read from the schema — the correction belongs in the error,
+                // and the field list itself stays on `describe_index` where it is
+                // expected rather than appended to every failure.
                 if names_a_missing_field(&err_str)
                     && let Ok(schema_result) = state
                         .router
@@ -281,15 +286,16 @@ pub(super) fn search_index(
                             index: index_name.clone(),
                         })
                         .await
-                    && let Some(fields_obj) =
-                        schema_result.get("fields").and_then(|v| v.as_object())
                 {
-                    let field_names: Vec<String> = fields_obj.keys().cloned().collect();
-                    return Err(ToolError::caller(with_valid_fields(
-                        &err_str,
-                        &index_name,
-                        &field_names,
-                    )));
+                    let field_infos = extract_field_info(&schema_result);
+                    if !field_infos.is_empty() {
+                        return Err(ToolError::caller(with_field_suggestions(
+                            &err_str,
+                            &index_name,
+                            &field_infos,
+                            &query,
+                        )));
+                    }
                 }
 
                 Err(tool_error(err))
@@ -417,11 +423,12 @@ pub(super) fn search_across_indexes(
                                 index: index_name.clone(),
                             })
                             .await
-                        && let Some(fields_obj) =
-                            schema_result.get("fields").and_then(|v| v.as_object())
                     {
-                        let field_names: Vec<String> = fields_obj.keys().cloned().collect();
-                        message = with_valid_fields(&err_str, &index_name, &field_names);
+                        let field_infos = extract_field_info(&schema_result);
+                        if !field_infos.is_empty() {
+                            message =
+                                with_field_suggestions(&err_str, &index_name, &field_infos, &query);
+                        }
                     }
 
                     errors.push(serde_json::json!({"index": index_name, "error": message}));
