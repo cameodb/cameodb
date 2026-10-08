@@ -12,7 +12,9 @@ C3–C6, CH8–CH12 and OB3–OB9 — and a re-read on the same day is recorded 
 changesets is filed as its own activity group under
 [L. Post-0.3.4 review](#l-post-034-review--preparing-the-next-cycle--planned), held until the
 release has settled. The 2026-10-07 whole-code review, taken at the 0.3.6 cut, is filed as
-[N. Pre-0.3.6 whole-code review](#n-pre-036-whole-code-review--planned).
+[N. Pre-0.3.6 whole-code review](#n-pre-036-whole-code-review--planned). The 2026-10-08 review
+of the released 0.3.6, read as a database-systems pass, is filed as
+[O. Post-0.3.6 review](#o-post-036-review--the-base-for-the-next-iteration--planned).
 
 ## How to read this file
 
@@ -55,6 +57,7 @@ on one.
 | L — Post-0.3.4 review: the refactor cycle | ✅ Done | All twenty closed — four defects, six security remainder items, three decompositions, six simplifications, and the retrospective (L20, run 2026-09-19) |
 | M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed; M1, M2, M3, M4, M5 and M7 done — the blocker is cleared, the surface is metered, and tenants are bounded and isolated per index. No feature build remains; M8 closed with the prefix floor and default-field cap, the clause cap deferred. M6 done: the open-loop arms show goodput degrading rather than collapsing on the bulk, single-write and read lanes, after fixing the two defects its arms found — [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) and [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput), and its confirmation run on 2026-09-27 found OB22 costs a single node nothing measurable. What is left is the release cut |
 | N — Pre-0.3.6 whole-code review | 📋 Planned | N1–N10 before the 0.3.6 cut: a `HEAD` authorization gap, batched writes that never learn a field, a peer's 400 answered as 503, node identity replaced silently, query rewrites by substring, three client errors, the first shard's memory budget, streaming broadcast, a storage shutdown race, flattened storage errors. N11–N17 after it: one way to reach a peer, dead surface, `run_change`, typed boundaries, single owners, the orchestrator split |
+| O — Post-0.3.6 review: the next-iteration base | 📋 Planned | O1–O4 code items — a `wal_sync=false` durability barrier, deadlines on every remote ask, shard-map merges on a per-owner epoch (the prerequisite N15 does not name), the request budget on the wire. O5 folds Rust-surface items into N16/N17; O6 reconciles the architecture doc |
 
 ## Reconciliation, 2026-08-26
 
@@ -6134,6 +6137,139 @@ to start on a corrupt identity file; N7 by the first shard of *N* receiving the 
 last); `scripts/validate/all.sh` and the 38-check cluster suite green on the cut binary; the
 CHANGELOG entry for each that changes behaviour (N1, N2, N3, N4, N6, N7). N11–N17 are not 0.3.6
 work, and the release is not held for them.
+
+## O. Post-0.3.6 review — the base for the next iteration 📋 Planned
+
+Reviewed 2026-10-08, at `92e22e4` (the 0.3.6 tag), on the question *does the code hold the
+architecture's stated invariants, and where does it pay for what it does not hold*. Read as a
+database-systems pass — durability ordering, the convergence protocol, overload behaviour —
+with N read first, so what is filed below is what N did not already file. `cargo clippy
+--workspace --all-targets` is clean; 653 unit tests pass.
+
+**What the review found, in one paragraph.** The components hold their contracts: the write
+path's locking discipline, the checkpoint stamped inside the Tantivy commit, worker-pool
+accounting released by `Drop`, the shed-before-permit check, writer-thread supervision, and
+the `Answer::Later` pattern that keeps peer waits off the mailbox are all sound where read.
+What the system lacks is a *convergence protocol* for cluster metadata: the shard map merges
+on recency alone, with no versioning, which the periodic 10 s pull currently papers over and
+Phase 15 (migration) will expose — O3 is the item the rest of the group's order exists to
+serve. Two smaller items close out the operational hazards: remote asks that can wait
+forever, and a `wal_sync = false` mode that can leave the search index durable ahead of the
+store. The remainder is code shape, and it has the same cause N named: the system has grown
+by accretion of fixes, each correct, and the incident history lives in the code comments.
+
+**The order, agreed for the iteration:** O1–O2 first — small, and each closes an operational
+hazard. O3 next: it is the prerequisite N15 does not name, because N15's event-driven
+exchange only works once a stale map cannot win. N15 then runs as amended by O3. O4 after —
+it touches the same wire types. O5 folds into N16 and N17 wherever those items are taken up.
+O6 last, reconciling the architecture document after the code it describes has moved.
+
+### O1 — A durability barrier makes `wal_sync = false` safe
+
+**Planned.**
+
+`apply_batch` commits the write transaction at `Durability::None` when `wal_sync` is off, and
+Tantivy commits its segment on its own schedule; a kill between them leaves documents indexed
+that redb never fsynced — durable in search, absent from the store, and unreachable by replay
+(docs/CONFIGURATION.md "What `wal_sync = false` actually costs" states the same hazard).
+Search hydrates hits from redb, so the symptom is over-counted `total_hits` and short pages
+rather than wrong data — but the invariant "Tantivy is derived" is broken, and a recovery
+that trusts it would index nothing the WAL lost.
+
+redb's own contract closes it for a few lines: `Durability::None` commits persist once
+*followed by* an `Immediate` commit. An empty `Immediate` write transaction immediately
+before `commit_writer_at` in `commit_locked_writer` (`store.rs:2167`) makes durable every
+redb row the Tantivy commit is about to publish — one fsync per Tantivy commit instead of
+one per write. **Change:** add the barrier behind a named `durability_barrier()` so tests can
+find it, keep the existing `Immediate` checkpoint after the commit, and pin it with a
+`recovery_checkpoint_test` case proving no committed segment cites a redb row a crash could
+have lost.
+
+### O2 — Every remote conversation runs under a deadline
+
+**Planned.**
+
+`SyncShardMaps` bounds its peer asks (`SHARD_MAP_FETCH_TIMEOUT`, `coordinator.rs:2327`); the
+`PeerDiscovered` push/pull task (`:1468–1507`), `exchange_shards_with_peer` (`:378`) and the
+peer `RemoteActorRef::lookup` fallbacks do not, and kameo remote asks carry no reply timeout
+of their own. A wedged peer then leaks a `peer_tasks` task until shutdown — bounded only
+because the paths are rare. `RemotePeerPool::converse` already has the right shape: one
+timeout over lookup-and-ask. **Change:** route all three through it. The hand-rolled 5×
+backoff inside `PeerDiscovered` goes when N15 folds that handler into the one exchange —
+the retry belongs to the exchange, not to the event handler.
+
+### O3 — Shard maps merge on a version, not on recency
+
+**Planned.**
+
+Three defects share one cause — the cluster's only notion of shard-map currency is "whatever
+arrived last":
+
+- `MergeRemoteShards` rewrites every entry it carries, including shards owned by third nodes
+  (`coordinator.rs:2158–2164`); only the *sender's own* shards are pruned. Node A's stale view
+  of node C overwrites node B's fresher one until the next tick flips it back. Latent while
+  shards are only created, never moved or deleted; **Phase 15 makes it live** — a migrated
+  shard is precisely two views of one owner disagreeing.
+- The "data identical, skip" short-circuit (`:1976`) compares a checksum that hashes
+  `document_count` and `storage_bytes` (`:303–315`) — under write load it never matches, so
+  every push is a full merge over 256 vnode tokens per shard — while the merge itself
+  correctly treats only routing changes as state (`:2154`). `PeerShardDiscovered` bumps the
+  generation on a doc-count change (`:1915`): a third definition of what changed.
+- The periodic pull that papers over the first two is O(N²) full-map transfers every 10 s.
+
+**Change, one item:** each node owns a monotonic `epoch: u64` for *its own* shard set — bumped
+on any change to its shards, persisted in the snapshot; the wire map becomes
+`HashMap<NodeId, { epoch, shards }>`; a merge replaces an owner's entry only when
+`incoming.epoch > known.epoch` (the per-endpoint version, ~100 lines). The checksum then
+hashes the epoch vector — routing data only — in `xxh3` per N17, cached and invalidated on
+generation change; `PeerShardDiscovered` stops bumping generation on counts. **This amends
+N15:** its "one exchange on events" is safe only once a stale map cannot win, so N15's
+shard-map-sync item runs after this; and the residual anti-entropy N15 calls a "rare safety
+net" becomes digest-first — exchange epoch vectors, pull only newer owners — at a
+minutes-long interval rather than a 10 s full-map pull.
+
+### O4 — The request budget crosses the wire
+
+**Planned.**
+
+F7 shedding measures `REQUEST_STARTED_AT`, a task-local: a forwarded `ClientOp` starts a
+fresh clock on the peer, which then runs work for a client the first hop already abandoned —
+and the router's retry in `handle_remote` spends the peer's writer time again. **Change:**
+carry `remaining_budget_ms` on forwarded ops and let the peer lane shed on it; document in
+API_REFERENCE that a remote write answered 503 may have been applied — retry is safe because
+puts and deletes are keyed by id.
+
+### O5 — The Rust surface, folded into N16 and N17
+
+**Planned.** Small idiomatic items, each cheap inside work already agreed:
+
+- **Comments carry the incident archive.** `orchestrator.rs`, `shard.rs` and `store.rs` read
+  as incident histories ("OB14 measured…", "the mistake M0-j already caught once"). The
+  invariants they state are load-bearing; the archaeology is not — it is a third of
+  `orchestrator.rs`'s 7,100 lines. With N16's split: each comment keeps the invariant
+  ("the writer is held from sequence reservation until the document is added") and cites its
+  measurement (`// OB14`), while the narrative moves to this file, which already holds the
+  incidents. From here on the rule holds for new comments: the invariant lives in code, the
+  evidence lives in ROADMAP.
+- `exchange_shards_with_peer` returns `Box<dyn Error + Send + Sync>`; the server crate's rule
+  is `anyhow`. Converted as part of O2's edit of the same function.
+- `Ordering::SeqCst` on every counter — correct but unreasoned; `Relaxed`/`AcqRel` wherever
+  nothing depends on ordering. One audit pass, not per-site.
+- `apply_batch_attempt` recurses to retry a detached writer (`store.rs:3046`); a `loop` to
+  `LIVE_WRITER_ATTEMPTS` reads as what it is.
+- Peer identity is tracked three times — `PeerBook` in the swarm, `peer_meta` in the
+  `InitSwarm` forwarder, `cluster.peer_nodes` — and reconciles by convention. One owner, in
+  the coordinator, when N17 extracts `forward_swarm_events`.
+
+### O6 — The architecture document says what the code does
+
+**Planned.** ARCHITECTURE.md claims "no background polling or timeouts" while the code runs a
+10 s shard-map pull, a 30 s schema sweep and a 5 s seed check; §4.3 serialises hits by
+`doc.to_json` where the code hydrates them from redb; §7.2 names the writer mutex where the
+writer thread is the real serialisation point; ADR 002's code sample shows a WAL carrying the
+document where it now carries only the id. **Change:** reconcile after O3 lands — the sync
+section is what O3 rewrites — and add to the docs' own conventions that the claims in this
+file are checked against the code each review, as this roadmap's own reconciliations are.
 
 ---
 
