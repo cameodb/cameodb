@@ -440,7 +440,7 @@ pub(super) fn refuse_if_clauses_discarded(response: &JsonValue) -> Result<(), St
     Err(format!(
         "Query rejected: part of this query could not be interpreted and was dropped, so the \
          results would not be the ones asked for.\n{detail}\n\nRewrite the query and retry. \
-         `validate_query` lists the fields this index actually has, with the operators each \
+         `describe_index` lists the fields this index actually has, with the operators each \
          field's type supports."
     ))
 }
