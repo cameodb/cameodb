@@ -3,6 +3,9 @@
 //! Pure functions over a query string, a JSON response and a field list. Nothing here reaches the
 //! engine, which is what keeps every test in this module a unit test.
 
+use std::cmp::Ordering;
+use std::collections::HashSet;
+
 use serde_json::Value as JsonValue;
 
 use cameodb_mcp::ToolError;
@@ -216,12 +219,199 @@ pub(super) fn names_a_missing_field(error: &str) -> bool {
         .any(|signal| error.contains(signal))
 }
 
-/// Append an index's field list to an engine error, keeping the original message.
-pub(super) fn with_valid_fields(error: &str, index: &str, field_names: &[String]) -> String {
+/// How many fields a correction may name: enough to cover a family of related names
+/// without becoming a dump of the schema — on a wide index the dump is the failure
+/// mode this replaces.
+const MAX_FIELD_SUGGESTIONS: usize = 10;
+
+/// The similarity a candidate must clear to be offered. Below it the matches are
+/// coincidental — a handful of shared trigrams like `_re` across `*_record_timestamp`
+/// fields — and offering them reads as a finding rather than a guess.
+const MIN_SUGGESTION_SCORE: f64 = 0.25;
+
+/// A field name split into the words a caller compares it by.
+///
+/// Separators and camelCase boundaries both split, and everything is lowercased, so
+/// `sandbox.threatLabels`, `sandbox_threat_labels` and `sandbox-threat-labels` are the
+/// same three tokens.
+fn name_tokens(name: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in name.chars() {
+        if matches!(ch, '_' | '.' | '-' | ' ' | ':' | '/' | '\\') {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+        } else if ch.is_uppercase() && !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+            current.push(ch.to_ascii_lowercase());
+        } else {
+            current.extend(ch.to_lowercase());
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Two tokens are the same word when they are equal or one is a prefix of the other —
+/// `name`/`names`, `sha`/`sha256` — with a floor on length so `a` does not match
+/// everything starting with it.
+fn tokens_match(a: &str, b: &str) -> bool {
+    a == b || (a.len() >= 3 && b.len() >= 3 && (a.starts_with(b) || b.starts_with(a)))
+}
+
+/// The F1 over the input's tokens against a candidate's: how much of what the caller
+/// wrote survives in this field's name, balanced against how much extra the field
+/// carries. Catches reordered and partial guesses — `compile_date` against
+/// `date_binary_compiled_on` — that no whole-string comparison sees.
+fn token_f1(input_tokens: &[String], candidate_tokens: &[String]) -> f64 {
+    if input_tokens.is_empty() || candidate_tokens.is_empty() {
+        return 0.0;
+    }
+    let matched = input_tokens
+        .iter()
+        .filter(|token| candidate_tokens.iter().any(|c| tokens_match(token, c)))
+        .count() as f64;
+    if matched == 0.0 {
+        return 0.0;
+    }
+    let precision = matched / input_tokens.len() as f64;
+    let recall = matched / candidate_tokens.len() as f64;
+    2.0 * precision * recall / (precision + recall)
+}
+
+/// Character-trigram Dice over the whole name, padded so the ends participate.
+///
+/// Catches what tokens cannot: transposition typos (`titel` → `title`), names written
+/// fused (`threatlabel` → `*_threat_label`) and contained names (`hash` → `fuzzyhash`).
+fn trigram_dice(input: &str, candidate: &str) -> f64 {
+    let grams = |name: &str| -> HashSet<String> {
+        let chars: Vec<char> = format!("_{}_", name.to_lowercase()).chars().collect();
+        (0..chars.len().saturating_sub(2))
+            .map(|i| chars[i..i + 3].iter().collect())
+            .collect()
+    };
+    let (a, b) = (grams(input), grams(candidate));
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    2.0 * a.intersection(&b).count() as f64 / (a.len() + b.len()) as f64
+}
+
+/// The queryable fields closest to a name the index does not answer, best first.
+///
+/// One score is taken of the two that differ in what they see: `token_f1` rewards a
+/// name made of the same words, and `trigram_dice` rewards one made of the same
+/// characters. Neither alone covers both failure shapes — a reordered guess and a
+/// typo — and the `max` keeps whichever explanation is stronger.
+fn similar_fields<'a>(unknown: &str, candidates: &[&'a FieldInfo]) -> Vec<&'a FieldInfo> {
+    let input_tokens = name_tokens(unknown);
+    let mut scored: Vec<(f64, &FieldInfo)> = candidates
+        .iter()
+        .map(|info| {
+            let score = token_f1(&input_tokens, &name_tokens(&info.name))
+                .max(trigram_dice(unknown, &info.name));
+            (score, *info)
+        })
+        .filter(|(score, _)| *score >= MIN_SUGGESTION_SCORE)
+        .collect();
+    scored.sort_by(|(a_score, a), (b_score, b)| {
+        b_score
+            .partial_cmp(a_score)
+            .unwrap_or(Ordering::Equal)
+            .then(a.name.len().cmp(&b.name.len()))
+            .then(a.name.cmp(&b.name))
+    });
+    scored
+        .into_iter()
+        .take(MAX_FIELD_SUGGESTIONS)
+        .map(|(_, info)| info)
+        .collect()
+}
+
+/// `a (b)` — how a suggestion reads: the name, then the type that decides which
+/// operators it takes.
+fn name_with_type(info: &FieldInfo) -> String {
+    format!("{} ({})", info.name, info.field_type)
+}
+
+/// The name of the index's identifier field, for steering a caller that matched
+/// nothing: the shadow name where one exists — the identifier under its source name —
+/// else `id` when the schema carries it. Either is the key-value lookup rather than a
+/// search.
+fn identifier_field(field_infos: &[FieldInfo]) -> Option<&str> {
+    field_infos
+        .iter()
+        .find(|info| info.is_shadow)
+        .or_else(|| field_infos.iter().find(|info| info.name == "id"))
+        .map(|info| info.name.as_str())
+}
+
+/// The correction for a field name the index does not answer: the closest real fields,
+/// each with the type that decides which operators it takes.
+fn did_you_mean(unknown: &str, similar: &[&FieldInfo]) -> String {
     format!(
-        "{error}\n\nFields available in '{index}': [{}]",
-        field_names.join(", ")
+        "Unknown field '{unknown}'. Did you mean: {}?",
+        similar
+            .iter()
+            .map(|info| name_with_type(info))
+            .collect::<Vec<_>>()
+            .join(", ")
     )
+}
+
+/// What is true when nothing is close: the catalogue of fields lives on
+/// `describe_index`, and the identifier — the field the dataset is keyed on — is the
+/// lookup worth knowing about when every other guess failed.
+fn no_match_warning(unknown: &str, identifier: Option<&str>) -> String {
+    match identifier {
+        Some(name) => format!(
+            "Unknown field '{unknown}'. No similar field exists — `describe_index` lists this \
+             index's fields. If you meant the record's identifier, `{name}:VALUE` on its own is \
+             answered from the key-value store: the fastest lookup this index has."
+        ),
+        None => format!(
+            "Unknown field '{unknown}'. No similar field exists — `describe_index` lists this \
+             index's fields."
+        ),
+    }
+}
+
+/// Append what an engine error about a missing field cannot say: which real fields the
+/// caller probably meant.
+///
+/// The names come from the query rather than from the error text, because the engine's
+/// wordings differ and the query is the reliable account of what was asked for. A
+/// caller-fault error in an agent's hands is a query to rewrite, so the correction
+/// belongs in the error rather than in a separate tool's answer.
+pub(super) fn with_field_suggestions(
+    error: &str,
+    index: &str,
+    field_infos: &[FieldInfo],
+    query: &str,
+) -> String {
+    let queryable: Vec<&FieldInfo> = field_infos.iter().filter(|i| i.is_queryable()).collect();
+    let identifier = identifier_field(field_infos);
+    let mut corrections = String::new();
+    for name in referenced_field_names(query) {
+        if queryable.iter().any(|info| info.name == name) {
+            continue;
+        }
+        let similar = similar_fields(&name, &queryable);
+        corrections.push('\n');
+        corrections.push_str(&if similar.is_empty() {
+            no_match_warning(&name, identifier)
+        } else {
+            did_you_mean(&name, &similar)
+        });
+    }
+    if corrections.is_empty() {
+        format!("{error}\n\n`describe_index` lists the fields '{index}' has.")
+    } else {
+        format!("{error}\n{corrections}")
+    }
 }
 
 /// Turn a search response carrying dropped clauses into a tool execution error.
@@ -310,16 +500,29 @@ pub(super) fn analyze_query(query_text: &str, field_infos: &[FieldInfo]) -> Json
     let mut unknown = Vec::new();
     let mut not_indexed = Vec::new();
     let mut field_hints = Vec::new();
+    // A field's hint is its type's — the shadow rule for a shadow field, whatever its
+    // declared type — so the text is written once per distinct key into `hints` and
+    // each entry names the key it resolved to. On a wide index the repeated paragraph
+    // is the difference between guidance and a schema dump.
+    let mut hints = serde_json::Map::new();
 
     for field_name in &referenced_fields {
         if queryable_names.contains(&field_name.as_str()) {
             recognized.push(field_name.clone());
             if let Some(info) = field_infos.iter().find(|i| i.name == *field_name) {
+                let key = if info.is_shadow {
+                    "shadow".to_string()
+                } else {
+                    info.field_type.clone()
+                };
                 field_hints.push(serde_json::json!({
                     "field": field_name,
                     "type": info.field_type,
-                    "hint": field_query_hint(info),
+                    "hint": key,
                 }));
+                hints
+                    .entry(key)
+                    .or_insert_with(|| JsonValue::String(field_query_hint(info)));
             }
         } else if all_names.contains(&field_name.as_str()) {
             not_indexed.push(field_name.clone());
@@ -333,31 +536,17 @@ pub(super) fn analyze_query(query_text: &str, field_infos: &[FieldInfo]) -> Json
     }
 
     if !unknown.is_empty() && !all_names.is_empty() {
+        let queryable: Vec<&FieldInfo> = field_infos
+            .iter()
+            .filter(|info| info.is_queryable())
+            .collect();
+        let identifier = identifier_field(field_infos);
         for unk in &unknown {
-            let unk_lower = unk.to_lowercase();
-            let close_matches: Vec<&str> = queryable_names
-                .iter()
-                .filter(|known| {
-                    let known_lower = known.to_lowercase();
-                    known_lower.starts_with(&unk_lower)
-                        || unk_lower.starts_with(&known_lower)
-                        || known_lower.contains(&unk_lower)
-                        || unk_lower.contains(&known_lower)
-                })
-                .copied()
-                .collect();
-            if !close_matches.is_empty() {
-                suggestions.push(format!(
-                    "Unknown field '{}'. Did you mean: {}?",
-                    unk,
-                    close_matches.join(", ")
-                ));
+            let similar = similar_fields(unk, &queryable);
+            if similar.is_empty() {
+                warnings.push(no_match_warning(unk, identifier));
             } else {
-                warnings.push(format!(
-                    "Unknown field '{}'. Available queryable fields: {}.",
-                    unk,
-                    queryable_names.join(", ")
-                ));
+                suggestions.push(did_you_mean(unk, &similar));
             }
         }
     }
@@ -368,6 +557,7 @@ pub(super) fn analyze_query(query_text: &str, field_infos: &[FieldInfo]) -> Json
         "unknown_fields": unknown,
         "not_indexed_fields": not_indexed,
         "field_hints": field_hints,
+        "hints": hints,
         "warnings": warnings,
         "suggestions": suggestions,
     })
@@ -535,7 +725,20 @@ mod zero_results_advice_tests {
 
 #[cfg(test)]
 mod search_error_interception_tests {
-    use super::{names_a_missing_field, with_valid_fields};
+    use super::{names_a_missing_field, with_field_suggestions};
+    use crate::mcp::schema::FieldInfo;
+
+    fn field(name: &str, field_type: &str) -> FieldInfo {
+        FieldInfo {
+            name: name.to_string(),
+            field_type: field_type.to_string(),
+            indexed: true,
+            fast: false,
+            is_shadow: false,
+            searchable: true,
+            sortable: false,
+        }
+    }
 
     #[test]
     fn a_sort_error_is_not_read_as_a_missing_field() {
@@ -562,20 +765,290 @@ mod search_error_interception_tests {
         }
     }
 
+    /// The correction is appended, the engine's message survives, and the schema is not.
     #[test]
-    fn the_field_list_is_appended_rather_than_replacing_the_error() {
+    fn a_correction_is_appended_rather_than_the_field_list() {
         let original = "Field 'titel' does not exist in schema";
-        let enriched =
-            with_valid_fields(original, "docs", &["title".to_string(), "body".to_string()]);
+        let fields = [field("title", "text"), field("body", "text")];
+        let enriched = with_field_suggestions(original, "docs", &fields, "titel:rust");
 
         assert!(
             enriched.starts_with(original),
             "the engine's own message must survive: {enriched}"
         );
         assert!(
-            enriched.contains("title, body") && enriched.contains("docs"),
-            "the caller needs the real fields and the index they belong to: {enriched}"
+            enriched.contains("Did you mean: title (text)"),
+            "the caller needs the field it meant, with its type: {enriched}"
         );
+        assert!(
+            !enriched.contains("body"),
+            "a field nothing resembles is not a correction: {enriched}"
+        );
+    }
+
+    /// With nothing close, the error points at the catalogue and at the identifier lookup
+    /// rather than reciting the schema — the same answer `validate_query` gives.
+    #[test]
+    fn with_nothing_close_the_error_points_at_describe_index_and_the_identifier() {
+        let fields = [field("id", "text"), field("title", "text")];
+        let enriched = with_field_suggestions("unknown field 'zzz'", "docs", &fields, "zzz:rust");
+        assert!(enriched.contains("describe_index"), "{enriched}");
+        assert!(enriched.contains("`id:VALUE`"), "{enriched}");
+        assert!(!enriched.contains("title"), "{enriched}");
+
+        // A name the query scan cannot see still gets the catalogue pointer.
+        let enriched = with_field_suggestions("unknown field 'zzz'", "docs", &fields, "rust");
+        assert!(
+            enriched.contains("describe_index") && enriched.contains("'docs'"),
+            "{enriched}"
+        );
+    }
+}
+
+/// Corrections are scored against a synthetic malware-sample catalogue: invented field names
+/// shaped like a wide security index, since the matcher's failure modes only show on that shape
+/// — a generic word matching a dozen fields that share its prefix, a reordered guess sharing no
+/// substring with the field it means, a name written fused, and a dump of every name in place
+/// of a correction.
+///
+/// Invented on purpose. Tests are modelled on a real use case, never copied from one: field
+/// names from a deployment's schema describe that deployment's data, and do not belong here.
+#[cfg(test)]
+mod field_suggestion_tests {
+    use super::{MAX_FIELD_SUGGESTIONS, analyze_query, name_tokens, similar_fields, trigram_dice};
+    use crate::mcp::schema::FieldInfo;
+
+    const SAMPLE_CATALOGUE_FIELDS: &[(&str, &str)] = &[
+        ("id", "text"),
+        // The identifier under its source name, made a shadow field where a test needs one.
+        ("sample_digest", "text"),
+        // A digest family, and longer names that merely end in a digest.
+        ("digest_md5", "text"),
+        ("digest_sha1", "text"),
+        ("digest_sha256", "text"),
+        ("digest_sha384", "text"),
+        ("digest_sha512", "text"),
+        ("fuzzyhash", "text"),
+        ("overlay_section_sha1", "text"),
+        ("resource_blob_sha256", "text"),
+        // Names under which a sample was submitted.
+        ("upload_name", "text"),
+        ("upload_names", "text"),
+        ("upload_count", "i64"),
+        ("suggested_upload_name", "text"),
+        // Threat labels from several sources, sharing words in different positions.
+        ("sandbox_threat_labels", "text"),
+        ("intel_threat_label", "text"),
+        ("intel_engine_threat_label", "text"),
+        ("intel_feed_threat_label", "text"),
+        ("intel_threat_severity", "text"),
+        ("intel_malware_family", "text"),
+        ("intel_malware_class", "text"),
+        ("sandbox_malware_configs", "text"),
+        // Scores of two numeric types.
+        ("sandbox_risk_score", "i64"),
+        ("exploit_score_f", "f64"),
+        ("sandbox_behavior_rules", "text"),
+        ("sandbox_engine_name", "text"),
+        ("verdicts", "text"),
+        ("intel_verdicts", "text"),
+        // Dates, one with its words in an order a caller would not guess.
+        ("date_binary_compiled_on", "date"),
+        ("doc_created_date", "date"),
+        ("doc_title", "text"),
+        ("observed_first", "date"),
+        ("observed_last", "date"),
+        ("ingest_record_timestamp", "date"),
+        ("intel_record_timestamp", "date"),
+        // One scanner verdict per engine: more fields under one prefix than the cap.
+        ("scanner_alpha", "text"),
+        ("scanner_bravo", "text"),
+        ("scanner_charlie", "text"),
+        ("scanner_delta", "text"),
+        ("scanner_echo", "text"),
+        ("scanner_foxtrot", "text"),
+        ("scanner_golf", "text"),
+        ("scanner_hotel", "text"),
+        ("scanner_india", "text"),
+        ("scanner_juliett", "text"),
+        ("scanner_kilo", "text"),
+        ("scanner_quickcheck", "text"),
+    ];
+
+    fn info(name: &str, field_type: &str) -> FieldInfo {
+        FieldInfo {
+            name: name.to_string(),
+            field_type: field_type.to_string(),
+            indexed: true,
+            fast: false,
+            is_shadow: false,
+            searchable: true,
+            sortable: false,
+        }
+    }
+
+    fn schema() -> Vec<FieldInfo> {
+        SAMPLE_CATALOGUE_FIELDS
+            .iter()
+            .map(|(name, field_type)| info(name, field_type))
+            .collect()
+    }
+
+    fn suggest(unknown: &str) -> Vec<String> {
+        let fields = schema();
+        let refs: Vec<&FieldInfo> = fields.iter().collect();
+        similar_fields(unknown, &refs)
+            .into_iter()
+            .map(|info| info.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn names_split_on_separators_and_camel_case() {
+        assert_eq!(
+            name_tokens("sandbox_threat_labels"),
+            ["sandbox", "threat", "labels"]
+        );
+        assert_eq!(
+            name_tokens("sandbox.threatLabels"),
+            ["sandbox", "threat", "labels"]
+        );
+        assert_eq!(name_tokens("k8s-node"), ["k8s", "node"]);
+    }
+
+    /// A reordered guess shares words and no substring: the case whole-string matching missed
+    /// entirely and answered with every name in the schema.
+    #[test]
+    fn a_reordered_guess_finds_the_field_by_its_words() {
+        assert_eq!(
+            suggest("compile_date").first().map(String::as_str),
+            Some("date_binary_compiled_on")
+        );
+        let labels = suggest("threat_label");
+        assert!(
+            labels.contains(&"intel_threat_label".to_string()),
+            "{labels:?}"
+        );
+        assert!(
+            labels.contains(&"sandbox_threat_labels".to_string()),
+            "{labels:?}"
+        );
+    }
+
+    /// Typos and fused names share characters rather than words.
+    #[test]
+    fn a_typo_or_a_fused_name_finds_the_field_by_its_characters() {
+        assert!(trigram_dice("titel", "title") >= super::MIN_SUGGESTION_SCORE);
+        assert_eq!(
+            suggest("riskscore").first().map(String::as_str),
+            Some("sandbox_risk_score")
+        );
+        assert!(suggest("threatlabel").contains(&"intel_threat_label".to_string()));
+        assert!(suggest("hash").contains(&"fuzzyhash".to_string()));
+    }
+
+    /// The digest family ranks ahead of the long names that merely end in a digest.
+    #[test]
+    fn exact_word_matches_rank_ahead_of_partial_ones() {
+        let found = suggest("sha");
+        let top4: Vec<&str> = found.iter().take(4).map(String::as_str).collect();
+        for name in [
+            "digest_sha1",
+            "digest_sha256",
+            "digest_sha384",
+            "digest_sha512",
+        ] {
+            assert!(
+                top4.contains(&name),
+                "{name} not in the top four: {found:?}"
+            );
+        }
+    }
+
+    /// A generic word matches every field under its prefix; the answer is bounded however wide
+    /// the schema.
+    #[test]
+    fn a_generic_word_is_capped() {
+        let found = suggest("scanner");
+        assert_eq!(found.len(), MAX_FIELD_SUGGESTIONS, "{found:?}");
+        assert!(found.iter().all(|f| f.starts_with("scanner_")), "{found:?}");
+    }
+
+    /// Below the threshold the shared trigrams are coincidence, and offering them would read as
+    /// a finding.
+    #[test]
+    fn nothing_resembling_suggests_nothing() {
+        assert!(
+            suggest("zzz_nonexistent").is_empty(),
+            "{:?}",
+            suggest("zzz_nonexistent")
+        );
+    }
+
+    /// The analysis puts a correction in `suggestions` with each field's type, and never lists
+    /// the schema when nothing is close — it names the identifier fast path instead.
+    #[test]
+    fn the_analysis_corrects_with_types_and_never_dumps_the_schema() {
+        let mut fields = schema();
+        let close = analyze_query("compile_date:[2024 TO 2025}", &fields);
+        let suggestion = close["suggestions"].to_string();
+        assert!(
+            suggestion.contains("date_binary_compiled_on (date)"),
+            "{close}"
+        );
+
+        let far = analyze_query("zzz_nonexistent:x", &fields);
+        let warning = far["warnings"].to_string();
+        assert!(warning.contains("describe_index"), "{far}");
+        assert!(
+            warning.contains("`id:VALUE`"),
+            "with no shadow field, `id` is the identifier to point at: {far}"
+        );
+        assert!(
+            !warning.contains("scanner_alpha"),
+            "the schema must not be recited: {far}"
+        );
+
+        // On an index with a shadow field, the shadow name is the identifier to point at.
+        if let Some(digest) = fields.iter_mut().find(|f| f.name == "sample_digest") {
+            digest.is_shadow = true;
+            digest.indexed = false;
+        }
+        let far = analyze_query("zzz_nonexistent:x", &fields);
+        assert!(
+            far["warnings"]
+                .to_string()
+                .contains("`sample_digest:VALUE`"),
+            "{far}"
+        );
+    }
+
+    /// Each referenced field names its hint by key; the text is written once per key.
+    #[test]
+    fn hints_are_written_once_per_type() {
+        let fields = schema();
+        let analysis = analyze_query(
+            "upload_name:a AND sandbox_behavior_rules:b AND doc_title:c AND observed_first:>2024",
+            &fields,
+        );
+        let entries = analysis["field_hints"].as_array().expect("field_hints");
+        assert_eq!(entries.len(), 4, "{analysis}");
+        assert!(entries.iter().all(|e| e["hint"].is_string()), "{analysis}");
+        let hints = analysis["hints"].as_object().expect("hints");
+        let mut keys: Vec<&str> = hints.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["date", "text"],
+            "two types referenced, two paragraphs: {analysis}"
+        );
+        for entry in entries {
+            let key = entry["hint"].as_str().unwrap_or_default();
+            assert!(
+                hints.contains_key(key),
+                "{key} has no paragraph: {analysis}"
+            );
+        }
     }
 }
 

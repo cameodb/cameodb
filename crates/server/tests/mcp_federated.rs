@@ -1060,21 +1060,14 @@ async fn a_shadow_field_is_described_as_the_queryable_alias_of_id() {
          from the key-value store: {validated}"
     );
 
-    let listed = validated["available_fields"]
+    // The referenced field carries its hint, and a shadow field's hint is the shadow rule.
+    let sha1 = analysis["field_hints"]
         .as_array()
-        .expect("available_fields");
-    let sha1 = listed
-        .iter()
-        .find(|f| f["name"] == "sha1")
-        .unwrap_or_else(|| panic!("sha1 missing from available_fields: {validated}"));
-    assert_eq!(
-        sha1["queryable"].as_bool(),
-        Some(true),
-        "a field the engine answers on is queryable: {validated}"
-    );
-    assert_eq!(sha1["shadow"].as_bool(), Some(true), "{validated}");
+        .and_then(|entries| entries.iter().find(|f| f["field"] == "sha1"))
+        .unwrap_or_else(|| panic!("sha1 missing from field_hints: {validated}"));
+    let key = sha1["hint"].as_str().expect("hint key");
     assert!(
-        sha1["query_hint"]
+        analysis["hints"][key]
             .as_str()
             .is_some_and(|hint| hint.contains("id")),
         "a shadow field's hint has to say what it is a shadow of: {validated}"
@@ -1315,22 +1308,6 @@ async fn descriptions_written_into_the_schema_reach_every_discovery_surface() {
             .as_str()
             .is_some_and(|text| text.contains("Quarterly")),
         "the catalogue lists the index without saying what it is: {listed}"
-    );
-
-    // And the tool an agent reaches for when a query looks wrong.
-    let (_, validated) = node
-        .call_tool(
-            "validate_query",
-            json!({"index": "filings", "query": "title:filing"}),
-        )
-        .await;
-    let title = validated["available_fields"]
-        .as_array()
-        .and_then(|fields| fields.iter().find(|f| f["name"] == "title"))
-        .unwrap_or_else(|| panic!("title missing from available_fields: {validated}"));
-    assert_eq!(
-        title["description"].as_str(),
-        Some("Headline as filed, not normalised.")
     );
 }
 
@@ -2365,30 +2342,37 @@ async fn validating_a_query_reads_one_index_rather_than_the_catalogue() {
         .await;
     assert!(!is_error, "{result}");
 
-    // The fields still arrive, with their types and hints.
-    let fields: Vec<&str> = result["available_fields"]
-        .as_array()
-        .expect("available_fields")
-        .iter()
-        .filter_map(|field| field["name"].as_str())
-        .collect();
+    // The misspelling is caught against this index's fields, and corrected with the type.
+    let suggestions = result["query_analysis"]["suggestions"].to_string();
     assert!(
-        fields.contains(&"title") && fields.contains(&"created"),
-        "the index's fields did not survive: {result}"
-    );
-    for field in result["available_fields"].as_array().expect("fields") {
-        assert!(
-            field["query_hint"].is_string(),
-            "a field lost its query hint: {field}"
-        );
-        assert!(field["type"].is_string(), "a field lost its type: {field}");
-    }
-    // And the misspelling is still caught against them.
-    assert!(
-        serde_json::to_string(&result["query_analysis"])
-            .unwrap_or_default()
-            .contains("title"),
+        suggestions.contains("title (text)"),
         "the typo was not matched against this index's fields: {result}"
+    );
+    // The schema the correction was scored against is not echoed: that is `describe_index`'s.
+    for key in [
+        "available_fields",
+        "searchable_field_names",
+        "syntax_reference",
+    ] {
+        assert!(
+            result.get(key).is_none(),
+            "validation must not carry '{key}': {result}"
+        );
+    }
+
+    // A search naming the same misspelling fails with the same correction in the error, so an
+    // agent that skipped validation is not sent to it to learn what the error could have said.
+    let (is_error, refusal) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "alpha", "query": "titel:rust"}),
+        )
+        .await;
+    assert!(is_error, "a query on a missing field must fail: {refusal}");
+    let text = refusal.to_string();
+    assert!(
+        text.contains("titel") && text.contains("Did you mean: title (text)"),
+        "the error should carry the correction: {refusal}"
     );
 
     // An index that does not exist is still refused, in the words `describe_index` uses.
@@ -2794,22 +2778,18 @@ async fn describe_index_relates_id_to_the_shadow_name_that_replaces_it() {
     assert!(hit["sha1"].is_string(), "{result}");
     assert!(hit.get("id").is_none(), "{result}");
 
-    // `validate_query` reads the same schema, so it carries the same relation.
+    // `validate_query` reads the same schema: with nothing close to a name, it points at
+    // the shadow name as the identifier lookup rather than at `id`, since hits carry that one.
     let (_, validated) = node
         .call_tool(
             "validate_query",
-            json!({"index": "files", "query": "id:deadbeef01"}),
+            json!({"index": "files", "query": "zzzqqq:x"}),
         )
         .await;
-    let listed = validated["available_fields"].as_array().expect("fields");
-    let id_entry = listed
-        .iter()
-        .find(|f| f["name"] == "id")
-        .unwrap_or_else(|| panic!("id missing: {validated}"));
-    assert_eq!(
-        id_entry["returned_as"].as_str(),
-        Some("sha1"),
-        "{validated}"
+    let warnings = validated["query_analysis"]["warnings"].to_string();
+    assert!(
+        warnings.contains("`sha1:VALUE`") && warnings.contains("key-value store"),
+        "a caller that matched nothing should be pointed at the identifier: {validated}"
     );
 }
 

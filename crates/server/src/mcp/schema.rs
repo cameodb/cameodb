@@ -73,17 +73,6 @@ pub(super) struct FieldInfo {
     /// approximately rather than refused, so this is the flag that decides whether an order can
     /// be trusted or paged through.
     pub(super) sortable: bool,
-    /// Whether a term with no field in front of it searches this field — decided by the index's
-    /// declared `default_fields` and the node's `max_default_fields`, not by the type alone.
-    pub(super) default_search: bool,
-    /// What the field records, if anyone wrote it down. Never inferred.
-    pub(super) description: Option<String>,
-    /// The name a hit carries this field's value under, when it is not the field's own name.
-    ///
-    /// Set on `id` alone, and only on an index with a shadow field, where the identifier
-    /// travels under the source's name and no hit carries an `id`. Everywhere else a field
-    /// answers under its own name and this is `None`.
-    pub(super) returned_as: Option<String>,
 }
 
 impl FieldInfo {
@@ -131,18 +120,6 @@ pub(super) fn extract_field_info(value: &JsonValue) -> Vec<FieldInfo> {
                         .get("sortable")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false),
-                    default_search: def
-                        .get("default_search")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
-                    description: def
-                        .get("description")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string),
-                    returned_as: def
-                        .get("returned_as")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string),
                 })
                 .filter(|info| !info.name.is_empty())
                 .collect()

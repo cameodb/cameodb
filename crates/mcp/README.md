@@ -36,11 +36,10 @@ This is the caller-facing reference — the tools, the paging rules and the quer
 CameoDB is designed as a self-contained document store where indexed fields, schemas, and data types drive automatic agent adaptation. When new indexes are created or fields evolve, the MCP tools **automatically reflect the changes** — no configuration or manual updates needed.
 
 **Optimized Schema Responses:**
-Schema and field structures are optimized to return only relevant information for AI clients to build effective queries. Responses avoid overwhelming agents with redundant or irrelevant metadata, focusing on:
-- `searchable_field_names`: List of all queryable field names (for quick reference)
-- `fields` (from `describe_index`/`list_indexes`): Per-field type with compact details
-- `available_fields` (from `validate_query`): Per-field type with detailed query hints
-- `query_hints`: Section showing which operators work with each field type
+Schema and field structures are optimized to return only relevant information for AI clients to build effective queries. The schema is delivered once, by the discovery tools; the operational tools (`validate_query`, `search_index`) describe only the fields a query names. Responses focus on:
+- `field_names` (from `list_indexes`): Every field name, for choosing an index
+- `fields` (from `describe_index`): Per-field type and flags
+- `query_hints` (from `describe_index`): One entry per field type present, naming the operators it supports
 - Essential statistics and metadata (for context)
 
 **Agent workflow (no prior knowledge required):**
@@ -48,9 +47,9 @@ Schema and field structures are optimized to return only relevant information fo
 1. **`list_indexes`** → Discover all indexes with schemas and per-field `query_hint` (what operators work with each field type)
 2. **`describe_index`** → Deep-dive into a specific index: field definitions, types, stats, `fields` array, and `query_hints` section
 3. **`search_index`** → Construct queries using the field names and operators learned from the schema
-4. **`validate_query`** *(optional)* → Parse a query with the same parser a search uses: whether it parses, where it fails, the form the engine will actually run, and which clauses can never match. Also typo detection ("did you mean?") and the full syntax reference
+4. **`validate_query`** *(optional)* → Parse a query with the same parser a search uses: whether it parses, where it fails, the form the engine will actually run, and which clauses can never match. Also "did you mean?" corrections for unknown fields, and the full syntax reference when called with no arguments
 
-Each `available_fields` entry (from `validate_query`) and `fields` entry (from `describe_index`/`list_indexes`) carries a `query_hint` naming the operators that field's type supports, plus the `indexed`, `fast` and `shadow` flags that decide whether it can be queried and sorted at all. The hints are rendered from [`src/syntax.rs`](src/syntax.rs), so they cannot disagree with the reference.
+Each `fields` entry from `describe_index` carries the `indexed`, `fast` and `shadow` flags that decide whether a field can be queried and sorted at all, and `query_hints` names the operators each type supports. The hints are rendered from [`src/syntax.rs`](src/syntax.rs), so they cannot disagree with the reference.
 
 This means an agent can go from zero knowledge to well-formed queries in **two tool calls** (`list_indexes` → `search_index`), with the schema metadata providing all the guidance needed for operator selection.
 
@@ -298,7 +297,7 @@ List every CameoDB index this key can see, with enough about each to choose betw
 
 ### 5. `validate_query`
 
-Validate and get guidance on CameoDB search query syntax. This is the **primary syntax guide** for agents.
+Validate a CameoDB search query before running it, and get the full syntax reference.
 
 **Parameters:**
 - `index` (string, optional): Index name for schema-aware field validation
@@ -307,16 +306,17 @@ Validate and get guidance on CameoDB search query syntax. This is the **primary 
 
 **Usage patterns for agents:**
 1. **No arguments**: Returns complete query syntax reference with operator-by-field-type compatibility matrix
-2. **Index only**: Returns schema-aware field list with type-specific operator hints per field
+2. **Index + query**: Runs the real parser. This is the only combination that can tell you whether the query parses — a query on its own gets a structural check that passes things like `title:` and `title:[2020 TO`, neither of which parse
 3. **Index + partial_field**: Returns autocomplete suggestions matching available fields
-4. **Index + query**: Runs the real parser. This is the only combination that can tell you whether the query parses — a query on its own gets a structural check that passes things like `title:` and `title:[2020 TO`, neither of which parse
+
+An index alone returns a pointer to `describe_index`, which is where the field list lives. The
+schema is read for validation and never echoed: on a wide index (hundreds of fields) a copy of it
+is most of an agent's context.
 
 **Returns:**
-- `syntax_reference`: Full query syntax documentation with all operators, examples, and field-type compatibility
-- `available_fields`: Schema fields with types, indexed status, and per-field query hints (includes `query_hint` per field)
+- `syntax_reference`: Full query syntax documentation — only on a call with no arguments
 - `field_suggestions`: Autocomplete matches for partial field names
 - `query_analysis`: The parser's verdict plus the structural pass — see below
-- `searchable_field_names`: List of all queryable field names
 
 **Example:**
 ```json
@@ -337,9 +337,16 @@ Validate and get guidance on CameoDB search query syntax. This is the **primary 
 | `syntax_errors` | The parser's own messages, each with the position it reached |
 | `normalized_query` | What the engine actually runs, after date, facet and prefix rewriting |
 | `discarded_clauses` | Clauses that parse but can never match — unknown fields, non-indexed fields, unsupported constructs. Exactly what a search would drop |
-| `warnings` | Structural findings, plus a line per syntax error |
-| `suggestions` | Field corrections, e.g. `Unknown field 'titel'. Did you mean: title?` |
-| `field_hints` | Type-specific query guidance per referenced field |
+| `warnings` | Structural findings, plus a line per syntax error. An unknown field with nothing similar gets one line pointing at `describe_index` and at the identifier lookup (`id`, or the shadow field) |
+| `suggestions` | Field corrections, up to ten per unknown field, each with its type: `Unknown field 'titel'. Did you mean: title (text)?` |
+| `field_hints` | `{field, type, hint}` per referenced field, where `hint` is a key into `hints` |
+| `hints` | Each hint's text once — the operators a type supports, or the shadow rule |
+
+Corrections are scored by the stronger of two similarities: word overlap (F1 over the
+snake/dot/camelCase tokens, so `compile_date` finds `date_binary_compiled_on`) and
+character-trigram Dice (so `titel` finds `title` and `riskscore` finds `sandbox_risk_score`).
+Candidates below 0.25 are not offered. The same corrections are appended to a `search_index`
+error naming a missing field.
 
 A clause in `discarded_clauses` is the dangerous case: the search runs, returns results, and
 answers a narrower question than the one asked. `search_index` refuses such a query outright;
@@ -755,7 +762,7 @@ Here's a complete workflow using the MCP tools:
      }
    }
    ```
-   Response will warn about unknown field `titel` and suggest `title`.
+   Response will report unknown field `titel` and suggest `title (text)`.
 
 4. **Execute corrected search:**
    ```json
