@@ -131,23 +131,43 @@ Signed off by:
 
 <!-- Newest first. Append a filled-in template per release. -->
 
-## v0.3.6 — in progress
+## v0.3.6 — 2026-10-08
 
 Commit: the `chore(release): 0.3.6` commit, which follows 2f358f3, the search 404 — the fix is
 ordered before the version bump. `MANIFEST.txt` records the hash when the release is built.
 
-Built targets: **not yet.** `dist/0.3.6/` holds an earlier build (macOS, musl + `.deb`/`.rpm`, both
-SBOMs) that predates 2f358f3 and the MCP change after it, so it is stale: rebuild with
-`release.sh --stage build,sbom`, re-run the suites against the rebuilt binary, then sign. The
-Windows build is not made.
+Built targets: macOS arm64 (30M); x86_64-unknown-linux-musl (37M binary, `cameodb_0.3.6_amd64.deb`
+12M, `cameodb-0.3.6-1.x86_64.rpm` 13M); Windows x86_64 (`cameodb.exe`, 40M, sidecar reads
+`cameodb 0.3.6`); SPDX (582 packages) and CycloneDX (581 components, against 581 in `Cargo.lock`).
+Built 2026-10-08 01:26–01:27, after the last change to `crates/`; the macOS binary is
+byte-identical to `target/release/cameodb`. All seven artifacts signed (01:29). `MANIFEST.txt`
+records the tip, `92e22e4`, after `publish.sh` was repeated.
 
 What the validation covered, and on what:
 
-- **Host suites, 2026-10-08 00:17:25 → 00:21:00,** `target/release/cameodb`: deps, unit, posture,
-  auth, tls, remote-sources and artifact all PASS. That release binary was built 23:51, before the
-  last edit (the MCP search tools no longer look an index up after an empty result, in
-  `mcp/search.rs`). After that edit `deps` and `unit` were re-run on the tree and PASS; `posture`,
-  `auth`, `tls`, `remote-sources` and `artifact` were not, and are re-run on the rebuilt binary.
+- **Host suites on the shipped binary,** `target/release/cameodb`, sha256
+  `38f0524eaf314c5cb137d251531478bb5686a8b783a975e05147dc267c0f4fab`, byte-identical to
+  `dist/0.3.6/mac/cameodb`, reporting `cameodb 0.3.6`:
+
+  ```
+  PASS deps
+  PASS unit
+  PASS posture
+  PASS auth
+  PASS tls
+  PASS remote-sources
+  PASS artifact
+  ```
+
+  An earlier full run (2026-10-08 00:17:25 → 00:21:00) was on a binary built 23:51, before the last
+  edit to `crates/` (the MCP search tools no longer look an index up after an empty result, in
+  `mcp/search.rs`); it also passed all seven, and is superseded by the run above. One `unit` run in
+  between failed on `changing_a_flag_leaves_the_rest_of_the_schema_alone` while the machine was
+  busy with Docker builds; it did not reproduce in 40+ runs alone and under load, and `unit` has
+  passed on a quiet machine since — recorded as a load-induced flake, cause not confirmed (the
+  assertion text was not captured).
+- **`remote-sources` on Windows:** PASS against the Windows build, run on the Windows machine as
+  reported by goranc (output not attached). On musl: not recorded.
 - **Cluster suite** (`all.sh cluster`, three nodes in Docker), 39/39 PASS, including the new
   `probe missing` check: a missing index is a 404 through every node, and a new one is found
   through every node. The image was built from the tree before the MCP edit above.
@@ -183,13 +203,18 @@ loads; re-measure search on the rebuilt binary.
 Advisory exceptions reviewed: RUSTSEC-2026-0118, RUSTSEC-2026-0119 and RUSTSEC-2024-0436, all via
 libp2p 0.56.0, review-by 2026-11-01; none came due, none renewed.
 
-Still to do: rebuild `dist/0.3.6/`; re-run posture, auth, tls, remote-sources and artifact on it;
-`remote-sources` on musl and Windows; the Windows build; `release.sh --stage sign`; `publish.sh`
-and `--commit`; the web project commit; the Docker image.
+Docker: `docker-push.sh 0.3.6 --no-push` built both platforms (`Verified: linux/amd64,linux/arm64`)
+after the cargo caches were split per architecture, which a parallel push had tripped over
+(`failed to unpack package hmac ... .cargo-ok: File exists`). The local image reports
+`cameodb 0.3.6`, no `+fault-injection`, user `nonroot`. Not yet pushed.
 
-Known gaps acknowledged: pending — the standing list above is unchanged.
+Left open at sign-off, on goranc's call: `remote-sources` on musl is not recorded (the Windows run
+is), the Docker image is built but not yet pushed, so its digest is not recorded, and the
+`cameodb-web` commit is not made. Each is a step after the signed artifacts, not a change to them.
 
-Signed off by: pending
+Known gaps acknowledged: yes — the standing list above is unchanged.
+
+Signed off by: goranc
 
 ## v0.3.5 — 2026-09-28
 
