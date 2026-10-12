@@ -3339,6 +3339,92 @@ fn a_gather_whose_every_shard_was_shed_is_a_shed_not_a_fault() {
     );
 }
 
+/// A search that outran its deadline is the request's to fix, not this node's.
+///
+/// The classification is what a caller acts on: `BadRequest` everywhere it is read — the
+/// verdict the HTTP surface and the wire form both consult, and `is_caller_error`, which
+/// is how a gather where every shard refused decides whose fault the empty page was.
+#[test]
+fn a_search_that_outran_its_deadline_is_the_callers_error() {
+    let err = OrchestratorError::SearchDeadlineExceeded {
+        elapsed_ms: 1200,
+        budget_ms: 1000,
+    };
+    assert_eq!(err.verdict(), RemoteVerdict::BadRequest);
+    assert!(is_caller_error(&err));
+    assert!(
+        !matches!(
+            no_shard_answered("papers", 0, &[(Uuid::nil(), err)]),
+            Some(OrchestratorError::NoShardAnswered {
+                caller_error: false,
+                ..
+            })
+        ),
+        "a query every shard ran out of budget on is a caller's refusal"
+    );
+}
+
+/// The projection a shard is asked to keep is the caller's plus what the merge reads off
+/// a hit — which is the sort field, and on a document-key sort the key under every name
+/// it travels by.
+#[test]
+fn the_shard_projection_adds_back_what_the_merge_needs() {
+    let mut schema = IndexSchema::default();
+    for name in ["title", "created"] {
+        schema.fields.insert(
+            name.to_string(),
+            FieldDef::new(name.to_string(), TantivyFieldType::Text),
+        );
+    }
+
+    let title = vec!["title".to_string()];
+    // No sort: the caller's list is all the shard is asked to keep.
+    assert_eq!(
+        shard_projection(Some(&title), None, &schema),
+        Some(title.clone())
+    );
+    // No projection: `None` stays `None` — the whole document, as before.
+    assert_eq!(shard_projection(None, None, &schema), None);
+
+    // A sort on an ordinary field adds exactly that field, once.
+    let sort = SortSpec {
+        field: "created".to_string(),
+        order: SortOrder::Asc,
+    };
+    assert_eq!(
+        shard_projection(Some(&title), Some(&sort), &schema),
+        Some(vec!["title".to_string(), "created".to_string()])
+    );
+    // Already present stays once.
+    let both = vec!["title".to_string(), "created".to_string()];
+    assert_eq!(
+        shard_projection(Some(&both), Some(&sort), &schema),
+        Some(both)
+    );
+
+    // On a shadow index a document-key sort needs the key under both names: the caller's
+    // `id` and the `sha1` the hits carry it under.
+    let mut shadow_schema = IndexSchema::default();
+    shadow_schema.fields.insert(
+        "title".to_string(),
+        FieldDef::new("title".to_string(), TantivyFieldType::Text),
+    );
+    shadow_schema
+        .fields
+        .insert("sha1".to_string(), shadow_field("sha1"));
+    let by_key = SortSpec {
+        field: "id".to_string(),
+        order: SortOrder::Asc,
+    };
+    let kept = shard_projection(Some(&title), Some(&by_key), &shadow_schema).unwrap();
+    for name in ["title", "id", "sha1"] {
+        assert!(
+            kept.contains(&name.to_string()),
+            "missing '{name}': {kept:?}"
+        );
+    }
+}
+
 /// Health reads the shard count from the placement snapshot, so it must be the shard map's.
 ///
 /// It was asked for through `GetIdentity`, which a worker answers from the shard map — and under

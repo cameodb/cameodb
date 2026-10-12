@@ -480,6 +480,19 @@ pub enum OrchestratorError {
         budget_ms: u64,
     },
 
+    /// A shard's search ran out of the request's own budget while it was running.
+    ///
+    /// Distinct from [`Self::ReadDeadlineExpired`], which is work refused at dequeue
+    /// because the wait already spent the budget: this one was *running* — the deadline
+    /// fired inside the segment walk — so the query asked for more work than the deadline
+    /// covers. The caller's to fix, the way an unsortable field is: narrow the query or
+    /// sort on a fast field, which is what the message says.
+    #[error(
+        "search exceeded its {budget_ms} ms budget after {elapsed_ms} ms; narrow the query, \
+         sort on a fast field, or use limit 0 to count"
+    )]
+    SearchDeadlineExceeded { elapsed_ms: u64, budget_ms: u64 },
+
     /// No shard could run the query, so the empty result it produced is not an answer.
     ///
     /// A scatter-gather reports a failed shard as a partial outage — the hits it did get, plus
@@ -679,9 +692,9 @@ impl OrchestratorError {
 
             Self::SchemaBeingMinted { .. } => RemoteVerdict::Minting,
 
-            Self::UnsortableField { .. } | Self::UnrunnableQuery { .. } => {
-                RemoteVerdict::BadRequest
-            }
+            Self::UnsortableField { .. }
+            | Self::UnrunnableQuery { .. }
+            | Self::SearchDeadlineExceeded { .. } => RemoteVerdict::BadRequest,
 
             // A query no shard could run carries its own verdict: the shards refused what was
             // asked, or they failed. Only the first is the caller's to fix.
@@ -858,12 +871,20 @@ pub struct BatchWriteReply {
 }
 
 /// Search request message for MicroshardActor.
+///
+/// `fields` is the projection the node pushes down to the shard: the names to keep in each
+/// hit, already widened by the gather to include whatever the merge still needs (the sort
+/// field, the document key). `serde(default)` because a peer on a build that predates the
+/// field sends a request without it, and that request means "every field", as it always
+/// did — `None` is the whole document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchRequest {
     pub index: String,
     pub query: String,
     pub limit: Option<usize>,
     pub sort: Option<SortSpec>,
+    #[serde(default)]
+    pub fields: Option<Vec<String>>,
 }
 
 /// Message to delete an index and all its data
@@ -927,6 +948,11 @@ impl From<OrchestratorError> for RemoteError {
             OrchestratorError::UnrunnableQuery { notes } => RemoteError::InvalidInput(format!(
                 "no clause of this query can run against this index: {notes}"
             )),
+            // The request's to fix — the query outspend the deadline it was given — so it
+            // travels as a refusal, the same kind an unsortable sort takes.
+            err @ OrchestratorError::SearchDeadlineExceeded { .. } => {
+                RemoteError::InvalidInput(err.to_string())
+            }
             // A peer whose shards all refused the request passes that on as a refusal; one whose
             // shards all failed passes on a failure. Collapsing both into `Io` would make a
             // requesting node answer 500 for a query the caller could fix.
@@ -1052,6 +1078,12 @@ pub struct SearchReply {
     /// refused on a claim it never made.
     #[serde(default)]
     pub emptied: bool,
+    /// Where this shard's search spent its time; see [`storage::SearchTimings`].
+    ///
+    /// Defaulted for the same reason as `discarded`, and advisory the same way: a peer
+    /// that does not send it reads as "unmeasured", and the node aggregates what it gets.
+    #[serde(default)]
+    pub timings: storage::SearchTimings,
 }
 
 /// Client operation messages for RouterActor.

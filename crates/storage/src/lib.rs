@@ -33,6 +33,8 @@ use tantivy::query::QueryParserError;
 use thiserror::Error;
 
 mod analysis;
+mod deadline;
+mod projection;
 mod query;
 mod schema;
 mod search;
@@ -45,6 +47,8 @@ mod tests;
 // `store` whole, so any `pub` added in those modules widened the crate's API with no review step
 // (O4). Now widening it is an edit here: an item a caller outside the crate needs goes in the
 // list, on purpose, and everything else stays the crate's own business.
+pub use deadline::{DeadlineQuery, SearchDeadline};
+pub use projection::apply_field_projection;
 pub use query::{FieldReference, field_references};
 pub use schema::{
     DropsCounted, FieldDef, IndexSchema, SchemaChange, SchemaFieldUpdate, SchemaFields,
@@ -52,6 +56,7 @@ pub use schema::{
     byte_value_error, count_drops, date_out_of_range, date_sort_secs, document_key_field,
     facet_path_error, is_date_value, parse_date_to_timestamp_secs, select_default_fields,
 };
+pub use search::SearchOptions;
 pub use store::HybridStore;
 // `SchemaFields` is in the list because `HybridStore::get_or_create_index` returns it, not because
 // a caller reads it: its fields are crate-private, so outside the crate it is a handle to hold and
@@ -233,6 +238,37 @@ pub struct SearchOutcome {
     /// this says nothing about the data — read as "no document matches", it is a claim about a
     /// query that never ran.
     pub emptied: bool,
+    /// Where the search spent its wall time, per stage. See [`SearchTimings`].
+    pub timings: SearchTimings,
+}
+
+/// Where one `search_documents` call spent its time, in milliseconds per stage.
+///
+/// A search is five stages, and they answer different questions: `walk` is the tantivy
+/// segment walk (bounded by `limit` only in the hits it keeps, not in the matches it
+/// touches), `resolve` is turning doc addresses into document keys, `fetch` is the redb
+/// batch read, `build` is deserialization plus shadow reconstruction plus the post-fetch
+/// sort and projection, and `parse` is what the query cost before any of it ran.
+/// `fetched_docs` is the row count `fetch` returned — the payload size the later stages
+/// scale with.
+///
+/// Stages a path never ran stay `0`: a count-only search has no resolve, fetch or build,
+/// and an exact-id lookup has no parse or walk because it never reaches the query engine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchTimings {
+    /// `prepare_query_parser` plus `parse()`: normalization, rewriting, tree building.
+    pub parse_ms: u64,
+    /// The `searcher.search` call — the segment walk itself.
+    pub walk_ms: u64,
+    /// Turning collected doc addresses into document ids (fast-column reads plus the
+    /// stored-document fallback loop).
+    pub resolve_ms: u64,
+    /// The redb `get_batch_by_keys_with` call.
+    pub fetch_ms: u64,
+    /// Deserialize + shadow reconstruction + post-fetch sort + projection.
+    pub build_ms: u64,
+    /// Documents the fetch stage returned.
+    pub fetched_docs: usize,
 }
 
 impl SearchOutcome {
@@ -252,6 +288,7 @@ impl SearchOutcome {
             approximate_sort: None,
             narrowed_default_fields: None,
             emptied,
+            timings: SearchTimings::default(),
         }
     }
 }
@@ -513,6 +550,20 @@ pub enum StoreError {
     /// `InvalidInput` kind and would otherwise call a bad document an internal error.
     #[error("invalid value for field '{field}': {reason}")]
     InvalidFieldValue { field: String, reason: String },
+
+    /// A search that outlived the request's budget while it was running. The HTTP timeout
+    /// abandons the *answer* but cannot cancel the walk — `spawn_blocking` work is
+    /// uncancellable — so this is the search refusing itself, from inside, before it holds a
+    /// read thread for a client that has already gone.
+    ///
+    /// The advice is the caller's, not an apology: the budget is the request's timeout, so
+    /// spending it all on one segment walk means the query asked for more work than the
+    /// deadline covers, and the message says how to ask for less.
+    #[error(
+        "search exceeded its {budget_ms} ms budget after {elapsed_ms} ms; narrow the query, \
+         sort on a fast field, or use limit 0 to count"
+    )]
+    SearchDeadlineExceeded { elapsed_ms: u64, budget_ms: u64 },
 }
 
 impl StoreError {

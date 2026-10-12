@@ -22,6 +22,56 @@ use tantivy::{Index, IndexReader};
 use tracing::{debug, trace, warn};
 use walkdir::WalkDir;
 
+/// What `search_documents` needs beyond the query string: how long it may run, and which
+/// fields the answer has to carry.
+///
+/// Both default to "as before" — no deadline, every field — so the plain call and the
+/// dozen tests on it change nothing.
+#[derive(Default)]
+pub struct SearchOptions<'a> {
+    /// The request's own budget, from the same clock the dequeue check measures against.
+    /// Wrapped around the parsed query, so each segment walk reads it from inside — the
+    /// only place a running search can still be stopped.
+    pub deadline: Option<SearchDeadline>,
+    /// Fields to project each hit down to, applied after sorting and reconstruction.
+    /// `None` returns the whole document.
+    pub fields: Option<&'a [String]>,
+}
+
+/// Wrap the parsed query so the segment walks it drives sample the deadline from inside.
+///
+/// Identity when there is no deadline: the wrapper exists to stop work, and a search with
+/// no budget to spend has nothing to stop.
+fn with_deadline(
+    parsed_query: Box<dyn tantivy::query::Query>,
+    deadline: Option<&SearchDeadline>,
+) -> Box<dyn tantivy::query::Query> {
+    match deadline {
+        Some(deadline) => Box::new(DeadlineQuery::new(parsed_query, deadline.clone())),
+        None => parsed_query,
+    }
+}
+
+/// A search error under a tripped deadline is the deadline's error, whatever it rode out
+/// on. The walk reports through tantivy's error channel, which has no deadline variant,
+/// so the flag — not the message text — is what decides.
+fn deadline_or<T>(
+    result: tantivy::Result<T>,
+    deadline: Option<&SearchDeadline>,
+) -> Result<T, StoreError> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            if let Some(deadline) = deadline
+                && deadline.tripped()
+            {
+                deadline.check()?;
+            }
+            Err(StoreError::from(err))
+        }
+    }
+}
+
 /// Wrapper to handle both sorted (u64) and unsorted (f32) search results
 pub(crate) enum SearchResult {
     Unsorted(Vec<(f32, tantivy::DocAddress)>),
@@ -172,6 +222,22 @@ impl HybridStore {
         index: &str,
         keys: &[String],
     ) -> Result<Vec<(String, Vec<u8>)>, StoreError> {
+        self.get_batch_by_keys_with(index, keys, None)
+    }
+
+    /// [`get_batch_by_keys`](Self::get_batch_by_keys) under a search deadline.
+    ///
+    /// A `limit` cap bounds the key count, not the work each key costs: the whole batch
+    /// runs in one read transaction, so a search that came to its deadline during the
+    /// Tantivy walk still pays the full fetch for a page nobody will read. The deadline is
+    /// sampled every 256 keys — cheap enough to answer the budget, sparse enough to cost
+    /// nothing against a B-tree lookup per key.
+    pub fn get_batch_by_keys_with(
+        &self,
+        index: &str,
+        keys: &[String],
+        deadline: Option<&SearchDeadline>,
+    ) -> Result<Vec<(String, Vec<u8>)>, StoreError> {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
@@ -188,7 +254,12 @@ impl HybridStore {
 
         let mut results = Vec::with_capacity(keys.len());
 
-        for key in keys {
+        for (i, key) in keys.iter().enumerate() {
+            if i.is_multiple_of(256)
+                && let Some(deadline) = deadline
+            {
+                deadline.check()?;
+            }
             if let Some(value) = data_table.get(key.as_str())? {
                 results.push((key.clone(), value.value().to_vec()));
             }
@@ -390,6 +461,31 @@ impl HybridStore {
         limit: usize,
         _sort: Option<&SortSpec>,
     ) -> Result<SearchOutcome, StoreError> {
+        self.search_documents_with(index, query, limit, _sort, &SearchOptions::default())
+    }
+
+    /// [`search_documents`](Self::search_documents) with the two things a node wants the
+    /// shard to know: how long the search may run, and which fields the answer needs.
+    ///
+    /// `limit` bounds the *response size*, not the work: a `limit = 10` over a million
+    /// matches still walks every match to rank them. `opts.deadline` is what bounds the
+    /// work — it is wrapped around the parsed query so each segment walk checks the clock
+    /// from inside, which is the only place a running `spawn_blocking` search can be
+    /// stopped (the request timeout abandons the future; it cannot reach in here).
+    ///
+    /// `opts.fields` is applied dead last — after shadow reconstruction and after the
+    /// post-fetch string sort, which reads the sort field off the full document — so the
+    /// shard answers with the projected shape rather than the full record. The sort field
+    /// and the document key are the caller's to add back if the projection omits them;
+    /// the node does that when it widens the list it sends (see `shard_projection`).
+    pub fn search_documents_with(
+        &self,
+        index: &str,
+        query: &str,
+        limit: usize,
+        _sort: Option<&SortSpec>,
+        opts: &SearchOptions<'_>,
+    ) -> Result<SearchOutcome, StoreError> {
         // Get reader and field mapping from cache or disk
         let (reader, fields) = match self.get_reader(index)? {
             Some(r) => r,
@@ -409,20 +505,30 @@ impl HybridStore {
             .get_schema_cached(index)?
             .unwrap_or_else(|| Arc::new(IndexSchema::default()));
 
+        let mut timings = SearchTimings::default();
+
         // Count-only mode: limit=0 means return just total_hits without document data.
         // Runs only the Count collector (cheaper than TopDocs) and skips all redb lookups.
         if limit == 0 {
             // For exact ID queries, we can short-circuit: total_hits is 0 or 1
             if let Some((id_value, _)) = parse_exact_id_query(query, &schema) {
+                let fetch_start = Instant::now();
                 let exists = self.get_batch_by_keys(index, &[id_value])?.len();
+                timings.fetch_ms = fetch_start.elapsed().as_millis() as u64;
+                timings.fetched_docs = exists;
                 let total_hits = if exists > 0 { 1 } else { 0 };
                 // No parse happens on this path, so nothing can be discarded.
-                return Ok(SearchOutcome::counted(total_hits, Vec::new(), false));
+                let mut outcome = SearchOutcome::counted(total_hits, Vec::new(), false);
+                outcome.timings = timings;
+                debug!(index = %index, ?timings, "search stage timings");
+                return Ok(outcome);
             }
 
+            let parse_start = Instant::now();
             let prepared =
                 prepare_query_parser(tantivy_index, &fields, &schema, query, &self.config.query)?;
             let (parsed_query, parse_errors) = prepared.parse();
+            timings.parse_ms = parse_start.elapsed().as_millis() as u64;
             let mut discarded = describe_discarded_all(&parse_errors, query, &schema);
             discarded.extend(prepared.notes.iter().cloned());
             let normalized_query = prepared.shown();
@@ -448,8 +554,14 @@ impl HybridStore {
                 }
             }
 
+            let parsed_query = with_deadline(parsed_query, opts.deadline.as_ref());
             let count_collector = tantivy::collector::Count;
-            let total_hits = searcher.search(&parsed_query, &count_collector)?;
+            let walk_start = Instant::now();
+            let total_hits = deadline_or(
+                searcher.search(&parsed_query, &count_collector),
+                opts.deadline.as_ref(),
+            )?;
+            timings.walk_ms = walk_start.elapsed().as_millis() as u64;
 
             debug!(
                 index = %index,
@@ -457,10 +569,13 @@ impl HybridStore {
                 "Count-only search completed (limit=0)"
             );
 
-            return Ok(SearchOutcome {
+            let mut outcome = SearchOutcome {
                 narrowed_default_fields,
                 ..SearchOutcome::counted(total_hits, discarded, emptied)
-            });
+            };
+            outcome.timings = timings;
+            debug!(index = %index, ?timings, "search stage timings");
+            return Ok(outcome);
         }
 
         // Check if this is an exact ID lookup (id:field or shadow field) that can bypass Tantivy
@@ -480,7 +595,10 @@ impl HybridStore {
                 .map(|(_, id)| id.clone())
                 .collect();
 
+            let fetch_start = Instant::now();
             let redb_docs = self.get_batch_by_keys(index, &doc_ids)?;
+            timings.fetch_ms = fetch_start.elapsed().as_millis() as u64;
+            timings.fetched_docs = redb_docs.len();
 
             debug!(
                 index = %index,
@@ -494,6 +612,7 @@ impl HybridStore {
                 redb_docs.into_iter().collect();
 
             // Step 3: Combine scores with complete documents (reuse existing logic)
+            let build_start = Instant::now();
             let mut results = Vec::new();
             for (score, doc_id) in doc_ids_with_scores {
                 if let Some(doc_bytes) = doc_map.get(&doc_id) {
@@ -524,9 +643,11 @@ impl HybridStore {
                 }
             }
 
+            timings.build_ms = build_start.elapsed().as_millis() as u64;
             let total_hits = if results.is_empty() { 0 } else { 1 };
             // No parse happens on this path, and no sort: an id lookup returns the one document
             // it names. So nothing can be discarded and no order can be approximate.
+            debug!(index = %index, ?timings, "search stage timings");
             return Ok(SearchOutcome {
                 hits: results,
                 total_hits,
@@ -534,15 +655,18 @@ impl HybridStore {
                 approximate_sort: None,
                 narrowed_default_fields: None,
                 emptied: false,
+                timings,
             });
         }
 
+        let parse_start = Instant::now();
         let prepared =
             prepare_query_parser(tantivy_index, &fields, &schema, query, &self.config.query)?;
 
         // Lenient, so one bad clause does not fail the whole query; what it drops is reported
         // through `SearchOutcome::discarded` rather than swallowed.
         let (parsed_query, parse_errors) = prepared.parse();
+        timings.parse_ms = parse_start.elapsed().as_millis() as u64;
         let mut discarded = describe_discarded_all(&parse_errors, query, &schema);
         discarded.extend(prepared.notes.iter().cloned());
         let normalized_query = prepared.shown();
@@ -571,6 +695,10 @@ impl HybridStore {
                 );
             }
         }
+
+        // The deadline rides on the query from here on: every collector path below —
+        // scored, sorted, count-only — walks segments through it.
+        let parsed_query = with_deadline(parsed_query, opts.deadline.as_ref());
 
         // Flag set when sorting by a string field (post-fetch alphabetic sort).
         // The field name and order are captured here and used after redb retrieval.
@@ -654,7 +782,12 @@ impl HybridStore {
                     let top_docs_handle = multi_collector.add_collector(top_docs_collector);
                     let count_handle = multi_collector.add_collector(count_collector);
 
-                    let mut multi_fruit = searcher.search(&parsed_query, &multi_collector)?;
+                    let walk_start = Instant::now();
+                    let mut multi_fruit = deadline_or(
+                        searcher.search(&parsed_query, &multi_collector),
+                        opts.deadline.as_ref(),
+                    )?;
+                    timings.walk_ms += walk_start.elapsed().as_millis() as u64;
                     let sorted: Vec<(Option<$t>, tantivy::DocAddress)> =
                         top_docs_handle.extract(&mut multi_fruit);
                     let total_hits = count_handle.extract(&mut multi_fruit);
@@ -685,7 +818,12 @@ impl HybridStore {
                     let top_docs_handle = multi_collector.add_collector(top_docs_collector);
                     let count_handle = multi_collector.add_collector(count_collector);
 
-                    let mut multi_fruit = searcher.search(&parsed_query, &multi_collector)?;
+                    let walk_start = Instant::now();
+                    let mut multi_fruit = deadline_or(
+                        searcher.search(&parsed_query, &multi_collector),
+                        opts.deadline.as_ref(),
+                    )?;
+                    timings.walk_ms += walk_start.elapsed().as_millis() as u64;
                     let sorted: Vec<(Option<String>, tantivy::DocAddress)> =
                         top_docs_handle.extract(&mut multi_fruit);
                     let total_hits = count_handle.extract(&mut multi_fruit);
@@ -736,7 +874,12 @@ impl HybridStore {
                     let top_docs_handle = multi_collector.add_collector(top_docs_collector);
                     let count_handle = multi_collector.add_collector(count_collector);
 
-                    let mut multi_fruit = searcher.search(&parsed_query, &multi_collector)?;
+                    let walk_start = Instant::now();
+                    let mut multi_fruit = deadline_or(
+                        searcher.search(&parsed_query, &multi_collector),
+                        opts.deadline.as_ref(),
+                    )?;
+                    timings.walk_ms += walk_start.elapsed().as_millis() as u64;
                     let top_docs: Vec<(f32, tantivy::DocAddress)> =
                         top_docs_handle.extract(&mut multi_fruit);
                     let total_hits = count_handle.extract(&mut multi_fruit);
@@ -762,7 +905,12 @@ impl HybridStore {
             let top_docs_handle = multi_collector.add_collector(top_docs_collector);
             let count_handle = multi_collector.add_collector(count_collector);
 
-            let mut multi_fruit = searcher.search(&parsed_query, &multi_collector)?;
+            let walk_start = Instant::now();
+            let mut multi_fruit = deadline_or(
+                searcher.search(&parsed_query, &multi_collector),
+                opts.deadline.as_ref(),
+            )?;
+            timings.walk_ms += walk_start.elapsed().as_millis() as u64;
             let top_docs: Vec<(f32, tantivy::DocAddress)> =
                 top_docs_handle.extract(&mut multi_fruit);
             let total_hits = count_handle.extract(&mut multi_fruit);
@@ -786,11 +934,18 @@ impl HybridStore {
         };
 
         if is_empty {
-            return Ok(SearchOutcome {
+            let mut outcome = SearchOutcome {
                 narrowed_default_fields,
                 ..SearchOutcome::counted(total_hits, discarded, emptied)
-            });
+            };
+            outcome.timings = timings;
+            debug!(index = %index, ?timings, "search stage timings");
+            return Ok(outcome);
         }
+
+        // The resolve stage starts here: doc addresses in, document ids out — the
+        // fast-column batch reads first, the stored-document loop for what they miss.
+        let resolve_start = Instant::now();
 
         // Step 1: Extract document IDs from Tantivy results. `id` carries a fast column on
         // indexes built since it gained one, but a per-hit `ord_to_str` re-opens the term
@@ -892,6 +1047,11 @@ impl HybridStore {
         }
 
         for (pos, (score, doc_address)) in hits.into_iter().enumerate() {
+            if pos.is_multiple_of(256)
+                && let Some(deadline) = opts.deadline.as_ref()
+            {
+                deadline.check()?;
+            }
             let id_str = match resolved[pos].take() {
                 Some(id) => Some(id),
                 None => {
@@ -940,7 +1100,15 @@ impl HybridStore {
             .map(|(_, id)| id.clone())
             .collect();
 
-        let redb_docs = self.get_batch_by_keys(index, &doc_ids)?;
+        timings.resolve_ms = resolve_start.elapsed().as_millis() as u64;
+
+        if let Some(deadline) = opts.deadline.as_ref() {
+            deadline.check()?;
+        }
+        let fetch_start = Instant::now();
+        let redb_docs = self.get_batch_by_keys_with(index, &doc_ids, opts.deadline.as_ref())?;
+        timings.fetch_ms = fetch_start.elapsed().as_millis() as u64;
+        timings.fetched_docs = redb_docs.len();
 
         debug!(
             index = %index,
@@ -953,6 +1121,7 @@ impl HybridStore {
         let doc_map: std::collections::HashMap<String, Vec<u8>> = redb_docs.into_iter().collect();
 
         // Step 3: Combine scores with complete documents
+        let build_start = Instant::now();
         let mut results = Vec::new();
         for (score, doc_id) in doc_ids_with_scores {
             if let Some(doc_bytes) = doc_map.get(&doc_id) {
@@ -1026,6 +1195,18 @@ impl HybridStore {
             results.truncate(limit);
         }
 
+        // The last thing before the answer leaves: the shard trims each hit to the fields
+        // asked for, so the wire carries the projected shape rather than the whole record.
+        // Last on purpose — shadow reconstruction and the post-fetch string sort above
+        // both read the full document.
+        if let Some(field_list) = opts.fields {
+            for (_, doc) in results.iter_mut() {
+                *doc = apply_field_projection(std::mem::take(doc), field_list);
+            }
+        }
+
+        timings.build_ms = build_start.elapsed().as_millis() as u64;
+        debug!(index = %index, ?timings, "search stage timings");
         Ok(SearchOutcome {
             hits: results,
             total_hits,
@@ -1033,6 +1214,7 @@ impl HybridStore {
             approximate_sort,
             narrowed_default_fields,
             emptied,
+            timings,
         })
     }
 

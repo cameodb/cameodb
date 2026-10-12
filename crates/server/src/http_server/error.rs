@@ -135,6 +135,23 @@ impl AppError {
             OrchestratorError::Overloaded { .. } | OrchestratorError::ReadDeadlineExpired { .. }
         );
         let quiet = matches!(err, OrchestratorError::PeerUnreachable { .. });
+
+        // A search that ran out of its own deadline is a 408, not the 400 its `BadRequest`
+        // verdict would otherwise carry: the verdict is about whose fault it is (the
+        // request asked for more work than the deadline covers, so the message reaches the
+        // caller), while the status is about what to do — retry the same request narrower,
+        // not assume the node will always refuse it. Not `shed`: the work ran, and ShedLog
+        // counts work refused before it started.
+        if matches!(err, OrchestratorError::SearchDeadlineExceeded { .. }) {
+            return Self {
+                error: err.into(),
+                status: Some(StatusCode::REQUEST_TIMEOUT),
+                retry_after_secs: None,
+                shed: false,
+                quiet: false,
+            };
+        }
+
         let mut app = match err.verdict() {
             RemoteVerdict::NotFound => Self::index_not_found(err.caller_message()),
             RemoteVerdict::BadRequest => Self::bad_request(err.to_string()),
@@ -322,5 +339,24 @@ mod tests {
             response.headers().get(axum::http::header::RETRY_AFTER),
             Some(&axum::http::HeaderValue::from_static("1")),
         );
+    }
+
+    /// A search that outran its deadline is the caller's error but not a 400: 408 says the
+    /// request ran out of time, and the body keeps the message that tells it how to fit —
+    /// the same split of verdict from status the arm in `from_route` makes.
+    #[test]
+    fn a_search_that_outran_its_deadline_answers_408_with_the_reason() {
+        let err = AppError::from_route(OrchestratorError::SearchDeadlineExceeded {
+            elapsed_ms: 1200,
+            budget_ms: 1000,
+        });
+        assert_eq!(err.status, Some(StatusCode::REQUEST_TIMEOUT));
+        assert!(!err.shed, "the work ran; only refused-before-start is shed");
+        assert!(
+            err.error.to_string().contains("1000 ms"),
+            "the caller is told which budget it outran: {err:?}"
+        );
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
     }
 }

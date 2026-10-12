@@ -1218,6 +1218,7 @@ pub(super) fn is_caller_error(err: &OrchestratorError) -> bool {
         ),
         OrchestratorError::UnsortableField { .. }
         | OrchestratorError::UnrunnableQuery { .. }
+        | OrchestratorError::SearchDeadlineExceeded { .. }
         | OrchestratorError::NoShardAnswered { .. } => true,
         OrchestratorError::Storage(storage::StoreError::InvalidFieldValue { .. }) => true,
         _ => false,

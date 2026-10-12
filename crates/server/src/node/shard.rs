@@ -1675,12 +1675,30 @@ impl MicroshardActor {
         let limit = request.limit.unwrap_or(self.default_search_limit);
         let index = request.index.clone();
         let sort = request.sort;
+        let fields = request.fields;
+
+        // The same clock the dequeue shed in `dispatch_read_pool` measures against: the
+        // deadline covers everything the request has already spent, not just the walk
+        // about to start. Carried into the search itself because the pool cannot cancel
+        // running work — only the walk can stop the walk.
+        let deadline = self
+            .read_budget
+            .map(|budget| storage::SearchDeadline::new(request_started_at(), budget));
 
         let outcome = self
             .spawn_on_read_pool(move || {
                 #[cfg(feature = "fault-injection")]
                 fault_injection::panic_if_read_trap(&query);
-                store.search_documents(&index, &query, limit, sort.as_ref())
+                store.search_documents_with(
+                    &index,
+                    &query,
+                    limit,
+                    sort.as_ref(),
+                    &storage::SearchOptions {
+                        deadline,
+                        fields: fields.as_deref(),
+                    },
+                )
             })
             .await?
             .map_err(|e: StoreError| match e {
@@ -1694,6 +1712,15 @@ impl MicroshardActor {
                 StoreError::FieldNotFound(_) | StoreError::QueryParser(_) => {
                     OrchestratorError::Validation(e.to_string())
                 }
+                // Kept typed across the crossing: the deadline's numbers and its verdict
+                // are the answer, and a flattened `Io` would read as this node's fault.
+                StoreError::SearchDeadlineExceeded {
+                    elapsed_ms,
+                    budget_ms,
+                } => OrchestratorError::SearchDeadlineExceeded {
+                    elapsed_ms,
+                    budget_ms,
+                },
                 _ => OrchestratorError::Io(std::io::Error::other(e.to_string())),
             })?;
 
@@ -1710,6 +1737,7 @@ impl MicroshardActor {
             approximate_sort: outcome.approximate_sort,
             narrowed_default_fields: outcome.narrowed_default_fields,
             emptied: outcome.emptied,
+            timings: outcome.timings,
         })
     }
 
@@ -2097,6 +2125,7 @@ impl Message<SearchRequest> for MicroshardActor {
                 approximate_sort: result.approximate_sort,
                 narrowed_default_fields: result.narrowed_default_fields,
                 emptied: result.emptied,
+                timings: result.timings,
             })
             .map_err(RemoteError::from)
     }

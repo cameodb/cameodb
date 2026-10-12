@@ -14,6 +14,10 @@ use uuid::Uuid;
 use serde_json::Value as JsonValue;
 use storage::{FieldDef, IndexSchema, TantivyFieldType};
 pub use storage::{SortOrder, SortSpec};
+// The projection itself lives in storage now — a shard applies it to each hit before the
+// wire, and the merge applies it again after. One function serves both so the two cannot
+// drift; the re-export keeps every caller here spelling it the way they did.
+pub(super) use storage::apply_field_projection;
 
 /// The prefix a per-document reason carries: its place in the batch it was sent in.
 pub(super) const DOCUMENT_PREFIX: &str = "document ";
@@ -236,6 +240,12 @@ impl ScatterCtx<'_> {
             return Err(refusal);
         }
 
+        // What each shard is asked to keep. The caller's projection is pushed down so a
+        // one-field `return` does not pull every matching document across the wire whole;
+        // the merge's own needs — the sort field and the document key — are added back so
+        // `stamp_sort_keys` still finds them on a hit the shard trimmed.
+        let shard_fields = shard_projection(fields, sort, schema);
+
         let shard_targets: Vec<(Uuid, MicroshardActor)> = self
             .shards
             .iter()
@@ -245,11 +255,13 @@ impl ScatterCtx<'_> {
             futures::stream::iter(shard_targets.into_iter().map(|(shard_id, shard)| {
                 // Every shard is asked for the whole window from the front, because any of
                 // them may hold all of it. The skip is applied once, below.
+                let shard_fields = shard_fields.clone();
                 let req = SearchRequest {
                     index: index.to_string(),
                     query: query.to_string(),
                     limit: Some(window.fetch_count()),
                     sort: sort.cloned(),
+                    fields: shard_fields,
                 };
                 async move { (shard_id, shard.handle_search(req).await) }
             }))
@@ -275,11 +287,20 @@ impl ScatterCtx<'_> {
         // One shard is enough. Shards can hold different schemas for the same index, and a
         // query that one of them could not run at all is not answered by the ones that could.
         let mut emptied = false;
+        // The shards ran in parallel, so the stage cost of the search is the worst of
+        // them, not the sum; the row count they fetched together is the sum.
+        let mut shard_timings = storage::SearchTimings::default();
         for (shard_id, result) in shard_results {
             match result {
                 Ok(r) => {
                     emptied |= r.emptied;
                     total_hits_sum += r.total_hits;
+                    shard_timings.parse_ms = shard_timings.parse_ms.max(r.timings.parse_ms);
+                    shard_timings.walk_ms = shard_timings.walk_ms.max(r.timings.walk_ms);
+                    shard_timings.resolve_ms = shard_timings.resolve_ms.max(r.timings.resolve_ms);
+                    shard_timings.fetch_ms = shard_timings.fetch_ms.max(r.timings.fetch_ms);
+                    shard_timings.build_ms = shard_timings.build_ms.max(r.timings.build_ms);
+                    shard_timings.fetched_docs += r.timings.fetched_docs;
                     for hit in r.hits {
                         results.push((shard_id, hit.score, hit.doc));
                     }
@@ -299,6 +320,24 @@ impl ScatterCtx<'_> {
             }
         }
 
+        // Every shard ran the same query under the same budget, so a deadline that fired on
+        // one of them describes the whole search: the shards that finished are a page of a
+        // search that did not complete, not an answer. Refused whole — the same call the
+        // `emptied` path below makes, and for the same reason: a partial 200 is
+        // indistinguishable from the query having meant something it did not.
+        for (_, err) in &failures {
+            if let OrchestratorError::SearchDeadlineExceeded {
+                elapsed_ms,
+                budget_ms,
+            } = err
+            {
+                return Err(OrchestratorError::SearchDeadlineExceeded {
+                    elapsed_ms: *elapsed_ms,
+                    budget_ms: *budget_ms,
+                });
+            }
+        }
+
         // Nothing ran, so there is nothing to qualify: refuse rather than answer with the empty
         // page a partial outage would produce. This is where the one refusal the sort guard above
         // cannot make lands — `fast` is a declaration and the column is written from it when the
@@ -308,6 +347,9 @@ impl ScatterCtx<'_> {
             return Err(refusal);
         }
         let errors = shard_error_notes(&failures);
+
+        // The node's own work: order the shard answers into one page.
+        let merge_start = std::time::Instant::now();
 
         // Order merged results: by the requested sort field when provided, otherwise by
         // score descending. Each shard already returned field-sorted results, so a global
@@ -343,6 +385,7 @@ impl ScatterCtx<'_> {
                 }
             })
             .collect();
+        let merge_ms = merge_start.elapsed().as_millis() as u64;
         let mut response = serde_json::json!({
             "hits": hits,
             "hits_returned": hits.len(),
@@ -359,6 +402,17 @@ impl ScatterCtx<'_> {
                 // The schema these shards were searched under, so a merge across nodes can tell
                 // whether they all searched the same one.
                 "schema": searched_schema_stats(schema),
+                // Per-stage the worst shard — they ran in parallel — plus this node's
+                // own merge, and the rows the shards fetched between them.
+                "timings_ms": {
+                    "parse": shard_timings.parse_ms,
+                    "walk": shard_timings.walk_ms,
+                    "resolve": shard_timings.resolve_ms,
+                    "fetch": shard_timings.fetch_ms,
+                    "build": shard_timings.build_ms,
+                    "merge": merge_ms,
+                },
+                "fetched_docs": shard_timings.fetched_docs,
             },
         });
         attach_shard_errors(&mut response, errors);
@@ -376,38 +430,6 @@ impl ScatterCtx<'_> {
         attach_approximate_sort(&mut response, approximate_sort);
         attach_narrowed_default_fields(&mut response, narrowed_default_fields);
         Ok(response)
-    }
-}
-
-/// Apply field projection to a JSON document, keeping only specified fields.
-/// Always preserves metadata fields (_score, _sort_key, etc.) that start with underscore.
-///
-/// User-specified fields are inserted first in the exact order given by the projection
-/// list, so the response field order matches the user's `return` clause. Metadata fields
-/// are appended afterwards. This guarantees a consistent field order whether or not a
-/// sort is active — the internal `_sort_key` (if present) simply appears at the end and
-/// is stripped by `strip_sort_keys` at the client boundary.
-pub(super) fn apply_field_projection(doc: JsonValue, fields: &[String]) -> JsonValue {
-    if let JsonValue::Object(mut map) = doc {
-        let mut filtered = serde_json::Map::new();
-
-        // Add requested fields first, in user-specified projection order
-        for field in fields {
-            if let Some(value) = map.remove(field) {
-                filtered.insert(field.clone(), value);
-            }
-        }
-
-        // Then append metadata fields (those starting with _)
-        for (key, value) in map.iter() {
-            if key.starts_with('_') {
-                filtered.insert(key.clone(), value.clone());
-            }
-        }
-
-        JsonValue::Object(filtered)
-    } else {
-        doc
     }
 }
 
@@ -606,6 +628,41 @@ pub(super) fn normalize_projection_fields(schema: &IndexSchema, fields: &[String
             }
         })
         .collect()
+}
+
+/// The field list each shard is asked to keep: the caller's projection, plus whatever the
+/// merge above the shards still has to read off a hit.
+///
+/// Pushed down because a shard is where the full document already exists — trimming there
+/// keeps `shards × limit` hits from crossing the wire whole when the caller asked for one
+/// field. But a trimmed hit must still be mergeable: [`stamp_sort_keys`] reads the sort
+/// field off it, and on a document-key sort reads the key under every name it travels by
+/// (the caller's `id` or the shadow name reconstruction used instead). So those names are
+/// added back to what the shard keeps, and the node-level projection — applied after the
+/// merge, unchanged — strips them out of the answer again.
+///
+/// `None` in, `None` out: no projection asked for means the whole document, as before.
+/// `fields` is expected already normalized — `id` spelled as the shadow name — because the
+/// shard's hits are.
+pub(super) fn shard_projection(
+    fields: Option<&[String]>,
+    sort: Option<&SortSpec>,
+    schema: &IndexSchema,
+) -> Option<Vec<String>> {
+    let mut projected = fields?.to_vec();
+    let mut keep = |name: &str| {
+        if !projected.iter().any(|field| field == name) {
+            projected.push(name.to_string());
+        }
+    };
+    if let Some(spec) = sort {
+        keep(&spec.field);
+        if spec.field == "id" || schema.is_shadow_field(&spec.field) {
+            keep(&storage::document_key_field(schema));
+            keep("id");
+        }
+    }
+    Some(projected)
 }
 
 /// Whether a value written under a name for the document key is that key.
