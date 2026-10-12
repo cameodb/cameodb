@@ -2738,83 +2738,102 @@ fn compare_hits_by_field_distinguishes_large_i64_keys() {
     );
 }
 
-/// Finding #3: date sort keys are normalized to epoch seconds so ordering is
-/// chronological rather than lexicographic.
+/// The merge over key-phase hits: same primary rules the stamped-key merge uses,
+/// shard id then shard position as the tie-break.
 #[test]
-fn normalize_sort_key_converts_dates_to_epoch_seconds() {
-    let date_def = FieldDef::new("published".to_string(), TantivyFieldType::Date);
+fn order_key_hits_orders_on_the_key_then_breaks_ties() {
+    use storage::SortKey;
 
-    let early = normalize_sort_key(&json!("2018-11-30"), Some(&date_def)).unwrap();
-    let late = normalize_sort_key(&json!("2024-03-10T00:00:00Z"), Some(&date_def)).unwrap();
-
-    assert!(early.is_i64(), "date key should be numeric, got {early:?}");
-    assert!(
-        early.as_i64().unwrap() < late.as_i64().unwrap(),
-        "chronological order must hold numerically"
-    );
-
-    // Unparseable date → no key (hit will sort last).
-    assert!(normalize_sort_key(&json!("not-a-date"), Some(&date_def)).is_none());
-}
-
-/// A date the writer indexed from epoch seconds is keyed by them. Only strings were read, so such
-/// a hit went unkeyed and a merged sort put it among the hits with no date — after every other
-/// row ascending, before none of them descending — while each shard had ordered it correctly.
-#[test]
-fn a_date_sent_as_epoch_seconds_is_keyed_where_its_column_sorts_it() {
-    let date_def = FieldDef::new("published".to_string(), TantivyFieldType::Date);
-    let written = normalize_sort_key(&json!("2024-03-15T16:13:13Z"), Some(&date_def)).unwrap();
-
-    assert_eq!(
-        normalize_sort_key(&json!(1_710_519_193), Some(&date_def)),
-        Some(written.clone()),
-        "whole seconds key to the same second as the written form"
-    );
-    // A list is several values, and the column sorts by the first one written.
-    assert_eq!(
-        normalize_sort_key(&json!([1_710_519_193, "1999-01-01"]), Some(&date_def)),
-        Some(written)
-    );
-    // Seconds past what tantivy holds are clamped as the writer clamps them.
-    assert_eq!(
-        normalize_sort_key(&json!(i64::MAX), Some(&date_def)),
-        normalize_sort_key(&json!(i64::MAX - 1), Some(&date_def))
-    );
-}
-
-#[test]
-fn normalize_sort_key_passes_through_non_date_values() {
-    let numeric_def = FieldDef::new("year".to_string(), TantivyFieldType::I64);
-    assert_eq!(
-        normalize_sort_key(&json!(2020), Some(&numeric_def)).unwrap(),
-        json!(2020)
-    );
-    // No schema entry → passthrough.
-    assert_eq!(
-        normalize_sort_key(&json!("hello"), None).unwrap(),
-        json!("hello")
-    );
-}
-
-#[test]
-fn stamp_sort_keys_injects_normalized_date_key() {
-    let mut schema = IndexSchema::default();
-    schema.fields.insert(
-        "published".to_string(),
-        FieldDef::new("published".to_string(), TantivyFieldType::Date),
-    );
-    let spec = SortSpec {
-        field: "published".to_string(),
-        order: SortOrder::Asc,
+    let shard_a = Uuid::from_u128(1);
+    let shard_b = Uuid::from_u128(2);
+    let key = |id: &str, sort_key: Option<SortKey>| storage::KeyHit {
+        score: 0.0,
+        id: id.to_string(),
+        sort_key,
     };
-    let mut hits = vec![(
-        Uuid::nil(),
-        1.0f32,
-        json!({"title": "x", "published": "2020-06-01"}),
-    )];
-    stamp_sort_keys(&mut hits, &spec, &schema);
-    let key = hits[0].2.get(SORT_KEY_FIELD).expect("sort key stamped");
-    assert!(key.is_i64());
+
+    // Numbers order on their value; Desc reverses only the value, not the placement of
+    // hits that carry none — missing always lands last, in either order.
+    let mut hits = vec![
+        (shard_a, 0, key("n1", None)),
+        (shard_a, 1, key("n2", Some(SortKey::U64(3)))),
+        (shard_b, 0, key("n3", Some(SortKey::U64(9)))),
+        (shard_b, 1, key("n4", Some(SortKey::U64(1)))),
+    ];
+    let desc = SortSpec {
+        field: "n".to_string(),
+        order: SortOrder::Desc,
+    };
+    order_key_hits(&mut hits, Some(&desc));
+    let ids: Vec<&str> = hits.iter().map(|(_, _, h)| h.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["n3", "n2", "n4", "n1"],
+        "desc: biggest first, missing last"
+    );
+
+    let asc = SortSpec {
+        order: SortOrder::Asc,
+        ..desc.clone()
+    };
+    order_key_hits(&mut hits, Some(&asc));
+    let ids: Vec<&str> = hits.iter().map(|(_, _, h)| h.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["n4", "n2", "n3", "n1"],
+        "asc: smallest first, missing last"
+    );
+
+    // Equal keys fall to the shard id, then to the hit's place inside that shard —
+    // the order the gather's contiguity already fixed.
+    let mut tied = vec![
+        (shard_b, 0, key("b0", Some(SortKey::U64(5)))),
+        (shard_a, 0, key("a0", Some(SortKey::U64(5)))),
+        (shard_b, 1, key("b1", Some(SortKey::U64(5)))),
+        (shard_a, 1, key("a1", Some(SortKey::U64(5)))),
+    ];
+    order_key_hits(&mut tied, Some(&asc));
+    let ids: Vec<&str> = tied.iter().map(|(_, _, h)| h.id.as_str()).collect();
+    assert_eq!(ids, ["a0", "a1", "b0", "b1"]);
+
+    // Unsorted is score descending, same tie-break.
+    let mut scored = vec![
+        (shard_b, 0, key("lo", None)),
+        (shard_a, 0, key("hi", None)),
+        (shard_b, 1, key("mid", None)),
+    ];
+    scored[0].2.score = 0.2;
+    scored[1].2.score = 0.9;
+    scored[2].2.score = 0.5;
+    order_key_hits(&mut scored, None);
+    let ids: Vec<&str> = scored.iter().map(|(_, _, h)| h.id.as_str()).collect();
+    assert_eq!(ids, ["hi", "mid", "lo"]);
+}
+
+/// One fetch request per owning shard, ids inside it in the window's own order.
+#[test]
+fn group_window_by_shard_keeps_the_windows_order() {
+    let shard_a = Uuid::from_u128(1);
+    let shard_b = Uuid::from_u128(2);
+    let key = |id: &str| storage::KeyHit {
+        score: 0.0,
+        id: id.to_string(),
+        sort_key: None,
+    };
+
+    let window = vec![
+        (shard_a, 0, key("a-first")),
+        (shard_b, 0, key("b-first")),
+        (shard_a, 1, key("a-second")),
+        (shard_b, 1, key("b-second")),
+        (shard_a, 2, key("a-third")),
+    ];
+    let groups = group_window_by_shard(&window);
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0].0, shard_a);
+    assert_eq!(groups[0].1, ["a-first", "a-second", "a-third"]);
+    assert_eq!(groups[1].0, shard_b);
+    assert_eq!(groups[1].1, ["b-first", "b-second"]);
 }
 
 #[test]
@@ -3362,67 +3381,6 @@ fn a_search_that_outran_its_deadline_is_the_callers_error() {
         ),
         "a query every shard ran out of budget on is a caller's refusal"
     );
-}
-
-/// The projection a shard is asked to keep is the caller's plus what the merge reads off
-/// a hit — which is the sort field, and on a document-key sort the key under every name
-/// it travels by.
-#[test]
-fn the_shard_projection_adds_back_what_the_merge_needs() {
-    let mut schema = IndexSchema::default();
-    for name in ["title", "created"] {
-        schema.fields.insert(
-            name.to_string(),
-            FieldDef::new(name.to_string(), TantivyFieldType::Text),
-        );
-    }
-
-    let title = vec!["title".to_string()];
-    // No sort: the caller's list is all the shard is asked to keep.
-    assert_eq!(
-        shard_projection(Some(&title), None, &schema),
-        Some(title.clone())
-    );
-    // No projection: `None` stays `None` — the whole document, as before.
-    assert_eq!(shard_projection(None, None, &schema), None);
-
-    // A sort on an ordinary field adds exactly that field, once.
-    let sort = SortSpec {
-        field: "created".to_string(),
-        order: SortOrder::Asc,
-    };
-    assert_eq!(
-        shard_projection(Some(&title), Some(&sort), &schema),
-        Some(vec!["title".to_string(), "created".to_string()])
-    );
-    // Already present stays once.
-    let both = vec!["title".to_string(), "created".to_string()];
-    assert_eq!(
-        shard_projection(Some(&both), Some(&sort), &schema),
-        Some(both)
-    );
-
-    // On a shadow index a document-key sort needs the key under both names: the caller's
-    // `id` and the `sha1` the hits carry it under.
-    let mut shadow_schema = IndexSchema::default();
-    shadow_schema.fields.insert(
-        "title".to_string(),
-        FieldDef::new("title".to_string(), TantivyFieldType::Text),
-    );
-    shadow_schema
-        .fields
-        .insert("sha1".to_string(), shadow_field("sha1"));
-    let by_key = SortSpec {
-        field: "id".to_string(),
-        order: SortOrder::Asc,
-    };
-    let kept = shard_projection(Some(&title), Some(&by_key), &shadow_schema).unwrap();
-    for name in ["title", "id", "sha1"] {
-        assert!(
-            kept.contains(&name.to_string()),
-            "missing '{name}': {kept:?}"
-        );
-    }
 }
 
 /// Health reads the shard count from the placement snapshot, so it must be the shard map's.

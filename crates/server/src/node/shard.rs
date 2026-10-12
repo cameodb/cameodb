@@ -1701,28 +1701,7 @@ impl MicroshardActor {
                 )
             })
             .await?
-            .map_err(|e: StoreError| match e {
-                StoreError::Io(io_err) => OrchestratorError::Io(io_err),
-                // A field this index does not carry, or a query it cannot parse, is the
-                // request's fault rather than the node's — and the distinction has to survive
-                // the crossing, because an error leaves this actor as a string and everything
-                // downstream reads its verdict to decide who is at fault. Flattened to
-                // `other`, a sort naming a column the index never built read as an internal
-                // failure, which is how it came back as a partial outage inside a `200`.
-                StoreError::FieldNotFound(_) | StoreError::QueryParser(_) => {
-                    OrchestratorError::Validation(e.to_string())
-                }
-                // Kept typed across the crossing: the deadline's numbers and its verdict
-                // are the answer, and a flattened `Io` would read as this node's fault.
-                StoreError::SearchDeadlineExceeded {
-                    elapsed_ms,
-                    budget_ms,
-                } => OrchestratorError::SearchDeadlineExceeded {
-                    elapsed_ms,
-                    budget_ms,
-                },
-                _ => OrchestratorError::Io(std::io::Error::other(e.to_string())),
-            })?;
+            .map_err(store_error_to_orchestrator)?;
 
         let search_hits: Vec<SearchHit> = outcome
             .hits
@@ -1738,6 +1717,94 @@ impl MicroshardActor {
             narrowed_default_fields: outcome.narrowed_default_fields,
             emptied: outcome.emptied,
             timings: outcome.timings,
+        })
+    }
+
+    /// Phase 1 of a two-phase search, on the read pool: keys and sort keys, no bodies.
+    ///
+    /// Built the way [`handle_search`](Self::handle_search) is — same deadline from the
+    /// same clock, because a search's budget covers both of its phases and each one
+    /// measures from the request's start, not its own.
+    pub(super) async fn handle_search_keys(
+        &self,
+        request: SearchKeysRequest,
+    ) -> Result<SearchKeysReply, OrchestratorError> {
+        let store = self.store.as_ref().ok_or_else(|| {
+            OrchestratorError::NotReady("HybridStore not initialized".to_string())
+        })?;
+
+        let store = Arc::clone(store);
+        let query = request.query;
+        let limit = request.limit.unwrap_or(self.default_search_limit);
+        let index = request.index.clone();
+        let sort = request.sort;
+
+        let deadline = self
+            .read_budget
+            .map(|budget| storage::SearchDeadline::new(request_started_at(), budget));
+
+        let outcome = self
+            .spawn_on_read_pool(move || {
+                #[cfg(feature = "fault-injection")]
+                fault_injection::panic_if_read_trap(&query);
+                store.search_keys(
+                    &index,
+                    &query,
+                    limit,
+                    sort.as_ref(),
+                    &storage::SearchOptions {
+                        deadline,
+                        fields: None,
+                    },
+                )
+            })
+            .await?
+            .map_err(store_error_to_orchestrator)?;
+
+        Ok(SearchKeysReply {
+            hits: outcome.hits,
+            total_hits: outcome.total_hits,
+            discarded: outcome.discarded,
+            approximate_sort: outcome.approximate_sort,
+            narrowed_default_fields: outcome.narrowed_default_fields,
+            emptied: outcome.emptied,
+            timings: outcome.timings,
+        })
+    }
+
+    /// Phase 2 of a two-phase search, on the read pool: the documents behind keys a
+    /// merge already ordered — answered in the order the keys were given.
+    ///
+    /// Same deadline construction as [`handle_search`](Self::handle_search): the fetch
+    /// shares the request's budget, measured from the request's start.
+    pub(super) async fn handle_fetch_docs(
+        &self,
+        request: FetchDocsRequest,
+    ) -> Result<FetchDocsReply, OrchestratorError> {
+        let store = self.store.as_ref().ok_or_else(|| {
+            OrchestratorError::NotReady("HybridStore not initialized".to_string())
+        })?;
+
+        let store = Arc::clone(store);
+        let index = request.index.clone();
+        let ids = request.ids;
+        let fields = request.fields;
+
+        let deadline = self
+            .read_budget
+            .map(|budget| storage::SearchDeadline::new(request_started_at(), budget));
+
+        let outcome = self
+            .spawn_on_read_pool(move || {
+                store.fetch_documents(&index, &ids, fields.as_deref(), deadline.as_ref())
+            })
+            .await?
+            .map_err(store_error_to_orchestrator)?;
+
+        Ok(FetchDocsReply {
+            docs: outcome.docs,
+            fetch_ms: outcome.fetch_ms,
+            build_ms: outcome.build_ms,
         })
     }
 
@@ -2102,6 +2169,33 @@ impl MicroshardActor {
     }
 }
 
+/// The one reading of a store error every read path makes.
+///
+/// A field the index does not carry, or a query it cannot parse, is the request's
+/// fault rather than the node's — and the distinction has to survive the crossing,
+/// because an error leaves this actor as a string and everything downstream reads its
+/// verdict to decide who is at fault. Flattened to `other`, a sort naming a column the
+/// index never built read as an internal failure, which is how it came back as a
+/// partial outage inside a `200`.
+fn store_error_to_orchestrator(e: StoreError) -> OrchestratorError {
+    match e {
+        StoreError::Io(io_err) => OrchestratorError::Io(io_err),
+        StoreError::FieldNotFound(_) | StoreError::QueryParser(_) => {
+            OrchestratorError::Validation(e.to_string())
+        }
+        // Kept typed across the crossing: the deadline's numbers and its verdict are
+        // the answer, and a flattened `Io` would read as this node's fault.
+        StoreError::SearchDeadlineExceeded {
+            elapsed_ms,
+            budget_ms,
+        } => OrchestratorError::SearchDeadlineExceeded {
+            elapsed_ms,
+            budget_ms,
+        },
+        _ => OrchestratorError::Io(std::io::Error::other(e.to_string())),
+    }
+}
+
 // ============================================================================
 // Remote Message Implementations for Distributed Actors
 // ============================================================================
@@ -2128,6 +2222,36 @@ impl Message<SearchRequest> for MicroshardActor {
                 timings: result.timings,
             })
             .map_err(RemoteError::from)
+    }
+}
+
+/// Message implementation for MicroshardActor two-phase search, key phase.
+#[remote_message("cameo.microshard.search_keys")]
+impl Message<SearchKeysRequest> for MicroshardActor {
+    type Reply = Result<SearchKeysReply, RemoteError>;
+
+    async fn handle(
+        &mut self,
+        msg: SearchKeysRequest,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.handle_search_keys(msg)
+            .await
+            .map_err(RemoteError::from)
+    }
+}
+
+/// Message implementation for MicroshardActor two-phase search, fetch phase.
+#[remote_message("cameo.microshard.fetch_docs")]
+impl Message<FetchDocsRequest> for MicroshardActor {
+    type Reply = Result<FetchDocsReply, RemoteError>;
+
+    async fn handle(
+        &mut self,
+        msg: FetchDocsRequest,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.handle_fetch_docs(msg).await.map_err(RemoteError::from)
     }
 }
 

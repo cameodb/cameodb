@@ -208,7 +208,7 @@ async fn mcp_refuses_a_search_whose_clause_was_discarded() {
             "{label}: the refusal must say a clause was dropped, got: {text}"
         );
         assert!(
-            text.contains("validate_query"),
+            text.contains("describe_index"),
             "{label}: the refusal must point at the tool that lists valid fields, got: {text}"
         );
     }

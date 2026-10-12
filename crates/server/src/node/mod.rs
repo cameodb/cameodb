@@ -1086,6 +1086,70 @@ pub struct SearchReply {
     pub timings: storage::SearchTimings,
 }
 
+/// Phase 1 of a two-phase search: keys and sort keys only, no document bodies.
+///
+/// The gather asks every shard for `offset + limit` keys, orders them itself, and then
+/// asks back — through [`FetchDocsRequest`] — for only the documents the window kept.
+/// That is what stops `shards × limit` full documents from crossing the wire so that
+/// `(shards - 1) / shards` of them can be discarded after the merge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchKeysRequest {
+    pub index: String,
+    pub query: String,
+    pub limit: Option<usize>,
+    pub sort: Option<SortSpec>,
+}
+
+/// What a shard's key phase answered: the matches as keys, plus the same
+/// refusal-shaped fields [`SearchReply`] carries — see [`storage::KeyOutcome`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchKeysReply {
+    pub hits: Vec<storage::KeyHit>,
+    pub total_hits: usize,
+    /// Clauses the query parser dropped; see [`SearchReply::discarded`].
+    #[serde(default)]
+    pub discarded: Vec<String>,
+    /// The field whose order is approximate; see [`SearchReply::approximate_sort`].
+    #[serde(default)]
+    pub approximate_sort: Option<String>,
+    /// The default fields an unqualified term searched; see
+    /// [`SearchReply::narrowed_default_fields`].
+    #[serde(default)]
+    pub narrowed_default_fields: Option<storage::NarrowedDefaultFields>,
+    /// Nothing survived the parse on this shard; see [`SearchReply::emptied`].
+    #[serde(default)]
+    pub emptied: bool,
+    /// Where the key phase spent its time; see [`SearchReply::timings`].
+    #[serde(default)]
+    pub timings: storage::SearchTimings,
+}
+
+/// Phase 2 of a two-phase search: the documents behind a set of keys, in key order.
+///
+/// `fields` is the caller's projection as the caller spelled it (shadow-normalized) —
+/// never widened, because the sort key no longer travels inside the document: the
+/// merge reads it off the [`storage::KeyHit`] that asked for this fetch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FetchDocsRequest {
+    pub index: String,
+    pub ids: Vec<String>,
+    #[serde(default)]
+    pub fields: Option<Vec<String>>,
+}
+
+/// What a shard's fetch phase answered: the documents it holds, in request order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FetchDocsReply {
+    /// `(id, doc)` in request order; an id the shard no longer stores is absent.
+    pub docs: Vec<(String, JsonValue)>,
+    /// The redb batch read.
+    #[serde(default)]
+    pub fetch_ms: u64,
+    /// Deserialization, shadow reconstruction and projection.
+    #[serde(default)]
+    pub build_ms: u64,
+}
+
 /// Client operation messages for RouterActor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientOp {

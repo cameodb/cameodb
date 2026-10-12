@@ -240,12 +240,11 @@ impl ScatterCtx<'_> {
             return Err(refusal);
         }
 
-        // What each shard is asked to keep. The caller's projection is pushed down so a
-        // one-field `return` does not pull every matching document across the wire whole;
-        // the merge's own needs — the sort field and the document key — are added back so
-        // `stamp_sort_keys` still finds them on a hit the shard trimmed.
-        let shard_fields = shard_projection(fields, sort, schema);
-
+        // The search runs in two phases: every shard answers keys only — score, sort
+        // key and document id — the merge windows those, and phase two asks the owning
+        // shards for just the documents that survived. A `shards × limit` fan-out used
+        // to carry `shards × limit` full documents across the wire so that all but a
+        // `limit` of them could be discarded here.
         let shard_targets: Vec<(Uuid, MicroshardActor)> = self
             .shards
             .iter()
@@ -255,21 +254,21 @@ impl ScatterCtx<'_> {
             futures::stream::iter(shard_targets.into_iter().map(|(shard_id, shard)| {
                 // Every shard is asked for the whole window from the front, because any of
                 // them may hold all of it. The skip is applied once, below.
-                let shard_fields = shard_fields.clone();
-                let req = SearchRequest {
+                let req = SearchKeysRequest {
                     index: index.to_string(),
                     query: query.to_string(),
                     limit: Some(window.fetch_count()),
                     sort: sort.cloned(),
-                    fields: shard_fields,
                 };
-                async move { (shard_id, shard.handle_search(req).await) }
+                async move { (shard_id, shard.handle_search_keys(req).await) }
             }))
             .buffer_unordered(self.max_concurrent_shard_searches.max(1))
             .collect()
             .await;
 
-        let mut results: Vec<(Uuid, f32, JsonValue)> = Vec::new();
+        // Each shard's hits stay contiguous, so a hit's place inside its shard's block
+        // is its rank there — the position the merge's tie-break reads.
+        let mut key_hits: Vec<(Uuid, usize, storage::KeyHit)> = Vec::new();
         // Kept as values rather than formatted here: whether nothing ran at all, and whose fault
         // that was, is decided from the errors themselves once the gather is complete.
         let mut failures: Vec<(Uuid, OrchestratorError)> = Vec::new();
@@ -288,21 +287,21 @@ impl ScatterCtx<'_> {
         // query that one of them could not run at all is not answered by the ones that could.
         let mut emptied = false;
         // The shards ran in parallel, so the stage cost of the search is the worst of
-        // them, not the sum; the row count they fetched together is the sum.
-        let mut shard_timings = storage::SearchTimings::default();
+        // them, not the sum. Fetch and build fold in here too: the approximate-sort path
+        // fetches its candidate documents inside the key phase.
+        let mut timings = storage::SearchTimings::default();
         for (shard_id, result) in shard_results {
             match result {
                 Ok(r) => {
                     emptied |= r.emptied;
                     total_hits_sum += r.total_hits;
-                    shard_timings.parse_ms = shard_timings.parse_ms.max(r.timings.parse_ms);
-                    shard_timings.walk_ms = shard_timings.walk_ms.max(r.timings.walk_ms);
-                    shard_timings.resolve_ms = shard_timings.resolve_ms.max(r.timings.resolve_ms);
-                    shard_timings.fetch_ms = shard_timings.fetch_ms.max(r.timings.fetch_ms);
-                    shard_timings.build_ms = shard_timings.build_ms.max(r.timings.build_ms);
-                    shard_timings.fetched_docs += r.timings.fetched_docs;
-                    for hit in r.hits {
-                        results.push((shard_id, hit.score, hit.doc));
+                    timings.parse_ms = timings.parse_ms.max(r.timings.parse_ms);
+                    timings.walk_ms = timings.walk_ms.max(r.timings.walk_ms);
+                    timings.resolve_ms = timings.resolve_ms.max(r.timings.resolve_ms);
+                    timings.fetch_ms = timings.fetch_ms.max(r.timings.fetch_ms);
+                    timings.build_ms = timings.build_ms.max(r.timings.build_ms);
+                    for (pos, hit) in r.hits.into_iter().enumerate() {
+                        key_hits.push((shard_id, pos, hit));
                     }
                     for note in r.discarded {
                         if !discarded.contains(&note) {
@@ -346,28 +345,92 @@ impl ScatterCtx<'_> {
         if let Some(refusal) = no_shard_answered(index, shard_success, &failures) {
             return Err(refusal);
         }
+
+        // Refuse instead of answering — and before phase two spends a fetch on a query
+        // that ran as nothing. The zero it produces is not a negative result; reported
+        // as a 200 it cannot be told apart from "no document matches", which is the same
+        // confusion an unrunnable sort caused.
+        if emptied {
+            return Err(OrchestratorError::UnrunnableQuery {
+                notes: discarded.join("; "),
+            });
+        }
+
+        // The node's own work in both phases is accounted as `merge`: ordering the keys,
+        // grouping the window by shard, and assembling the page.
+        let mut merge_ms = 0u64;
+        let merge_start = std::time::Instant::now();
+        order_key_hits(&mut key_hits, sort);
+        let windowed: Vec<(Uuid, usize, storage::KeyHit)> = window.apply(key_hits);
+        let fetch_groups = group_window_by_shard(&windowed);
+        merge_ms += merge_start.elapsed().as_millis() as u64;
+
+        // Phase two: only the documents the window kept, and only from the shards that
+        // own them. `fields` is the caller's projection as the caller spelled it — the
+        // merge's own needs no longer ride inside the document, because the sort key
+        // travels beside the `KeyHit` that asked for this fetch.
+        let fetch_results: Vec<_> =
+            futures::stream::iter(fetch_groups.into_iter().map(|(shard_id, ids)| {
+                let req = FetchDocsRequest {
+                    index: index.to_string(),
+                    ids,
+                    fields: fields.map(|list| list.to_vec()),
+                };
+                let shard = self.shards[&shard_id].clone();
+                async move { (shard_id, shard.handle_fetch_docs(req).await) }
+            }))
+            .buffer_unordered(self.max_concurrent_shard_searches.max(1))
+            .collect()
+            .await;
+
+        let mut docs: HashMap<(Uuid, String), JsonValue> = HashMap::new();
+        for (shard_id, result) in fetch_results {
+            match result {
+                Ok(reply) => {
+                    timings.fetch_ms = timings.fetch_ms.max(reply.fetch_ms);
+                    timings.build_ms = timings.build_ms.max(reply.build_ms);
+                    timings.fetched_docs += reply.docs.len();
+                    for (id, doc) in reply.docs {
+                        docs.insert((shard_id, id), doc);
+                    }
+                }
+                Err(err) => {
+                    // A shard that failed here cost the window its documents, not the
+                    // search its answer: the hits it owned are dropped below, and the
+                    // failure joins `errors` the way a phase-one failure would. A
+                    // deadline is different — same search, same budget, same refusal.
+                    warn!(%shard_id, error = %err, "Document fetch shard failed");
+                    failures.push((shard_id, err));
+                }
+            }
+        }
+        for (_, err) in &failures {
+            if let OrchestratorError::SearchDeadlineExceeded {
+                elapsed_ms,
+                budget_ms,
+            } = err
+            {
+                return Err(OrchestratorError::SearchDeadlineExceeded {
+                    elapsed_ms: *elapsed_ms,
+                    budget_ms: *budget_ms,
+                });
+            }
+        }
         let errors = shard_error_notes(&failures);
 
-        // The node's own work: order the shard answers into one page.
-        let merge_start = std::time::Instant::now();
-
-        // Order merged results: by the requested sort field when provided, otherwise by
-        // score descending. Each shard already returned field-sorted results, so a global
-        // re-sort here is required to interleave them correctly across shards.
-        //
-        // When sorting, stamp each hit with the normalized `SORT_KEY_FIELD` first (while
-        // the full doc is still present) and key the sort on it. The metadata field
-        // survives the field projection below and lets a downstream cross-node merge
-        // re-order these results even if the sort field is not among the returned fields.
-        if let Some(spec) = sort {
-            stamp_sort_keys(&mut results, spec, schema);
-        }
-        order_shard_hits(&mut results, sort);
-        let results: Vec<(Uuid, f32, JsonValue)> = window.apply(results);
-        let hits: Vec<JsonValue> = results
+        let assembly_start = std::time::Instant::now();
+        let hits: Vec<JsonValue> = windowed
             .into_iter()
-            .map(|(_shard_id, score, mut doc)| {
-                // Add metadata fields
+            .filter_map(|(shard_id, _pos, key)| {
+                let storage::KeyHit {
+                    score,
+                    id,
+                    sort_key,
+                } = key;
+                // Absent means the document is gone — deleted between the phases, or on
+                // a shard that failed its fetch. Skipping it is what the doc-map lookup
+                // always did; a missing row is not a hole in the page worth an error.
+                let mut doc = docs.remove(&(shard_id, id))?;
                 if let JsonValue::Object(ref mut o) = doc {
                     o.insert(
                         "_score".to_string(),
@@ -375,17 +438,24 @@ impl ScatterCtx<'_> {
                             .map(JsonValue::Number)
                             .unwrap_or(JsonValue::Null),
                     );
+                    // Stamped for the merge above this one: `SORT_KEY_FIELD` survives
+                    // the projection below and lets a cross-node merge re-order these
+                    // hits even when the sort field was projected away.
+                    if sort.is_some()
+                        && let Some(sort_key) = &sort_key
+                    {
+                        o.insert(SORT_KEY_FIELD.to_string(), sort_key.to_json());
+                    }
                 }
-
                 // Apply field projection if specified
-                if let Some(field_list) = fields {
-                    apply_field_projection(doc, field_list)
-                } else {
-                    doc
-                }
+                Some(match fields {
+                    Some(field_list) => apply_field_projection(doc, field_list),
+                    None => doc,
+                })
             })
             .collect();
-        let merge_ms = merge_start.elapsed().as_millis() as u64;
+        merge_ms += assembly_start.elapsed().as_millis() as u64;
+
         let mut response = serde_json::json!({
             "hits": hits,
             "hits_returned": hits.len(),
@@ -405,32 +475,72 @@ impl ScatterCtx<'_> {
                 // Per-stage the worst shard — they ran in parallel — plus this node's
                 // own merge, and the rows the shards fetched between them.
                 "timings_ms": {
-                    "parse": shard_timings.parse_ms,
-                    "walk": shard_timings.walk_ms,
-                    "resolve": shard_timings.resolve_ms,
-                    "fetch": shard_timings.fetch_ms,
-                    "build": shard_timings.build_ms,
+                    "parse": timings.parse_ms,
+                    "walk": timings.walk_ms,
+                    "resolve": timings.resolve_ms,
+                    "fetch": timings.fetch_ms,
+                    "build": timings.build_ms,
                     "merge": merge_ms,
                 },
-                "fetched_docs": shard_timings.fetched_docs,
+                "fetched_docs": timings.fetched_docs,
             },
         });
         attach_shard_errors(&mut response, errors);
-        // Refuse instead of answering. An emptied query ran as nothing, so the zero it
-        // produces is not a negative result — reported as a 200 it cannot be told apart from
-        // "no document matches", which is the same confusion an unrunnable sort caused.
-        if emptied {
-            return Err(OrchestratorError::UnrunnableQuery {
-                notes: discarded.join("; "),
-            });
-        }
-
         discarded.extend(unknown_projection_fields(schema, fields));
         attach_discarded(&mut response, discarded);
         attach_approximate_sort(&mut response, approximate_sort);
         attach_narrowed_default_fields(&mut response, narrowed_default_fields);
         Ok(response)
     }
+}
+
+/// Order the key phase's hits into one sequence, deterministically.
+///
+/// The primary key is the caller's sort — the normalized [`storage::SortKey`] each hit
+/// carries, compared by the same rules [`compare_hits_by_field`] orders stamped values
+/// — or the relevance score descending when no sort was requested. Neither key is a
+/// total order: every document matching one term scores identically, and a sort field
+/// repeats as readily as any other value. So a tie falls to the shard's id — fixed when
+/// the shard was created — and then to the hit's place in that shard's own ordering,
+/// which the engine has already made total. That is the same tie-break
+/// `order_hit_blocks` gives a cross-node merge, so a page means the same thing here.
+pub(super) fn order_key_hits(hits: &mut [(Uuid, usize, storage::KeyHit)], sort: Option<&SortSpec>) {
+    hits.sort_by(
+        |(left_shard, left_pos, left), (right_shard, right_pos, right)| {
+            let primary = match sort {
+                Some(spec) => {
+                    let left_key = left.sort_key.as_ref().map(storage::SortKey::to_json);
+                    let right_key = right.sort_key.as_ref().map(storage::SortKey::to_json);
+                    compare_sort_values(left_key.as_ref(), right_key.as_ref(), spec.order)
+                }
+                None => right
+                    .score
+                    .partial_cmp(&left.score)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            };
+            primary
+                .then_with(|| left_shard.cmp(right_shard))
+                .then_with(|| left_pos.cmp(right_pos))
+        },
+    );
+}
+
+/// Group a windowed, ordered page of keys into one fetch request per owning shard.
+///
+/// The ids inside each shard's request keep their window order, which is the order
+/// [`storage::HybridStore::fetch_documents`] answers in — the assembly reads a lookup,
+/// not a re-sort.
+pub(super) fn group_window_by_shard(
+    window: &[(Uuid, usize, storage::KeyHit)],
+) -> Vec<(Uuid, Vec<String>)> {
+    let mut groups: Vec<(Uuid, Vec<String>)> = Vec::new();
+    for (shard_id, _, hit) in window {
+        match groups.iter_mut().find(|(id, _)| id == shard_id) {
+            Some((_, ids)) => ids.push(hit.id.clone()),
+            None => groups.push((*shard_id, vec![hit.id.clone()])),
+        }
+    }
+    groups
 }
 
 pub(super) fn hit_score(hit: &JsonValue) -> f64 {
@@ -628,41 +738,6 @@ pub(super) fn normalize_projection_fields(schema: &IndexSchema, fields: &[String
             }
         })
         .collect()
-}
-
-/// The field list each shard is asked to keep: the caller's projection, plus whatever the
-/// merge above the shards still has to read off a hit.
-///
-/// Pushed down because a shard is where the full document already exists — trimming there
-/// keeps `shards × limit` hits from crossing the wire whole when the caller asked for one
-/// field. But a trimmed hit must still be mergeable: [`stamp_sort_keys`] reads the sort
-/// field off it, and on a document-key sort reads the key under every name it travels by
-/// (the caller's `id` or the shadow name reconstruction used instead). So those names are
-/// added back to what the shard keeps, and the node-level projection — applied after the
-/// merge, unchanged — strips them out of the answer again.
-///
-/// `None` in, `None` out: no projection asked for means the whole document, as before.
-/// `fields` is expected already normalized — `id` spelled as the shadow name — because the
-/// shard's hits are.
-pub(super) fn shard_projection(
-    fields: Option<&[String]>,
-    sort: Option<&SortSpec>,
-    schema: &IndexSchema,
-) -> Option<Vec<String>> {
-    let mut projected = fields?.to_vec();
-    let mut keep = |name: &str| {
-        if !projected.iter().any(|field| field == name) {
-            projected.push(name.to_string());
-        }
-    };
-    if let Some(spec) = sort {
-        keep(&spec.field);
-        if spec.field == "id" || schema.is_shadow_field(&spec.field) {
-            keep(&storage::document_key_field(schema));
-            keep("id");
-        }
-    }
-    Some(projected)
 }
 
 /// Whether a value written under a name for the document key is that key.
@@ -1129,59 +1204,6 @@ pub(super) fn collect_narrowed_default_fields(
     })
 }
 
-/// Produce a comparable sort key for a hit's raw field value.
-///
-/// Date fields are keyed by the epoch second their fast column holds, so that cross-node merges
-/// order them chronologically (matching each shard's FAST-field ordering) rather than by
-/// lexicographic string comparison, which breaks across mixed date formats/offsets — and read
-/// in every shape the writer indexes, epoch seconds included. Every other value passes through
-/// unchanged — the merge comparator handles the numeric-vs-string distinction. Returns `None`
-/// when the value cannot be keyed (e.g. an unparseable date string), in which case the hit
-/// sorts last.
-pub(super) fn normalize_sort_key(
-    value: &JsonValue,
-    field_def: Option<&FieldDef>,
-) -> Option<JsonValue> {
-    if let Some(def) = field_def
-        && matches!(def.field_type, TantivyFieldType::Date)
-    {
-        return storage::date_sort_secs(value).map(|ts| JsonValue::Number(ts.into()));
-    }
-    Some(value.clone())
-}
-
-/// Attach the `SORT_KEY_FIELD` metadata value to each gathered hit, in place, so that
-/// downstream merges (local multi-shard and cross-node) have a projection-independent
-/// key to order by. No-op for hits lacking the sort field or an unparseable date.
-///
-/// The key is read under the name the *document* carries, which is not always the name the
-/// caller sorted by. A sort on the document key is the case: an index with shadow fields
-/// answers with the shadow name in place of `id`, so `sort=id` and `sort=<shadow>` both have to
-/// look for whichever of the two is on the hit. Reading only the caller's name leaves every hit
-/// unstamped, and an unstamped merge keeps each shard's block whole — a per-shard order
-/// presented as a global one.
-pub(super) fn stamp_sort_keys(
-    hits: &mut [(Uuid, f32, JsonValue)],
-    spec: &SortSpec,
-    schema: &IndexSchema,
-) {
-    let field_def = schema.fields.get(&spec.field);
-    let sorts_by_document_key = spec.field == "id" || schema.is_shadow_field(&spec.field);
-    let fallback = sorts_by_document_key.then(|| storage::document_key_field(schema));
-
-    for (_, _, doc) in hits.iter_mut() {
-        if let JsonValue::Object(o) = doc
-            && let Some(raw) = o
-                .get(&spec.field)
-                .or_else(|| fallback.as_deref().and_then(|name| o.get(name)))
-                .or_else(|| sorts_by_document_key.then(|| o.get("id")).flatten())
-            && let Some(key) = normalize_sort_key(raw, field_def)
-        {
-            o.insert(SORT_KEY_FIELD.to_string(), key);
-        }
-    }
-}
-
 /// Remove the internal `SORT_KEY_FIELD` from every hit in a search response, in place.
 /// Called once at the client boundary so the key never leaks to callers.
 pub(super) fn strip_sort_keys(response: &mut JsonValue) {
@@ -1194,21 +1216,26 @@ pub(super) fn strip_sort_keys(response: &mut JsonValue) {
     }
 }
 
-/// Compare two hit documents by a named field for field-sorted search merges.
+/// The ordering between two sort values, whatever document or key carried them.
 ///
 /// Integer values are compared as `i64` first (so keys beyond f64's exact-integer
 /// range, e.g. large ids or nanosecond timestamps, order precisely); otherwise values
-/// are compared as `f64`, then fall back to string comparison. Documents missing the
-/// field always sort last, regardless of the requested order.
-pub(super) fn compare_hits_by_field(
-    a: &JsonValue,
-    b: &JsonValue,
-    field: &str,
+/// are compared as `f64`, then fall back to string comparison. A missing value sorts
+/// last, regardless of the requested order — a reversal orders what is there, it does
+/// not promote what is not.
+///
+/// Factored out of [`compare_hits_by_field`] because two things order hits this way:
+/// stamped `SORT_KEY_FIELD` values on documents (the cross-node merge), and the
+/// [`storage::SortKey`] a key-phase hit carries (the shard merge). One comparator keeps
+/// the two orders identical.
+pub(super) fn compare_sort_values(
+    a: Option<&JsonValue>,
+    b: Option<&JsonValue>,
     order: SortOrder,
 ) -> std::cmp::Ordering {
     use std::cmp::Ordering;
 
-    match (a.get(field), b.get(field)) {
+    match (a, b) {
         (Some(x), Some(y)) => {
             let base = match (x.as_i64(), y.as_i64()) {
                 (Some(nx), Some(ny)) => nx.cmp(&ny),
@@ -1232,6 +1259,19 @@ pub(super) fn compare_hits_by_field(
     }
 }
 
+/// Compare two hit documents by a named field for field-sorted search merges.
+///
+/// Documents missing the field always sort last, regardless of the requested order —
+/// see [`compare_sort_values`], which does the comparing.
+pub(super) fn compare_hits_by_field(
+    a: &JsonValue,
+    b: &JsonValue,
+    field: &str,
+    order: SortOrder,
+) -> std::cmp::Ordering {
+    compare_sort_values(a.get(field), b.get(field), order)
+}
+
 /// Compare two hits by what the caller asked to order on.
 ///
 /// Relevance score descending by default — the engine's own ranking, and the order in which it
@@ -1249,34 +1289,6 @@ pub(super) fn compare_hits_primary(
             .partial_cmp(&hit_score(a))
             .unwrap_or(std::cmp::Ordering::Equal),
     }
-}
-
-/// Order one node's shard hits, deterministically.
-///
-/// The tuple form of [`order_hit_blocks`], for the scatter paths that hold a shard id and a
-/// score beside each document rather than a finished hit. Shards are polled concurrently and
-/// answer in whatever order they finish, so a tie falls back to the shard's id — fixed when the
-/// shard was created — and then to the hit's place in that shard's own ordering, which Tantivy
-/// has already made total. `results` holds each shard's hits contiguously, so a comparison of
-/// positions within one shard is a comparison within its block.
-pub(super) fn order_shard_hits(results: &mut Vec<(Uuid, f32, JsonValue)>, sort: Option<&SortSpec>) {
-    let mut ranked: Vec<(usize, (Uuid, f32, JsonValue))> =
-        std::mem::take(results).into_iter().enumerate().collect();
-
-    ranked.sort_by(|(left_position, left), (right_position, right)| {
-        let primary = match sort {
-            Some(spec) => compare_hits_by_field(&left.2, &right.2, SORT_KEY_FIELD, spec.order),
-            None => right
-                .1
-                .partial_cmp(&left.1)
-                .unwrap_or(std::cmp::Ordering::Equal),
-        };
-        primary
-            .then_with(|| left.0.cmp(&right.0))
-            .then_with(|| left_position.cmp(right_position))
-    });
-
-    *results = ranked.into_iter().map(|(_, tuple)| tuple).collect();
 }
 
 /// The slice of an ordered result a caller asked for.

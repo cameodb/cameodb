@@ -75,11 +75,11 @@ fn deadline_or<T>(
 /// Wrapper to handle both sorted (u64) and unsorted (f32) search results
 pub(crate) enum SearchResult {
     Unsorted(Vec<(f32, tantivy::DocAddress)>),
-    /// The key slot is `Some` only when the sort was on the document key itself — then the
-    /// collector's sort key *is* the document id, already read off the column, and no hit
-    /// needs a second read to answer it. Every other sort drops its key here: the ordering
-    /// lives in the sequence.
-    Sorted(Vec<(Option<String>, tantivy::DocAddress)>),
+    /// The collector's ordering value, normalized to a [`SortKey`], travelling beside
+    /// the hit so a merge can order it without ever seeing the document. On a
+    /// document-key sort the key is also the hit's id, already read off the column,
+    /// and answers the resolve stage outright.
+    Sorted(Vec<(Option<SortKey>, tantivy::DocAddress)>),
 }
 
 pub(crate) const TANTIVY_DATA_FILE_EXTENSIONS: &[&str] =
@@ -467,25 +467,70 @@ impl HybridStore {
     /// [`search_documents`](Self::search_documents) with the two things a node wants the
     /// shard to know: how long the search may run, and which fields the answer needs.
     ///
+    /// This is the composition of the two phases a scatter-gather runs —
+    /// [`search_keys`](Self::search_keys) then [`fetch_documents`](Self::fetch_documents)
+    /// — so a one-shot call pays the same phases rather than a different path, and the
+    /// whole storage test suite keeps answering it.
+    pub fn search_documents_with(
+        &self,
+        index: &str,
+        query: &str,
+        limit: usize,
+        sort: Option<&SortSpec>,
+        opts: &SearchOptions<'_>,
+    ) -> Result<SearchOutcome, StoreError> {
+        let key_outcome = self.search_keys(index, query, limit, sort, opts)?;
+
+        let ids: Vec<String> = key_outcome.hits.iter().map(|hit| hit.id.clone()).collect();
+        let fetch = self.fetch_documents(index, &ids, opts.fields, opts.deadline.as_ref())?;
+        let fetched_count = fetch.docs.len();
+
+        // The keys fixed the order; the fetch answered the documents. Re-attach each
+        // key's score to its document in key order — an id whose document never came
+        // back is skipped, exactly as a doc_map miss was before.
+        let doc_map: HashMap<String, JsonValue> = fetch.docs.into_iter().collect();
+        let hits: Vec<(f32, JsonValue)> = key_outcome
+            .hits
+            .iter()
+            .filter_map(|hit| doc_map.get(&hit.id).map(|doc| (hit.score, doc.clone())))
+            .collect();
+
+        let mut timings = key_outcome.timings;
+        timings.fetch_ms += fetch.fetch_ms;
+        timings.build_ms += fetch.build_ms;
+        timings.fetched_docs += fetched_count;
+        debug!(index = %index, ?timings, "search stage timings");
+        Ok(SearchOutcome {
+            hits,
+            total_hits: key_outcome.total_hits,
+            discarded: key_outcome.discarded,
+            approximate_sort: key_outcome.approximate_sort,
+            narrowed_default_fields: key_outcome.narrowed_default_fields,
+            emptied: key_outcome.emptied,
+            timings,
+        })
+    }
+
+    /// The first phase of [`search_documents_with`]: parse, walk, and resolve — the
+    /// document keys the query's page needs, each with its score and normalized sort
+    /// key, and no document bodies.
+    ///
     /// `limit` bounds the *response size*, not the work: a `limit = 10` over a million
     /// matches still walks every match to rank them. `opts.deadline` is what bounds the
     /// work — it is wrapped around the parsed query so each segment walk checks the clock
     /// from inside, which is the only place a running `spawn_blocking` search can be
     /// stopped (the request timeout abandons the future; it cannot reach in here).
     ///
-    /// `opts.fields` is applied dead last — after shadow reconstruction and after the
-    /// post-fetch string sort, which reads the sort field off the full document — so the
-    /// shard answers with the projected shape rather than the full record. The sort field
-    /// and the document key are the caller's to add back if the projection omits them;
-    /// the node does that when it widens the list it sends (see `shard_projection`).
-    pub fn search_documents_with(
+    /// `opts.fields` is answered by the fetch phase, not this one: a key has no fields
+    /// to trim.
+    pub fn search_keys(
         &self,
         index: &str,
         query: &str,
         limit: usize,
         _sort: Option<&SortSpec>,
         opts: &SearchOptions<'_>,
-    ) -> Result<SearchOutcome, StoreError> {
+    ) -> Result<KeyOutcome, StoreError> {
         // Get reader and field mapping from cache or disk
         let (reader, fields) = match self.get_reader(index)? {
             Some(r) => r,
@@ -493,7 +538,7 @@ impl HybridStore {
                 // Normal for an index with no commits yet, and emitted once per shard per
                 // search — four lines for one query against an empty index at `warn`.
                 debug!(index = %index, "No tantivy reader found for index");
-                return Ok(SearchOutcome::empty());
+                return Ok(KeyOutcome::default());
             }
         };
 
@@ -518,10 +563,12 @@ impl HybridStore {
                 timings.fetched_docs = exists;
                 let total_hits = if exists > 0 { 1 } else { 0 };
                 // No parse happens on this path, so nothing can be discarded.
-                let mut outcome = SearchOutcome::counted(total_hits, Vec::new(), false);
-                outcome.timings = timings;
                 debug!(index = %index, ?timings, "search stage timings");
-                return Ok(outcome);
+                return Ok(KeyOutcome {
+                    total_hits,
+                    timings,
+                    ..Default::default()
+                });
             }
 
             let parse_start = Instant::now();
@@ -569,13 +616,15 @@ impl HybridStore {
                 "Count-only search completed (limit=0)"
             );
 
-            let mut outcome = SearchOutcome {
-                narrowed_default_fields,
-                ..SearchOutcome::counted(total_hits, discarded, emptied)
-            };
-            outcome.timings = timings;
             debug!(index = %index, ?timings, "search stage timings");
-            return Ok(outcome);
+            return Ok(KeyOutcome {
+                total_hits,
+                discarded,
+                narrowed_default_fields,
+                emptied,
+                timings,
+                ..Default::default()
+            });
         }
 
         // Check if this is an exact ID lookup (id:field or shadow field) that can bypass Tantivy
@@ -586,76 +635,33 @@ impl HybridStore {
                 "Exact ID query detected, bypassing Tantivy search"
             );
 
-            // Simulate Tantivy result with score 1.0
-            let doc_ids_with_scores = vec![(1.0, id_value)];
-
-            // Skip to Step 2: Batch retrieve from redb (reuse existing logic)
-            let doc_ids: Vec<String> = doc_ids_with_scores
-                .iter()
-                .map(|(_, id)| id.clone())
-                .collect();
-
+            // The key phase answers keys, not documents — but an id that names no stored
+            // document is no hit at all, so existence is checked here the same way the
+            // count path checks it.
             let fetch_start = Instant::now();
-            let redb_docs = self.get_batch_by_keys(index, &doc_ids)?;
+            let exists = !self
+                .get_batch_by_keys(index, std::slice::from_ref(&id_value))?
+                .is_empty();
             timings.fetch_ms = fetch_start.elapsed().as_millis() as u64;
-            timings.fetched_docs = redb_docs.len();
+            timings.fetched_docs = exists as usize;
 
-            debug!(
-                index = %index,
-                requested_ids = doc_ids.len(),
-                retrieved_docs = redb_docs.len(),
-                "Retrieved documents from redb (direct ID lookup)"
-            );
-
-            // Create lookup map for O(1) access
-            let doc_map: std::collections::HashMap<String, Vec<u8>> =
-                redb_docs.into_iter().collect();
-
-            // Step 3: Combine scores with complete documents (reuse existing logic)
-            let build_start = Instant::now();
-            let mut results = Vec::new();
-            for (score, doc_id) in doc_ids_with_scores {
-                if let Some(doc_bytes) = doc_map.get(&doc_id) {
-                    // Deserialize complete document from redb
-                    let stored_doc: StoredDocOwned = serde_json::from_slice(doc_bytes)
-                        .map_err(|e| StoreError::Serialization(e.to_string()))?;
-
-                    // Get schema for shadow field reconstruction
-                    let schema = if let Some(schema) = self.get_schema_cached(index)? {
-                        schema
-                    } else {
-                        self.get_schema(index)?
-                            .map(Arc::new)
-                            .unwrap_or_else(|| Arc::new(IndexSchema::default()))
-                    };
-
-                    // OPTIMIZATION: Pass ownership to avoid cloning all fields
-                    let final_doc = if let Some(json_blob) = stored_doc.json_blob {
-                        reconstruct_shadow_fields_owned(json_blob, &schema, &doc_id)
-                    } else {
-                        // Fallback if blob was empty
-                        serde_json::json!({ "id": doc_id })
-                    };
-
-                    results.push((score, final_doc));
-                } else {
-                    trace!(index = %index, doc_id = %doc_id, "Document not found in redb lookup map");
-                }
-            }
-
-            timings.build_ms = build_start.elapsed().as_millis() as u64;
-            let total_hits = if results.is_empty() { 0 } else { 1 };
-            // No parse happens on this path, and no sort: an id lookup returns the one document
-            // it names. So nothing can be discarded and no order can be approximate.
+            let hits = if exists {
+                vec![KeyHit {
+                    score: 1.0,
+                    id: id_value,
+                    sort_key: None,
+                }]
+            } else {
+                Vec::new()
+            };
+            let total_hits = hits.len();
+            // No parse happens on this path, so nothing can be discarded.
             debug!(index = %index, ?timings, "search stage timings");
-            return Ok(SearchOutcome {
-                hits: results,
+            return Ok(KeyOutcome {
+                hits,
                 total_hits,
-                discarded: Vec::new(),
-                approximate_sort: None,
-                narrowed_default_fields: None,
-                emptied: false,
                 timings,
+                ..Default::default()
             });
         }
 
@@ -700,9 +706,15 @@ impl HybridStore {
         // scored, sorted, count-only — walks segments through it.
         let parsed_query = with_deadline(parsed_query, opts.deadline.as_ref());
 
-        // Flag set when sorting by a string field (post-fetch alphabetic sort).
-        // The field name and order are captured here and used after redb retrieval.
+        // Flag set when sorting by a string field with no fast column (post-resolve
+        // alphabetic sort). The field name and order are captured here and used after
+        // the candidate fetch.
         let mut string_sort: Option<(String, SortOrder)> = None;
+
+        // A sort on `id` or a shadow name is a sort on the document key: the resolve
+        // stage reads the ids straight off the sort keys rather than the store.
+        // Declared out here because the resolve stage is outside the sort block.
+        let mut sorted_by_document_key = false;
 
         let (top_docs, total_hits) = if let Some(sort_spec) = _sort {
             // A sort names one value under two names, and on an index with a shadow field they
@@ -717,6 +729,7 @@ impl HybridStore {
             // above this one, has to look for it under the name the document actually carries.
             let sorts_by_document_key =
                 sort_spec.field == "id" || schema.is_shadow_field(&sort_spec.field);
+            sorted_by_document_key = sorts_by_document_key;
             let column_name: &str = if sorts_by_document_key {
                 "id"
             } else {
@@ -769,10 +782,11 @@ impl HybridStore {
             // Run a TopDocs sort ordered by a FAST field of the given type. The generic
             // type MUST match the field's actual type — `order_by_fast_field::<u64>` on an
             // i64/f64/date field returns a Tantivy SchemaError at collection time.
-            // The sort key itself is discarded downstream (ordering is encoded in the Vec
-            // sequence), so all branches normalize to `(None, doc_address)`.
+            // The collector's ordering value is kept, normalized to `SortKey` by the
+            // conversion each branch passes: the merge above orders on it, so it is no
+            // longer discarded the way a full-document search discarded it.
             macro_rules! collect_sorted {
-                ($t:ty) => {{
+                ($t:ty, $key:expr) => {{
                     let top_docs_collector = tantivy::collector::TopDocs::with_limit(limit)
                         .order_by_fast_field::<$t>(column_name, order);
                     let count_collector = tantivy::collector::Count;
@@ -792,8 +806,10 @@ impl HybridStore {
                         top_docs_handle.extract(&mut multi_fruit);
                     let total_hits = count_handle.extract(&mut multi_fruit);
 
-                    let docs: Vec<(Option<String>, tantivy::DocAddress)> =
-                        sorted.into_iter().map(|(_, addr)| (None, addr)).collect();
+                    let docs: Vec<(Option<SortKey>, tantivy::DocAddress)> = sorted
+                        .into_iter()
+                        .map(|(key, addr)| (($key)(key), addr))
+                        .collect();
                     (SearchResult::Sorted(docs), total_hits)
                 }};
             }
@@ -801,10 +817,20 @@ impl HybridStore {
             // u64, i64, f64 and Date sort on their FAST column; text sorts on its own when it
             // has one, and falls back to a post-fetch sort of scored candidates when it does not.
             match field_entry.field_type() {
-                tantivy::schema::FieldType::U64(_) => collect_sorted!(u64),
-                tantivy::schema::FieldType::I64(_) => collect_sorted!(i64),
-                tantivy::schema::FieldType::F64(_) => collect_sorted!(f64),
-                tantivy::schema::FieldType::Date(_) => collect_sorted!(tantivy::DateTime),
+                tantivy::schema::FieldType::U64(_) => {
+                    collect_sorted!(u64, |v: Option<u64>| v.map(SortKey::U64))
+                }
+                tantivy::schema::FieldType::I64(_) => {
+                    collect_sorted!(i64, |v: Option<i64>| v.map(SortKey::I64))
+                }
+                tantivy::schema::FieldType::F64(_) => {
+                    collect_sorted!(f64, |v: Option<f64>| v.map(SortKey::F64))
+                }
+                tantivy::schema::FieldType::Date(_) => {
+                    collect_sorted!(tantivy::DateTime, |v: Option<tantivy::DateTime>| {
+                        v.map(|d| SortKey::Date(d.into_timestamp_secs()))
+                    })
+                }
                 // A text field with a fast column is sorted by the column, in the collector,
                 // like any other sortable type. Tantivy keys this on the term ordinal, which
                 // its term dictionary holds in lexicographic order, so the result is a true
@@ -828,14 +854,13 @@ impl HybridStore {
                         top_docs_handle.extract(&mut multi_fruit);
                     let total_hits = count_handle.extract(&mut multi_fruit);
 
-                    // Ordering is carried by the sequence from here on, as it is for the
-                    // numeric branches. The key survives only when the sort named the
-                    // document key — then the column ordered on is `id` and each key is
-                    // the hit's identifier; any other string column's key is the field's
-                    // value, not an id, and is dropped as before.
-                    let docs: Vec<(Option<String>, tantivy::DocAddress)> = sorted
+                    // The key is the sort value — kept for every string sort now, since
+                    // the merge orders on it. When the sort named the document key the
+                    // column ordered on is `id`, so each key is also the hit's
+                    // identifier and the resolve stage reads it straight back.
+                    let docs: Vec<(Option<SortKey>, tantivy::DocAddress)> = sorted
                         .into_iter()
-                        .map(|(key, addr)| (if sorts_by_document_key { key } else { None }, addr))
+                        .map(|(key, addr)| (key.map(SortKey::Str), addr))
                         .collect();
                     (SearchResult::Sorted(docs), total_hits)
                 }
@@ -934,13 +959,15 @@ impl HybridStore {
         };
 
         if is_empty {
-            let mut outcome = SearchOutcome {
-                narrowed_default_fields,
-                ..SearchOutcome::counted(total_hits, discarded, emptied)
-            };
-            outcome.timings = timings;
             debug!(index = %index, ?timings, "search stage timings");
-            return Ok(outcome);
+            return Ok(KeyOutcome {
+                total_hits,
+                discarded,
+                narrowed_default_fields,
+                emptied,
+                timings,
+                ..Default::default()
+            });
         }
 
         // The resolve stage starts here: doc addresses in, document ids out — the
@@ -966,36 +993,39 @@ impl HybridStore {
             SearchResult::Sorted(docs) => docs.len(),
             SearchResult::Unsorted(docs) => docs.len(),
         };
-        let mut doc_ids_with_scores = Vec::with_capacity(capacity);
-
-        // A document-key sort's keys are the ids themselves — they arrive with the hits and
-        // answer every position outright; every other hit starts unresolved.
         let mut resolved: Vec<Option<String>> = Vec::with_capacity(capacity);
-        let hits: Vec<(f32, tantivy::DocAddress)> = match top_docs {
-            // For sorted results the order is what matters, not the key — a 1.0 placeholder
-            // score, exactly as before.
+        let hits: Vec<(f32, Option<SortKey>, tantivy::DocAddress)> = match top_docs {
+            // For sorted results the order is what matters, and the key travels with the
+            // hit: a document-key sort's key is the id itself, so it answers every
+            // position outright; every other hit starts unresolved. The score is a 1.0
+            // placeholder, exactly as before.
             SearchResult::Sorted(docs) => docs
                 .into_iter()
-                .map(|(id, addr)| {
+                .map(|(key, addr)| {
+                    let id = match &key {
+                        Some(SortKey::Str(id)) if sorted_by_document_key => Some(id.clone()),
+                        _ => None,
+                    };
                     resolved.push(id);
-                    (1.0, addr)
+                    (1.0, key, addr)
                 })
                 .collect(),
             SearchResult::Unsorted(docs) => docs
                 .into_iter()
                 .map(|(score, addr)| {
                     resolved.push(None);
-                    (score, addr)
+                    (score, None, addr)
                 })
                 .collect(),
         };
+        let mut keyed: Vec<KeyHit> = Vec::with_capacity(capacity);
 
         let id_is_fast = tantivy_index.schema().get_field_entry(fields.id).is_fast();
         if id_is_fast && hits.len() >= DENSE_HIT_MIN {
             let mut by_segment: Vec<Vec<usize>> = (0..searcher.segment_readers().len())
                 .map(|_| Vec::new())
                 .collect();
-            for (pos, (_, doc_address)) in hits.iter().enumerate() {
+            for (pos, (_, _, doc_address)) in hits.iter().enumerate() {
                 if resolved[pos].is_none() {
                     by_segment[doc_address.segment_ord as usize].push(pos);
                 }
@@ -1016,7 +1046,7 @@ impl HybridStore {
                     .iter()
                     .filter_map(|&pos| {
                         column
-                            .term_ords(hits[pos].1.doc_id)
+                            .term_ords(hits[pos].2.doc_id)
                             .next()
                             .map(|ord| (ord, pos))
                     })
@@ -1046,7 +1076,7 @@ impl HybridStore {
             }
         }
 
-        for (pos, (score, doc_address)) in hits.into_iter().enumerate() {
+        for (pos, (score, sort_key, doc_address)) in hits.into_iter().enumerate() {
             if pos.is_multiple_of(256)
                 && let Some(deadline) = opts.deadline.as_ref()
             {
@@ -1069,7 +1099,11 @@ impl HybridStore {
                         doc_addr = ?doc_address,
                         "Tantivy document matched"
                     );
-                    doc_ids_with_scores.push((score, id_str));
+                    keyed.push(KeyHit {
+                        score,
+                        id: id_str,
+                        sort_key,
+                    });
                 }
                 None => {
                     // The stored document answered nothing — fetch it once more only to say
@@ -1090,95 +1124,65 @@ impl HybridStore {
 
         debug!(
             index = %index,
-            ids_extracted = doc_ids_with_scores.len(),
+            ids_extracted = keyed.len(),
             "Extracted document IDs from tantivy results"
         );
 
-        // Step 2: Batch retrieve complete documents from redb (single transaction)
-        let doc_ids: Vec<String> = doc_ids_with_scores
-            .iter()
-            .map(|(_, id)| id.clone())
-            .collect();
-
         timings.resolve_ms = resolve_start.elapsed().as_millis() as u64;
 
-        if let Some(deadline) = opts.deadline.as_ref() {
-            deadline.check()?;
-        }
-        let fetch_start = Instant::now();
-        let redb_docs = self.get_batch_by_keys_with(index, &doc_ids, opts.deadline.as_ref())?;
-        timings.fetch_ms = fetch_start.elapsed().as_millis() as u64;
-        timings.fetched_docs = redb_docs.len();
-
-        debug!(
-            index = %index,
-            requested_ids = doc_ids.len(),
-            retrieved_docs = redb_docs.len(),
-            "Retrieved documents from redb"
-        );
-
-        // Create lookup map for O(1) access
-        let doc_map: std::collections::HashMap<String, Vec<u8>> = redb_docs.into_iter().collect();
-
-        // Step 3: Combine scores with complete documents
-        let build_start = Instant::now();
-        let mut results = Vec::new();
-        for (score, doc_id) in doc_ids_with_scores {
-            if let Some(doc_bytes) = doc_map.get(&doc_id) {
-                // Deserialize complete document from redb
-                let stored_doc: StoredDocOwned = serde_json::from_slice(doc_bytes)
-                    .map_err(|e| StoreError::Serialization(e.to_string()))?;
-
-                // Get schema for shadow field reconstruction
-                let schema = if let Some(schema) = self.get_schema_cached(index)? {
-                    schema
-                } else {
-                    self.get_schema(index)?
-                        .map(Arc::new)
-                        .unwrap_or_else(|| Arc::new(IndexSchema::default()))
-                };
-
-                // OPTIMIZATION: Pass ownership to avoid cloning all fields
-                let final_doc = if let Some(json_blob) = stored_doc.json_blob {
-                    reconstruct_shadow_fields_owned(json_blob, &schema, &doc_id)
-                } else {
-                    // Fallback if blob was empty
-                    serde_json::json!({ "id": doc_id })
-                };
-
-                results.push((score, final_doc));
-            } else {
-                trace!(index = %index, doc_id = %doc_id, "Document not found in redb lookup map");
-            }
-        }
-
-        // Post-fetch alphabetic sort for string fields.
-        // Candidates were collected with budget = limit*2; sort and truncate to limit.
+        // Read before the sort below consumes it: an approximate order is a property of
+        // the answer, and the caller has to be able to see it on the answer.
         //
-        // Documents arrive in Tantivy's order, which is total — it breaks its own ties on
-        // document address — so a value repeated across documents falls back to that order
-        // rather than to whatever the comparison happened to leave in place. Stated as a
-        // comparison on the original position instead of relying on the sort being stable: a
-        // later switch to `sort_unstable_by` would otherwise make this shard's answer vary
-        // between runs, and every merge above it inherits that.
-        // Read before the sort below consumes it: an approximate order is a property of the
-        // answer, and the caller has to be able to see it on the answer.
-        //
-        // Named as the *documents* name it, not as the request did. The two differ only when
-        // the sort is on the document key of a shadow index, where a caller may say `id` and
-        // every hit comes back carrying the shadow name instead — reporting `id` there names a
-        // field absent from every hit in the same response, which is the one thing a caller
-        // cannot check the order against.
+        // Named as the *documents* name it, not as the request did. The two differ only
+        // when the sort is on the document key of a shadow index, where a caller may say
+        // `id` and every hit comes back carrying the shadow name instead — reporting
+        // `id` there names a field absent from every hit in the same response, which is
+        // the one thing a caller cannot check the order against.
         let approximate_sort = string_sort.as_ref().map(|(name, _)| name.clone());
 
-        if let Some((field, order)) = string_sort {
-            let mut ranked: Vec<(usize, _)> = std::mem::take(&mut results)
+        // The one branch that must read documents to order them: `limit * 2` candidates
+        // were collected by score, so the sort field is fetched for those alone, the
+        // candidates are ordered on it, and the result is cut back to `limit`. The
+        // bodies are dropped at the cut — the fetch phase re-reads the page that
+        // survives, which is cheaper than carrying twice the documents forward.
+        if let Some((document_name, order)) = string_sort {
+            if let Some(deadline) = opts.deadline.as_ref() {
+                deadline.check()?;
+            }
+            let candidate_ids: Vec<String> = keyed.iter().map(|hit| hit.id.clone()).collect();
+            let projected = [document_name.clone()];
+            let fetch = self.fetch_documents(
+                index,
+                &candidate_ids,
+                Some(&projected),
+                opts.deadline.as_ref(),
+            )?;
+            timings.fetch_ms += fetch.fetch_ms;
+            timings.build_ms += fetch.build_ms;
+            timings.fetched_docs += fetch.docs.len();
+            let doc_map: HashMap<String, JsonValue> = fetch.docs.into_iter().collect();
+
+            // The documents arrive in Tantivy's order, which is total — it breaks its
+            // own ties on document address — so a value repeated across documents falls
+            // back to that order rather than to whatever the comparison happened to
+            // leave in place. Stated as a comparison on the original position instead of
+            // relying on the sort being stable: a later switch to `sort_unstable_by`
+            // would otherwise make this shard's answer vary between runs, and every
+            // merge above it inherits that.
+            let mut ranked: Vec<(usize, Option<String>, KeyHit)> = keyed
                 .into_iter()
                 .enumerate()
+                .filter_map(|(position, hit)| {
+                    doc_map.get(&hit.id).map(|doc| {
+                        let value = doc
+                            .get(&document_name)
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        (position, value, hit)
+                    })
+                })
                 .collect();
-            ranked.sort_by(|(left_position, a), (right_position, b)| {
-                let av = a.1.get(&field).and_then(|v| v.as_str());
-                let bv = b.1.get(&field).and_then(|v| v.as_str());
+            ranked.sort_by(|(left_position, av, _), (right_position, bv, _)| {
                 let base = match (av, bv) {
                     (Some(ax), Some(bx)) => ax.cmp(bx),
                     (Some(_), None) => std::cmp::Ordering::Less,
@@ -1191,30 +1195,102 @@ impl HybridStore {
                 };
                 base.then_with(|| left_position.cmp(right_position))
             });
-            results = ranked.into_iter().map(|(_, hit)| hit).collect();
-            results.truncate(limit);
+            ranked.truncate(limit);
+            keyed = ranked
+                .into_iter()
+                .map(|(_, value, mut hit)| {
+                    hit.sort_key = value.map(SortKey::Str);
+                    hit
+                })
+                .collect();
         }
 
-        // The last thing before the answer leaves: the shard trims each hit to the fields
-        // asked for, so the wire carries the projected shape rather than the whole record.
-        // Last on purpose — shadow reconstruction and the post-fetch string sort above
-        // both read the full document.
-        if let Some(field_list) = opts.fields {
-            for (_, doc) in results.iter_mut() {
-                *doc = apply_field_projection(std::mem::take(doc), field_list);
-            }
-        }
-
-        timings.build_ms = build_start.elapsed().as_millis() as u64;
         debug!(index = %index, ?timings, "search stage timings");
-        Ok(SearchOutcome {
-            hits: results,
+        Ok(KeyOutcome {
+            hits: keyed,
             total_hits,
             discarded,
             approximate_sort,
             narrowed_default_fields,
             emptied,
             timings,
+        })
+    }
+
+    /// The second phase of [`search_documents_with`]: the documents behind a list of
+    /// document keys — one redb batch read, deserialize, shadow reconstruction, and the
+    /// caller's projection — answered in the order the keys were given.
+    ///
+    /// Written for the window a scatter-gather kept: the keys arrive in final order and
+    /// the answer preserves it, so assembling the page is a lookup rather than another
+    /// sort. An id with no stored document is skipped — it was deleted between the
+    /// phases, and a missing row is what the lookup map already tolerated.
+    pub fn fetch_documents(
+        &self,
+        index: &str,
+        ids: &[String],
+        fields: Option<&[String]>,
+        deadline: Option<&SearchDeadline>,
+    ) -> Result<FetchOutcome, StoreError> {
+        if let Some(deadline) = deadline {
+            deadline.check()?;
+        }
+        let fetch_start = Instant::now();
+        let redb_docs = self.get_batch_by_keys_with(index, ids, deadline)?;
+        let fetch_ms = fetch_start.elapsed().as_millis() as u64;
+
+        debug!(
+            index = %index,
+            requested_ids = ids.len(),
+            retrieved_docs = redb_docs.len(),
+            "Retrieved documents from redb"
+        );
+
+        // Create lookup map for O(1) access
+        let doc_map: std::collections::HashMap<String, Vec<u8>> = redb_docs.into_iter().collect();
+
+        let build_start = Instant::now();
+
+        // One schema read for the batch: shadow reconstruction asks it of every document,
+        // and the cache already made the per-document call cheap — this makes it free.
+        let schema = if let Some(schema) = self.get_schema_cached(index)? {
+            schema
+        } else {
+            self.get_schema(index)?
+                .map(Arc::new)
+                .unwrap_or_else(|| Arc::new(IndexSchema::default()))
+        };
+
+        let mut docs = Vec::with_capacity(ids.len());
+        for doc_id in ids {
+            let Some(doc_bytes) = doc_map.get(doc_id) else {
+                trace!(index = %index, doc_id = %doc_id, "Document not found in redb lookup map");
+                continue;
+            };
+            let stored_doc: StoredDocOwned = serde_json::from_slice(doc_bytes)
+                .map_err(|e| StoreError::Serialization(e.to_string()))?;
+
+            // OPTIMIZATION: Pass ownership to avoid cloning all fields
+            let mut doc = if let Some(json_blob) = stored_doc.json_blob {
+                reconstruct_shadow_fields_owned(json_blob, &schema, doc_id)
+            } else {
+                // Fallback if blob was empty
+                serde_json::json!({ "id": doc_id })
+            };
+
+            // The projection is the last thing before the answer leaves: shadow
+            // reconstruction — and anything else reading the full document — works on
+            // the whole record.
+            if let Some(field_list) = fields {
+                doc = apply_field_projection(doc, field_list);
+            }
+            docs.push((doc_id.clone(), doc));
+        }
+
+        Ok(FetchOutcome {
+            docs,
+            fetch_ms,
+            build_ms: build_start.elapsed().as_millis() as u64,
         })
     }
 

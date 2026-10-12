@@ -271,26 +271,91 @@ pub struct SearchTimings {
     pub fetched_docs: usize,
 }
 
-impl SearchOutcome {
-    /// No hits and nothing dropped: an index with no committed segments.
-    fn empty() -> Self {
-        Self::default()
-    }
+/// The normalized value a sorted hit ordered on, carried beside the hit rather than
+/// inside it.
+///
+/// Carrying it is what makes a two-phase search work: phase one returns keys only, so
+/// the merge above has no document to read the sort field back off — and a projection
+/// may have trimmed that field anyway. The variants mirror the collector's ordering
+/// types exactly, and [`SortKey::to_json`] spells one as the same JSON a `_sort_key`
+/// stamped from the full document carries, so a cross-node merge comparing the two
+/// sees equal values either way.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum SortKey {
+    U64(u64),
+    I64(i64),
+    F64(f64),
+    /// Epoch seconds, as the date fast column holds them.
+    Date(i64),
+    Str(String),
+}
 
-    /// A count with no documents attached, for `limit = 0`.
-    ///
-    /// Never approximate: a count is over every match, and no order was produced to approximate.
-    fn counted(total_hits: usize, discarded: Vec<String>, emptied: bool) -> Self {
-        Self {
-            hits: Vec::new(),
-            total_hits,
-            discarded,
-            approximate_sort: None,
-            narrowed_default_fields: None,
-            emptied,
-            timings: SearchTimings::default(),
+impl SortKey {
+    /// The key as JSON: numbers as numbers, a date as its epoch second, a string as a
+    /// string — the shapes `compare_hits_by_field` already knows how to order.
+    pub fn to_json(&self) -> JsonValue {
+        match self {
+            SortKey::U64(value) => JsonValue::Number((*value).into()),
+            SortKey::I64(value) | SortKey::Date(value) => JsonValue::Number((*value).into()),
+            SortKey::F64(value) => serde_json::Number::from_f64(*value)
+                .map(JsonValue::Number)
+                .unwrap_or(JsonValue::Null),
+            SortKey::Str(value) => JsonValue::String(value.clone()),
         }
     }
+}
+
+/// One match in the key phase of a search: everything a merge needs to order the hit
+/// and address its document, and nothing else — the body is fetched only if the hit
+/// survives the merge's window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeyHit {
+    /// Relevance score; `1.0` on a field sort, whose order the sort key carries.
+    pub score: f32,
+    /// The document key — the redb key the fetch phase looks the body up under.
+    pub id: String,
+    /// The normalized sort value, when the search was ordered; `None` on a score sort
+    /// or a hit with no value in the sort field.
+    pub sort_key: Option<SortKey>,
+}
+
+/// What `search_keys` answers: the parse, walk and resolve of a search, as keys.
+///
+/// The refusal-shaped fields match [`SearchOutcome`]'s because they are all decided
+/// before a document body is read — the parser drops clauses, the approximate sort is
+/// a property of the ordering, and an emptied query matched nothing — so the key
+/// phase reports them exactly as a full search would.
+#[derive(Debug, Clone, Default)]
+pub struct KeyOutcome {
+    /// The page of keys, in the same order a full search's hits would be.
+    pub hits: Vec<KeyHit>,
+    /// Matches the query produced, counted over every segment — not `hits.len()`.
+    pub total_hits: usize,
+    /// Clauses the query parser dropped; see [`SearchOutcome::discarded`].
+    pub discarded: Vec<String>,
+    /// The field whose order is approximate; see [`SearchOutcome::approximate_sort`].
+    pub approximate_sort: Option<String>,
+    /// The default fields an unqualified term searched; see
+    /// [`SearchOutcome::narrowed_default_fields`].
+    pub narrowed_default_fields: Option<NarrowedDefaultFields>,
+    /// Every clause was discarded; see [`SearchOutcome::emptied`].
+    pub emptied: bool,
+    /// Where the key phase spent its time. Fetch and build stay zero unless the
+    /// approximate sort path fetched candidate documents to order them.
+    pub timings: SearchTimings,
+}
+
+/// What `fetch_documents` answers: the documents behind a list of document keys, in
+/// the order the keys were given.
+#[derive(Debug, Clone, Default)]
+pub struct FetchOutcome {
+    /// `(id, doc)` in input order. An id with no stored document is absent — it was
+    /// deleted between the key phase and the fetch, which the caller tolerates.
+    pub docs: Vec<(String, JsonValue)>,
+    /// The redb batch read.
+    pub fetch_ms: u64,
+    /// Deserialization, shadow reconstruction and projection.
+    pub build_ms: u64,
 }
 
 /// Which default fields an unqualified term searched, out of how many it could have.
