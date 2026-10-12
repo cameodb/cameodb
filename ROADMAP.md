@@ -195,6 +195,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [L1](#l1--size-cache-invalidation-by-substring-evicts-neighbouring-indexes) … [L20](#l20--the-retrospective-and-the-sequence-into-the-next-cycle) | Post-0.3.4 review group — all twenty closed; the retrospective's output is [M](#m-the-035-goal-set--multi-tenant-exposure--planned) | — | 2026-09-19 | ✅ |
 | [M0](#m0--the-architecture-review-and-the-order-of-work) … [M8](#m8--re-decide-the-query-complexity-caps) | The 0.3.5 goal set — a node exposed on the internet serving several tenants from one process; M0 closed, the M1 blocker cleared, and M2–M8 done; M6's open-loop arms found and fixed [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) and [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput), and were confirmed on the cut binary 2026-09-27. The release cut remains | — | 2026-09-27 | ◐ |
 | [N1](#n1--head-requests-skip-authorization) … [N17](#n17--smaller-items-filed-so-they-are-not-lost) | Pre-0.3.6 whole-code review — ten defects (N1–N10) to close before the cut, then the duplication and structure behind them: one way to reach a peer, dead surface, `run_change`, typed boundaries, single owners, the `orchestrator.rs` split | — | 2026-10-07 | 📋 |
+| [F10](#f10--fast-field-projection-the-pages-fields-answered-from-the-columns) | Fast-field projection — the page's fields answered from the columns, and the fetch phase skipped when they can be; the last layer of the search-economics work opened by the TS5 outage | — | 2026-10-09 | 📋 |
 
 ---
 
@@ -6270,6 +6271,55 @@ writer thread is the real serialisation point; ADR 002's code sample shows a WAL
 document where it now carries only the id. **Change:** reconcile after O3 lands — the sync
 section is what O3 rewrites — and add to the docs' own conventions that the claims in this
 file are checked against the code each review, as this roadmap's own reconciliations are.
+
+### F10 — Fast-field projection: the page's fields answered from the columns
+
+📋 **Planned.** The fourth layer of the search-economics work opened by the TS5 incident
+(2026-10-08): a 310-value `IN` query matching 88M documents asked for one field at
+`limit 10,000` and refused the endpoint new sessions for ~25 minutes, because `limit` bounded
+the answer but never the work — every shard materialised `offset + limit` full documents and
+the merge threw all but the page away.
+
+Three of the layers are shipped. `32b4390` put the request's budget inside the walk —
+`DeadlineQuery` rides the parsed query and a tripped check surfaces as a typed
+`SearchDeadlineExceeded` (408 at the edge, refused whole by the gather) — and pushed the
+caller's projection onto `SearchRequest.fields`, so hits leave the shard already trimmed.
+`dddd459` split the shard search into `search_keys` (parse, walk, resolve → `KeyHit`) and
+`fetch_documents` (redb → reconstruct → project): a merge now orders keys and fetches only
+the documents that survive its window. Measured on a 1.5M-doc 4-shard bench index,
+`fetched_docs` for `limit 10,000` fell 40,000 → 10,000 and warm latency 2.5–7× — and `build`
+(the JSON parse of each surviving blob) plus `fetch` (the redb reads behind it) are now most
+of what is left.
+
+**This item.** When a projection is *column-coverable* — every requested field is `id` or a
+shadow name (the value is the document key itself, already in hand) or a schema field that is
+`is_fast()` of an eligible type — `search_keys` reads the values in the same per-segment pass
+that resolves ids and answers them on `KeyHit.doc`. `fetch_documents` is then asked only for
+hits without one — zero when the projection is covered, so the fetch round trip disappears
+for exactly the workload that caused the incident. A hit whose column a segment lacks falls
+back to the fetch phase per id, as a doc-map miss already does; `fields: None` (the full
+document) never qualifies. For a sorted search the sort field's value arrives free — the
+collector already read it.
+
+**What a fast projection is allowed to say** — the indexed view, not the stored one; the same
+contract Elasticsearch's `fields`/`docvalue_fields` carries. `String` (keyword), `I64`, `U64`
+and `F64` round-trip exactly for the values that index. A value that did not index (a `5.5`
+under an `i64`) reads as absent rather than projected. A single-element array reads as its
+scalar — the column cannot tell `["a"]` from `"a"`. Two decisions open:
+
+- **Dates.** The column holds `DateTime`; the stored shape — RFC 3339 string, epoch seconds,
+  RFC 2822 — is unrecoverable from it. Either emit epoch seconds (the shape `SortKey::Date`
+  already reports, documented as the canonical rendering) or exclude `Date` in v1 and let a
+  date in the field list take the redb path.
+- **Text.** An analysed field's fast column holds raw strings — faithful for string-valued
+  documents, not for the non-string values `add_json_value_to_doc` indexes as serialized
+  JSON. Same choice: in with the contract stated, or out of v1.
+
+**Schema posture, agreed:** `fast` stays a per-field opt-in — a recommendation schema
+designers apply to the fields their use case projects, never a requirement; everything
+uncovered falls back to the fetch phase unchanged, and `id` stays fast by default.
+`describe_index`/`_config` should say which fields qualify, so an architect marking a field
+`fast` knows what it buys.
 
 ---
 
