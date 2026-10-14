@@ -1326,7 +1326,7 @@ impl RouterActor {
     ///
     /// It could not have been fixed while this merge still terminated early either: a page
     /// assembled from whichever sources answered first is not the page that was asked for,
-    /// wherever the skip is applied. Every source now always answers (2d13f4c).
+    /// wherever the skip is applied. Every source now always answers (67c73b7).
     pub(super) async fn handle_broadcast_streaming(
         &self,
         op: ClientOp,

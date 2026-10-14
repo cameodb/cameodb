@@ -170,7 +170,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [F5](#f5--concurrency-sweep-measured-2026-09-02) | Concurrency sweep on the release build — the operating point, and bulk's serialization measured | — | 2026-09-02 | ✅ |
 | [F6](#f6--what-fsync-actually-costs-measured-2026-09-02) | What fsync actually costs — and why turning it off is a reallocation, not a speedup | — | 2026-09-02 | ✅ |
 | [F7](#f7--the-request-timeout-sheds-the-client-not-the-work) | The request timeout sheds the client, not the work — measured: goodput goes to zero, not down | — | 2026-09-15 | ✅ |
-| [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path) | The overload gates do not cover the bulk write path — health fixed, both lanes gated, admission predicting against a measured spread, and bulk folded into the service estimate by `0836df2`. All three items closed; the re-measurement is [M6](#m6--close-and-re-measure-the-bulk-lane) | — | 2026-09-17 | ✅ |
+| [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path) | The overload gates do not cover the bulk write path — health fixed, both lanes gated, admission predicting against a measured spread, and bulk folded into the service estimate by `490608b`. All three items closed; the re-measurement is [M6](#m6--close-and-re-measure-the-bulk-lane) | — | 2026-09-17 | ✅ |
 | [CH1](#ch1--one-scatter-gather-written-twice) … [CH7](#ch7--the-string-fast-collector-repeats-the-macros-body) | Code health, seven items — CH1 done | — | 2026-08-16 | 📋 |
 | [CH11](#ch11--routing-key-derivation-is-written-four-times-with-two-algorithms) | Routing-key derivation, four spellings and two hashes — closed ahead of the split | — | 2026-09-01 | ✅ |
 | [CH8](#ch8--the-single-write-path-clones-the-whole-schema-and-document) … [CH12](#ch12--write-path-serialization-and-round-trip-waste) | Code health, write-path efficiency, five items — all done | — | 2026-09-01 | ✅ |
@@ -195,7 +195,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [L1](#l1--size-cache-invalidation-by-substring-evicts-neighbouring-indexes) … [L20](#l20--the-retrospective-and-the-sequence-into-the-next-cycle) | Post-0.3.4 review group — all twenty closed; the retrospective's output is [M](#m-the-035-goal-set--multi-tenant-exposure--planned) | — | 2026-09-19 | ✅ |
 | [M0](#m0--the-architecture-review-and-the-order-of-work) … [M8](#m8--re-decide-the-query-complexity-caps) | The 0.3.5 goal set — a node exposed on the internet serving several tenants from one process; M0 closed, the M1 blocker cleared, and M2–M8 done; M6's open-loop arms found and fixed [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) and [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput), and were confirmed on the cut binary 2026-09-27. The release cut remains | — | 2026-09-27 | ◐ |
 | [N1](#n1--head-requests-skip-authorization) … [N17](#n17--smaller-items-filed-so-they-are-not-lost) | Pre-0.3.6 whole-code review — ten defects (N1–N10) to close before the cut, then the duplication and structure behind them: one way to reach a peer, dead surface, `run_change`, typed boundaries, single owners, the `orchestrator.rs` split | — | 2026-10-07 | 📋 |
-| [F10](#f10--fast-field-projection-the-pages-fields-answered-from-the-columns) | Fast-field projection — the page's fields answered from the columns, and the fetch phase skipped when they can be; the last layer of the search-economics work opened by the TS5 outage | — | 2026-10-09 | 📋 |
+| [F10](#f10--fast-field-projection-the-pages-fields-answered-from-the-columns) | Fast-field projection — the page's fields answered from the columns, and the fetch phase skipped when they can be; the last layer of the search-economics work opened by the TS5 outage — deferred: the gain over the two-phase search is small for today's workloads, and the design is filed so it can be picked up | — | 2026-10-09 | 💭 |
 
 ---
 
@@ -645,7 +645,7 @@ on, and six tests read it.
 
 ### C6 — Redact the cluster PSK in `Debug`
 
-✅ **Done 2026-09-07**, in `33399d6` — and carried as 📋 until **2026-09-19**, when
+✅ **Done 2026-09-07**, in `924f35d` — and carried as 📋 until **2026-09-19**, when
 [M7](#m7--redact-the-cluster-psk-in-debug) went to do it and found it already done. The original
 finding (H4): `ClusterConfig` derived `Debug` while holding `psk: Option<String>`, so any future
 `debug!("{:?}", config)` would have leaked the key.
@@ -887,7 +887,7 @@ concurrency. None of it is an arrival-rate SLA.
 not been re-run against it, and the numbers above stay as they were taken.
 
 **Re-measured 2026-09-06 on the unwind build, and the figures above stand.** Every number in this
-sweep was taken on a `panic = "abort"` binary, three days before `2c53e97` set the release profile
+sweep was taken on a `panic = "abort"` binary, three days before `232fa9d` set the release profile
 to `unwind` — so as written they described a build that no longer ships. Re-running against
 today's tree settles what that change cost.
 
@@ -1142,7 +1142,7 @@ the coordinator's own `RouteOperation` debug line, so this is asks and not infer
 
 A search has no routing key to resolve, so *every* search took the ask — and the answer could
 only ever be `Local`, because `decide_route` has one node in `expected_nodes`. `NodeConfig`
-already grew `clustered` for 12c3ad9's schema gate, and it answers the same question statically:
+already grew `clustered` for a5ed2ff's schema gate, and it answers the same question statically:
 a node with clustering off will never have a peer. `RouterActor` now reads it and takes the local
 arm for keyed and keyless alike. Pinned by `a_lone_node_can_only_ever_be_routed_to_locally`, in
 the coordinator's own tests, because the claim being relied on is `decide_route`'s and not the
@@ -1466,13 +1466,13 @@ walking into it. Two of the three entries were wrong about their own premise unt
 
 **Verified against the pre-fix binary, 2026-09-16.** Every arm above was measured as its own
 fix landed, each against the binary carrying it. This is the comparison that was missing: a node
-built from `9a56de5` — the commit before fix 1, and the one that made `request_timeout_secs`
+built from `6c43c7e` — the commit before fix 1, and the one that made `request_timeout_secs`
 honoured at all — run in the same session on the same M1, against the same seeded index and the
 same configuration as the current binary. 200,000 documents, 4 shards, `search_threads = 2`,
 `max_concurrent_requests = 3000`, `request_timeout_secs = 1`, 20s arms, harness lag p99 at or
 below 2.2ms on every arm quoted.
 
-| offered | before (`9a56de5`) | after (`bc1a50e`) |
+| offered | before (`6c43c7e`) | after (`c105536`) |
 |---|---|---|
 | 300/s | 299 ok/s, 0 shed, p99 22.9ms | 299 ok/s, 0 shed, p99 16.7ms |
 | 1,000/s | **0 ok/s**, 19,956 × 408 | **541 ok/s**, 9,138 × 503, 10 × 408 |
@@ -1517,7 +1517,7 @@ the current one 200 in ~130ms on sixteen of sixteen.
 
 **Re-measured on the M5 Pro, 2026-09-16.** The before-and-after above is an M1 result; the M5 had
 only a pre-fix column, recorded the day before. This closes that gap on the second machine, and
-one of its numbers contradicts the M1 reading. Release build of `beab920`, 15 cores, 24 GB,
+one of its numbers contradicts the M1 reading. Release build of `525740c`, 15 cores, 24 GB,
 macOS 26.6.2, same protocol throughout: 200,000 documents, 4 shards, `search_threads = 2`,
 `max_concurrent_requests = 3000`, `request_timeout_secs = 1`, 20s arms after a 5s warmup, Poisson
 arrivals, seed 1. Harness lag p99 stayed at or below 1.12ms on every arm, no arm dropped an
@@ -1525,7 +1525,7 @@ arrival and no verdict came back INVALID, so these are node measurements and not
 Seeded once at the default timeout with the node restarted on the one-second budget, which
 `check-config` confirmed as `timeout 1s (set)` while raising the `overload` warning on it.
 
-| offered | before (pre-fix, 2026-09-15) | after (`beab920`) |
+| offered | before (pre-fix, 2026-09-15) | after (`525740c`) |
 |---|---|---|
 | 300/s | — | 300 ok/s, 0 shed, p99 5.6ms |
 | 1,000/s | **233 ok/s**, 15,304 × 408 | **927 ok/s**, 1,433 × 503, **0 × 408** |
@@ -1577,12 +1577,12 @@ OB13 reopening on a second mechanism. Filed as
 ### F8 — The overload gates do not cover the bulk write path
 
 ✅ **Done — all three items closed, item 3 on 2026-09-17.** Measured before it was
-planned, 2026-09-16, on the M5 Pro against `beab920` —
+planned, 2026-09-16, on the M5 Pro against `525740c` —
 the binary that closed [F7](#f7--the-request-timeout-sheds-the-client-not-the-work), with all
 three of its fixes in.
 
 ⚠️ **Every table below predates the fix for item 3 and describes a design that no longer
-exists.** `0836df2` (2026-09-17) moved `BulkWrite` and `BulkDelete` off the actor mailbox and
+exists.** `490608b` (2026-09-17) moved `BulkWrite` and `BulkDelete` off the actor mailbox and
 onto the worker pool. The diagnosis below — a lane the gates could not see — is what motivated
 that move and is kept for it, but the numbers record the node as it was on 2026-09-16 and are
 not a description of `main`. Re-measuring is [M6](#m6--close-and-re-measure-the-bulk-lane).
@@ -1802,7 +1802,7 @@ by anything further here.
    Worth having done independently of 1: it is the difference between a degraded node and an
    undiagnosable one.
 3. ✅ **Feed bulk into the service estimate**, so the blended figure the door uses reflects the
-   workload with by far the largest per-request cost. **Done 2026-09-17 by `0836df2`** — and by
+   workload with by far the largest per-request cost. **Done 2026-09-17 by `490608b`** — and by
    the route item 1 had considered and declined, rather than the one this item proposed.
    `BulkWrite` and `BulkDelete` became worker-eligible in `handle_client_op`, so a fan-out is
    served off the pool instead of holding the mailbox for its whole duration. `OpClass::of` maps
@@ -2414,7 +2414,7 @@ The response reports `offset` alongside `limit`, as the non-streaming path alrea
 it a caller cannot tell a correct page from page 1 returned twice, which is most of why this
 survived.
 
-**Not fixable before `2d13f4c`.** While the early-exit `break` that commit removed could discard
+**Not fixable before `67c73b7`.** While the early-exit `break` that commit removed could discard
 a source, a page assembled from whichever sources answered first is not the page that was asked
 for, wherever the skip is applied. Every source always answers now.
 
@@ -2487,7 +2487,7 @@ runs on every healthy cross-node delete above.
 
 ### OB10 — The record limit meant different things depending on how the wire split the line
 
-✅ **Done** 2026-09-01, reviewing the 35f8fbc stream fix.
+✅ **Done** 2026-09-01, reviewing the 3e640b8 stream fix.
 
 Moving the oversize check after the complete lines are drained fixed the false positives it was
 written for, and left the check reachable only for a line *still arriving* — the buffer has
@@ -2504,7 +2504,7 @@ without the fix that line is parsed and written.
 
 ### OB11 — Reasons and totals that went missing on the way out
 
-✅ **Done** 2026-09-01, reviewing the 59dd785/35f8fbc accounting work.
+✅ **Done** 2026-09-01, reviewing the 1c0fa02/3e640b8 accounting work.
 
 Two small holes in code whose whole subject is not losing track of anything. `renumber_reasons`
 returns exactly one reason per item unwritten, which is what makes a bulk answer add up — and it
@@ -2521,7 +2521,7 @@ log catches it in production.
 
 ✅ **Done** 2026-09-02, found verifying the 0.3.3 perf work on the compose cluster rather than by
 reading anything. **The most serious defect of this cycle**, and it was in unreleased code:
-[3f6fdb7](#the-order-of-work)'s gate, which had been verified on a path that happened not to fan
+[c6da72a](#the-order-of-work)'s gate, which had been verified on a path that happened not to fan
 out.
 
 The gate runs inside `NodeOrchestrator`'s message handler. A bulk write holds that mailbox for its
@@ -2563,7 +2563,7 @@ it.
 The receiver *answers* rather than asking, which is what keeps the deadlock closed: it cannot
 canvass peers from inside a write without waiting on the mailbox those peers are using to run the
 writes this fan-out just sent them. Recognised by verdict — a new `RemoteVerdict::SchemaRequired`
-— rather than by reading the message text, which is what bfe5fde's classification work exists to
+— rather than by reading the message text, which is what a0cf3da's classification work exists to
 avoid.
 
 The sender-side alternative was a cache of "peer P already has index I". Cheaper still, and
@@ -2704,7 +2704,7 @@ row is worth having on record: it is the evidence that the exemption works where
 ### OB14 — A timed-out request never leaves the worker pool, and the node degrades until it is restarted
 
 ✅ **Found and fixed 2026-09-25**, by the first [M6](#m6--close-and-re-measure-the-bulk-lane) arm, on the
-M5 Pro against `91fc382`, release build, harness co-located. This is the run F8's re-measurement
+M5 Pro against `f4a20a3`, release build, harness co-located. This is the run F8's re-measurement
 was owed, and it did not get as far as an open-loop arm: the closed-loop capacity probe wedged the
 node.
 
@@ -2874,12 +2874,12 @@ stays there.
 ### OB15 — Every refused request was an `ERROR` line, and under write overload the logging cost half the goodput
 
 ✅ **Found and fixed 2026-09-25**, by the single-write arm of [M6](#m6--close-and-re-measure-the-bulk-lane)
-session 3, on the M5 Pro against `c54ae33`, release build, harness co-located, F8 protocol.
+session 3, on the M5 Pro against `bccb5b7`, release build, harness co-located, F8 protocol.
 
 **The shape.** Bulk and read overload degraded cleanly; single-write overload did not. At 2× the
 write capacity (4,000/s offered against ~2,000/s sustained) goodput fell to **1,116 ok/s**, 15%
 of requests ended as `408`, ~1,000 as transport errors, and `/_cluster/health` took up to 2.2s,
-some probes answering `408` or refused at the socket. The pre-M4 baseline `079ad0b` did the same
+some probes answering `408` or refused at the socket. The pre-M4 baseline `9fd6b3d` did the same
 (1,290 ok/s), so it was older than any of the M work.
 
 **The cause was the log.** `TraceLayer::new_for_http()` logs every 5xx at `ERROR`, and
@@ -2892,7 +2892,7 @@ logged 90,000 and were not hurt, because search work runs on its own runtime.
 
 Isolated before changing code — same binary, same arm, only the filter changed:
 
-| `c54ae33`, writes at 4,000/s | ok/s | `408` | health max |
+| `bccb5b7`, writes at 4,000/s | ok/s | `408` | health max |
 |---|---|---|---|
 | default filter | 1,116 | 10,218 | 1,990ms, failures |
 | `RUST_LOG=warn` | 1,040 | 10,335 | 1,715ms, failures |
@@ -2911,9 +2911,9 @@ schema the cluster cannot agree — keeps its `ERROR` line, because an operator 
 The dequeue refusal now reads `request abandoned` rather than `read abandoned`, since the worker
 pool raises it for writes too, and three per-shard `INFO` lines per bulk request moved to `DEBUG`.
 
-**Measured after**, fixed binary against `c54ae33` back to back, default filter on both:
+**Measured after**, fixed binary against `bccb5b7` back to back, default filter on both:
 
-| writes offered | fixed | `c54ae33` |
+| writes offered | fixed | `bccb5b7` |
 |---|---|---|
 | 2,000/s | 1,987 ok/s, sustained | 1,987 ok/s, sustained |
 | 4,000/s (2×) | **2,621 ok/s**, 0 × `408`, 0 transport, health ≤ 518ms | 1,056 ok/s, 9,043 × `408`, health ≤ 1,740ms, 4 failures |
@@ -3026,7 +3026,7 @@ the burst is missed until the next local shard change. The exchange that should 
 **Why node3 stayed alone.** Seeds are dialed once at startup; a dial that finds the seed not yet
 listening is never retried (`RequestBootstrapRedial` is a stub).
 
-**Baseline**, `cameodb:validate` at `f2df2ab`, OrbStack on an M5 Pro, two runs:
+**Baseline**, `cameodb:validate` at `5d28b17`, OrbStack on an M5 Pro, two runs:
 
 | | run 1 | run 2 |
 |---|---|---|
@@ -4206,7 +4206,7 @@ replacement — the comment that promised per-key merging was the false abstract
 
 ### L20 — The retrospective, and the sequence into the next cycle
 
-✅ **Run 2026-09-19**, against the 52 commits since the 0.3.4 cut (`433f8b9`): 96 files,
+✅ **Run 2026-09-19**, against the 52 commits since the 0.3.4 cut (`fa3c972`): 96 files,
 +40,139/−31,629, of which the moves are the bulk. The first thing the retrospective has to
 record is that it did not gate anything — L1–L19 were all delivered before it ran. L1–L4, L8
 and L10 landed 2026-09-08; L11–L19, then L5–L7 and L9, landed 2026-09-17 → 09-19. The sequence
@@ -4672,7 +4672,7 @@ names a node has touched, and that is precisely the dimension
 
   **Measured 2026-09-19, and it does not show — which is the honest result.** `cameodb-bench`
   bulk mode, 1 shard, a commit every 100 operations, 500-document batches, alternating against
-  `0e2c1b2`: 12 922 / 12 883 docs/s baseline against 13 013 / 12 885 on this build, p99 within
+  `e8b8303`: 12 922 / 12 883 docs/s baseline against 13 013 / 12 885 on this build, p99 within
   noise of each other. The reason is measurable too: after that run the index directory holds
   **65 files**, not the ~300 this entry's fifty-segment figure assumes, so the walk removed some
   66 syscalls from a request that spends ~150 ms indexing 500 documents. The syscalls are gone —
@@ -4743,7 +4743,7 @@ batch size, which is the disagreement L-group work already closed. The cost is s
   commits, and there is now no between.
 
   **Measured 2026-09-19.** `cargo run -p storage --release --example evolving_write_cost`, 400
-  writes per cell, three rounds alternating between this build and `0e2c1b2`, on one developer
+  writes per cell, three rounds alternating between this build and `e8b8303`, on one developer
   machine (macOS, so every pinning path is a no-op) — relative figures, not an SLA.
 
   | 400 writes, `wal_sync=true` | baseline | this build |
@@ -4807,7 +4807,7 @@ step reaches it first. `cargo clippy --workspace --all-targets` is clean and
 posture 46, auth 114, tls 9, remote-sources 4, artifact 8 — **7 suites, 189 checks, 0 failed,
 0 skipped**, which is the standard
 [L20](#l20--the-retrospective-and-the-sequence-into-the-next-cycle) set. A node-level A/B
-against `0e2c1b2` on the mixed workload found no regression and no gain (375 → 373 writes/s,
+against `e8b8303` on the mixed workload found no regression and no gain (375 → 373 writes/s,
 19 008 → 18 652 searches/s, p99 34.0 → 35.0 ms and 600 → 597 µs) — expected, because the
 harness declares its schema and so never evolves one. The change that *is* visible is recorded
 under M0-i.
@@ -5104,7 +5104,7 @@ binary 2026-09-27, session 4, with OB22 in it.** ◐ until then: measurement
 only, and the first session found a blocker. Corrected 2026-09-25.
 This entry was written on
 2026-09-19 claiming [F8](#f8--the-overload-gates-do-not-cover-the-bulk-write-path) item 3 as the
-last of its three still open. It was already closed: `0836df2` landed it on 2026-09-17, two days
+last of its three still open. It was already closed: `490608b` landed it on 2026-09-17, two days
 after F8 was written and two days before this entry said otherwise. Bulk ops are worker-eligible,
 carry their own `OpClass`, and fold into the blend the door judges on — see
 [F8 item 3](#f8--the-overload-gates-do-not-cover-the-bulk-write-path) for what shipped.
@@ -5122,7 +5122,7 @@ twelve days there against eight here.
 Three arms, one session, one harness:
 
 - **The bulk lane**, which is the item's name. Every table in F8 was taken against a binary where
-  a bulk write held the actor mailbox for its entire fan-out. `0836df2` replaced that design and
+  a bulk write held the actor mailbox for its entire fan-out. `490608b` replaced that design and
   nothing has re-measured it, so the exit criterion — goodput that degrades rather than
   collapsing — has no evidence either way.
 - **The single-write lane**, which F8's caveats flag and no arm has ever covered: `Write` *is*
@@ -5139,7 +5139,7 @@ presenting a number it cannot stand behind.
 **Expect two runs, not one.** [M4](#m4--per-key-resource-quotas) and
 [M5](#m5--per-index-capability-subtraction) add refusal paths on the write ingress and will move
 the overload curve by design, and the exit criterion is a statement about the shipped binary. This
-run is the baseline that attributes the curve to `0836df2`; a shorter confirmation arm belongs at
+run is the baseline that attributes the curve to `490608b`; a shorter confirmation arm belongs at
 the cut.
 
 The F7/F8 precedent is the standard here: this lane's behaviour has twice been worse than the
@@ -5151,7 +5151,7 @@ arms on the F8 protocol. Two results, one expected and one not.
 *Expected, and it closes the question F8 left open.* `dispatch.round_robin_sends` is **non-zero on
 every bulk arm** — 269, 217, 559 — against the **0** F8 measured, which was the tell that no bulk
 work reached the worker pool at all. Bulk is served on the pool, `OpClass::Bulk` is carrying its
-samples, and `0836df2` does what its message says. The third time this lane has been measured is
+samples, and `490608b` does what its message says. The third time this lane has been measured is
 the first time the gates can see it.
 
 *Not expected.* The capacity probe wedged the node. Root-caused and fixed the same day as
@@ -5310,10 +5310,10 @@ choosing open-loop rates, not a regression.
 per arm, in one session: F8 protocol (4 shards, `search_threads = 2`,
 `max_concurrent_requests = 3000`, `request_timeout_secs = 1`, `wal_sync = true`), 200,000
 documents seeded, Poisson arrivals, 20s steps, release build, harness co-located. Every arm ran
-on `c54ae33` and on `079ad0b` — the build session 2 measured, before M5, M4, M8 and O4 — back to
+on `bccb5b7` and on `9fd6b3d` — the build session 2 measured, before M5, M4, M8 and O4 — back to
 back, so drift lands on both. Harness lag p99 stayed under 1.5ms and no arm dropped an arrival.
 
-| lane | offered | `c54ae33` ok/s | `079ad0b` ok/s | refused, `c54ae33` |
+| lane | offered | `bccb5b7` ok/s | `9fd6b3d` ok/s | refused, `bccb5b7` |
 |---|---|---|---|---|
 | bulk, batch 500 | 60/s | 59, sustained | 59 | — |
 | | 120/s | **105** (52,419 docs/s) | 104 | 275 × 503, **0 × 408** |
@@ -5340,7 +5340,7 @@ and read did not move.
 
 *M4, M5, M8 and O4 cost nothing measurable.* Every pair is inside run-to-run noise, closed-loop
 probes included (bulk 27 req/s on both, writes 643 against 645/s). Reads read ~3% lower on
-`c54ae33` in this session and higher than both on the fixed binary (884/872/871) in the next, so
+`bccb5b7` in this session and higher than both on the fixed binary (884/872/871) in the next, so
 that difference is noise and not M8's query preparation.
 
 **The criterion is met** on the binary that carries the OB15 fix: goodput that degrades rather
@@ -5352,14 +5352,14 @@ item.
 question this time was narrower than the criterion: [OB22](#ob22--an-orchestrator-waited-on-peers-while-holding-its-mailbox)
 rebuilt how the orchestrator answers — deferred answers, a peer lane, bulk always handled
 locally, health counting indexes off the request path — and was measured only on a cluster.
-So an A/B on one standalone node: `a05e5bd` (the last commit before OB22) against `9c0fd9a`, both
+So an A/B on one standalone node: `1456256` (the last commit before OB22) against `cd1c9c2`, both
 release builds, M5 Pro, harness co-located, each binary from a wiped volume, two rounds with the
 order reversed in the second so drift lands on both. The two arms that looked borderline after
 two rounds were given four more.
 
 *Closed loop, F5 protocol* (defaults, 4 shards, `wal_sync`, 5,000 seeded, 5 s + 20 s per arm):
 
-| arm | `a05e5bd` | `9c0fd9a` | Δ |
+| arm | `1456256` | `cd1c9c2` | Δ |
 |---|---|---|---|
 | search c8 / c16, ok/s | 22,353 / 31,010 | 22,454 / 30,774 | +0.5% / −0.8% |
 | write c8 / c16, ok/s | 376 / 602 | 377 / 609 | +0.3% / +1.2% |
@@ -5376,7 +5376,7 @@ binaries alike.
 *Open loop, the session 3 protocol*, with the bulk lane pushed further because its capacity has
 moved (below):
 
-| lane | offered/s | `a05e5bd` ok/s | `9c0fd9a` ok/s | refused |
+| lane | offered/s | `1456256` ok/s | `cd1c9c2` ok/s | refused |
 |---|---|---|---|---|
 | bulk, batch 500 | 60 / 120 / 300 | 59 / 118 / 300 | 59 / 119 / 302 | ≤ 29 × 503 |
 | | 600 | 540 (270k docs/s) | 545 (272k docs/s) | 9–11% × 503 |
@@ -5401,7 +5401,7 @@ third is a sizing note:*
 
 - **A health probe's `GetIdentity` ask runs past its budget under write overload** — half of a 1 s
   request timeout, so health p99 sits at ~505 ms and every such probe logs an `ERROR` line.
-  `9c0fd9a` logged half as many (1,241 against 2,377 over the session), because OB22's index
+  `cd1c9c2` logged half as many (1,241 against 2,377 over the session), because OB22's index
   counts took the `ListIndexes` ask off the probe; `GetIdentity` is the other half. The node's
   identity does not change while it runs, so the ask is avoidable, and a line per probe is
   [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput)'s
@@ -5553,7 +5553,7 @@ both documented and dead (M0-h); and `scripts/validate/all.sh` runs clean at the
 
 ## N. Pre-0.3.6 whole-code review 📋 Planned
 
-Reviewed 2026-10-07, at `ee3db6d`, on the question *what is interconnected, and what in it is
+Reviewed 2026-10-07, at `ae98807`, on the question *what is interconnected, and what in it is
 not idiomatic Rust or not a coordinated design*. Five read-only passes ran in parallel — `storage`;
 the server's `node/`; the coordinator, swarm, `main.rs` and config; the request-facing layers
 (`http_server/`, `auth`, `authz`, `audit`, `posture`, `ratelimit`); and `client`, `mcp` and
@@ -6141,7 +6141,7 @@ work, and the release is not held for them.
 
 ## O. Post-0.3.6 review — the base for the next iteration 📋 Planned
 
-Reviewed 2026-10-08, at `92e22e4` (the 0.3.6 tag), on the question *does the code hold the
+Reviewed 2026-10-08, at `73b8fd5` (the 0.3.6 tag), on the question *does the code hold the
 architecture's stated invariants, and where does it pay for what it does not hold*. Read as a
 database-systems pass — durability ordering, the convergence protocol, overload behaviour —
 with N read first, so what is filed below is what N did not already file. `cargo clippy
@@ -6274,17 +6274,22 @@ file are checked against the code each review, as this roadmap's own reconciliat
 
 ### F10 — Fast-field projection: the page's fields answered from the columns
 
-📋 **Planned.** The fourth layer of the search-economics work opened by the TS5 incident
+💭 **Deferred 2026-10-15, deliberately.** After the deadline and two-phase layers the
+remaining cost of a large page is the redb read and the JSON parse behind each surviving
+document, and for the workloads this node serves today that is a small share of the request;
+the layer buys little and adds a second answer path whose values can differ from the stored
+ones. Not planned, and the design below is the starting point if a workload changes that —
+see **Reopen when**. The fourth layer of the search-economics work opened by the TS5 incident
 (2026-10-08): a 310-value `IN` query matching 88M documents asked for one field at
 `limit 10,000` and refused the endpoint new sessions for ~25 minutes, because `limit` bounded
 the answer but never the work — every shard materialised `offset + limit` full documents and
 the merge threw all but the page away.
 
-Three of the layers are shipped. `32b4390` put the request's budget inside the walk —
+Three of the layers are shipped. `a8c61f8` put the request's budget inside the walk —
 `DeadlineQuery` rides the parsed query and a tripped check surfaces as a typed
 `SearchDeadlineExceeded` (408 at the edge, refused whole by the gather) — and pushed the
 caller's projection onto `SearchRequest.fields`, so hits leave the shard already trimmed.
-`dddd459` split the shard search into `search_keys` (parse, walk, resolve → `KeyHit`) and
+`7c794eb` split the shard search into `search_keys` (parse, walk, resolve → `KeyHit`) and
 `fetch_documents` (redb → reconstruct → project): a merge now orders keys and fetches only
 the documents that survive its window. Measured on a 1.5M-doc 4-shard bench index,
 `fetched_docs` for `limit 10,000` fell 40,000 → 10,000 and warm latency 2.5–7× — and `build`
@@ -6320,6 +6325,78 @@ designers apply to the fields their use case projects, never a requirement; ever
 uncovered falls back to the fetch phase unchanged, and `id` stays fast by default.
 `describe_index`/`_config` should say which fields qualify, so an architect marking a field
 `fast` knows what it buys.
+
+**Where it hooks in** (as the code stands after `7c794eb`):
+
+- `crates/storage/src/search.rs`, `search_keys`, resolve stage (the block that builds `keyed:
+  Vec<KeyHit>`): the per-segment pass that already reads the `id` column — one
+  `sorted_ords_to_term_cb` walk when a segment contributes ≥ 32 hits packed within 4× their
+  count, a stored-document read otherwise. The projected columns are read for the same
+  `DocAddress` list in the same loop; `opts.fields` is already on `SearchOptions` but `search_keys`
+  ignores it today ("answered by the fetch phase").
+- `crates/storage/src/lib.rs`: `KeyHit` gains `doc: Option<JsonValue>` (`#[serde(default,
+  skip_serializing_if = "Option::is_none")]` — a mixed-version cluster must still read the old
+  shape); `SearchTimings` should report how many hits were answered from columns, so the
+  response can say which path a page took.
+- `search_documents_with` (the one-shot composition) fetches only the hits whose `doc` is
+  `None`; the string-sort candidate fetch inside `search_keys` already projects to one field and
+  is the first place a column read could replace it.
+- `crates/server/src/node/mod.rs` + `search.rs`: `SearchKeysRequest` has no `fields` today —
+  the gather would pass the normalized projection (after `normalize_projection_fields`, so `id`
+  is already the shadow name on a shadow index). `group_window_by_shard` builds the phase-two
+  requests from the windowed `KeyHit`s and must skip those that carry a `doc`; the assembly step
+  already stamps `_score` and `_sort_key` and applies `apply_field_projection`, so a column doc
+  goes through the same last step as a fetched one and a cross-node merge sees no difference.
+
+**Coverability is decided from the built index, not the declared schema.** `FieldDef::is_fast()`
+is the declaration; the column exists only if the index was built with it, and
+`SchemaFields::built_types` already records that the two can disagree (an edit waiting for its
+rebuild, an index older than the declaration). So the per-segment lookup (`fast_fields().i64(..)`,
+`.u64`, `.f64`, `.str`) is the test, and a segment without the column sends its hits to the fetch
+phase rather than answering them empty. Never coverable: `Boolean`, `Bytes`, `Ip`, `Json`, `Facet`
+(`can_be_fast` is false — the builder does not consult `fast` for them); fields added by a write
+(`new_learned`, non-indexed, so no column until promoted); `_`-prefixed metadata other than what
+the gather itself stamps.
+
+**Behaviours the column path changes, to settle before building:**
+
+- **Freshness.** The fetch phase reads redb, the source of truth at the time of the call; a
+  column reads the last *committed* segment (`commit_interval_ms`, 2000 by default). A document
+  deleted or updated since the commit is dropped or re-read today ("deleted between the phases")
+  and would be answered from its old committed values. Either accept near-real-time and document
+  it, as Elasticsearch's `docvalue_fields` does, or keep a redb existence check per hit — which
+  keeps most of the cost this item exists to remove.
+- **Multi-valued fields.** A list indexes as several column entries (`add_json_value_to_doc`);
+  the stored array's order and any repeated values are not guaranteed to come back from the
+  column. A one-element list reads as its scalar. Verify tantivy's ordering and de-duplication
+  for each column type before promising a shape.
+- **Shadow indexes.** The identifier replaces `id` with *every* shadow name carrying the same
+  value (`reconstruct_shadow_fields_owned`); a projection naming `id` or a shadow name is
+  answered from the document key with no column read, and must produce the same keys, in the
+  projection's order, as `apply_field_projection` does.
+- **Field order.** `apply_field_projection` emits requested fields in the caller's order and then
+  the `_` metadata; the column doc is built in that order so the two paths serialise
+  identically.
+- **Dates** also lose the stored original at index time when clamped to tantivy's safe range
+  (`Date clamped to Tantivy safe range`), so the column cannot be more faithful than the index.
+- **Text** fast columns are built with `set_fast(None)`: the whole untokenized value, so a
+  string-valued document round-trips; a number or object written to a text field was indexed as
+  its serialized JSON and would come back as a string.
+
+If built, the lean is to exclude both `Date` and analysed `Text` from v1 and cover `id`, shadow
+names, `String`, `I64`, `U64` and `F64` — the types whose column is the value.
+
+**Test shape.** Parity is the property: for every covered projection the column path and the
+fetch path return identical documents, so the suite runs each case through both (a switch on
+`SearchOptions` forces the fetch path) — scalar and list values, an absent value, a value that
+did not index, a shadow index, a sorted search, a segment without the column (a field declared
+fast after the data), and a document deleted after the commit. `two_phase_test.rs` and
+`projection_test.rs` hold the harness for the first two phases.
+
+**Reopen when** `stats.timings_ms` shows `fetch` + `build` dominating the request for a
+workload whose projections are column-coverable — a large `limit` over a few scalar fields, the
+TS5 shape — measured on a real index with the fields declared `fast`, not on a synthetic bench.
+Until then `fast` stays what it is today: a sort and range column.
 
 ---
 

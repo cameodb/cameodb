@@ -133,7 +133,7 @@ Signed off by:
 
 ## v0.3.6 — 2026-10-08
 
-Commit: the `chore(release): 0.3.6` commit, which follows 2f358f3, the search 404 — the fix is
+Commit: the `chore(release): 0.3.6` commit, which follows fa4854e, the search 404 — the fix is
 ordered before the version bump. `MANIFEST.txt` records the hash when the release is built.
 
 Built targets: macOS arm64 (30M); x86_64-unknown-linux-musl (37M binary, `cameodb_0.3.6_amd64.deb`
@@ -141,7 +141,7 @@ Built targets: macOS arm64 (30M); x86_64-unknown-linux-musl (37M binary, `cameod
 `cameodb 0.3.6`); SPDX (582 packages) and CycloneDX (581 components, against 581 in `Cargo.lock`).
 Built 2026-10-08 01:26–01:27, after the last change to `crates/`; the macOS binary is
 byte-identical to `target/release/cameodb`. All seven artifacts signed (01:29). `MANIFEST.txt`
-records the tip, `92e22e4`, after `publish.sh` was repeated.
+records the tip, `73b8fd5`, after `publish.sh` was repeated.
 
 What the validation covered, and on what:
 
@@ -218,7 +218,7 @@ Signed off by: goranc
 
 ## v0.3.5 — 2026-09-28
 
-Commit: f348371 (`release: 0.3.5`), the last commit to touch `crates/` or `Cargo.*`.
+Commit: e73083b (`release: 0.3.5`), the last commit to touch `crates/` or `Cargo.*`.
 
 Built targets: macOS arm64 (24M), x86_64-unknown-linux-musl (32M binary, 8/8 hardening checks,
 + `cameodb_0.3.5_amd64.deb` 9.3M + `cameodb-0.3.5-1.x86_64.rpm` 10M), Windows x86_64
@@ -277,7 +277,7 @@ signature was checked against the key `dl.cameodb.com` serves (byte-identical to
 `cameodb-web` copy) rather than taken from the manifest's "signed" column — `cosign verify-blob`
 returns `Verified OK` for all seven.
 
-`MANIFEST.txt` records `f3483710a84b7a1f90ba94a4ec9a36bf8eba05ae` with no dirty flag. The first
+`MANIFEST.txt` records `e73083b0bbd354a6d84d9a6bdc0512d61444bf76` with no dirty flag. The first
 dry run marked it "(dirty at build time)": `publish.sh` reads `git status` when it runs, not when
 the build ran, and this record was uncommitted then. The build itself logged no dirty-tree warning;
 the manifest was regenerated with this file stashed.
@@ -297,7 +297,7 @@ Skipped checks and why: none of the suites.
 
 Docker Hub: `goranc/cameodb:0.3.5` and `latest` are the same index
 (`sha256:dd1edd6dbd704c35ed7163c1ff00a6252c96e5f85cd91abc62c63e799c93681b`), amd64 and arm64, pushed
-2026-09-28T19:39Z from an image built at 19:31Z, after f348371. Both architectures pulled report
+2026-09-28T19:39Z from an image built at 19:31Z, after e73083b. Both architectures pulled report
 `cameodb 0.3.5` with no `+fault-injection` marker and run as `nonroot`; the arm64 image started and
 `/_cluster/health` answered `green` with no panic logged. The site's Docker section names 0.3.5.
 
@@ -307,7 +307,7 @@ Signed off by: goranc
 
 ## v0.3.4 — 2026-09-07
 
-Commit: 433f8b9 — `MANIFEST.txt` records `433f8b94b6067ef2005b9ad4bdacb4f7add468ed`, and that is
+Commit: fa3c972 — `MANIFEST.txt` records `fa3c9727f7eb28e46b5f59b7134430dd2ed119ab`, and that is
 also the last commit to touch `crates/` or `Cargo.*`, so the recorded commit, the validated tree
 and the current one are the same.
 
@@ -370,7 +370,7 @@ Signed off by: g.c.
 
 ## v0.3.3 — 2026-09-03
 
-Commit: 673ca55 — `MANIFEST.txt` records `673ca5513524676011a4fa7ef150e03ac270b2fe`, which is the
+Commit: ccf7a76 — `MANIFEST.txt` records `ccf7a7694f110a976918eeffcf610b4552040b0e`, which is the
 tree the validation suite ran against, so for once the recorded commit and the validated one are
 the same. Commits after it are this checklist record and nothing else.
 
@@ -394,14 +394,14 @@ binary: target/release/cameodb
 That binary is byte-identical to the staged `dist/0.3.3/mac/cameodb`
 (sha256 `b90f335bdf25f925f4a895930a9bafca2c4268f63d2edcde2bc2b7759fdaaa8e`), so the result
 describes the artifact that ships rather than a neighbouring build of it. It also still describes
-the current tree: the last commit to touch `crates/` or `Cargo.*` was fed149a, before this binary
+the current tree: the last commit to touch `crates/` or `Cargo.*` was 5451fc6, before this binary
 was built, and everything committed since is docs and scripts.
 
 | Suite | Host build | musl | windows | notes |
 |-------|-----------|------|---------|-------|
 | deps           | PASS | —    | —    | three transitive advisories ignored, all review-by 2026-11-01 |
 | unit           | PASS | —    | —    | |
-| posture        | PASS | —    | —    | 44 checks; one had gone stale and is corrected in 673ca55 — see below |
+| posture        | PASS | —    | —    | 44 checks; one had gone stale and is corrected in ccf7a76 — see below |
 | auth           | PASS | —    | —    | |
 | tls            | PASS | —    | —    | |
 | remote-sources | PASS | —    | —    | **outstanding on musl and Windows** — trust store differs per platform, so this result does not transfer (procedure step 5) |
@@ -462,11 +462,11 @@ Outstanding, and neither blocks the artifacts:
   and its last commit is still `96c83da` "Publish 0.3.2 binaries". 17 modified and 6 untracked
   files are sitting there (procedure step 10). Nothing is served until that is committed.
 - **No `v0.3.3` tag, and no GitHub release object.** The release was tagged during the run and
-  pushed to `origin` — annotated tag `01e68ab` over `673ca551`, the tree the artifacts were
+  pushed to `origin` — annotated tag `01e68ab` over `ccf7a769`, the tree the artifacts were
   built from — and both the remote and the local tag were deleted on 2026-09-03. No remote
   carries it now; `upstream` never did. That leaves 0.3.3 as 0.3.0 through 0.3.2 were, none of
   which is tagged either. The artifacts do not depend on it: MANIFEST.txt records commit
-  `673ca551`, `dl.cameodb.com` serves the signed binaries and DockerHub serves the images.
+  `ccf7a769`, `dl.cameodb.com` serves the signed binaries and DockerHub serves the images.
 
 Known gaps acknowledged: yes
 Signed off by: Goran Cvijanovic
