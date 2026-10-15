@@ -11,11 +11,11 @@ feature-depth = 1
 ignore = [
     # hickory-proto 0.25.x vulnerabilities — transitive via libp2p 0.56.0.
     # Fix requires hickory-proto >=0.26.1, which libp2p hasn't adopted yet.
-    { id = "RUSTSEC-2026-0118", reason = "transitive via libp2p 0.56.0; needs hickory-proto >=0.26.1; review-by 2026-11-01" },
-    { id = "RUSTSEC-2026-0119", reason = "transitive via libp2p 0.56.0; needs hickory-proto >=0.26.1; review-by 2026-11-01" },
+    { id = "RUSTSEC-2026-0118", reason = "transitive via libp2p 0.56.0; needs hickory-proto >=0.26.1 (libp2p 0.57), and kameo 0.22.2 still pins libp2p 0.56; review-by 2026-12-31" },
+    { id = "RUSTSEC-2026-0119", reason = "transitive via libp2p 0.56.0; needs hickory-proto >=0.26.1 (libp2p 0.57), and kameo 0.22.2 still pins libp2p 0.56; review-by 2026-12-31" },
     # paste is unmaintained but pulled in transitively via libp2p → if-watch → netlink-packet-core.
     # No actionable fix until the upstream chain replaces it.
-    { id = "RUSTSEC-2024-0436", reason = "unmaintained `paste`, transitive via libp2p -> if-watch; review-by 2026-11-01" },
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained `paste`, transitive via libp2p -> if-watch, kameo 0.22.2 still pins libp2p 0.56; review-by 2026-12-31" },
 ]
 
 [licenses]

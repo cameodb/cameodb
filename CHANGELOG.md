@@ -89,6 +89,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lists fields and their operators, rather than to `validate_query`, which no longer returns
   them.
 
+### Security
+
+- **rustls 0.23.45 → 0.23.46**, the TLS stack for HTTPS and outbound connections, for
+  RUSTSEC-2026-0346 to 0349: client session `Debug` output exposing TLS secrets, a downgrade to
+  classical key exchange through an unauthenticated ServerHello, Brotli certificate
+  decompression allocating up to 1 GiB before authentication, and buffered data sent to the outer
+  server after an ECH rejection. Taken with the rest of the in-range dependency updates (tokio
+  1.53.3, hyper 1.12, h2, serde_json, uuid 1.28 among them) and a yanked `yoke-derive` replaced.
+- **The three libp2p advisory exceptions are renewed to 2026-12-31.** The fix needs libp2p 0.57,
+  and kameo, which carries the cluster transport, still pins 0.56. RUSTSEC-2026-0118 is in DNSSEC
+  validation, which this build does not compile in; RUSTSEC-2026-0119 is reachable only through
+  resolving a `/dns` peer address.
+
 ## [0.3.6] - 2026-10-07
 
 ### Added
