@@ -273,6 +273,8 @@ pub struct NodeConfig {
     pub request_timeout_secs: u64,
     /// Enable WAL fsync for durability
     pub wal_sync: bool,
+    /// Record redb's allocator state per commit, so a crash restart skips the full repair
+    pub quick_repair: bool,
     /// Default batch size for smart commit calculations
     pub default_batch_size: usize,
     /// Number of indexing worker threads per tantivy IndexWriter (default: 1)
@@ -356,6 +358,7 @@ impl Default for NodeConfig {
             memory_pressure_threshold_percent: 80,
             search_threads: 8,
             wal_sync: true,
+            quick_repair: true,
             default_batch_size: 1000,
             indexer_num_threads: 1,
             merge_num_threads: 2,

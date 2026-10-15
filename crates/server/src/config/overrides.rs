@@ -100,6 +100,11 @@ pub(crate) const OVERRIDES: &[Override] = &[
         apply: |c, v| { c.storage.wal_sync = parse_bool(v); Ok(()) },
     },
     Override {
+        flag: "--storage-quick-repair", env: "CAMEODB_STORAGE_QUICK_REPAIR", kind: FlagKind::Switch,
+        placeholder: "", help: "Record allocator state per commit so a crash restart skips the redb repair (=false to disable)",
+        apply: |c, v| { c.storage.quick_repair = parse_bool(v); Ok(()) },
+    },
+    Override {
         flag: "--storage-default-batch-size", env: "CAMEODB_STORAGE_DEFAULT_BATCH_SIZE", kind: FlagKind::Value,
         placeholder: "<N>", help: "Documents per write batch before an automatic commit",
         apply: |c, v| { c.storage.default_batch_size = v.parse()?; Ok(()) },

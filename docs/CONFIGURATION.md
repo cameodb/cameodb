@@ -379,6 +379,11 @@ disk_usage_threshold_percent = 90
 # see "What `wal_sync = false` actually costs" below.
 wal_sync = true
 
+# Record redb's allocator state on every commit (default: true), so a restart after a crash
+# or an OOM kill opens each shard in milliseconds instead of repairing its whole file. Costs a
+# second flush per durable commit — see "What `quick_repair` decides" below.
+quick_repair = true
+
 # WAL segment size in MB (default: 64)
 wal_segment_size_mb = 64
 
@@ -1490,6 +1495,7 @@ is the bottleneck, `jobs_completed` over the run is this node's real service rat
 | Setting | Performance | Durability | Note |
 |---------|-------------|------------|------|
 | `wal_sync = false` | ⬆️ High | ⬇️ Low | Recent writes can be lost **and** the search index can end up ahead of the document store — see below |
+| `quick_repair = false` | ⬆️ Single writes on a flush-bound disk | ➡️ Same | A restart after a crash repairs each shard's whole redb file before it opens — see below |
 | `indexer_memory_max_mb = 1024` | ⬆️ High | ➡️ Same | Uses more RAM |
 | `memory_pressure_threshold_percent = 90` | ⬆️ High | ➡️ Same | Higher memory usage |
 
@@ -1510,6 +1516,36 @@ documents are rewritten or the index is rebuilt.
 
 Use it for bulk-loading data you can replay from an external source, and turn it back on before
 the node holds anything you cannot regenerate.
+
+#### What `quick_repair` decides
+
+How long a node takes to start after it was killed rather than shut down — a crash, an OOM
+kill, a `SIGKILL`, a power loss. It changes nothing about what survives: durability is
+`wal_sync`'s, and a clean shutdown needs no repair either way.
+
+redb marks its file while it is open and clears the mark on a clean close. Found still marked,
+it either loads the allocator state the last commit recorded, or — when that commit recorded
+none — repairs the file: up to three passes over every page, verifying checksums and rebuilding
+the allocator, before the shard can open. That costs time in proportion to the data the shard
+holds, not to the writes that were in flight, and at most `max(2, cores / 4)` shards open at
+once. With `quick_repair = true` every commit records the state, and the reopen takes
+milliseconds at any size.
+
+Measured on Apple M5 Pro, file already in the page cache: a 1 GB shard took 0.4–0.7 s to repair
+against 5–8 ms to open cleanly, and a 4 GB file 1.57 s against 7 ms with `quick_repair`. A
+repair read from disk, at hundreds of gigabytes per shard, takes minutes per shard.
+
+The cost is on the write side: each durable commit is two-phase and flushes twice. Bulk-sized
+commits measured about 5% slower; single-record durable commits, which are bounded by the flush
+itself, fell from about 250/s to 140/s on macOS, where `F_FULLFSYNC` makes every flush
+expensive. Concurrent single writes share commits, so a node's single-write ceiling falls by less
+than that — measure it on your hardware with `cameodb-bench` if single-write throughput is what
+the node is for.
+
+A repair is logged per shard — `Database was not closed cleanly; redb is repairing it`, progress,
+then `redb repair complete` with its duration — so a slow start after a crash is visible. The
+first restart after turning `quick_repair` on can still repair once, if the crash came before
+any commit that recorded the state.
 
 ## Production Deployment
 

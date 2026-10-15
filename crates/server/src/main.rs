@@ -388,6 +388,7 @@ async fn main() -> Result<()> {
         memory_pressure_threshold_percent: cameodb_config.search.memory_pressure_threshold_percent,
         search_threads: cameodb_config.search.search_threads,
         wal_sync: cameodb_config.storage.wal_sync,
+        quick_repair: cameodb_config.storage.quick_repair,
         default_batch_size: cameodb_config.storage.default_batch_size,
         indexer_num_threads: cameodb_config.search.indexer_num_threads,
         merge_num_threads: cameodb_config.search.merge_num_threads,
@@ -783,6 +784,14 @@ async fn main() -> Result<()> {
         "Eventual"
     };
     println!("  Durability: {}", durability_label);
+    println!(
+        "  Crash repair: {}",
+        if cameodb_config.storage.quick_repair {
+            "quick (allocator state recorded per commit)"
+        } else {
+            "full (a restart after a crash scans each shard's file)"
+        }
+    );
     println!(
         "  Indexer Memory: {}-{}MB",
         cameodb_config.search.indexer_memory_min_mb, cameodb_config.search.indexer_memory_max_mb

@@ -140,6 +140,18 @@ pub struct StorageConfig {
     pub default_batch_size: usize,
     /// Whether to call fsync() on every redb commit.
     pub wal_sync: bool,
+    /// Whether every redb commit records its allocator state, so reopening after an unclean
+    /// stop loads it instead of repairing the file.
+    ///
+    /// Without it, redb opened after a crash walks the whole database — verifying checksums
+    /// and rebuilding the allocator from every reachable page — so the restart costs time in
+    /// proportion to the data the shard holds, not to the writes that were in flight. With it,
+    /// each commit is two-phase and writes the allocator state alongside the data: a second
+    /// flush per durable commit, which lowers the ceiling of a flush-bound single-write
+    /// workload, in exchange for a reopen that takes milliseconds at any size. A clean close
+    /// records the state either way; this only decides what a crash costs.
+    #[serde(default = "default_quick_repair")]
+    pub quick_repair: bool,
     /// How long, in milliseconds, an index's oldest uncommitted write may wait for the commit
     /// that makes it searchable, while writes keep arriving; `0` commits by count alone.
     ///
@@ -401,6 +413,10 @@ impl QueryValidation {
     }
 }
 
+fn default_quick_repair() -> bool {
+    true
+}
+
 impl Default for StorageConfig {
     fn default() -> Self {
         const DEFAULT_TOTAL_MEMORY_LIMIT_MB: u64 = 1024;
@@ -423,6 +439,7 @@ impl Default for StorageConfig {
             // Other Configuration
             default_batch_size: 1000,
             wal_sync: true,
+            quick_repair: default_quick_repair(),
             commit_interval_ms: 0,
             query: QueryPolicy::default(),
         }

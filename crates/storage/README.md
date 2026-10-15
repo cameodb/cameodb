@@ -395,6 +395,7 @@ let config = StorageConfig {
     memory_pressure_threshold_percent: 80,   // Use 80% of configured limit for cache
     default_batch_size: 1000,                // Base of the commit count (see "Commit policy")
     wal_sync: true,                          // Maximum durability
+    quick_repair: true,
 };
 
 // Initialize store
@@ -535,6 +536,7 @@ let high_perf_config = StorageConfig {
     memory_pressure_threshold_percent: 90,   // Aggressive memory usage
     default_batch_size: 2000,                // Higher commit threshold
     wal_sync: false,                         // Skip fsync for speed
+    quick_repair: true,
 };
 
 // High-durability configuration with frequent commits
@@ -547,6 +549,7 @@ let high_durability_config = StorageConfig {
     memory_pressure_threshold_percent: 80,
     default_batch_size: 500,                 // Lower commit threshold
     wal_sync: true,                          // Always fsync
+    quick_repair: true,
 };
 
 // Memory-constrained configuration
@@ -559,6 +562,7 @@ let low_memory_config = StorageConfig {
     memory_pressure_threshold_percent: 80,
     default_batch_size: 250,                 // Very low commit threshold
     wal_sync: true,
+    quick_repair: true,
 };
 ```
 

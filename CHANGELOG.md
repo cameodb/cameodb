@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A restart after a crash opens each shard in milliseconds: `[storage] quick_repair`,
+  default on.** A node killed rather than shut down — a crash, an OOM kill, a `SIGKILL` — left
+  every shard's redb file to be repaired before the shard could open: up to three passes over
+  the whole file, so the restart cost time in proportion to the data held, not to the writes in
+  flight (0.4–0.7 s per gigabyte with the file in the page cache, minutes per shard read from
+  disk). Every commit now records redb's allocator state, and the reopen loads it. The cost is a
+  second flush per durable commit, which lowers the single-write ceiling on a flush-bound disk;
+  `quick_repair = false` (or `--storage-quick-repair=false`) restores the old trade.
+- **A redb repair is logged.** A shard whose file needs one says so as it starts, reports its
+  progress, and logs how long it took, where before the shard was silently slow to open.
+
 ### Changed
 
 - **redb 4.3.0 → 4.4.0**, for its fix to page-cache memory growing without bound under write

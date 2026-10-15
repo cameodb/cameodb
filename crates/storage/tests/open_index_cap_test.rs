@@ -29,6 +29,7 @@ fn capped_config(shard_path: &std::path::Path, cap: usize) -> StorageConfig {
         merge_num_threads: 1,
         default_batch_size: 100_000,
         wal_sync: true,
+        quick_repair: true,
         commit_interval_ms: 0,
         query: Default::default(),
     }

@@ -680,6 +680,7 @@ mod tests {
             merge_num_threads: 1,
             default_batch_size: 100_000,
             wal_sync: true,
+            quick_repair: true,
             commit_interval_ms: 0,
             query: Default::default(),
         }
@@ -1058,6 +1059,7 @@ mod tests {
             merge_num_threads: 1,
             default_batch_size: 100_000,
             wal_sync: true,
+            quick_repair: true,
             commit_interval_ms: 0,
             query: Default::default(),
         };
@@ -1153,6 +1155,7 @@ mod tests {
             merge_num_threads: 1,
             default_batch_size: 100_000,
             wal_sync: true,
+            quick_repair: true,
             commit_interval_ms: 0,
             query: Default::default(),
         };
@@ -1245,6 +1248,7 @@ mod tests {
             merge_num_threads: 1,
             default_batch_size: 100_000,
             wal_sync: true,
+            quick_repair: true,
             commit_interval_ms: 0,
             query: Default::default(),
         };
@@ -1459,6 +1463,7 @@ mod tests {
             merge_num_threads: 1,
             default_batch_size: 100,
             wal_sync: true,
+            quick_repair: true,
             commit_interval_ms: 0,
             query: Default::default(),
         };
@@ -1523,6 +1528,7 @@ mod tests {
             // Other Configuration
             default_batch_size: 1000,
             wal_sync: true,
+            quick_repair: true,
             commit_interval_ms: 0,
             query: Default::default(),
         };
@@ -2585,6 +2591,7 @@ mod commit_interval_tests {
             merge_num_threads: 1,
             default_batch_size: BATCH,
             wal_sync: false,
+            quick_repair: true,
             commit_interval_ms,
             query: Default::default(),
         }

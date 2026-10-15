@@ -402,6 +402,13 @@ pub struct StorageConfig {
     #[serde(default = "default_wal_sync")]
     pub wal_sync: bool,
 
+    /// Record redb's allocator state on every commit, so a restart after a crash or an OOM kill
+    /// opens each shard in milliseconds instead of repairing the whole file (default: true).
+    /// Costs a second flush per durable commit, which lowers the single-write ceiling on a
+    /// flush-bound disk; a clean shutdown needs no repair either way.
+    #[serde(default = "default_quick_repair")]
+    pub quick_repair: bool,
+
     /// WAL segment size in MB (default: 64)
     #[serde(default = "default_wal_segment_size_mb")]
     pub wal_segment_size_mb: usize,
@@ -1537,6 +1544,7 @@ impl Default for StorageConfig {
             data_paths: vec![PathBuf::from("./data/cameodb")],
             disk_usage_threshold_percent: default_disk_usage_threshold_percent(),
             wal_sync: default_wal_sync(),
+            quick_repair: default_quick_repair(),
             wal_segment_size_mb: default_wal_segment_size_mb(),
             default_batch_size: default_default_batch_size(),
             num_shards_init: default_num_shards_init(),
@@ -1755,6 +1763,7 @@ config_defaults! {
     default_node_zone -> String = "default".to_string();
     default_disk_usage_threshold_percent -> u8 = 90;
     default_wal_sync -> bool = true;
+    default_quick_repair -> bool = true;
     default_wal_segment_size_mb -> usize = 64;
     default_default_batch_size -> usize = 1000;
     default_num_shards_init -> usize = 4;

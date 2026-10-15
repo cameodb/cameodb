@@ -90,6 +90,8 @@ seed_nodes = []
 data_paths = ["/var/lib/cameodb"]
 disk_usage_threshold_percent = 90
 wal_sync = true
+# Skip the full redb repair on a restart after a crash, at a second flush per commit.
+quick_repair = true
 wal_segment_size_mb = 64
 default_batch_size = 2000
 num_shards_init = 4

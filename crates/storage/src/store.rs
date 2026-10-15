@@ -5,7 +5,7 @@ use crate::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -529,9 +529,44 @@ impl HybridStore {
                 "HybridStore: Opening existing database"
             );
 
+            // redb repairs a file it was not closed cleanly on before `open` returns, and
+            // without a recorded allocator state that repair walks the whole file. It is
+            // invisible unless reported: the shard just takes minutes to open.
+            let repair_start = Instant::now();
+            let repaired = Arc::new(AtomicBool::new(false));
             let mut builder = redb::Builder::new();
             builder.set_cache_size(normal_cache_size);
-            builder.open(&kv_path)?
+            builder.set_repair_callback({
+                let repaired = Arc::clone(&repaired);
+                let db_path = kv_path.display().to_string();
+                move |session| {
+                    if !repaired.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            db_path = %db_path,
+                            file_size_mb = db_file_size / (1024 * 1024),
+                            "Database was not closed cleanly; redb is repairing it before the \
+                             shard opens"
+                        );
+                    }
+                    tracing::info!(
+                        db_path = %db_path,
+                        progress_percent = (session.progress() * 100.0).round() as u32,
+                        elapsed_ms = repair_start.elapsed().as_millis(),
+                        "redb repair in progress"
+                    );
+                }
+            });
+            let kv = builder.open(&kv_path)?;
+            if repaired.load(Ordering::Relaxed) {
+                tracing::warn!(
+                    db_path = %kv_path.display(),
+                    file_size_mb = db_file_size / (1024 * 1024),
+                    elapsed_ms = repair_start.elapsed().as_millis(),
+                    quick_repair = config.quick_repair,
+                    "redb repair complete"
+                );
+            }
+            kv
         } else {
             // NEW DATABASE: Just create with normal cache
             tracing::info!(
@@ -578,6 +613,17 @@ impl HybridStore {
             index_cache_expiry: Duration::from_secs(3600), // 1 hour
             config: config.clone(),
         })
+    }
+
+    /// Begin a redb write transaction carrying this store's `quick_repair` setting.
+    ///
+    /// Every write transaction is begun here. redb skips the repair on open only when the last
+    /// durable commit recorded its allocator state, so a single commit made without the setting
+    /// is enough to make the next crash pay for a full repair.
+    fn begin_write(&self) -> Result<redb::WriteTransaction, redb::TransactionError> {
+        let mut txn = self.kv.begin_write()?;
+        txn.set_quick_repair(self.config.quick_repair);
+        Ok(txn)
     }
 
     /// Gracefully shutdown the HybridStore, releasing all locks and resources
@@ -657,7 +703,7 @@ impl HybridStore {
 
         // Force a final redb fsync/flush to reduce WAL replay on startup
         let redb_start = std::time::Instant::now();
-        match self.kv.begin_write() {
+        match self.begin_write() {
             Ok(mut txn) => {
                 if let Err(e) = txn.set_durability(Durability::Immediate) {
                     tracing::warn!(error = %e, "Failed to set durability on shutdown flush");
@@ -2223,7 +2269,7 @@ impl HybridStore {
         let wal_table_name = format!("wal_{}", index);
         let wal_table_def = TableDefinition::<u64, &[u8]>::new(&wal_table_name);
 
-        let mut write_txn = self.kv.begin_write()?;
+        let mut write_txn = self.begin_write()?;
         {
             write_txn.set_durability(Durability::Immediate)?;
 
@@ -2519,7 +2565,7 @@ impl HybridStore {
         let mut tombstone: Option<IndexSchema> = None;
 
         // Delete redb tables completely using delete_table() for efficiency
-        let mut write_txn = self.kv.begin_write()?;
+        let mut write_txn = self.begin_write()?;
         {
             // Index deletion always uses Immediate durability for critical metadata operations
             write_txn.set_durability(Durability::Immediate)?;
@@ -2595,7 +2641,7 @@ impl HybridStore {
         let schema_bytes =
             serde_json::to_vec(schema).map_err(|e| StoreError::Serialization(e.to_string()))?;
 
-        let mut write_txn = self.kv.begin_write()?;
+        let mut write_txn = self.begin_write()?;
         {
             // Schema changes always use Immediate durability for critical metadata
             write_txn.set_durability(Durability::Immediate)?;
@@ -2835,7 +2881,7 @@ impl HybridStore {
     /// the same table through [`Self::checkpoint_committed`], together with the WAL truncation
     /// the checkpoint authorises, so that the two can never be separated by a crash.
     pub(crate) fn persist_committed_seq(&self, index: &str, seq: u64) -> Result<(), StoreError> {
-        let mut write_txn = self.kv.begin_write()?;
+        let mut write_txn = self.begin_write()?;
         {
             write_txn.set_durability(Durability::Immediate)?;
             let mut meta_table = write_txn.open_table(TABLE_RECOVERY_META)?;
@@ -3214,7 +3260,7 @@ impl HybridStore {
         }
 
         // Single transaction for all operations
-        let mut write_txn = self.kv.begin_write()?;
+        let mut write_txn = self.begin_write()?;
         let batch_size = ops_len as u64;
 
         /// The last operation for an id in this batch. A batch may name the same id several

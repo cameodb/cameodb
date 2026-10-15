@@ -36,6 +36,7 @@ fn test_config(shard_path: &std::path::Path) -> StorageConfig {
         // `Durability::None` while the schema transaction was `Immediate`, so an evolving write
         // was the one write whose two halves did not even agree on durability.
         wal_sync: false,
+        quick_repair: true,
         commit_interval_ms: 0,
         query: Default::default(),
     }
