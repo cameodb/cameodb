@@ -3172,3 +3172,101 @@ mod learned_field_tests {
         assert!(json["fields"]["n"].get("learned").is_none(), "{json}");
     }
 }
+
+/// `wal_sync = false` and the barrier that keeps Tantivy behind redb (ROADMAP O1).
+///
+/// The crash is a copy of the store's file taken while the store holds it open: redb writes a
+/// non-durable commit's pages but publishes it on disk only with the next durable commit, so the
+/// copy holds exactly what a killed process would have left.
+#[cfg(test)]
+mod durability_barrier {
+    use super::*;
+    use redb::{ReadableDatabase, ReadableTableMetadata, TableDefinition};
+    use tempfile::TempDir;
+
+    const INDEX: &str = "unsynced";
+
+    /// Rows in the index's data table of a copy of the store's file, taken with the store open,
+    /// after writing `docs` documents with `wal_sync` off and then running `before_copy`.
+    fn rows_a_crash_keeps(docs: u32, before_copy: impl FnOnce(&HybridStore)) -> u64 {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let shard = temp_dir.path().join("shard");
+        let crashed = temp_dir.path().join("crashed.redb");
+        let config = StorageConfig {
+            shard_path: shard.clone(),
+            wal_sync: false,
+            default_batch_size: 100_000,
+            ..StorageConfig::default()
+        };
+
+        let store = HybridStore::new(config, 1).expect("open store");
+        // Schema rows are always written durably, so the data table's absence below is the
+        // writes', not the index's.
+        store
+            .store_schema_and_cache(INDEX, &IndexSchema::default())
+            .expect("store schema");
+        for n in 0..docs {
+            store
+                .apply_write(
+                    INDEX,
+                    WalOp::Put {
+                        id: format!("doc-{n}"),
+                        json_blob: Some(serde_json::json!({ "n": n })),
+                    },
+                )
+                .expect("write");
+        }
+        before_copy(&store);
+        std::fs::copy(shard.join("store.redb"), &crashed).expect("copy the open store");
+        drop(store);
+
+        let db = redb::Database::open(&crashed).expect("open the crashed copy");
+        let read = db.begin_read().expect("read");
+        let table_name = format!("data_{INDEX}");
+        match read.open_table(TableDefinition::<&str, &[u8]>::new(&table_name)) {
+            Ok(table) => table.len().expect("len"),
+            Err(_) => 0,
+        }
+    }
+
+    #[test]
+    fn unsynced_writes_are_lost_to_a_crash_without_the_barrier() {
+        // The first write teaches the schema `n`, and a batch that evolves the schema commits
+        // durably whatever `wal_sync` says; the nineteen after it are the unsynced ones.
+        assert_eq!(
+            rows_a_crash_keeps(20, |_| {}),
+            1,
+            "the copy must reproduce a crash, or the tests below prove nothing"
+        );
+    }
+
+    #[test]
+    fn the_barrier_makes_every_unsynced_write_durable() {
+        assert_eq!(
+            rows_a_crash_keeps(20, |store| store.durability_barrier().expect("barrier")),
+            20
+        );
+    }
+
+    /// The Tantivy commit runs the barrier first, so a committed segment never cites a row a
+    /// crash could take back. Copied right after the Tantivy commit and before the checkpoint
+    /// transaction that follows it in `commit_index`, which is durable itself and would make
+    /// the rows durable with or without the barrier — the window O1 is about.
+    #[test]
+    fn a_tantivy_commit_leaves_no_indexed_document_without_its_row() {
+        assert_eq!(
+            rows_a_crash_keeps(20, |store| {
+                let writer = store
+                    .writers
+                    .get(INDEX)
+                    .map(|entry| Arc::clone(entry.value()))
+                    .expect("the writes opened a writer");
+                let mut writer = writer.lock().expect("writer lock");
+                store
+                    .commit_locked_writer(INDEX, &mut writer)
+                    .expect("tantivy commit");
+            }),
+            20
+        );
+    }
+}

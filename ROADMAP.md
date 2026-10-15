@@ -6299,7 +6299,17 @@ O6 last, reconciling the architecture document after the code it describes has m
 
 ### O1 — A durability barrier makes `wal_sync = false` safe
 
-**Planned.**
+✅ **Done 2026-10-15.** `HybridStore::durability_barrier` commits an empty `Immediate` transaction
+when `wal_sync` is off, and does nothing when it is on. `commit_locked_writer` runs it under the
+writer lock before the Tantivy commit — every write in the writer committed its redb rows before
+its document was added, so the barrier covers all the commit publishes — and so does the
+threshold commit inside WAL replay, which on an index reopened in a running process can read
+non-durable rows. The tests in `storage/src/tests.rs` (`durability_barrier`) copy the store's
+file while it is open, the state a kill leaves: 1 of 20 unsynced rows survives without the
+barrier (the one write that evolved the schema, which is always durable), 20 with it, and 20
+copied between the Tantivy commit and the checkpoint transaction — the window this item names,
+and the case that fails with the barrier removed from `commit_locked_writer`. The configuration
+reference now says what `wal_sync = false` loses rather than that it can split the engines.
 
 `apply_batch` commits the write transaction at `Durability::None` when `wal_sync` is off, and
 Tantivy commits its segment on its own schedule; a kill between them leaves documents indexed

@@ -228,8 +228,8 @@ ping_timeout_secs = 10
 [storage]
 data_paths = ["./data/cameodb"]
 disk_usage_threshold_percent = 90
-# fsync every redb commit. Leave this on: with it off, a crash can leave the search index
-# holding documents the document store lost, which recovery cannot repair.
+# fsync every redb commit. Leave this on: with it off, a crash loses the acknowledged writes
+# since the last index commit (up to commit_interval_ms of them).
 wal_sync = true
 # Record redb's allocator state on every commit, so a restart after a crash or an OOM kill
 # opens each shard in milliseconds instead of repairing its whole file. Costs a second flush

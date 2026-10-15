@@ -626,6 +626,25 @@ impl HybridStore {
         Ok(txn)
     }
 
+    /// Make every redb commit so far durable, ahead of a Tantivy commit that may cite it.
+    ///
+    /// With `wal_sync` off, writes commit at `Durability::None`: visible, not yet on disk. A
+    /// Tantivy commit is durable when it returns, so without this a crash after one could keep
+    /// documents in the search index whose rows redb never wrote — the derived index ahead of
+    /// its source, which replay cannot repair because it only ever replays forward (ROADMAP
+    /// O1). redb makes every non-durable commit durable with the next durable one, so an empty
+    /// `Immediate` transaction is the whole barrier: one flush per Tantivy commit, not one per
+    /// write. With `wal_sync` on every write is durable already, and this does nothing.
+    pub(crate) fn durability_barrier(&self) -> Result<(), StoreError> {
+        if self.config.wal_sync {
+            return Ok(());
+        }
+        let mut txn = self.begin_write()?;
+        txn.set_durability(Durability::Immediate)?;
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Gracefully shutdown the HybridStore, releasing all locks and resources
     pub fn shutdown(&self) -> Result<(), StoreError> {
         tracing::info!("HybridStore: Starting graceful shutdown");
@@ -1323,6 +1342,9 @@ impl HybridStore {
                     checkpoint_seq = seq_id,
                     "Recovery: threshold commit during WAL replay"
                 );
+                // Replay reads committed rows, which on an index reopened in a running process
+                // can still be non-durable ones.
+                self.durability_barrier()?;
                 commit_writer_at(writer, seq_id)?;
                 replayed_since_commit = 0;
             }
@@ -2210,7 +2232,7 @@ impl HybridStore {
     /// and nothing is half-applied. Read before the lock, as it used to be, it could include a
     /// write another thread had reserved and not yet added — stamping as durable a document
     /// this commit did not contain, and letting the checkpoint truncate its WAL entry.
-    fn commit_locked_writer(
+    pub(crate) fn commit_locked_writer(
         &self,
         index: &str,
         writer: &mut IndexWriter,
@@ -2219,6 +2241,9 @@ impl HybridStore {
             .current_seq
             .get(index)
             .map(|counter| counter.load(Ordering::SeqCst));
+        // Every write in this writer committed its rows to redb before its document was added,
+        // so with the lock held, making redb durable now covers everything this commit publishes.
+        self.durability_barrier()?;
         // Stamp the sequence into the commit itself, so the checkpoint lands atomically with
         // the segments rather than in a second write that a crash can separate them from.
         match committed_seq {

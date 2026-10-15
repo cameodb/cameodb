@@ -375,8 +375,8 @@ data_paths = ["./data/cameodb"]
 disk_usage_threshold_percent = 90
 
 # Enable fsync after WAL batches for durability (default: true).
-# Turning this off can leave the search index ahead of the document store after a crash —
-# see "What `wal_sync = false` actually costs" below.
+# Turning this off lets a crash lose the writes since the last index commit — see "What
+# `wal_sync = false` actually costs" below.
 wal_sync = true
 
 # Record redb's allocator state on every commit (default: true), so a restart after a crash
@@ -1348,7 +1348,7 @@ default_batch_size = 2000
 ```toml
 [storage]
 # Disable fsync for maximum write speed. Only for data you can reload from elsewhere:
-# a crash can leave the search index ahead of the document store.
+# a crash loses the writes since the last index commit.
 #
 # Measure before accepting this trade. On write-only bulk ingest it made no measurable
 # difference at saturation (370,932 docs/s with fsync on against 365,382 with it off), so
@@ -1494,25 +1494,29 @@ is the bottleneck, `jobs_completed` over the run is this node's real service rat
 
 | Setting | Performance | Durability | Note |
 |---------|-------------|------------|------|
-| `wal_sync = false` | ⬆️ High | ⬇️ Low | Recent writes can be lost **and** the search index can end up ahead of the document store — see below |
+| `wal_sync = false` | ⬆️ High | ⬇️ Low | A crash loses the writes since the last index commit — at most `commit_interval_ms` of them — see below |
 | `quick_repair = false` | ⬆️ Single writes on a flush-bound disk | ➡️ Same | A restart after a crash repairs each shard's whole redb file before it opens — see below |
 | `indexer_memory_max_mb = 1024` | ⬆️ High | ➡️ Same | Uses more RAM |
 | `memory_pressure_threshold_percent = 90` | ⬆️ High | ➡️ Same | Higher memory usage |
 
 #### What `wal_sync = false` actually costs
 
-More than the row above can say in a cell, because it does not just lose data — it can make the
-two engines disagree.
-
 Crash recovery rests on redb being the authority: the Tantivy index is derived from it, so
 startup replays whatever redb has that Tantivy does not. `wal_sync = false` sets redb's
-durability to `None`, which means a committed transaction may never reach disk at all. A
-process kill can therefore lose WAL and document rows that Tantivy had *already committed to
-its own segments* — leaving the derived index ahead of the source of truth.
+durability to `None` for document writes: a write is acknowledged once it is committed in
+memory, and reaches disk with the next durable commit. A process kill loses every write since
+that commit — acknowledged writes, gone from the document store and the search index alike.
 
-Recovery cannot repair that. It only ever replays forward, so a search will return hits whose
-documents `GET /api/{index}/{id}` reports as missing, and it will keep doing so until those
-documents are rewritten or the index is rebuilt.
+How many: every index commit — every `commit_interval_ms` (2 s by default) under load, and the
+idle commit after a burst — is preceded by a durable redb commit, so the loss is bounded by
+the commit interval. A write that teaches the schema a new field commits durably whatever this
+says.
+
+That barrier is also what keeps the two engines agreeing. Before 0.3.7 the index commit had no
+durable redb commit ahead of it, so a kill could keep documents in the search index whose rows
+the store had lost — hits that `GET /api/{index}/{id}` reported as missing, which replay, only
+ever going forward, could not repair. It costs one flush per index commit instead of one per
+write, which is the whole of what `wal_sync = false` buys.
 
 Use it for bulk-loading data you can replay from an external source, and turn it back on before
 the node holds anything you cannot regenerate.

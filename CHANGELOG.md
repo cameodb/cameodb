@@ -58,6 +58,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **With `wal_sync = false`, a crash could leave the search index ahead of the document
+  store.** The index committed without a durable store commit ahead of it, so a kill could keep
+  documents searchable whose rows the store had lost — hits `GET` reported as missing, which
+  recovery could not repair. Every index commit is now preceded by a durable store commit,
+  which costs one flush per index commit, not one per write; a crash still loses the writes
+  since the last index commit, from both alike.
 - **MCP `search_index` errors for a missing field now suggest the fields meant.** They were
   meant to list the index's fields and never did — the code read the schema's field list as an
   object, and it arrives as an array. They now carry the same suggestions as `validate_query`.

@@ -192,8 +192,8 @@ cors_allowed_origins = []    # Disable CORS for performance
 [storage]
 data_paths = ["./data/cameodb"]
 disk_usage_threshold_percent = 95  # Use more disk space
-wal_sync = false             # No fsync. Reloadable data only: a crash can leave the
-                             # search index ahead of the document store.
+wal_sync = false             # No fsync. Reloadable data only: a crash loses the writes
+                             # since the last index commit.
 wal_segment_size_mb = 256    # Large WAL segments
 max_shards_per_node = 100    # Many shards for parallelism
 
