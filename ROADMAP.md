@@ -230,7 +230,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [OB22](#ob22--an-orchestrator-waited-on-peers-while-holding-its-mailbox) | **An orchestrator waited on peers while holding its mailbox** — schema canvasses and forwards ran inside it, so two nodes doing either at once waited on each other until a 5 s or 60 s timeout: bulk writes through every node all timed out, and new indexes created through every node ran at 0.1/s, most refused. Fixed; now 510 batches/s and 134 new indexes/s, none failed; several nodes minting one index at once settle it by node id, where 88 of 120 such writes were refused. Found by the cluster suite's new cross-node phase | — | 2026-09-26 | ✅ |
 | [OB23](#ob23--recreating-an-index-after-dropping-its-schema-lost-most-of-what-was-written) | **Recreating an index after dropping its schema lost most of what was written** — the drop's record read as a schema, the node re-minted the index from every batch, and a retyped column killed the Tantivy writer, which stayed dead until restart. 1,030 of 16,559 documents landed; now all do, a dying writer is retired and replayed, and the loader counts every failure by its file line | — | 2026-09-27 | ✅ |
 | [OB24](#ob24--a-and-not-b-and-a-or-not-b-parsed-cleanly-and-answered-wrongly) | **`a AND NOT b` and `a OR NOT b` parsed cleanly and answered wrongly** — a `NOT` arm under `Must`/`Should` matched nothing and nothing reported it; rewritten to `a AND -b` / `a OR (* -b)` before the parser runs | — | 2026-10-05 | ✅ |
-| [OB25](#ob25--a-search-during-a-restart-answered-short-without-saying-so) | **A search during a restart answered short without saying so** — a rejoining node searched 5 of 9 shards and reported `failed: 0`; on one node, HTTP serves before the replayed tail is committed | — | 2026-10-15 | 📋 |
+| [OB25](#ob25--a-search-during-a-restart-answered-short-without-saying-so) | **A search during a restart answered short without saying so** — a rejoining node searched 5 of 9 shards and reported `failed: 0`; on one node, HTTP serves before the replayed tail is committed. Both fixed the same day | — | 2026-10-15 | ✅ |
 | [OB26](#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap) | **A restarted node waits on every expected peer before it leaves bootstrap** — with one peer down it never does, and its shard maps converge on the 10 s pull | — | 2026-10-15 | 📋 |
 | [F9](#f9--commit-on-a-clock-not-a-count) | **Commit on a clock, not a count** — bulk ingest 1.8–6.6×, a trickle searchable within 2 s, single writes unchanged | — | 2026-09-26 | ✅ |
 | [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
@@ -3395,7 +3395,18 @@ to report rather than rewritten into a form that means something else.
 
 ### OB25 — A search during a restart answered short without saying so
 
-📋 **Planned.** Observed 2026-10-15 in the crash measurements of the
+✅ **Done 2026-10-15**, both arms, the day it was filed. **Single node:** `MicroshardActor::start`
+now returns once phase 1 has committed — it awaits a signal the recovery task sends after its
+commits, after spawning the writer thread those commits run on; phase 2 still never blocks it.
+`a_started_shard_searches_its_replayed_tail` finds 0 of 50 replayed documents without the wait
+and 50 with it. **Clustered:** the broadcast fan-out asks the coordinator for
+`GetBroadcastPeers` — the discovered peers, then every expected node not discovered yet, as not
+connected — so the merge counts such a node as one that did not answer, the path a lost peer
+already took. `GetKnownPeers` is unchanged: the bulk paths read addresses from it, and an
+undiscovered node has none worth dialling. `a_broadcast_counts_expected_peers_not_yet_discovered`
+pins both lists.
+
+Observed 2026-10-15 in the crash measurements of the
 [reconciliation](#reconciliation-2026-10-15), on both topologies. Both windows are brief; what makes
 them defects is that the answer claims to be whole.
 

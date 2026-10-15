@@ -2589,6 +2589,46 @@ impl Message<GetKnownPeers> for ClusterCoordinator {
     }
 }
 
+impl Message<GetBroadcastPeers> for ClusterCoordinator {
+    type Reply = Vec<KnownPeer>;
+
+    /// The discovered peers, then every expected node not discovered yet, as not connected.
+    ///
+    /// A node restarting knows the cluster from its snapshot before it has rediscovered it.
+    /// Fanning out to the discovered peers alone, a search on it skipped a peer it had not met
+    /// again and answered 5 of 9 shards as `failed: 0` — a partial answer claiming to be whole
+    /// (ROADMAP OB25). Listed here, that peer is counted as a node that did not answer, the way
+    /// a lost one already is.
+    async fn handle(
+        &mut self,
+        _msg: GetBroadcastPeers,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let local = self.cluster.local_node_id;
+        let peer_nodes = &self.cluster.peer_nodes;
+        let undiscovered = self
+            .expected_nodes
+            .values()
+            .filter(|node| node.node_id != local && !peer_nodes.contains_key(&node.node_id))
+            .map(|node| KnownPeer {
+                node_id: node.node_id,
+                node_name: node.node_name.clone(),
+                address: node.address.clone(),
+                connected: false,
+            });
+        peer_nodes
+            .values()
+            .map(|info| KnownPeer {
+                node_id: info.node_id,
+                node_name: info.node_name.clone(),
+                address: info.address.clone(),
+                connected: info.status == NodeStatus::Connected,
+            })
+            .chain(undiscovered)
+            .collect()
+    }
+}
+
 // ============================================================================
 // Cleanup on Drop
 // ============================================================================

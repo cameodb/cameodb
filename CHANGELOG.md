@@ -58,6 +58,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A search right after a restart answered without the writes replayed from the WAL.** A shard
+  was opened for searches when its store opened, and the commit that makes a replayed tail
+  searchable landed a moment later — so a search in between answered without writes that were
+  acknowledged before the crash, with nothing in the answer to say so. A shard is now served
+  once that commit has landed; the tail is one commit interval of writes, so the wait is
+  milliseconds.
+- **A search on a node rejoining a cluster answered from part of the cluster as if it were
+  all.** A restarted node knows its peers from its saved cluster state before it has met them
+  again, and a search in that moment skipped the ones it had not met: measured, 5 of 9 shards
+  answered as `failed: 0`. A peer the node expects and has not reached is now counted as a node
+  that did not answer — in `stats.shards.failed`, with an error naming it — as a lost peer
+  already was.
 - **With `wal_sync = false`, a crash could leave the search index ahead of the document
   store.** The index committed without a durable store commit ahead of it, so a kill could keep
   documents searchable whose rows the store had lost — hits `GET` reported as missing, which

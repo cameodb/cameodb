@@ -1339,8 +1339,11 @@ impl MicroshardActor {
         // client does not pay for opening the index. It runs on its own thread and never
         // gates serving — a request arriving first just warms that index on demand.
         //
-        // Neither phase blocks `start()`. Requests are served throughout via lazy
-        // initialization; the phases only determine whether that work has already been done.
+        // `start()` returns once phase 1 has committed, not before: the orchestrator registers
+        // the shard for routing when it returns, and a search before the recovery commit would
+        // answer without the replayed tail — writes acknowledged before the crash, reported as
+        // absent, with nothing in the answer to say so (ROADMAP OB25). The tail is one commit
+        // interval of writes, so the wait is milliseconds; phase 2 never blocks it.
         //
         // The writer channel is created here rather than beside the writer thread below,
         // because phase 1 needs a sender: the commit that finishes a replay belongs on the
@@ -1373,6 +1376,9 @@ impl MicroshardActor {
         let warmup_store = Arc::clone(&store_arc);
         let shard_id = self.shard_id;
         let rt_recovery = rt.clone();
+        // Sent once phase 1 has committed; dropped unsent on any early return, which ends the
+        // wait just the same.
+        let (recovered_tx, recovered_rx) = tokio::sync::oneshot::channel::<()>();
         tokio::task::spawn_blocking(move || {
             let plan = match warmup_store.recover_indices() {
                 Ok(plan) => plan,
@@ -1443,6 +1449,7 @@ impl MicroshardActor {
                 pending_warmup = plan.pending_warmup.len(),
                 "Phase 1 complete - shard is queryable"
             );
+            let _ = recovered_tx.send(());
 
             // One warmup thread per shard: startup warmup for the tail recovery just replayed,
             // then post-commit re-warms. Spawned through the shared helper so a respawn gets the
@@ -1467,7 +1474,15 @@ impl MicroshardActor {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(monitor);
 
-        info!(shard_id = %self.shard_id, "MicroshardActor initialized with dedicated writer thread");
+        // Phase 1's commits run on the writer thread spawned just above, so this wait comes
+        // after it, never before.
+        let recovery_start = Instant::now();
+        let _ = recovered_rx.await;
+        info!(
+            shard_id = %self.shard_id,
+            recovery_wait_ms = recovery_start.elapsed().as_millis(),
+            "MicroshardActor initialized with dedicated writer thread"
+        );
         Ok(())
     }
 

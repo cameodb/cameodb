@@ -817,7 +817,7 @@ impl RouterActor {
 
     /// The fan-out both broadcast paths share.
     ///
-    /// The broadcasts counter, the `GetKnownPeers` ask, the per-peer timeout, the
+    /// The broadcasts counter, the `GetBroadcastPeers` ask, the per-peer timeout, the
     /// remote-concurrency cap, the dispatch-ordinal tagging and the join with the local
     /// future were all written twice — once here and once in `handle_broadcast_streaming` —
     /// and had already drifted: the streaming half answered a paged search with page 1
@@ -837,14 +837,14 @@ impl RouterActor {
         F: FnOnce(ClientOp) -> Fut + Send,
         Fut: Future<Output = Result<JsonValue, OrchestratorError>> + Send,
     {
-        use crate::cluster_coordinator::{GetKnownPeers, KnownPeer};
+        use crate::cluster_coordinator::{GetBroadcastPeers, KnownPeer};
 
         self.broadcasts_total.fetch_add(1, AtomicOrdering::Relaxed);
 
         // Get known peers for remote fan-out
         let peers: Vec<KnownPeer> = self
             .coordinator
-            .ask(GetKnownPeers)
+            .ask(GetBroadcastPeers)
             .await
             .unwrap_or_default();
 

@@ -12,6 +12,7 @@ mod tests {
     use super::*;
     use crate::config::ClusterConfig;
     use crate::distributed::NodeStatus;
+    use std::collections::{HashMap, HashSet};
 
     fn make_cluster() -> DistributedCluster {
         let cfg = ClusterConfig::default();
@@ -334,5 +335,62 @@ mod tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    fn node(node_id: Uuid, status: NodeStatus) -> NodeInfo {
+        NodeInfo {
+            node_id,
+            node_name: None,
+            address: format!("/ip4/127.0.0.1/tcp/{}", 9000 + node_id.as_bytes()[0] as u16),
+            status,
+            shard_count: 0,
+        }
+    }
+
+    /// A restarting node expects peers from its snapshot before it has rediscovered them. A
+    /// broadcast lists those too, as not connected, so a search counts them as nodes that did
+    /// not answer instead of leaving them out and calling a partial answer whole (ROADMAP
+    /// OB25). A forward, which needs a discovered address, still sees only the discovered.
+    #[tokio::test]
+    async fn a_broadcast_counts_expected_peers_not_yet_discovered() {
+        let mut cluster = make_cluster();
+        let local = cluster.local_node_id;
+        let (connected, lost, undiscovered) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        cluster
+            .peer_nodes
+            .insert(connected, node(connected, NodeStatus::Connected));
+        cluster
+            .peer_nodes
+            .insert(lost, node(lost, NodeStatus::Disconnected));
+        let mut cc = ClusterCoordinator::new(cluster);
+        for id in [connected, lost, undiscovered] {
+            cc.expected_nodes
+                .insert(id, node(id, NodeStatus::Disconnected));
+        }
+        cc.expected_nodes
+            .insert(local, node(local, NodeStatus::Connected));
+
+        let actor = <ClusterCoordinator as kameo::actor::Spawn>::spawn(cc);
+        let broadcast: HashMap<Uuid, bool> = actor
+            .ask(GetBroadcastPeers)
+            .await
+            .expect("broadcast peers")
+            .into_iter()
+            .map(|peer| (peer.node_id, peer.connected))
+            .collect();
+        let known: HashSet<Uuid> = actor
+            .ask(GetKnownPeers)
+            .await
+            .expect("known peers")
+            .into_iter()
+            .map(|peer| peer.node_id)
+            .collect();
+
+        assert_eq!(
+            broadcast,
+            HashMap::from([(connected, true), (lost, false), (undiscovered, false)]),
+            "every expected peer once, the local node never, only the connected one as connected"
+        );
+        assert_eq!(known, HashSet::from([connected, lost]));
     }
 }

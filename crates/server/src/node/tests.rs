@@ -700,6 +700,65 @@ fn a_delete_routes_by_the_id_unless_the_index_routes_by_something_else() {
     );
 }
 
+/// A shard is registered for routing as soon as `start` returns, so by then a tail replayed from
+/// the WAL has to be searchable. It used to be committed after `start` had returned, and a
+/// search in between answered without writes acknowledged before the crash (ROADMAP OB25).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_started_shard_searches_its_replayed_tail() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let index = "replayed";
+    {
+        let store =
+            HybridStore::new(writer_test_config(dir.path().to_path_buf()), 1).expect("open store");
+        store
+            .store_schema_and_cache(index, &IndexSchema::default())
+            .expect("store schema");
+        for n in 0..50u32 {
+            store
+                .apply_write(
+                    index,
+                    storage::WalOp::Put {
+                        id: format!("doc-{n}"),
+                        json_blob: Some(json!({ "title": format!("document {n}") })),
+                    },
+                )
+                .expect("write");
+        }
+        // No commit: the WAL holds all fifty and Tantivy none — the state a crash leaves.
+    }
+
+    let mut shard = MicroshardActor::new(
+        Uuid::new_v4(),
+        writer_test_config(dir.path().to_path_buf()),
+        ShardRuntime {
+            default_search_limit: 10,
+            read_pool_handle: None,
+            read_pool_health: None,
+            read_budget: None,
+            total_shards: 1,
+            writer_shutdown_timeout_secs: 5,
+            supervisor_timeout_secs: 5,
+            writer_pin: WriterPin {
+                target: None,
+                outcome: Arc::new(AtomicI64::new(UNPINNED)),
+            },
+            writer_liveness: Arc::new(WriterLiveness::default()),
+        },
+    );
+    shard.start().await.expect("start");
+
+    let store = Arc::clone(shard.store.as_ref().expect("started shard has a store"));
+    let found = store
+        .search_documents(index, "*", 0, None)
+        .expect("search")
+        .total_hits;
+    shard.shutdown_writer().await;
+    assert_eq!(
+        found, 50,
+        "every replayed write must be searchable once start returns"
+    );
+}
+
 /// The engine cannot evolve a schema — it holds snapshots, not `&mut NodeOrchestrator`.
 /// What matters is that declining returns the *op*, not a sentinel error: the caller
 /// moved the op into the job and has nothing left to retry with otherwise. A write to an

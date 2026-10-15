@@ -131,9 +131,16 @@ pub struct RequestBootstrapRedial {
     pub reason: String,
 }
 
-/// Message to get known peers for broadcast scatter-gather.
+/// The peers this node has discovered, connected or lost — what a forward needs to find a
+/// peer's address by its id.
 #[derive(Debug, Clone)]
 pub struct GetKnownPeers;
+
+/// Every node a broadcast has to hear from before its answer is whole: the discovered peers,
+/// and the expected nodes — from the persisted snapshot or the shard map — not discovered yet,
+/// reported as not connected so the merge counts them as nodes that did not answer.
+#[derive(Debug, Clone)]
+pub struct GetBroadcastPeers;
 
 /// Response containing known peer information for broadcast.
 #[derive(Debug, Clone, Serialize, Deserialize)]
