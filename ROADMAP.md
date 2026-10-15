@@ -14,7 +14,11 @@ changesets is filed as its own activity group under
 release has settled. The 2026-10-07 whole-code review, taken at the 0.3.6 cut, is filed as
 [N. Pre-0.3.6 whole-code review](#n-pre-036-whole-code-review--planned). The 2026-10-08 review
 of the released 0.3.6, read as a database-systems pass, is filed as
-[O. Post-0.3.6 review](#o-post-036-review--the-base-for-the-next-iteration--planned).
+[O. Post-0.3.6 review](#o-post-036-review--the-base-for-the-next-iteration--planned). The
+2026-10-15 crash-recovery review, measured on a single node and a three-node cluster, is recorded
+under [Reconciliation, 2026-10-15](#reconciliation-2026-10-15): it corrected Phase 16's premise
+about redb, closed [E6](#e6--a-crash-restart-repaired-every-shards-redb-file), and filed OB25 and
+OB26.
 
 ## How to read this file
 
@@ -48,7 +52,7 @@ on one.
 | 13 — Thread-per-core & memory operations | ◐ Partial | Stage 2f.2 (CPU arenas) and 2f.3 (per-arena jemalloc stats) — both with the evidence against 2f.2 |
 | 14 — Security hardening | ◐ Partial | Stage C3 only (per-index role overrides); complexity caps deferred |
 | 15 — HA: reindex, replication, migration | 📋 Planned | All three stages |
-| 16 — Boot & OOM recovery at scale | ◐ Partial | Stage 4.2, Stage 3's deeper warming options, and the measurement on the reporting node; E5 (a cap on open indexes) done by M1 |
+| 16 — Boot & OOM recovery at scale | ◐ Partial | Stage 3's deeper warming options, and the measurement on the reporting node — now with `quick_repair` on and off; E5 (a cap on open indexes) done by M1, E6 (redb's crash repair) done 2026-10-15, E1 (Stage 4.2) overtaken by F9 |
 | 17 — Record deletion | ✅ Done | — |
 | 18 — Field types: Facet and JSON | ◐ Partial | J2 and J3 — a json field behaves exactly like a text one. J1 (facet writable) and OB1 (the `fast` three-state prerequisite) are done. No migration for what remains |
 | 19 — Field metrics: min and max | 📋 Planned | All of it — no aggregation of any kind exists today. Min and max on a fast numeric or date field, nothing else |
@@ -131,6 +135,43 @@ read, and this batch ignored it: everything done since 0.3.3 is an OB or CH item
 the table describes how the *remaining* work should be sequenced, not how work is sequenced when a
 review turns up something wrong.
 
+## Reconciliation, 2026-10-15
+
+Opened by a report from the field: a node restarted after an unclean exit is slow to start, and
+the suspicion was that recovery replays more of the WAL than it needs to. Measured rather than
+read, on a release build of `dc331cf`: one node with 4 shards and ~2.5 GB of redb, killed with
+`SIGKILL` mid-ingest; then three clustered nodes, one of them killed the same way.
+
+- **The WAL replay is exact, and was never the delay.** Replay starts one past the checkpoint
+  stamped into the Tantivy commit and stops at the WAL's last entry; every commit path stamps it,
+  and Tantivy's merges carry the payload forward. The tails measured 1,708–20,713 entries per
+  shard, replayed in 22–100 ms, and no acknowledged write was lost on either topology.
+- **The delay is redb's own repair, and Phase 16 said it did not exist.** Its analysis records
+  that redb's unclean restart "takes ~0 extra seconds"; that has been false since redb 2. Without
+  a recorded allocator state, `Database::open` on a file left open by a crash verifies and walks
+  the whole file — up to three passes — before the shard can open: 389–665 ms per 1 GB shard with
+  the file in the page cache, against 5–8 ms after a clean stop, and minutes per shard read from
+  disk at production sizes. Corrected in the archive, and fixed by
+  [E6](#e6--a-crash-restart-repaired-every-shards-redb-file).
+- **[E1](#e1--stage-42--a-max-wal-size-commit-trigger) was overtaken.** It was filed as the only
+  bound on worst-case replay; [F9](#f9--commit-on-a-clock-not-a-count)'s commit clock and its
+  backstop now bound the tail by time and by count, which is what the measurement above shows.
+- **A graceful stop is clean.** Every shard's file opened without repair after `SIGTERM`, so the
+  `Arc<HybridStore>` clones held by the writer, warmup and monitor threads do not outlive the
+  shutdown — checked because, had they, every restart would have paid for a repair.
+- **Two clustered findings, filed as observed:** a node rejoining answers a search from a partial
+  ring as if it were whole ([OB25](#ob25--a-search-during-a-restart-answered-short-without-saying-so)),
+  and a restarted node stays in bootstrap mode while any expected peer is down
+  ([OB26](#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap)).
+  Rejoin itself is fast: the killed node was serving 0.5 s after restart and its peers saw the
+  full cluster 0.56 s after it, because a killed process's sockets close at once and Identify
+  reintegrates it on the new connection.
+
+The post-0.3.6 commits — the search budget and stage timings (`a8c61f8`), the two-phase
+scatter-gather (`7c794eb`), the two MCP fixes and the retention-prune ops script — had reached
+[F10](#f10--fast-field-projection-the-pages-fields-answered-from-the-columns)'s background here but
+not `CHANGELOG.md`; they are recorded under `[Unreleased]`.
+
 ---
 
 # Part I — Active work
@@ -159,10 +200,11 @@ first written down here, so the chronology stays visible under the cost ordering
 | [D1](#d1--reindex) | Reindex | 15 | 2026-08-15 | 📋 |
 | [D2](#d2--replication) | Replication | 15 | 2026-08-15 | 📋 |
 | [D3](#d3--migration) | Migration | 15 | 2026-08-15 | 📋 |
-| [E1](#e1--stage-42--a-max-wal-size-commit-trigger) | Stage 4.2 — a max-WAL-size commit trigger | 16 | 2026-08-19 | 📋 |
+| [E1](#e1--stage-42--a-max-wal-size-commit-trigger) | Stage 4.2 — a max-WAL-size commit trigger — overtaken by F9's commit clock and backstop | 16 | 2026-08-19 | ⏭️ |
 | [E2](#e2--stage-3s-deeper-warming-options) | Stage 3's deeper warming options | 16 | 2026-08-19 | 📋 |
-| [E3](#e3--measure-recovery-on-the-reporting-node) | Measure recovery on the reporting node | 16 | 2026-08-19 | 📋 |
+| [E3](#e3--measure-recovery-on-the-reporting-node) | Measure recovery on the reporting node — with `quick_repair` on and off | 16 | 2026-08-19 | 📋 |
 | [E4](#e4--two-compatibility-paths-with-no-end-to-end-test) | Two compatibility paths with no end-to-end test | 16 | 2026-08-19 | 📋 |
+| [E6](#e6--a-crash-restart-repaired-every-shards-redb-file) | **A crash restart repaired every shard's redb file** — up to three passes over each file before the shard opened; `[storage] quick_repair`, on by default, records the allocator state per commit, and a repair is now logged. 1 GB shard: 2.1–2.5 s → 12–18 ms | 16 | 2026-10-15 | ✅ |
 | [F1](#f1--the-cost-of-a-durable-commit-under-read-load) | The cost of a durable commit under read load — deferred: redb has no middle durability level, and building one trades the guarantee this node keeps | — | 2026-08-10 | 💭 |
 | [F2](#f2--an-open-loop-load-generator) | An open-loop load generator | — | 2026-09-15 | ✅ |
 | [F3](#f3--take-unkeyed-searches-off-the-coordinator) | Take unkeyed searches off the coordinator — standalone half done, clustered half turned down: the published ring lags the coordinator | — | 2026-08-10 | ◐ |
@@ -188,6 +230,8 @@ first written down here, so the chronology stays visible under the cost ordering
 | [OB22](#ob22--an-orchestrator-waited-on-peers-while-holding-its-mailbox) | **An orchestrator waited on peers while holding its mailbox** — schema canvasses and forwards ran inside it, so two nodes doing either at once waited on each other until a 5 s or 60 s timeout: bulk writes through every node all timed out, and new indexes created through every node ran at 0.1/s, most refused. Fixed; now 510 batches/s and 134 new indexes/s, none failed; several nodes minting one index at once settle it by node id, where 88 of 120 such writes were refused. Found by the cluster suite's new cross-node phase | — | 2026-09-26 | ✅ |
 | [OB23](#ob23--recreating-an-index-after-dropping-its-schema-lost-most-of-what-was-written) | **Recreating an index after dropping its schema lost most of what was written** — the drop's record read as a schema, the node re-minted the index from every batch, and a retyped column killed the Tantivy writer, which stayed dead until restart. 1,030 of 16,559 documents landed; now all do, a dying writer is retired and replayed, and the loader counts every failure by its file line | — | 2026-09-27 | ✅ |
 | [OB24](#ob24--a-and-not-b-and-a-or-not-b-parsed-cleanly-and-answered-wrongly) | **`a AND NOT b` and `a OR NOT b` parsed cleanly and answered wrongly** — a `NOT` arm under `Must`/`Should` matched nothing and nothing reported it; rewritten to `a AND -b` / `a OR (* -b)` before the parser runs | — | 2026-10-05 | ✅ |
+| [OB25](#ob25--a-search-during-a-restart-answered-short-without-saying-so) | **A search during a restart answered short without saying so** — a rejoining node searched 5 of 9 shards and reported `failed: 0`; on one node, HTTP serves before the replayed tail is committed | — | 2026-10-15 | 📋 |
+| [OB26](#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap) | **A restarted node waits on every expected peer before it leaves bootstrap** — with one peer down it never does, and its shard maps converge on the 10 s pull | — | 2026-10-15 | 📋 |
 | [F9](#f9--commit-on-a-clock-not-a-count) | **Commit on a clock, not a count** — bulk ingest 1.8–6.6×, a trickle searchable within 2 s, single writes unchanged | — | 2026-09-26 | ✅ |
 | [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
@@ -760,13 +804,17 @@ the outcome table and Stage 7's write-path work. What remains:
 
 ### E1 — Stage 4.2 — a max-WAL-size commit trigger
 
-📋 **Planned.** So a bursty writer cannot accumulate a large tail before the operation-count
-threshold fires. **This is now the only thing that bounds worst-case replay length**, which is
-what makes it the first of these four.
+⏭️ **Skipped 2026-10-15 — overtaken by [F9](#f9--commit-on-a-clock-not-a-count).** Filed so a
+bursty writer could not accumulate a large tail before the operation-count threshold fired, when
+that threshold was the only bound on replay. F9 added the wall-clock term this entry found
+missing: an index commits once its oldest uncommitted write has waited `commit_interval_ms`
+(2 s), with 20× the count as a backstop, so the tail is bounded by time and by count. Measured
+2026-10-15 after a `SIGKILL` mid-ingest: 1,708–20,713 entries per shard, replayed in 22–100 ms. A
+byte-size term would bound the tail for very large documents only, and nothing has asked for it.
 
-Verified 2026-08-26: `should_commit_writer` in `crates/storage/src/lib.rs` still decides purely
-on `operations_since_commit` against a memory-budget-scaled threshold. There is no byte-size
-term and no wall-clock term.
+The original finding, 2026-08-26: `should_commit_writer` decided purely on
+`operations_since_commit` against a memory-budget-scaled threshold, with no byte-size term and no
+wall-clock term.
 
 ### E2 — Stage 3's deeper warming options
 
@@ -778,6 +826,14 @@ blunt at 30 TB. The budget shipped; these are the options it defers, not a repla
 📋 **Planned.** The change is verified by the storage suite and by construction; the
 30 TB / 16-shard figures in the archived success metrics are still the target, not a result.
 Nothing else in this phase should be called finished before this runs.
+
+**Measured on the development machine, 2026-10-15** (M5 Pro, 4 shards, ~1 GB of redb each, file in
+the page cache, `SIGKILL` mid-ingest): the WAL replay is 22–100 ms per shard; redb's repair of the
+file was 389–665 ms per shard, and 2.1–2.5 s once the files had grown, against 12–18 ms with
+`quick_repair` — see [E6](#e6--a-crash-restart-repaired-every-shards-redb-file). Run on the
+reporting node, the measurement needs both arms: a crash restart with `quick_repair = true` and
+with `false`, read from disk rather than the page cache, and the single-write and bulk throughput
+each setting gives — the second flush per commit is the cost that decides the default there.
 
 ### E4 — Two compatibility paths with no end-to-end test
 
@@ -804,6 +860,42 @@ indexes implicitly, that count is caller-controlled, so a tenant-per-index or da
 pattern reaches an uncomfortable footprint quickly. Bound the set: an LRU or total-budget cap that
 commits and drops the coldest writer when a new one would exceed it — the same drop-and-rebuild an
 eviction already does.
+
+### E6 — A crash restart repaired every shard's redb file
+
+✅ **Done 2026-10-15.** Found by measuring the field report that opened the
+[2026-10-15 reconciliation](#reconciliation-2026-10-15). redb marks its file while it is open and
+clears the mark on a clean close; found still marked, it loads the allocator state the last
+commit recorded, or — when that commit recorded none — repairs the file: verifies the primary
+root's checksums, then walks every reachable page to rebuild the allocator, up to three passes in
+all. No commit here recorded one, so every shard of a node killed rather than stopped was repaired
+inside `HybridStore::new`, before the shard could open and before HTTP bound, at most
+`max(2, cores / 4)` shards at a time. The cost grew with the data the shard held — the opposite of
+what Phase 16 was built to guarantee — and nothing logged it.
+
+**What landed.** `[storage] quick_repair`, default `true` (`--storage-quick-repair`,
+`CAMEODB_STORAGE_QUICK_REPAIR`). Every write transaction in the store is begun through
+`HybridStore::begin_write`, which sets redb's quick-repair, so each commit is two-phase and records
+the allocator state; one commit begun elsewhere would leave the next crash paying for a full
+repair, which is why there is one entry point. `HybridStore::new` registers a repair callback that
+logs the repair as it starts, its progress, and its duration. `crash_repair_test.rs` copies a
+store's file while the store holds it open — the state a killed process leaves — and asserts the
+reopen repairs nothing with the setting and repairs without it, the second case proving the copy
+reproduces a crash. redb 4.4.0 was taken in the same change.
+
+**Measured**, release build, 4 shards of ~1 GB, `SIGKILL` mid-ingest, files in the page cache:
+
+| | each shard opens in | all shards hydrated |
+|---|---|---|
+| `quick_repair = true` | 12–18 ms | 26 ms |
+| `quick_repair = false` | 2.1–2.5 s | 4.4 s |
+| clean stop, either setting | 5–8 ms | 13 ms |
+
+**The cost.** A second flush per durable commit. On redb alone, on this machine, single-record
+durable commits fell from ~250/s to ~140/s — `F_FULLFSYNC` makes each flush expensive — and
+bulk-sized commits by about 5%. Concurrent single writes share commits, so the node's ceiling falls
+by less; the number that decides whether the default stays `true` is [E3](#e3--measure-recovery-on-the-reporting-node)'s,
+on the reporting node's hardware.
 
 ---
 
@@ -3300,6 +3392,46 @@ which is the property [A6](#a6--the-syntax-reference-has-drifted-from-the-engine
 would take the field's scope and `field:*` is refused, so `title:(NOT a)` is left for the parser
 to report rather than rewritten into a form that means something else.
 `not_query_forms_test.rs` pins the hits, the rewrites and the non-operators.
+
+### OB25 — A search during a restart answered short without saying so
+
+📋 **Planned.** Observed 2026-10-15 in the crash measurements of the
+[reconciliation](#reconciliation-2026-10-15), on both topologies. Both windows are brief; what makes
+them defects is that the answer claims to be whole.
+
+- **Clustered.** Three nodes, 1.56 M documents, one node killed and restarted. 0.35 s after the
+  restart the rejoining node answered `total_hits` 992,448 with `stats.shards` `{total: 5,
+  responded: 5, failed: 0}` and `nodes.contacted: 2` — one peer's shards were not yet in its
+  ring, so they were neither searched nor counted as failed. 0.2 s later every node answered
+  9 of 9 shards and the full count. While the killed node was down, its peers did report it —
+  `failed: 1` and a `not reachable` error — so the gap is the rejoining node's view, not the
+  merge. Its persisted cluster snapshot already knows the shards to expect (12 shards on 3
+  nodes); a search should count an expected owner's shards that are not yet reachable as
+  failed, the way the merge already counts a known one that does not answer.
+- **Single node.** HTTP binds when shard hydration completes, and a shard's phase-1 recovery
+  commit runs after its hydration, on the writer thread — in one run 136 ms after the bind. A
+  search in that window does not see the replayed tail: documents acknowledged before the crash,
+  answered as absent, with nothing in the response to say recovery is still running. Either the
+  shard reports itself as recovering in `stats` until its recovery commit lands, or that commit
+  completes before the shard is registered for routing.
+
+### OB26 — A restarted node waits on every expected peer before it leaves bootstrap
+
+📋 **Planned.** Read from the code 2026-10-15, not yet reproduced. `bootstrap_complete` becomes
+true in `evaluate_and_transition_state` only when no expected node is inactive
+(`coordinator.rs:525–529`) — every node in the snapshot or the configuration, connected. Until then
+`PeerDiscovered` skips the actor push and pull of shard maps (`:1405`) and so does
+`RegisterLocalShards` (`:806`), leaving the node to the DHT records and the 10 s `SyncShardMaps`
+pull. A node restarted while any one peer is down therefore never leaves that mode, and every
+peer that does return is reintegrated on the 10–15 s tick rather than on its Identify event —
+the event-driven exchange [N15](#n15--per-index-state-and-node-state-each-with-one-owner) intends
+does not run at all. `MarkBootstrapComplete`, the override that would end the mode, is handled
+but nothing sends it (dead surface, for [N12](#n12--dead-surface-and-the-comments-that-no-longer-match)).
+
+The rule this should follow: bootstrap ends at the first peer connected, or on a deadline — a
+peer that is down is the steady state the cluster has to serve in, not a phase before it.
+Belongs with N15 and after [O3](#o3--shard-maps-merge-on-a-version-not-on-recency), whose epochs
+make the push safe to run against a partial view.
 
 ### F9 — Commit on a clock, not a count
 
@@ -7463,6 +7595,13 @@ The redb and Tantivy recovery models each describe a *single-engine* boot:
   seconds and scales with file-open latency, not transaction-log size. Verified in this
   codebase: `HybridStore::new` calls `builder.open(&kv_path)` and nothing more — there is no
   replay loop at the redb layer.
+
+  **Corrected 2026-10-15: this was wrong, and it was the larger cost.** There is no replay loop,
+  but since redb 2 an unclean open *repairs* the file unless the last commit recorded its
+  allocator state — verifying checksums and walking every reachable page, up to three passes —
+  so the restart scales with the data the shard holds after all. Nothing here recorded that
+  state until [E6](#e6--a-crash-restart-repaired-every-shards-redb-file); measured, a 1 GB
+  shard repaired in 0.4–2.5 s from the page cache, against 12–18 ms with `quick_repair`.
 - **Tantivy** keeps immutable segments on disk and memory-maps them, so boot has no warm-up
   phase that parses data back into a managed heap. Uncommitted indexing queue work is lost on
   OOM, safely reverting to the last `.commit()`. Verified: `open_tantivy_index` is

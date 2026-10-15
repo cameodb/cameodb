@@ -19,12 +19,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `quick_repair = false` (or `--storage-quick-repair=false`) restores the old trade.
 - **A redb repair is logged.** A shard whose file needs one says so as it starts, reports its
   progress, and logs how long it took, where before the shard was silently slow to open.
+- **A search says where its time went.** `stats.timings_ms` reports the stages — `parse`, `walk`
+  (the segment walk), `resolve`, `fetch`, `build` — each the slowest shard's, since shards run in
+  parallel, plus the node's own `merge`; `stats.fetched_docs` counts the documents the shards
+  read to build the page.
+- **`scripts/ops/retention-prune.sh`: delete what is older than a cutoff, in reviewed steps.**
+  CameoDB has no delete-by-query, so the script selects the ids of documents whose date field
+  is older than a cutoff (`--months N` or `--older-than DATE`) into a file, lets you review it,
+  and bulk-deletes it — a dry run unless `--execute`. `check` verifies the connection, key,
+  index, field and disk first; `fields` lists the date fields that can serve as the cutoff;
+  `count` shows how many documents match before and after. The selection walks the time range
+  in parallel windows under the 10,000-hit search cap and resumes where it stopped.
 
 ### Changed
 
 - **redb 4.3.0 → 4.4.0**, for its fix to page-cache memory growing without bound under write
   workloads, and to `Durability::None` commits lost on a clean close after a panic caught inside
   an earlier write transaction (`wal_sync = false` with a recovered writer panic).
+- **A search fetches only the page it returns.** Each shard used to read its own best `limit`
+  documents in full, and the gather discarded all but `limit` of them. Shards now answer with
+  keys first — score, id, sort key — the gather orders and windows them, and only the documents
+  that made the page are fetched, from the shards that hold them. On 4 shards at `limit` 10,000
+  the documents read fall from 40,000 to 10,000, and warm latency is 2.5–7× lower. A projection
+  (`fields`) is applied on the shard, so only the fields asked for — and those the merge needs
+  to order hits — travel back.
+- **A running search answers to the request's budget.** The request timeout used to refuse a
+  search only while it waited in the queue; once it held a read thread, it ran to the end
+  however long that took. The deadline is now checked inside the segment walk, and a search
+  that passes it is answered `408` — refused whole, since a page from a search that did not
+  finish is not an answer.
+- **MCP `validate_query` no longer echoes the index's schema.** On a wide index every call
+  returned every field with its query hint, plus the syntax reference — most of it what
+  `describe_index` already gives, and costly in an agent's context. It now returns hints only
+  for the fields the query names, the syntax reference only when called without arguments, and
+  a pointer to `describe_index` for an index named without a query. An unknown field is
+  answered with up to ten close matches, scored by word overlap and character similarity,
+  instead of every name containing a substring of it.
+
+### Fixed
+
+- **MCP `search_index` errors for a missing field now suggest the fields meant.** They were
+  meant to list the index's fields and never did — the code read the schema's field list as an
+  object, and it arrives as an array. They now carry the same suggestions as `validate_query`.
+- **MCP: the refusal for a dropped query clause points to `describe_index`,** the tool that
+  lists fields and their operators, rather than to `validate_query`, which no longer returns
+  them.
 
 ## [0.3.6] - 2026-10-07
 
