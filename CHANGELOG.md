@@ -61,6 +61,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that asked until shutdown. Each is now one conversation of at most 5 s, and a peer already
   known to be lost is not asked. Deleting an index across the cluster runs each peer's part under
   the remote timeout, and answers a lost peer at once instead of dialling it.
+- **Direct dependencies on their authors' current major versions:** `sha2` 0.11, `getrandom`
+  0.4 and `base64` 0.23 for API keys, `dirs` 7, `zip` 9 for `.zip` sources, and `serde-saphyr`
+  2 for YAML configuration. A key's hash is unchanged, so configured keys keep working. A `.zip`
+  source whose first file's name cannot be decoded is refused with an error naming the entry.
 
 ### Fixed
 

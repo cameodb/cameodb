@@ -1022,7 +1022,10 @@ pub(crate) fn zip_first_entry_bytes(data: &[u8]) -> Result<(Vec<u8>, Option<Stri
         if entry.is_dir() {
             continue;
         }
-        let entry_name = entry.name().to_string();
+        let entry_name = entry
+            .name()
+            .with_context(|| format!("ZIP entry {} has a name that cannot be decoded", i))?
+            .into_owned();
         let mut buf = Vec::new();
         entry
             .read_to_end(&mut buf)

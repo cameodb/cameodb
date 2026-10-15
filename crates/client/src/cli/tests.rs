@@ -1350,4 +1350,32 @@ mod header_hint_tests {
         assert_eq!(hint("n.unsigned"), Some(TantivyFieldType::U64));
         assert_eq!(hint("x.nonsense"), None);
     }
+
+    /// A `.zip` source is read from its first file. A directory entry ahead of it is skipped,
+    /// and the file's name comes back with its bytes, since the name is what picks the format.
+    #[test]
+    fn a_zip_source_reads_its_first_file_past_a_directory() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .add_directory("export/", SimpleFileOptions::default())
+            .expect("directory");
+        writer
+            .start_file("export/rows.csv", SimpleFileOptions::default())
+            .expect("file");
+        writer.write_all(b"id,n\n1,2\n").expect("write");
+        let archive = writer.finish().expect("finish").into_inner();
+
+        let (bytes, name) = super::super::ingest::zip_first_entry_bytes(&archive).expect("read");
+        assert_eq!(bytes, b"id,n\n1,2\n");
+        assert_eq!(name.as_deref(), Some("export/rows.csv"));
+
+        let empty = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()))
+            .finish()
+            .expect("finish")
+            .into_inner();
+        assert!(super::super::ingest::zip_first_entry_bytes(&empty).is_err());
+    }
 }

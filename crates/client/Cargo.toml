@@ -18,17 +18,17 @@ tokio.workspace = true
 uuid.workspace = true
 clap = { version = "4.6.0", features = ["derive", "env"] }
 rustyline = { workspace = true }
-dirs = "6.0.0"
+dirs = "7.0"
 csv = "1.4"
 storage = { path = "../storage", version = "0.3.6" }
 colored_json = "5.0.0"
 colored = "3.1.1"
 flate2 = "1.1.9"
-zip = "8.6"
+zip = "9.0"
 # Both already in the tree via the server's auth module and its transitive deps, so the
 # audit and licence surface is unchanged. sha2 computes the key_id the server logs; zeroize
 # scrubs a key from memory on drop.
-sha2 = "0.10"
+sha2 = "0.11"
 zeroize = "1.9"
 
 [dev-dependencies]
