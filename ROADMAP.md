@@ -14,7 +14,7 @@ changesets is filed as its own activity group under
 release has settled. The 2026-10-07 whole-code review, taken at the 0.3.6 cut, is filed as
 [N. Pre-0.3.6 whole-code review](#n-pre-036-whole-code-review--planned). The 2026-10-08 review
 of the released 0.3.6, read as a database-systems pass, is filed as
-[O. Post-0.3.6 review](#o-post-036-review--the-base-for-the-next-iteration--planned). The
+[O. Post-0.3.6 review](#o-post-036-review--the-base-for-the-next-iteration--partial). The
 2026-10-15 crash-recovery review, measured on a single node and a three-node cluster, is recorded
 under [Reconciliation, 2026-10-15](#reconciliation-2026-10-15): it corrected Phase 16's premise
 about redb, closed [E6](#e6--a-crash-restart-repaired-every-shards-redb-file), and filed OB25 and
@@ -61,7 +61,7 @@ on one.
 | L — Post-0.3.4 review: the refactor cycle | ✅ Done | All twenty closed — four defects, six security remainder items, three decompositions, six simplifications, and the retrospective (L20, run 2026-09-19) |
 | M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed; M1, M2, M3, M4, M5 and M7 done — the blocker is cleared, the surface is metered, and tenants are bounded and isolated per index. No feature build remains; M8 closed with the prefix floor and default-field cap, the clause cap deferred. M6 done: the open-loop arms show goodput degrading rather than collapsing on the bulk, single-write and read lanes, after fixing the two defects its arms found — [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) and [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput), and its confirmation run on 2026-09-27 found OB22 costs a single node nothing measurable. What is left is the release cut |
 | N — Pre-0.3.6 whole-code review | 📋 Planned | N1–N10 before the 0.3.6 cut: a `HEAD` authorization gap, batched writes that never learn a field, a peer's 400 answered as 503, node identity replaced silently, query rewrites by substring, three client errors, the first shard's memory budget, streaming broadcast, a storage shutdown race, flattened storage errors. N11–N17 after it: one way to reach a peer, dead surface, `run_change`, typed boundaries, single owners, the orchestrator split |
-| O — Post-0.3.6 review: the next-iteration base | 📋 Planned | O1–O4 code items — a `wal_sync=false` durability barrier, deadlines on every remote ask, shard-map merges on a per-owner epoch (the prerequisite N15 does not name), the request budget on the wire. O5 folds Rust-surface items into N16/N17; O6 reconciles the architecture doc |
+| O — Post-0.3.6 review: the next-iteration base | ◐ Partial | O1 (the `wal_sync=false` durability barrier) and O2 (deadlines on every remote ask) done 2026-10-15. Left: O3, shard-map merges on a per-owner epoch (the prerequisite N15 does not name), and O4, the request budget on the wire. O5 folds Rust-surface items into N16/N17; O6 reconciles the architecture doc |
 
 ## Reconciliation, 2026-08-26
 
@@ -6282,7 +6282,7 @@ last); `scripts/validate/all.sh` and the 38-check cluster suite green on the cut
 CHANGELOG entry for each that changes behaviour (N1, N2, N3, N4, N6, N7). N11–N17 are not 0.3.6
 work, and the release is not held for them.
 
-## O. Post-0.3.6 review — the base for the next iteration 📋 Planned
+## O. Post-0.3.6 review — the base for the next iteration ◐ Partial
 
 Reviewed 2026-10-08, at `73b8fd5` (the 0.3.6 tag), on the question *does the code hold the
 architecture's stated invariants, and where does it pay for what it does not hold*. Read as a
@@ -6341,7 +6341,18 @@ have lost.
 
 ### O2 — Every remote conversation runs under a deadline
 
-**Planned.**
+✅ **Done 2026-10-15.** Shard-map conversations with a peer's coordinator go through one function,
+`converse_with_coordinator`: the pool's lost-peer check, then lookup and ask under
+`SHARD_MAP_FETCH_TIMEOUT` (5 s) as a whole, the peer's cached ref dropped on a timeout, and a
+coordinator not registered yet answered as `Ok(None)` so the one caller that retries it still can.
+The exchange on `PeerDiscovered`, `exchange_shards_with_peer`, the stability push, the exchange's
+fallback push and the periodic pull all use it; it is the only direct coordinator lookup left.
+The 5× backoff in `PeerDiscovered` stays, each attempt now bounded, until N15 folds the handler
+into the one exchange. Found while sweeping every remote `ask`: the cluster-wide index delete
+asked each peer's orchestrator with no deadline and dialled lost peers; it now runs through
+`RemotePeerPool::converse`. Every remote ask in the server is now inside `converse`, this
+function, or an explicit timeout. `a_lost_peer_is_not_conversed_with` pins the short-circuit; a
+wedged peer needs a live swarm and is left to the cluster suite.
 
 `SyncShardMaps` bounds its peer asks (`SHARD_MAP_FETCH_TIMEOUT`, `coordinator.rs:2327`); the
 `PeerDiscovered` push/pull task (`:1468–1507`), `exchange_shards_with_peer` (`:378`) and the

@@ -393,4 +393,30 @@ mod tests {
         );
         assert_eq!(known, HashSet::from([connected, lost]));
     }
+
+    /// A shard-map conversation with a peer the pool knows is lost is answered at once, and
+    /// nothing is asked of it: dialling a frozen peer is exactly the wait O2 removes.
+    #[tokio::test]
+    async fn a_lost_peer_is_not_conversed_with() {
+        let pool = std::sync::Arc::new(crate::remote_peer_pool::RemotePeerPool::new());
+        let peer = Uuid::new_v4();
+        pool.set_lost_peers(HashSet::from([peer]));
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&asked);
+
+        let started = std::time::Instant::now();
+        let answer = super::super::coordinator::converse_with_coordinator(
+            Some(&pool),
+            peer,
+            |_remote| async move {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, String>(())
+            },
+        )
+        .await;
+
+        assert!(answer.is_err(), "a lost peer has no answer to give");
+        assert!(!asked.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
 }

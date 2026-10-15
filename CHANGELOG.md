@@ -55,6 +55,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a pointer to `describe_index` for an index named without a query. An unknown field is
   answered with up to ten close matches, scored by word overlap and character similarity,
   instead of every name containing a substring of it.
+- **Every conversation with a peer runs under a deadline.** The shard-map exchanges — when a
+  peer is discovered, when the cluster becomes stable, and the push that falls back from a failed
+  exchange — looked the peer up and asked it with no deadline, so a wedged peer held the task
+  that asked until shutdown. Each is now one conversation of at most 5 s, and a peer already
+  known to be lost is not asked. Deleting an index across the cluster runs each peer's part under
+  the remote timeout, and answers a lost peer at once instead of dialling it.
 
 ### Fixed
 

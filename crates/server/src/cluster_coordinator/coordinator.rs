@@ -351,62 +351,46 @@ impl ClusterCoordinator {
         local_generation: u64,
         local_checksum: u64,
         all_shards: HashMap<Uuid, ShardMetadata>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // First, query remote node's state — use pool if available, fallback to direct lookup
-        let remote_coord = if let Some(pool) = &local.pool {
-            pool.get_coordinator(peer_id)
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
-                .ok_or::<Box<dyn std::error::Error + Send + Sync>>(
-                    "Remote coordinator not found".into(),
-                )?
-        } else {
-            let remote_coord_name = format!("coordinator-{}", peer_id);
-            RemoteActorRef::<ClusterCoordinator>::lookup(remote_coord_name)
-                .await?
-                .ok_or::<Box<dyn std::error::Error + Send + Sync>>(
-                    "Remote coordinator not found".into(),
-                )?
-        };
-
+    ) -> Result<(), String> {
         let query_msg = QueryClusterState {
             node_id: local.node_id,
             generation: local_generation,
             shard_checksum: local_checksum,
         };
+        let push_msg = MergeRemoteShards {
+            node_id: local.node_id,
+            node_name: local.node_name.clone(),
+            shards: all_shards,
+            generation: local_generation,
+            shard_checksum: local_checksum,
+        };
 
-        let response = remote_coord.ask(&query_msg).await?;
+        let exchanged = converse_with_coordinator(local.pool.as_ref(), peer_id, |remote| async move {
+            let response = remote.ask(&query_msg).await.map_err(|e| e.to_string())?;
+            // Only push if remote node needs our data
+            if response.needs_full_sync {
+                debug!(
+                    remote_peer = %peer_id,
+                    remote_generation = response.generation,
+                    remote_checksum = response.shard_checksum,
+                    "Remote node needs shard update, pushing full state"
+                );
+                let shard_count = push_msg.shards.len();
+                remote.tell(&push_msg).send().map_err(|e| e.to_string())?;
+                info!(remote_peer = %peer_id, shard_count = shard_count, "Successfully pushed shard updates");
+            } else {
+                debug!(
+                    remote_peer = %peer_id,
+                    remote_generation = response.generation,
+                    remote_checksum = response.shard_checksum,
+                    "Remote node already has current shard state, skipping push"
+                );
+            }
+            Ok(())
+        })
+        .await?;
 
-        // Only push if remote node needs our data
-        if response.needs_full_sync {
-            debug!(
-                remote_peer = %peer_id,
-                remote_generation = response.generation,
-                remote_checksum = response.shard_checksum,
-                "Remote node needs shard update, pushing full state"
-            );
-
-            let shard_count = all_shards.len();
-            let push_msg = MergeRemoteShards {
-                node_id: local.node_id,
-                node_name: local.node_name.clone(),
-                shards: all_shards,
-                generation: local_generation,
-                shard_checksum: local_checksum,
-            };
-
-            remote_coord.tell(&push_msg).send()?;
-            info!(remote_peer = %peer_id, shard_count = shard_count, "Successfully pushed shard updates");
-        } else {
-            debug!(
-                remote_peer = %peer_id,
-                remote_generation = response.generation,
-                remote_checksum = response.shard_checksum,
-                "Remote node already has current shard state, skipping push"
-            );
-        }
-
-        Ok(())
+        exchanged.ok_or_else(|| "Remote coordinator not found".to_string())
     }
 
     /// Persist current cluster state snapshot to disk (event-driven)
@@ -566,17 +550,16 @@ impl ClusterCoordinator {
                         };
                         let pool_clone = pool.clone();
                         self.spawn_peer_task(async move {
-                            let coord_opt = if let Some(pool) = &pool_clone {
-                                pool.get_coordinator(peer_id).await.ok().flatten()
-                            } else {
-                                let name = format!("coordinator-{}", peer_id);
-                                RemoteActorRef::<ClusterCoordinator>::lookup(name)
-                                    .await
-                                    .ok()
-                                    .flatten()
-                            };
-                            if let Some(remote_coord) = coord_opt {
-                                let _ = remote_coord.tell(&msg).send();
+                            let pushed = converse_with_coordinator(
+                                pool_clone.as_ref(),
+                                peer_id,
+                                |remote| async move {
+                                    remote.tell(&msg).send().map_err(|e| e.to_string())
+                                },
+                            )
+                            .await;
+                            if let Err(e) = pushed {
+                                debug!(peer = %peer_id, error = %e, "stability shard push failed");
                             }
                         });
                     }
@@ -1416,68 +1399,54 @@ impl Message<PeerDiscovered> for ClusterCoordinator {
 
             self.spawn_peer_task(async move {
                 if let Some(self_ref) = self_weak.upgrade() {
-                    // Retry loop with exponential backoff for coordinator lookup
-                    let mut remote_coord_opt = None;
+                    let push_msg = MergeRemoteShards {
+                        node_id: local_node_id,
+                        node_name: local_node_name,
+                        shards: all_shards,
+                        generation: local_generation,
+                        shard_checksum: local_checksum,
+                    };
+                    // Push this node's map, then fetch the peer's — one conversation, under one
+                    // deadline. A peer that has only just connected may not have registered its
+                    // coordinator yet, so that one case is asked again, backing off.
+                    let mut shards_result = Ok(None);
                     for attempt in 0..5 {
-                        let lookup_result = if let Some(pool) = &pool {
-                            pool.get_coordinator(node_id)
-                                .await
-                                .map_err(|e| e.to_string())
-                        } else {
-                            RemoteActorRef::<ClusterCoordinator>::lookup(remote_coord_name.clone())
-                                .await
-                                .map_err(|e| e.to_string())
-                        };
-
-                        match lookup_result {
-                            Ok(Some(coord)) => {
-                                remote_coord_opt = Some(coord);
-                                break;
-                            }
-                            Ok(None) => {
-                                if attempt < 4 {
-                                    let delay_ms = 100 * (1 << attempt); // 100, 200, 400, 800, 1600ms
-                                    debug!(
-                                        coordinator = %remote_coord_name,
-                                        attempt = attempt + 1,
-                                        delay_ms = delay_ms,
-                                        "Remote coordinator not found, retrying..."
-                                    );
-                                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
-                                        .await;
-                                } else {
-                                    info!(coordinator = %remote_coord_name, "Remote coordinator not found after 5 attempts");
+                        let push_msg = push_msg.clone();
+                        let remote_coord_name = &remote_coord_name;
+                        shards_result = converse_with_coordinator(pool.as_ref(), node_id, |remote| async move {
+                            match remote.tell(&push_msg).send() {
+                                Ok(_) => {
+                                    debug!(node = %node_id, "Successfully pushed ALL shards to new peer");
+                                }
+                                Err(e) => {
+                                    warn!(node = %node_id, error = %e, "Failed to push ALL shards to new peer");
                                 }
                             }
-                            Err(e) => {
-                                error!(coordinator = %remote_coord_name, error = %e, "Failed to lookup remote coordinator");
-                                break;
-                            }
+                            info!(coordinator = %remote_coord_name, "Fetching shard assignments from peer");
+                            remote
+                                .ask(&GetShardAssignments)
+                                .await
+                                .map_err(|e| e.to_string())
+                        })
+                        .await;
+                        if !matches!(shards_result, Ok(None)) {
+                            break;
+                        }
+                        if attempt < 4 {
+                            let delay_ms = 100 * (1 << attempt); // 100, 200, 400, 800ms
+                            debug!(
+                                coordinator = %remote_coord_name,
+                                attempt = attempt + 1,
+                                delay_ms = delay_ms,
+                                "Remote coordinator not found, retrying..."
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        } else {
+                            info!(coordinator = %remote_coord_name, "Remote coordinator not found after 5 attempts");
                         }
                     }
 
-                    if let Some(remote_coord) = remote_coord_opt {
-                        // 1. Push ALL known shards to the remote node
-                        let push_msg = MergeRemoteShards {
-                            node_id: local_node_id,
-                            node_name: local_node_name,
-                            shards: all_shards,
-                            generation: local_generation,
-                            shard_checksum: local_checksum,
-                        };
-                        match remote_coord.tell(&push_msg).send() {
-                            Ok(_) => {
-                                debug!(node = %node_id, "Successfully pushed ALL shards to new peer");
-                            }
-                            Err(e) => {
-                                warn!(node = %node_id, error = %e, "Failed to push ALL shards to new peer");
-                            }
-                        }
-
-                        // 2. Fetch remote shards (existing behavior)
-                        info!(coordinator = %remote_coord_name, "Fetching shard assignments from peer");
-                        let shards_result: Result<HashMap<Uuid, ShardMetadata>, _> =
-                            remote_coord.ask(&GetShardAssignments).await;
+                    if let Some(shards_result) = shards_result.transpose() {
                         match shards_result {
                             Ok(remote_shards) => {
                                 if !remote_shards.is_empty() {
@@ -1734,72 +1703,48 @@ pub(crate) async fn delete_index_cluster(
             let delete_schema = msg.delete_schema;
             let pool = pool.clone();
             async move {
-                // Lookup via pool if available, fallback to direct lookup
-                let lookup_result = if let Some(pool) = &pool {
-                    use crate::remote_peer_pool::ConnectionChannel;
-                    pool.get_orchestrator(peer.node_id, ConnectionChannel::Operations)
-                        .await
-                        .map_err(|e| format!("Lookup failed for node {}: {}", peer.node_id, e))
-                } else {
-                    let remote_orchestrator_name =
-                        crate::node::orchestrator_remote_name(&peer.node_id);
-                    kameo::actor::RemoteActorRef::<crate::node::NodeOrchestrator>::lookup(
-                        remote_orchestrator_name.as_str(),
-                    )
-                    .await
-                    .map_err(|e| format!("Lookup failed for node {}: {}", peer.node_id, e))
+                let delete_msg = crate::node::ClientOp::DeleteIndex {
+                    index: index.clone(),
+                    delete_schema,
                 };
-
-                let result = match lookup_result {
-                    Ok(Some(remote_orchestrator)) => {
-                        let delete_msg = crate::node::ClientOp::DeleteIndex {
-                            index: index.clone(),
-                            delete_schema,
-                        };
-
-                        // `remote_answer` so a peer that ran the delete and refused it
-                        // keeps its own verdict, instead of it being flattened into the
-                        // same string as a peer that never received the message.
-                        match crate::node::remote_answer(remote_orchestrator.ask(&delete_msg).await)
-                        {
-                            Ok(result) => {
-                                info!(
-                                    node_id = %peer.node_id,
-                                    address = %peer.address,
-                                    "Successfully deleted index from remote node"
-                                );
-                                Ok(result)
-                            }
-                            Err(e) => {
-                                warn!(
-                                    node_id = %peer.node_id,
-                                    address = %peer.address,
-                                    error = %e,
-                                    "Failed to delete index from remote node"
-                                );
-                                Err(format!("node {}: {}", peer.node_id, e))
-                            }
-                        }
+                // Under the pool's deadline, lookup and ask together, the way every other
+                // conversation with a peer's orchestrator runs (ROADMAP O2): a lost peer is
+                // answered at once instead of dialled, and a wedged one does not hold the delete
+                // past the remote timeout. `remote_answer` keeps the verdict of a peer that ran
+                // the delete and refused it apart from one that never received the message.
+                let answer = match &pool {
+                    Some(pool) => {
+                        pool.converse(peer.node_id, async {
+                            let remote =
+                                crate::node::lookup_peer_orchestrator(pool, peer.node_id).await?;
+                            crate::node::remote_answer(remote.ask(&delete_msg).await)
+                        })
+                        .await
                     }
-                    Ok(None) => {
-                        warn!(
+                    None => Err(crate::node::OrchestratorError::PeerUnreachable {
+                        message: format!(
+                            "no remote peer pool on this node to reach node {}",
+                            peer.node_id
+                        ),
+                    }),
+                };
+                let result = match answer {
+                    Ok(result) => {
+                        info!(
                             node_id = %peer.node_id,
                             address = %peer.address,
-                            "Remote orchestrator not found for index deletion"
+                            "Successfully deleted index from remote node"
                         );
-                        Err(format!(
-                            "Remote orchestrator not found for node {}",
-                            peer.node_id
-                        ))
+                        Ok(result)
                     }
                     Err(e) => {
                         warn!(
                             node_id = %peer.node_id,
                             address = %peer.address,
                             error = %e,
-                            "Failed to lookup remote orchestrator for index deletion"
+                            "Failed to delete index from remote node"
                         );
-                        Err(e)
+                        Err(format!("node {}: {}", peer.node_id, e))
                     }
                 };
                 (peer, result)
@@ -2295,24 +2240,23 @@ impl Message<ExchangeShardsWithPeer> for ClusterCoordinator {
                 Err(e) => {
                     warn!(peer = %msg.peer_id, error = %e, "Failed to exchange shards with peer");
                     // Fall back to traditional push for reliability
-                    let fallback_coord = if let Some(pool) = &local.pool {
-                        pool.get_coordinator(msg.peer_id).await.ok().flatten()
-                    } else {
-                        let remote_coord_name = format!("coordinator-{}", msg.peer_id);
-                        RemoteActorRef::<ClusterCoordinator>::lookup(remote_coord_name)
-                            .await
-                            .ok()
-                            .flatten()
+                    let fallback_msg = MergeRemoteShards {
+                        node_id: local.node_id,
+                        node_name: local.node_name.clone(),
+                        shards: fallback_shards,
+                        generation: msg.generation,
+                        shard_checksum: msg.checksum,
                     };
-                    if let Some(remote_coord) = fallback_coord {
-                        let fallback_msg = MergeRemoteShards {
-                            node_id: local.node_id,
-                            node_name: local.node_name.clone(),
-                            shards: fallback_shards,
-                            generation: msg.generation,
-                            shard_checksum: msg.checksum,
-                        };
-                        let _ = remote_coord.tell(&fallback_msg).send();
+                    let pushed = converse_with_coordinator(
+                        local.pool.as_ref(),
+                        msg.peer_id,
+                        |remote| async move {
+                            remote.tell(&fallback_msg).send().map_err(|e| e.to_string())
+                        },
+                    )
+                    .await;
+                    if let Err(e) = pushed {
+                        debug!(peer = %msg.peer_id, error = %e, "fallback shard push failed");
                     }
                 }
             }
@@ -2322,9 +2266,61 @@ impl Message<ExchangeShardsWithPeer> for ClusterCoordinator {
 
 /// How often each node pulls its peers' shard maps.
 const SHARD_MAP_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-/// Bound on each step of one pull — the lookup and the ask — so a dead peer costs a task a
-/// few seconds, not forever: kameo remote asks carry no reply timeout of their own.
+/// Bound on one conversation with a peer's coordinator — the lookup and the ask together — so
+/// a dead peer costs a task a few seconds, not forever: kameo remote asks carry no reply
+/// timeout of their own.
 const SHARD_MAP_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One conversation with a peer's coordinator — finding it, then whatever `ask` does with it —
+/// under [`SHARD_MAP_FETCH_TIMEOUT`] as a whole.
+///
+/// Every shard-map exchange goes through here. Before, the exchange on a peer's discovery, the
+/// stability push and the exchange's fallback looked the peer up and asked it with no deadline
+/// at all, so a wedged peer held the task that asked it until shutdown (ROADMAP O2). A peer the
+/// pool knows is lost is not asked. `Ok(None)` is a peer whose coordinator is not registered
+/// yet — kept apart from a failure, because a peer that has only just connected registers in a
+/// moment and is worth asking again.
+pub(super) async fn converse_with_coordinator<T, Fut>(
+    pool: Option<&Arc<RemotePeerPool>>,
+    peer: Uuid,
+    ask: impl FnOnce(RemoteActorRef<ClusterCoordinator>) -> Fut,
+) -> Result<Option<T>, String>
+where
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    if pool.is_some_and(|pool| pool.is_lost(peer)) {
+        return Err(format!("node {peer} is not reachable"));
+    }
+    let conversation = async {
+        let found = match pool {
+            Some(pool) => pool
+                .get_coordinator(peer)
+                .await
+                .map_err(|e| e.to_string())?,
+            None => RemoteActorRef::<ClusterCoordinator>::lookup(format!("coordinator-{peer}"))
+                .await
+                .map_err(|e| e.to_string())?,
+        };
+        match found {
+            Some(coordinator) => ask(coordinator).await.map(Some),
+            None => Ok(None),
+        }
+    };
+    match tokio::time::timeout(SHARD_MAP_FETCH_TIMEOUT, conversation).await {
+        Ok(answer) => answer,
+        Err(_) => {
+            // A cached ref to a peer that stopped answering is the likeliest reason; drop it so
+            // the next conversation looks the peer up afresh.
+            if let Some(pool) = pool {
+                pool.invalidate_peer(peer);
+            }
+            Err(format!(
+                "node {peer} did not answer within {}s",
+                SHARD_MAP_FETCH_TIMEOUT.as_secs()
+            ))
+        }
+    }
+}
 
 /// How long after a peer connects its schema records are compared with this node's.
 const SCHEMA_SWEEP_AFTER_CONNECT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -2403,25 +2399,21 @@ impl Message<SyncShardMaps> for ClusterCoordinator {
             let pool = Arc::clone(&pool);
             let self_ref = self_ref.clone();
             self.spawn_peer_task(async move {
-                let lookup =
-                    tokio::time::timeout(SHARD_MAP_FETCH_TIMEOUT, pool.get_coordinator(peer));
-                let remote = match lookup.await {
-                    Ok(Ok(Some(remote))) => remote,
-                    Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
-                        debug!(peer = %peer, "shard-map sync: peer coordinator not reachable");
+                let fetched = converse_with_coordinator(Some(&pool), peer, |remote| async move {
+                    remote
+                        .ask(&GetShardAssignments)
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+                .await;
+                let shards = match fetched {
+                    Ok(Some(shards)) => shards,
+                    Ok(None) => {
+                        debug!(peer = %peer, "shard-map sync: peer coordinator not registered");
                         return;
                     }
-                };
-                let fetch =
-                    tokio::time::timeout(SHARD_MAP_FETCH_TIMEOUT, remote.ask(&GetShardAssignments));
-                let shards = match fetch.await {
-                    Ok(Ok(shards)) => shards,
-                    Ok(Err(e)) => {
+                    Err(e) => {
                         debug!(peer = %peer, error = %e, "shard-map sync: fetch failed");
-                        return;
-                    }
-                    Err(_) => {
-                        debug!(peer = %peer, "shard-map sync: fetch timed out");
                         return;
                     }
                 };
