@@ -5,23 +5,40 @@
 //! helpers are tiny and the synchronization uses an OS-level file lock, not in-process state.
 
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicU16, Ordering};
 
-/// Reserve an ephemeral port in a way that is safe to use across concurrent test binaries.
+/// Ports handed out here, all below every OS's ephemeral range (macOS and Windows start at
+/// 49152, Linux at 32768).
+const PORT_RANGE: std::ops::Range<u16> = 20000..32000;
+
+/// Reserve a port for a node this test is about to spawn.
 ///
-/// Every test binary that calls this competes for a cross-process file lock. While the lock is
-/// held, the function binds an ephemeral port, reads the number, and immediately closes the
-/// socket. Because only one test process is in the bind/release window at a time, the chance of
-/// another test process claiming the same port before the spawned server binds is reduced to the
-/// tiny external race between this function returning and the server process starting.
+/// The port is free when this returns, but the node binds it only once it has started, which
+/// under load takes seconds. A port taken with `bind(0)` comes from the ephemeral range, the
+/// same pool every outbound connection draws from, and the tests around this one open
+/// thousands of those: one of them landed on a reserved port and the node exited with
+/// "Address already in use" (seen under a saturated CPU). Below the ephemeral range nothing
+/// is handed out implicitly, so only another listener can collide, and the bind below skips
+/// any port one already holds.
 ///
-/// On non-Unix platforms the lock is skipped and the function falls back to a plain ephemeral
-/// bind, which is no worse than the previous behaviour on those platforms.
+/// Within a binary a counter keeps concurrent tests apart; between binaries the start is
+/// offset by the process id and the cross-process file lock serializes the bind check.
 pub fn reserve_port() -> u16 {
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+
     #[cfg(unix)]
     let _lock = PortLock::acquire();
 
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("local addr").port()
+    let span = PORT_RANGE.end - PORT_RANGE.start;
+    let base = (std::process::id() % u32::from(span)) as u16;
+    for _ in 0..span {
+        let offset = (base + NEXT.fetch_add(1, Ordering::Relaxed) % span) % span;
+        let port = PORT_RANGE.start + offset;
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no free port in {PORT_RANGE:?}");
 }
 
 #[cfg(unix)]
