@@ -27,6 +27,9 @@ PROFILE="${1:-release}"
 ARCH="${2:-x86_64}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
+# shellcheck source=../toolchain.sh
+source "$ROOT/scripts/toolchain.sh"
+RUST_VERSION="$(rust_version)"
 
 case "$ARCH" in
     x86_64)  TARGETS=("x86_64-unknown-linux-musl") ;;
@@ -55,13 +58,16 @@ build_in_container() {
     # is slow — that is the price of a cross-arch build here.
     local platform image
     case "$target" in
-        x86_64-*)  platform="linux/amd64"; image="cameo-builder-base-amd64:latest" ;;
-        aarch64-*) platform="linux/arm64"; image="cameo-builder-base:latest" ;;
+        x86_64-*)  platform="linux/amd64"; image="cameo-builder-base-amd64:$RUST_VERSION" ;;
+        aarch64-*) platform="linux/arm64"; image="cameo-builder-base:$RUST_VERSION" ;;
         *) echo "no builder image for $target" >&2; exit 2 ;;
     esac
     if ! docker image inspect "$image" > /dev/null 2>&1; then
-        echo "Building $image (one time; emulated if it is not this host's architecture)"
-        docker build --platform "$platform" -f docker/Dockerfile.builder -t "$image" docker/
+        # Tagged with the compiler it carries, so moving rust-toolchain.toml builds a new image
+        # instead of reusing one cached from an older compiler, which `:latest` used to do.
+        echo "Building $image (one time per compiler; emulated if it is not this host's architecture)"
+        docker build --platform "$platform" --build-arg "RUST_VERSION=$RUST_VERSION" \
+            -f docker/Dockerfile.builder -t "$image" docker/
     fi
     # A per-target volume: two architectures sharing one CARGO_TARGET_DIR thrash each other's
     # build scripts, and the emulated one is far too slow to rebuild casually.

@@ -66,4 +66,20 @@ while IFS= read -r line; do
     fi
 done < <(grep -E '^\s*\{\s*id = ' deny.toml 2>/dev/null)
 
+section "compiler pin"
+# rust-toolchain.toml is the version; the build scripts pass it to Docker. The Dockerfile
+# defaults only serve a bare `docker build`, and a default left behind on an upgrade is how a
+# build quietly uses the old compiler — so they must agree, and rustc here must be the pin.
+# shellcheck source=../toolchain.sh
+source "$ROOT/scripts/toolchain.sh"
+if pinned="$(rust_version)"; then
+    check_eq "Dockerfile RUST_VERSION default" "$pinned" \
+        "$(sed -n 's/^ARG RUST_VERSION=//p' Dockerfile)"
+    check_eq "docker/Dockerfile.builder RUST_VERSION default" "$pinned" \
+        "$(sed -n 's/^ARG RUST_VERSION=//p' docker/Dockerfile.builder)"
+    check_eq "rustc in this tree" "$pinned" "$(rustc --version | cut -d' ' -f2)"
+else
+    fail "rust-toolchain.toml names a channel" "no channel = \"...\" line"
+fi
+
 summary

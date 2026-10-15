@@ -348,6 +348,34 @@ cargo tree --invert <crate>@<current-version>  # anything here but our own crate
 cargo upgrade --incompatible -p <crate>        # cargo-edit; rewrites Cargo.toml
 ```
 
+### Compiler
+
+`rust-toolchain.toml` is the one place the compiler version is written. rustup reads it on every
+machine — the Mac, the Windows build host — and installs that exact release on first use, so
+`rustup update stable` alone does not move this workspace. The Docker builds take the same version
+from it through `scripts/toolchain.sh`: `docker-push.sh`, `build-packages.sh` and the cluster suite
+pass it as `RUST_VERSION`, and `build-musl.sh` tags its builder images with it, so an image cached
+from an older compiler is never reused. Before that tag, 0.3.6's Linux binary was built by 1.95.0
+from a builder image two months old while the repo pinned 1.98.1, and every stage passed it.
+
+```bash
+rustup check                                   # is there a newer release?
+# edit rust-toolchain.toml, and the two defaults it names:
+#   Dockerfile                ARG RUST_VERSION=<new>
+#   docker/Dockerfile.builder ARG RUST_VERSION=<new>
+rustc --version                                # in the repo: rustup installs <new> on first use
+scripts/validate/deps.sh                       # clippy on the new compiler, and the three pins agree
+scripts/validate/unit.sh
+```
+
+A new compiler brings new lints and deprecations, and `deps.sh` denies warnings, so expect to fix
+some in the same commit. The musl target is per toolchain: the zig fallback needs
+`rustup target add x86_64-unknown-linux-musl` (and `aarch64-unknown-linux-musl`) again under the new
+version; the container path carries its own. Every release binary is checked for the compiler that
+built it — `artifact.sh` for the Linux builds, and the release build stage for mac, Linux and
+Windows — so a host that missed the upgrade fails the release instead of shipping. Old toolchains
+can go once nothing pins them: `rustup toolchain list`, then `rustup toolchain uninstall <name>`.
+
 ### Tooling
 
 The cargo subcommands the release and validation paths lean on are installed globally, not
@@ -444,7 +472,7 @@ Scripts respect these environment variables when available:
 - **timeout**: Command execution limits (GNU coreutils)
 
 ### CameoDB Dependencies
-- **Rust Toolchain**: 1.85+ with Cargo (Rust 2024 Edition — `scripts/setup/install-deps.sh` enforces this floor)
+- **Rust Toolchain**: the release `rust-toolchain.toml` pins, which rustup installs on first use in the repo (1.85 is the Rust 2024 Edition floor `scripts/setup/install-deps.sh` enforces)
 - **CameoDB Project**: Must be built (`cargo build --release`)
 
 ### Development Tools (Optional)

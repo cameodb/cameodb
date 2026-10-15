@@ -1,0 +1,8 @@
+# The one compiler every build of this workspace uses: `cargo` on each machine through rustup,
+# and the Docker builds, which read their RUST_VERSION from this file (scripts/toolchain.sh).
+# Change it here; scripts/validate/deps.sh checks the Dockerfile defaults agree, and every
+# release binary is checked for the compiler that built it. Upgrade steps: scripts/README.md,
+# "Dependency and Toolchain Updates".
+[toolchain]
+channel = "1.99.0"
+profile = "default"

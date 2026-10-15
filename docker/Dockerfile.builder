@@ -1,6 +1,10 @@
 # Builder image for cross-compilation distribution builds
 # This image bakes in all heavy dependencies so they aren't downloaded every build
-FROM rust:1.98.1-slim
+# The build scripts pass rust-toolchain.toml's channel and tag the image with it, so a builder
+# cached from an older compiler is never reused; the default is for a bare `docker build`, and
+# scripts/validate/deps.sh fails when it disagrees with the toolchain file.
+ARG RUST_VERSION=1.99.0
+FROM rust:${RUST_VERSION}-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \

@@ -69,7 +69,10 @@ rpm_arch() {
 
 echo -e "${BLUE}Starting CameoDB distribution build for: ${ARCHS[*]}${NC}"
 
-BUILDER_ARGS=()
+# The compiler rust-toolchain.toml pins, not the builder Dockerfile's fallback default.
+# shellcheck source=../toolchain.sh
+source "$PROJECT_ROOT/scripts/toolchain.sh"
+BUILDER_ARGS=(--build-arg "RUST_VERSION=$(rust_version)")
 if [[ -f "${CORPORATE_CA_CERT}" ]]; then
     BUILDER_ARGS+=(--secret "id=corporate-ca,src=${CORPORATE_CA_CERT}")
 fi

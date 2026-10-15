@@ -65,9 +65,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0.4 and `base64` 0.23 for API keys, `dirs` 7, `zip` 9 for `.zip` sources, and `serde-saphyr`
   2 for YAML configuration. A key's hash is unchanged, so configured keys keep working. A `.zip`
   source whose first file's name cannot be decoded is refused with an error naming the entry.
+- **Built with Rust 1.99.0, pinned in `rust-toolchain.toml`.** The file is the one place the
+  compiler is named: rustup uses it on every build machine, and the Docker builds take their
+  `RUST_VERSION` from it. Three atomic read-modify-writes moved from the deprecated
+  `fetch_update` to `update`.
 
 ### Fixed
 
+- **0.3.6's Linux binary was built by Rust 1.95.0, not the 1.98.1 the repo pinned.** The musl
+  builder image was cached under `:latest` and never rebuilt when the pin moved; the macOS and
+  Windows binaries were 1.98.1. Builder images are now tagged with the compiler they carry, and
+  the release build refuses any binary — macOS, Linux or Windows — whose recorded compiler is not
+  the pinned one. The 0.3.6 binaries behave as tested; this records how they were built.
 - **A search right after a restart answered without the writes replayed from the WAL.** A shard
   was opened for searches when its store opened, and the commit that makes a replayed tail
   searchable landed a moment later — so a search in between answered without writes that were

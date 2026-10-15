@@ -38,8 +38,8 @@ cameodb/
 
 #### **Builder Stage Features**
 ```dockerfile
-# Rust 1.98.1 with musl/gnu static linking
-ARG RUST_VERSION=1.98.1
+# The rust-toolchain.toml channel, passed by the build scripts; musl/gnu static linking
+ARG RUST_VERSION=1.99.0
 ARG TARGET_ABI=musl
 FROM rust:${RUST_VERSION}-slim AS builder
 

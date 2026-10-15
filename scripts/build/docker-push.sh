@@ -66,7 +66,10 @@ if ! docker buildx inspect "${BUILDER_NAME}" >/dev/null 2>&1; then
 fi
 
 # 2. Prepare build arguments
-BUILD_ARGS=()
+# The compiler rust-toolchain.toml pins, not the Dockerfile's fallback default.
+# shellcheck source=../toolchain.sh
+source "$PROJECT_ROOT/scripts/toolchain.sh"
+BUILD_ARGS=(--build-arg "RUST_VERSION=$(rust_version)")
 if [[ -s "${CORPORATE_CA_CERT}" ]]; then
     BUILD_ARGS+=(--secret "id=corporate-ca,src=${CORPORATE_CA_CERT}")
     echo -e "${YELLOW}Using CA certificate: ${CORPORATE_CA_CERT}${NC}"

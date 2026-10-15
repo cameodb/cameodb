@@ -5,7 +5,9 @@
 ################################################################################
 # The exact release, not a channel: the fallback below downloads rust-std by version, and
 # `rustup default` then names the toolchain the image already carries rather than fetching one.
-ARG RUST_VERSION=1.98.1
+# The build scripts pass rust-toolchain.toml's channel; this default is for a bare
+# `docker build`, and scripts/validate/deps.sh fails when the two disagree.
+ARG RUST_VERSION=1.99.0
 ARG TARGET_ABI=musl
 FROM rust:${RUST_VERSION}-slim AS builder
 

@@ -21,6 +21,12 @@ source "$SCRIPT_DIR/lib.sh"
 
 ROOT="$(repo_root)"
 cd "$ROOT" || exit 2
+# shellcheck source=../toolchain.sh
+source "$ROOT/scripts/toolchain.sh"
+RUST_VERSION="$(rust_version)" || exit 2
+# What a binary built by the pinned compiler records; empty when that toolchain is not
+# installed here, which the check below reports as a skip rather than a pass.
+PINNED_COMMIT="$(rust_commit 2>/dev/null)"
 
 PROBE_ERR="$(mktemp)"
 trap 'rm -f "$PROBE_ERR"' EXIT
@@ -73,9 +79,9 @@ select_probe_image() {
     local candidates i
     case "$(uname -m)" in
         arm64 | aarch64)
-            candidates=(cameo-builder-base:latest linux/arm64 cameo-builder-base-amd64:latest linux/amd64) ;;
+            candidates=("cameo-builder-base:$RUST_VERSION" linux/arm64 "cameo-builder-base-amd64:$RUST_VERSION" linux/amd64) ;;
         *)
-            candidates=(cameo-builder-base-amd64:latest linux/amd64 cameo-builder-base:latest linux/arm64) ;;
+            candidates=("cameo-builder-base-amd64:$RUST_VERSION" linux/amd64 "cameo-builder-base:$RUST_VERSION" linux/arm64) ;;
     esac
     for ((i = 0; i < ${#candidates[@]}; i += 2)); do
         if docker image inspect "${candidates[i]}" > /dev/null 2>&1; then
@@ -85,7 +91,7 @@ select_probe_image() {
         fi
     done
     PROBE_BLOCKED="no builder image here (build one: scripts/build/build-musl.sh, or"
-    PROBE_BLOCKED="$PROBE_BLOCKED docker build -f docker/Dockerfile.builder -t ${candidates[0]} docker/)"
+    PROBE_BLOCKED="$PROBE_BLOCKED docker build --build-arg RUST_VERSION=$RUST_VERSION -f docker/Dockerfile.builder -t ${candidates[0]} docker/)"
     return 1
 }
 
@@ -123,6 +129,21 @@ check_binary() {
     if [ ! -f "$binary" ]; then
         skip "$binary (not built)"
         return 0
+    fi
+
+    # A binary records the compiler that built it, and nothing else in the build reports it:
+    # 0.3.6's Linux binary came from a builder image two compilers behind the pin.
+    if [ -z "$PINNED_COMMIT" ]; then
+        skip "built by the pinned compiler (rustc $RUST_VERSION is not installed here to compare)"
+    else
+        local commits
+        commits="$(binary_rustc_commits "$binary")"
+        if [ "$commits" = "$PINNED_COMMIT" ]; then
+            pass "built by the pinned compiler (rustc $RUST_VERSION)"
+        else
+            fail "built by the pinned compiler (rustc $RUST_VERSION)" \
+                "it records rustc ${commits:-<none>}, rust-toolchain.toml pins ${PINNED_COMMIT:0:9}"
+        fi
     fi
 
     local out

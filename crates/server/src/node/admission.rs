@@ -131,7 +131,7 @@ pub(super) const SERVICE_ADMISSION_SIGMAS: f64 = 3.0;
 
 /// A decaying log-bucketed histogram of service times.
 ///
-/// Recording is one `fetch_add` on an atomic counter — cheaper than the `fetch_update` CAS loop
+/// Recording is one `fetch_add` on an atomic counter — cheaper than the `update` CAS loop
 /// the EWMA beside it uses, and it never retries under contention. Reading a quantile means
 /// walking the buckets, which is far too much for an admission check that runs on every request,
 /// so the quantile is computed once per rotation and cached in a single atomic. The admission
@@ -410,18 +410,18 @@ impl DispatchCounters {
     /// 1/8 weight — slow enough not to chase a single slow query, fast enough to track a node
     /// whose load has changed.
     ///
-    /// Read-modify-write under `fetch_update` rather than load-then-store: every worker folds
+    /// Read-modify-write under `update` rather than load-then-store: every worker folds
     /// into these values, and a lost update is a sample the estimate never saw.
     pub(super) fn fold_ewma(slot: &AtomicU64, sample_us: u64) {
-        let _ = slot.fetch_update(
+        slot.update(
             AtomicOrdering::Relaxed,
             AtomicOrdering::Relaxed,
             |previous| {
-                Some(if previous == 0 {
+                if previous == 0 {
                     sample_us
                 } else {
                     (previous.saturating_mul(7).saturating_add(sample_us)) / 8
-                })
+                }
             },
         );
     }
@@ -431,11 +431,10 @@ impl DispatchCounters {
     /// which is what the tests use) must underflow to zero rather than wrap to `usize::MAX`
     /// and wedge the gate into refusing everything.
     pub(super) fn job_left_pool(&self) {
-        let _ =
-            self.outstanding
-                .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |v| {
-                    Some(v.saturating_sub(1))
-                });
+        self.outstanding
+            .update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |v| {
+                v.saturating_sub(1)
+            });
     }
 
     /// The estimate a reserve should be computed from for `class`: the class's own EWMA, or

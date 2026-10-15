@@ -134,7 +134,9 @@ if [ -z "$IMAGE" ]; then
     # The same CA handling as scripts/build/docker-push.sh: behind a TLS-inspecting proxy the
     # build's `cargo fetch` fails on every crates.io request without it.
     ca="${CAMEODB_CA_CERT:-/var/tmp/buildkit-ca/corporate-ca.crt}"
-    build_args=()
+    # shellcheck source=../toolchain.sh
+    source "$ROOT/scripts/toolchain.sh"
+    build_args=(--build-arg "RUST_VERSION=$(rust_version)")
     [ -s "$ca" ] && build_args+=(--secret "id=corporate-ca,src=$ca" --build-arg "CORPORATE_CA_ID=$ca")
     printf '  building %s from %s (log: %s)\n' "$IMAGE" "$ROOT/Dockerfile" "$WORK/build.log"
     if ! run_bounded 1800 docker build ${build_args[@]+"${build_args[@]}"} -t "$IMAGE" -f "$ROOT/Dockerfile" "$ROOT" \

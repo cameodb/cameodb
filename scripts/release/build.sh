@@ -72,6 +72,7 @@ MAC_BIN="target/release/cameodb"
 mac_arch="$(lipo -archs "$MAC_BIN" 2>/dev/null || echo unknown)"
 [ "$mac_arch" = "arm64" ] || die "mac binary is '$mac_arch', expected arm64 — downloads/mac/ is published as Apple Silicon only"
 ok "arm64 Mach-O"
+assert_pinned_compiler "$MAC_BIN" "the mac binary"
 
 mac_reported="$("$MAC_BIN" --version | head -1)" || die "mac binary does not run"
 
@@ -118,6 +119,9 @@ for arch in $LINUX_ARCHS; do
 
     linux_bin="target/$triple/release/cameodb"
     [ -f "$linux_bin" ] || die "expected $linux_bin"
+    # Also checked by artifact.sh inside build-musl.sh, but --allow-unhardened tolerates its
+    # failures, and a rehearsal built by the wrong compiler rehearses nothing.
+    assert_pinned_compiler "$linux_bin" "the $arch Linux binary"
     cp "$linux_bin" "$DIST/linux/$bin_name"
     ok "$bin_name  $(du -h "$linux_bin" | cut -f1)"
 
@@ -159,6 +163,9 @@ if [ -f "$WIN_EXE" ]; then
         *"PE32"*)           die "windows/cameodb.exe is 32-bit ($win_desc) — expected an x86_64 build" ;;
         *)                  die "windows/cameodb.exe is not a Windows executable: $win_desc" ;;
     esac
+    # The one binary built on another machine, by whatever that machine's rustup resolved —
+    # rust-toolchain.toml pins it there too, and this is where a stale toolchain would show.
+    assert_pinned_compiler "$WIN_EXE" "windows/cameodb.exe"
 
     # Shipping a stale .exe is the mistake a two-machine release invites, and nothing on this
     # host can catch it: the binary cannot be executed here, and the version is not recoverable

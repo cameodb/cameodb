@@ -285,10 +285,9 @@ impl WriterLiveness {
     /// `mark_writer_down`. Called once, after a monitor relaunches a crashed writer. Saturating at
     /// zero so it can never wrap the count below the number of writers actually down.
     pub(super) fn mark_writer_up(&self) {
-        let _ = self
-            .down
-            .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |n| {
-                Some(n.saturating_sub(1))
+        self.down
+            .update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |n| {
+                n.saturating_sub(1)
             });
     }
 

@@ -24,6 +24,8 @@ warn()    { printf '  %swarn%s %s\n' "$_c_yellow" "$_c_off" "$1"; }
 die()     { printf '\n%serror%s %s\n' "$_c_red" "$_c_off" "$1" >&2; exit 1; }
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=../toolchain.sh
+source "$PROJECT_ROOT/scripts/toolchain.sh"
 
 # The version is read from the tree, never passed in. A release where the argument and the
 # manifests disagree is a release where the binary reports one number and its filename
@@ -129,6 +131,19 @@ refuse_if_unhardened() {
     die "$DIST was built with --allow-unhardened and is not publishable:
 $(sed 's/^/  /' "$DIST/.unhardened")
   Rebuild through the container path: scripts/release/build.sh"
+}
+
+# The binary was built by the compiler rust-toolchain.toml pins. A binary records its rustc as
+# /rustc/<commit> and nothing else in a release reports it: 0.3.6 shipped a Linux binary built by
+# 1.95.0 from a stale builder image, against a pin of 1.98.1, and every stage passed it.
+assert_pinned_compiler() {
+    local binary="$1" label="$2" version pinned recorded
+    version="$(rust_version)" || die "cannot read rust-toolchain.toml"
+    pinned="$(rust_commit)" || die "rustc $version is not installed here — rustup toolchain install $version"
+    recorded="$(binary_rustc_commits "$binary")"
+    [ "$recorded" = "$pinned" ] \
+        || die "$label was built by rustc ${recorded:-<none recorded>}, but rust-toolchain.toml pins $version ($pinned)"
+    ok "built by rustc $version"
 }
 
 # Path relative to the staging root — what the manifest and the checksum files should say,
