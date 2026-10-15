@@ -84,7 +84,9 @@ for ARCH in "${ARCHS[@]}"; do
     RPM_ARCH=$(rpm_arch "$ARCH")
     PROFILE="release-docker"
     OUTPUT_DIR="target/${TARGET}/${PROFILE}"
-    ARCH_BUILDER_IMAGE="${BUILDER_IMAGE}-${ARCH}"
+    # Tagged with the compiler, like build-musl.sh's, so nothing falls back on a :latest
+    # left over from an older one.
+    ARCH_BUILDER_IMAGE="${BUILDER_IMAGE}-${ARCH}:$(rust_version)"
 
     echo -e "${YELLOW}Building builder image for ${ARCH}...${NC}"
     docker buildx build \

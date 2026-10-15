@@ -61,8 +61,8 @@ docker_ready() {
 # Executing a binary — unlike reading one — does need the architectures to agree.
 image_for_arch() {
     case "$1" in
-        "x86-64")      printf 'cameo-builder-base-amd64:latest linux/amd64' ;;
-        "ARM aarch64") printf 'cameo-builder-base:latest linux/arm64' ;;
+        "x86-64")      printf 'cameo-builder-base-amd64:%s linux/amd64' "$RUST_VERSION" ;;
+        "ARM aarch64") printf 'cameo-builder-base:%s linux/arm64' "$RUST_VERSION" ;;
         *)             return 1 ;;
     esac
 }
