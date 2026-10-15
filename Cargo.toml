@@ -20,7 +20,7 @@ futures = "0.3.32"
 kameo = { version = "0.22", features = ["remote", "macros"] }
 libp2p = { version = "0.56.0", features = ["tcp", "dns", "quic", "noise", "yamux", "macros", "kad", "tokio", "serde", "request-response", "pnet", "ping"] }
 num_cpus = "1.17"
-redb = "4.1.0"
+redb = "4.4.0"
 # One TLS stack for the whole workspace: rustls with the ring provider installed by
 # the binary. `rustls-no-provider` still pulls `rustls-platform-verifier`, so the OS
 # trust store (and any corporate CA added to it) is used for outbound HTTPS — that is

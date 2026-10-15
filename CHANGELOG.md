@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **redb 4.3.0 → 4.4.0**, for its fix to page-cache memory growing without bound under write
+  workloads, and to `Durability::None` commits lost on a clean close after a panic caught inside
+  an earlier write transaction (`wal_sync = false` with a recovered writer panic).
+
 ## [0.3.6] - 2026-10-07
 
 ### Added
