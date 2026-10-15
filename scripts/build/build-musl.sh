@@ -4,7 +4,8 @@
 #   ./scripts/build/build-musl.sh [profile] [arch]
 #
 #   profile   release (default) | dev | release-docker | any custom profile
-#   arch      x86_64 (default) | aarch64 | both
+#   arch      this host's (default) | x86_64 | aarch64 | both
+#             The default builds natively; the other architecture runs emulated and is slow.
 #
 # Two ways to get there, and they do not produce the same artifact:
 #
@@ -23,13 +24,14 @@
 
 set -euo pipefail
 
-PROFILE="${1:-release}"
-ARCH="${2:-x86_64}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 # shellcheck source=../toolchain.sh
 source "$ROOT/scripts/toolchain.sh"
 RUST_VERSION="$(rust_version)"
+
+PROFILE="${1:-release}"
+ARCH="${2:-$(host_arch)}"
 
 case "$ARCH" in
     x86_64)  TARGETS=("x86_64-unknown-linux-musl") ;;

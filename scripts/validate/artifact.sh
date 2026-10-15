@@ -233,7 +233,12 @@ check_binary() {
                 "$exec_image" /b --version 2> "$PROBE_ERR")"
             status=$?
             if [ "$status" -eq 0 ]; then
-                pass "starts and reports its version (emulated $arch: $(head -1 <<< "$reported"))"
+                local how="in a container"
+                case "$exec_platform:$(uname -m)" in
+                    linux/amd64:x86_64 | linux/arm64:arm64 | linux/arm64:aarch64) ;;
+                    *) how="emulated" ;;
+                esac
+                pass "starts and reports its version ($how, $arch: $(head -1 <<< "$reported"))"
             elif grep -qi 'exec format error\|exec user process' "$PROBE_ERR"; then
                 # No binfmt/Rosetta for this architecture. Nothing was learned about the binary.
                 skip "starts and reports its version ($arch cannot be emulated on this host)"

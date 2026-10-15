@@ -25,6 +25,16 @@ rust_commit() {
     rustc "+$(rust_version)" -vV | sed -n 's/^commit-hash: //p'
 }
 
+# This machine's architecture in Rust's spelling (x86_64 or aarch64): what the build scripts
+# default to, so a local build runs natively instead of under emulation.
+host_arch() {
+    case "$(uname -m)" in
+        x86_64 | amd64)  echo x86_64 ;;
+        arm64 | aarch64) echo aarch64 ;;
+        *) echo "unsupported host architecture $(uname -m)" >&2; return 1 ;;
+    esac
+}
+
 # The rustc commit hashes a binary records, one per line: normally exactly one.
 binary_rustc_commits() {
     LC_ALL=C grep -aoE '/rustc/[0-9a-f]{40}' "$1" | sed 's|/rustc/||' | sort -u

@@ -47,13 +47,14 @@ debugging; use the pipeline for releases.
   - Under the zig path, exports `AR="zig ar"` / `RANLIB="zig ranlib"` so jemalloc's C build archives correctly — without this, macOS's native `ranlib` silently produces an empty `libjemalloc.a` (it can't parse the ELF objects Zig's cross-compiler emits), and the failure only surfaces later as `undefined symbol: mallocx`/`mallctl` at link time. See [docs/BUILDING.md](../docs/BUILDING.md) for the full explanation
 - **Usage**:
   ```bash
-  ./scripts/build/build-musl.sh                    # release, x86_64
+  ./scripts/build/build-musl.sh                    # release, this host's architecture (native)
+  ./scripts/build/build-musl.sh release x86_64     # release, x86_64
   ./scripts/build/build-musl.sh release aarch64    # release, aarch64
   ./scripts/build/build-musl.sh release both       # both architectures
   ./scripts/build/build-musl.sh dev                # dev build (binary lands in target/.../debug/)
   BUILD_WITH=zig ./scripts/build/build-musl.sh     # force the no-Docker path
   ```
-- **Prerequisites**: Docker; or `zig` and `cargo-zigbuild` (`brew install zig && cargo install cargo-zigbuild`) for the fallback. A cross-architecture container build runs emulated and is slow
+- **Prerequisites**: Docker; or `zig` and `cargo-zigbuild` (`brew install zig && cargo install cargo-zigbuild`) for the fallback. Without an arch argument it builds for the host, natively; the other architecture runs emulated and is slow
 - **Audience**: Developers building/testing Linux binaries locally on macOS
 
 #### `docker-push.sh`
