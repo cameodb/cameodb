@@ -541,6 +541,14 @@ impl HybridStore {
                 let db_path = kv_path.display().to_string();
                 move |session| {
                     if !repaired.swap(true, Ordering::Relaxed) {
+                        // On the console as well as in the log, the one place this crate writes
+                        // there: a node logs at ERROR unless `RUST_LOG` says otherwise, and a
+                        // repair can hold the shard for minutes before the startup banner, so
+                        // without this the console says nothing while it runs.
+                        println!(
+                            "Repairing {db_path} ({} MB): it was not closed cleanly",
+                            db_file_size / (1024 * 1024)
+                        );
                         tracing::warn!(
                             db_path = %db_path,
                             file_size_mb = db_file_size / (1024 * 1024),
@@ -558,6 +566,11 @@ impl HybridStore {
             });
             let kv = builder.open(&kv_path)?;
             if repaired.load(Ordering::Relaxed) {
+                println!(
+                    "Repaired {} in {:.1?}",
+                    kv_path.display(),
+                    repair_start.elapsed()
+                );
                 tracing::warn!(
                     db_path = %kv_path.display(),
                     file_size_mb = db_file_size / (1024 * 1024),

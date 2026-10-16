@@ -4482,10 +4482,10 @@ impl NodeOrchestrator {
     }
 
     /// Scans the storage directory for existing shard folders and hydrates them with
-    /// bounded concurrency. The bottleneck is redb::Builder::create() which does heavy
-    /// disk I/O (WAL replay, compaction). Running all shards simultaneously causes I/O
-    /// contention that makes each open 10-100× slower. A semaphore limits how many shards
-    /// open their redb databases concurrently.
+    /// bounded concurrency: [`shard_file_concurrency`] shards at a time, each opening its redb
+    /// file — a full repair after an unclean exit without `quick_repair` — and replaying its WAL
+    /// tail before the permit is released. The replay's CPU is bounded separately, node-wide,
+    /// by the storage crate's recovery gate.
     pub(super) async fn hydrate_existing_shards(&mut self) -> Result<(), OrchestratorError> {
         let mut existing_shards = self.discover_existing_shards()?;
         // Sorted so ordinals — and therefore worker and core placement — come out the same
@@ -4504,15 +4504,10 @@ impl NodeOrchestrator {
             );
         }
 
-        // Limit concurrent shard initialization to reduce disk I/O contention.
-        // redb::Builder::create() is the bottleneck — too many concurrent opens
-        // cause I/O thrashing. Scale with available cores (NVMe can handle more
-        // concurrency than spinning disks): min(max(2, cpus/4), shard_count).
         let cpu_cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
-        let max_concurrent =
-            std::cmp::min(std::cmp::max(2, cpu_cores / 4), existing_shards.len()).max(1);
+        let max_concurrent = shard_file_concurrency(existing_shards.len());
         let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
 
         info!(

@@ -1531,7 +1531,7 @@ redb marks its file while it is open and clears the mark on a clean close. Found
 it either loads the allocator state the last commit recorded, or — when that commit recorded
 none — repairs the file: up to three passes over every page, verifying checksums and rebuilding
 the allocator, before the shard can open. That costs time in proportion to the data the shard
-holds, not to the writes that were in flight, and at most `max(2, cores / 4)` shards open at
+holds, not to the writes that were in flight, and at most `max(2, cores / 2)` shards open at
 once. With `quick_repair = true` every commit records the state, and the reopen takes
 milliseconds at any size.
 
@@ -1553,8 +1553,9 @@ the whole device on every sync — so a Linux host with a fast disk should pay l
 your hardware with `cameodb-bench` if write throughput is what the node is for. With
 `wal_sync = false` most commits do not flush, and the cost is smaller.
 
-A repair is logged per shard — `Database was not closed cleanly; redb is repairing it`, progress,
-then `redb repair complete` with its duration — so a slow start after a crash is visible. The
+A repair is printed on the console whatever the log level — `Repairing <file> (<size> MB): it
+was not closed cleanly` as it starts, `Repaired <file> in <time>` as it ends — so a slow start
+after a crash is visible. The log has the same at `warn`, with progress at `info`. The
 first restart after turning `quick_repair` on can still repair once, if the crash came before
 any commit that recorded the state.
 

@@ -900,6 +900,22 @@ pub struct GetShardStats {
     pub include_data_size: bool,
 }
 
+/// How many shards to open at once when the node starts: `min(max(2, cores / 2), shards)`.
+///
+/// Opening a shard is disk-bound: redb's open — a whole-file repair after an unclean exit
+/// without `quick_repair` — then the WAL tail's replay, whose CPU the storage crate bounds on
+/// its own (at most four indexes node-wide). Measured on the same kind of work, `cameodb
+/// compact`'s whole-file pass over four 1.4 GB shards took 29 s one at a time and 13.6 s all at
+/// once, under two cores busy, so the disk takes more than the `cores / 4` this used to allow.
+/// Half the cores still leaves the other half to the processes beside the node. Each shard's
+/// redb cache is its share of `total_memory_limit_mb`, so more at once costs no extra memory.
+pub(crate) fn shard_file_concurrency(shards: usize) -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    (cores / 2).max(2).min(shards).max(1)
+}
+
 // Admin types re-exported from the dedicated admin module.
 pub use crate::admin::memory::{
     AdminIndexCommitReport, AdminIndexEvictWriterReport, AdminIndexMergeReport, AdminMemoryReport,

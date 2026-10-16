@@ -35,8 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disk). Every commit now records redb's allocator state, and the reopen loads it. The cost is a
   second flush per durable commit, which lowers the single-write ceiling on a flush-bound disk;
   `quick_repair = false` (or `--storage-quick-repair=false`) restores the old trade.
-- **A redb repair is logged.** A shard whose file needs one says so as it starts, reports its
-  progress, and logs how long it took, where before the shard was silently slow to open.
+- **A redb repair is reported.** A shard whose file needs one prints `Repairing <file>` on the
+  console as it starts and `Repaired <file> in <time>` as it ends, whatever the log level — a
+  node logs at `ERROR` unless `RUST_LOG` says otherwise, so a repair holding a shard for minutes
+  used to show nothing until the startup banner. The log has the same at `warn`, with progress
+  at `info`.
 - **A search says where its time went.** `stats.timings_ms` reports the stages — `parse`, `walk`
   (the segment walk), `resolve`, `fetch`, `build` — each the slowest shard's, since shards run in
   parallel, plus the node's own `merge`; `stats.fetched_docs` counts the documents the shards
@@ -51,6 +54,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A node starts up to twice as many shards at once: `max(2, cores / 2)`, from `cores / 4`.**
+  Opening a shard is bound by the disk — redb's open, a whole-file repair after a crash without
+  `quick_repair` — and each shard's cache is its share of the memory limit, so more at once costs
+  no extra memory. A crash restart of four 1.4 GB shards without `quick_repair` went from
+  11.3–12.0 s to 7.3 s on a 15-core machine.
 - **redb 4.3.0 → 4.4.0**, for its fix to page-cache memory growing without bound under write
   workloads, and to `Durability::None` commits lost on a clean close after a panic caught inside
   an earlier write transaction (`wal_sync = false` with a recovered writer panic).
