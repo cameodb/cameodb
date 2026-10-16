@@ -1380,3 +1380,22 @@ mod header_hint_tests {
         assert!(super::super::ingest::zip_first_entry_bytes(&empty).is_err());
     }
 }
+
+/// Every operation the shell offers on `admin index` is also a one-shot command. The two are
+/// separate lists — the shell matches words, the one-shot parser has its own enum — and `merge`
+/// reached the shell without reaching this one.
+#[test]
+fn every_admin_index_operation_parses_as_a_one_shot_command() {
+    use clap::Parser;
+    for op in ["commit", "merge", "evict-writer"] {
+        let cli = ClientCli::try_parse_from(["cameodb-client", "admin", "index", "logs", op])
+            .unwrap_or_else(|e| panic!("`admin index logs {op}` did not parse: {e}"));
+        let Some(ClientCommand::Admin {
+            subcommand: AdminCommand::Index { index, .. },
+        }) = cli.command
+        else {
+            panic!("`admin index logs {op}` parsed as something else");
+        };
+        assert_eq!(index, "logs");
+    }
+}

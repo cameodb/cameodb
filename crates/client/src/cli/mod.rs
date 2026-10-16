@@ -606,6 +606,8 @@ pub enum MemoryOperation {
 pub enum IndexAdminOperation {
     /// Force commit the index writer
     Commit,
+    /// Merge each shard's segments into one, dropping deleted documents; returns once started
+    Merge,
     /// Evict the index writer from cache
     EvictWriter,
 }
@@ -916,6 +918,10 @@ pub async fn run_cli() -> Result<()> {
             AdminCommand::Index { index, operation } => match operation {
                 IndexAdminOperation::Commit => {
                     let result = client.admin_index_commit(&index).await?;
+                    print_json(&result)?;
+                }
+                IndexAdminOperation::Merge => {
+                    let result = client.admin_index_merge(&index).await?;
                     print_json(&result)?;
                 }
                 IndexAdminOperation::EvictWriter => {
