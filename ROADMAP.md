@@ -240,6 +240,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [M0](#m0--the-architecture-review-and-the-order-of-work) … [M8](#m8--re-decide-the-query-complexity-caps) | The 0.3.5 goal set — a node exposed on the internet serving several tenants from one process; M0 closed, the M1 blocker cleared, and M2–M8 done; M6's open-loop arms found and fixed [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) and [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput), and were confirmed on the cut binary 2026-09-27. The release cut remains | — | 2026-09-27 | ◐ |
 | [N1](#n1--head-requests-skip-authorization) … [N17](#n17--smaller-items-filed-so-they-are-not-lost) | Pre-0.3.6 whole-code review — ten defects (N1–N10) to close before the cut, then the duplication and structure behind them: one way to reach a peer, dead surface, `run_change`, typed boundaries, single owners, the `orchestrator.rs` split | — | 2026-10-07 | 📋 |
 | [F10](#f10--fast-field-projection-the-pages-fields-answered-from-the-columns) | Fast-field projection — the page's fields answered from the columns, and the fetch phase skipped when they can be; the last layer of the search-economics work opened by the TS5 outage — deferred: the gain over the two-phase search is small for today's workloads, and the design is filed so it can be picked up | — | 2026-10-09 | 💭 |
+| [F11](#f11--the-disk-a-delete-frees-was-never-returned) | The disk a delete frees was never returned — `cameodb compact` (redb, offline) and `POST /_admin/index/{index}/merge` (Tantivy, online) done; reclaiming deleted documents automatically, behind a setting, planned | — | 2026-10-16 | ◐ |
 
 ---
 
@@ -1918,6 +1919,58 @@ floor and the true multiple is higher. Neither affects the finding, which is qua
 goodput and zero refusals. Not measured: the single-write path (`Write` *is* worker-eligible, so it
 should be covered, and that is an assumption until an arm says so), and whether a retrying client
 deepens any of this.
+
+---
+
+### F11 — The disk a delete frees was never returned
+
+◐ **Partial.** Raised from the field on 2026-10-16: a node of about 500M records had a large share
+deleted to free disk, and the files kept their size.
+
+**What was measured** (4 shards, 2.2M documents of about 800 B, 75% deleted):
+
+| | After load | After the delete | Reclaimed |
+|---|---|---|---|
+| redb `store.redb`, per shard | 1,028 MB, holding 435 MB | 1,028 MB, unchanged | 310 MB with `compact`, 1.5 s |
+| Tantivy index, per shard | 160 MB | 176 MB, 62% of it deleted | 65 MB with a merge, 1.3 s |
+
+- **redb never returns space while it runs.** A delete frees pages inside the file and later writes
+  reuse them, but only `Database::compact` truncates, and it needs the database to itself. A
+  running node shares every shard's store, so this is offline.
+- **The redb file was 2.3× its data before any delete.** The WAL tables live in the same file and
+  are written and trimmed at every checkpoint, which is the likely cause. Not proven, and worth its
+  own look: it means a node that never deletes still carries that much free space.
+- **Tantivy keeps a deleted document until its segment is merged.** The default `LogMergePolicy`
+  merges similar-sized segments once there are eight, never because of deletes alone
+  (`del_docs_ratio_before_merge` is 1.0), and never a segment above ten million live documents.
+  On a large node, the deleted documents in its biggest segments may never go.
+- **Write speed after the delete was unchanged at this scale,** about 43k docs/s before, after and
+  after reclaiming. The site's slowdown was not reproduced; its data is hundreds of times larger.
+
+**✅ Done:**
+- `cameodb compact [-c <PATH>] [--dry-run]` (`a648898`), with the node stopped: compacts every
+  shard's `store.redb` and `metadata.redb`. `--dry-run` reports what each file would give back.
+- `POST /_admin/index/{index}/merge` (`8647baf`), with the node running: commits, then merges each
+  shard's segments into one on Tantivy's merge threads. It returns at once, and each shard logs
+  `Merge complete`. Writes carried on at full rate during a merge of 850k deleted documents.
+
+**📋 Planned: reclaim deleted documents automatically, behind a setting.** Postponed on
+2026-10-16 in favour of the two manual tools above. Off by default, so a node that does not set
+it merges exactly as it does today.
+
+- **The shape:** a merge policy wrapping `LogMergePolicy`. It keeps every candidate the default
+  proposes and adds a single-segment merge for any segment whose deleted share is above a
+  threshold, of any size. Rewriting one segment costs in proportion to that segment, which keeps a
+  delete from pulling a whole level into one merge.
+- **Not the built-in knob:** `set_del_docs_ratio_before_merge` alone would merge the whole level
+  around such a segment, and still skips segments above ten million live documents, which are the
+  ones that matter at the site's scale.
+- **Where it plugs in:** the writer is built in `HybridStore::get_or_create_index_locked`
+  (`store.rs`), beside `merge_num_threads`. The setting would follow the same path as
+  `merge_num_threads` and `quick_repair`: `[search]` in the config, the CLI and environment
+  overrides, `NodeConfig`, then `StorageConfig`.
+- **Open questions:** the default threshold (0.3 is a starting point), and whether a rewrite
+  should wait until the node is quiet. Every rewrite needs free disk for the new segment.
 
 ---
 
