@@ -13,8 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   redb file but never gave it back: the files stayed at their largest size, however much was
   deleted. With the node stopped, `cameodb compact -c <config>` shrinks every shard's
   `store.redb`, and the node's `metadata.redb`, to the data they hold; `--dry-run` reports what
-  each would give back and changes nothing. It refuses to run while the node holds the files.
-  1 GB shards with 75% of their documents deleted went to 310 MB in about 1.5 s each.
+  each would give back and changes nothing. It refuses to run while the node holds the files,
+  works on every file at once with a 256 MB cache each (`--jobs N` to limit it), and stops
+  cleanly on Ctrl+C: files in progress finish, the rest are listed, and running it again
+  continues. Four 1.4 GB shards with half their documents deleted took 18 s, at 1.5 GB of
+  memory, where one at a time took 29 s.
   `retention-prune.sh` says so when a delete finishes.
 - **`POST /_admin/index/{index}/merge` returns the disk the search index holds for deleted
   documents.** A delete only marks a document dead in its Tantivy segment, and the default merge

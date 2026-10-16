@@ -139,7 +139,7 @@ async fn main() -> Result<()> {
 
     // Offline: redb locks its files, so this refuses to run against a node that is up.
     if subcommand == "compact" {
-        return compact::run(args.into_iter().skip(2));
+        return compact::run(args.into_iter().skip(2)).await;
     }
 
     // Posture check without starting the node: the manual equivalent of a CI gate, so a
@@ -283,7 +283,7 @@ async fn main() -> Result<()> {
              cameodb generate-config\n  \
              cameodb check-config [-c <PATH>] [--allow-unauthenticated]\n  \
              cameodb keygen --role <admin|writer|reader>\n  \
-             cameodb compact [-c <PATH>] [--dry-run]\n  \
+             cameodb compact [-c <PATH>] [--dry-run] [--jobs <N>]\n  \
              cameodb client <subcommand>\n\n\
              Options:\n\
              {}\n  \
@@ -297,7 +297,8 @@ async fn main() -> Result<()> {
              keygen           Mint an API key and print the [[security.api_keys]] stanza for it\n  \
              compact          With the node stopped, shrink its redb files to the data they hold.\n  \
              \u{20}                 A delete frees space inside a file but never returns it to disk;\n  \
-             \u{20}                 --dry-run reports what each file would give back and changes nothing\n  \
+             \u{20}                 --dry-run reports what each file would give back and changes nothing;\n  \
+             \u{20}                 every file at once unless --jobs N limits it\n  \
              client           Run the bundled client CLI (health, index, search)\n\n\
              Client examples:\n  \
              cameodb client health\n  \

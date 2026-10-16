@@ -425,7 +425,17 @@ systemctl start cameodb
 Run it as the user that owns the data directory (`sudo -u cameodb …`). It refuses to start
 while the node holds the files, rewrites each file in place so it needs no free disk of its
 own, and took about 1.5 s per GB in testing (1,028 MB → 310 MB per shard after deleting 75%).
-A shard the node did not close cleanly is repaired first, which takes longer.
+It works on every file at once, with a 256 MB cache for each: four 1.4 GB shards took 18 s
+and peaked at 1.5 GB of memory, against 29 s one at a time. The work is bound by the disk, not
+the CPU, so on a spinning disk or a server busy with other work, `--jobs N` limits how many
+files it does at once. A shard the node did not close cleanly is repaired first, which takes
+longer.
+
+**Interrupting it is safe, and running it again continues.** Ctrl+C lets the files in
+progress finish, starts no more, and lists the ones it did not reach; run `compact` again to
+do them. Every step inside a file is a committed transaction, so nothing is lost even if it is
+killed outright — a second Ctrl+C stops at once — but a file stopped mid-compaction is
+repaired in full the next time anything opens it, `compact` or the node.
 
 The search index (`indices/`) is not affected by `compact`. Its deleted documents go when its
 segments merge, and that can be asked for while the node runs, per index:
