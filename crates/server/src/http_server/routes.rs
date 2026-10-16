@@ -30,8 +30,8 @@ use tracing::{info, warn};
 use crate::http_server::HEALTH_PATH;
 use crate::http_server::admin::{
     admin_audit_handler, admin_index_commit_handler, admin_index_evict_writer_handler,
-    admin_keys_reload_handler, admin_memory_handler, admin_memory_purge_handler,
-    admin_workers_handler,
+    admin_index_merge_handler, admin_keys_reload_handler, admin_memory_handler,
+    admin_memory_purge_handler, admin_workers_handler,
 };
 use crate::http_server::catalogue::{
     create_config_handler, delete_index_handler, get_config_handler, list_cluster_indexes_handler,
@@ -239,6 +239,10 @@ pub fn create_router(state: AppState, config: &RouterConfig<'_>) -> (Router, Mcp
             .route(
                 "/_admin/index/{index}/commit",
                 post(admin_index_commit_handler),
+            )
+            .route(
+                "/_admin/index/{index}/merge",
+                post(admin_index_merge_handler),
             )
             .route(
                 "/_admin/index/{index}/evict-writer",

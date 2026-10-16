@@ -12,7 +12,8 @@ use serde_json::Value as JsonValue;
 
 use crate::http_server::error::AppError;
 use crate::node::{
-    AdminIndexCommitReport, AdminIndexEvictWriterReport, AdminMemoryReport, WorkerPoolReport,
+    AdminIndexCommitReport, AdminIndexEvictWriterReport, AdminIndexMergeReport, AdminMemoryReport,
+    WorkerPoolReport,
 };
 use crate::state::AppState;
 
@@ -34,6 +35,13 @@ pub(super) async fn admin_index_commit_handler(
     State(state): State<AppState>,
 ) -> Result<Json<AdminIndexCommitReport>, AppError> {
     Ok(Json(state.router.admin_commit_index(index).await?))
+}
+
+pub(super) async fn admin_index_merge_handler(
+    Path(index): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<AdminIndexMergeReport>, AppError> {
+    Ok(Json(state.router.admin_merge_index(index).await?))
 }
 
 pub(super) async fn admin_index_evict_writer_handler(

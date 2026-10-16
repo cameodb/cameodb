@@ -134,6 +134,7 @@ const ROUTES: &[RouteRule] = &[
     // decides when revocation takes effect.
     rule("POST",   "/_admin/keys/reload",               Access::Needs(Capability::NodeAdmin)),
     rule("POST",   "/_admin/index/{index}/commit",      Access::Needs(Capability::NodeAdmin)),
+    rule("POST",   "/_admin/index/{index}/merge",       Access::Needs(Capability::NodeAdmin)),
     rule("POST",   "/_admin/index/{index}/evict-writer",Access::Needs(Capability::NodeAdmin)),
 
     // MCP. Streamable HTTP uses one path for all three verbs; the GET (SSE stream) and
@@ -1453,10 +1454,12 @@ mod tests {
         assert!(allowed(&writer, "POST", "/api/docs/_bulk"));
         assert!(refused(&writer, "PATCH", "/api/docs/_schema"));
         assert!(refused(&writer, "POST", "/_admin/memory/purge"));
+        assert!(refused(&writer, "POST", "/_admin/index/docs/merge"));
 
         assert!(allowed(&admin, "DELETE", "/api/docs"));
         assert!(allowed(&admin, "GET", "/_admin/workers"));
         assert!(allowed(&admin, "POST", "/_admin/index/docs/evict-writer"));
+        assert!(allowed(&admin, "POST", "/_admin/index/docs/merge"));
     }
 
     #[test]

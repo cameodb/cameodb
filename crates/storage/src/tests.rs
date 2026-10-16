@@ -3270,3 +3270,126 @@ mod durability_barrier {
         );
     }
 }
+
+mod full_merge {
+    use super::*;
+    use tempfile::TempDir;
+
+    const INDEX: &str = "pruned";
+
+    fn config(dir: &TempDir) -> StorageConfig {
+        StorageConfig {
+            shard_path: dir.path().join("shard"),
+            wal_sync: false,
+            default_batch_size: 100_000,
+            ..StorageConfig::default()
+        }
+    }
+
+    /// Four committed segments of 1,000 documents each, then three in four ids deleted and not
+    /// yet committed: the shape a retention prune leaves behind.
+    fn store_after_a_mass_delete(dir: &TempDir) -> HybridStore {
+        let store = HybridStore::new(config(dir), 1).expect("open store");
+        store
+            .store_schema_and_cache(INDEX, &IndexSchema::default())
+            .expect("store schema");
+        for segment in 0..4 {
+            let ops = (0..1_000)
+                .map(|i| WalOp::Put {
+                    id: format!("d{}", segment * 1_000 + i),
+                    json_blob: Some(serde_json::json!({
+                        "title": format!("document {i} of segment {segment}"),
+                        "body": "words that make each document take some room in its segment",
+                    })),
+                })
+                .collect();
+            store.apply_batch(INDEX, ops).expect("write");
+            store.commit_index(INDEX).expect("commit");
+        }
+        let deletes = (0..4_000)
+            .filter(|n| n % 4 != 0)
+            .map(|n| WalOp::Delete {
+                id: format!("d{n}"),
+            })
+            .collect();
+        store.apply_batch(INDEX, deletes).expect("delete");
+        store
+    }
+
+    #[test]
+    fn a_merge_drops_the_deleted_documents_and_returns_their_disk() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = store_after_a_mass_delete(&dir);
+
+        let started = store
+            .start_full_merge(INDEX)
+            .expect("start")
+            .expect("four segments with deletes have something to merge");
+        assert_eq!(started.segments, 4);
+        assert_eq!(
+            started.deleted_docs, 3_000,
+            "the deletes still buffered are committed first, so the merge drops them too"
+        );
+        assert_eq!(started.live_docs, 1_000);
+
+        let merged = started.merge.wait().expect("merge").expect("a segment");
+        assert_eq!(merged.num_docs(), 1_000);
+        assert!(!merged.has_deletes());
+        let after = store.finish_merge(INDEX).expect("finish");
+        assert!(
+            after < started.bytes_before / 2,
+            "three quarters of the documents are gone from disk: {} -> {after} bytes",
+            started.bytes_before
+        );
+        assert_eq!(
+            store
+                .search_documents(INDEX, "*", 10_000, None)
+                .expect("search")
+                .total_hits,
+            1_000
+        );
+    }
+
+    #[test]
+    fn a_merged_index_reopens_without_replaying_or_losing_anything() {
+        let dir = TempDir::new().expect("temp dir");
+        {
+            let store = store_after_a_mass_delete(&dir);
+            let started = store
+                .start_full_merge(INDEX)
+                .expect("start")
+                .expect("merge");
+            started.merge.wait().expect("merge");
+            store.finish_merge(INDEX).expect("finish");
+            store.shutdown().expect("shutdown");
+        }
+
+        let store = HybridStore::new(config(&dir), 1).expect("reopen");
+        assert_eq!(
+            store
+                .search_documents(INDEX, "*", 10_000, None)
+                .expect("search")
+                .total_hits,
+            1_000,
+            "the merge kept the commit's checkpoint, so the reopen neither replays the deletes' \
+             tail nor loses it"
+        );
+        assert!(store.get_by_key(INDEX, "d4").expect("lookup").is_some());
+        assert!(store.get_by_key(INDEX, "d5").expect("lookup").is_none());
+    }
+
+    #[test]
+    fn there_is_nothing_to_merge_in_one_clean_segment_or_an_index_this_shard_lacks() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = store_after_a_mass_delete(&dir);
+        let started = store
+            .start_full_merge(INDEX)
+            .expect("start")
+            .expect("merge");
+        started.merge.wait().expect("merge");
+        store.finish_merge(INDEX).expect("finish");
+
+        assert!(store.start_full_merge(INDEX).expect("again").is_none());
+        assert!(store.start_full_merge("absent").expect("absent").is_none());
+    }
+}

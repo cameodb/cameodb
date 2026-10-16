@@ -170,6 +170,75 @@ async fn a_written_document_is_retrievable_by_id() {
     assert_eq!(hits[0]["title"], "Dune");
 }
 
+/// A merge after a mass delete drops the deleted documents, and searches still answer the same.
+///
+/// The request returns once each shard has started its merge, so the report is what the merges
+/// started from; a second request answers "nothing to merge" only once they have all finished,
+/// which is what the poll waits for.
+#[tokio::test]
+async fn a_merge_after_a_mass_delete_drops_the_deleted_documents() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    // Several commits, so each shard holds more than one segment.
+    for round in 0..4 {
+        let batch: Vec<_> = (0..250)
+            .map(|i| {
+                let id = format!("r{round}-{i}");
+                json!({"id": id, "doc": {"id": id, "title": format!("round {round} doc {i}")}})
+            })
+            .collect();
+        client.bulk_index("pruned", &batch).await.expect("write");
+        client.admin_index_commit("pruned").await.expect("commit");
+    }
+    let doomed: Vec<_> = (0..4)
+        .flat_map(|round| {
+            (0..250)
+                .filter(|i| i % 4 != 0)
+                .map(move |i| json!(format!("r{round}-{i}")))
+        })
+        .collect();
+    client
+        .delete_documents("pruned", &doomed)
+        .await
+        .expect("delete");
+
+    let started = client.admin_index_merge("pruned").await.expect("merge");
+    assert!(started.errors.is_empty(), "{started:?}");
+    assert!(started.shards_merging >= 1, "{started:?}");
+    assert_eq!(
+        started.deleted_docs, 748,
+        "the buffered deletes are committed before the merge starts, so it drops all of them: \
+         every id but 0, 4, … 248 of each round's 250"
+    );
+    assert_eq!(started.live_docs, 252);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let again = client.admin_index_merge("pruned").await.expect("merge");
+        if again.shards_merging == 0 && again.errors.is_empty() {
+            assert_eq!(again.shards_unchanged, again.shards_total);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the merges never finished: {again:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let all = client
+        .search("pruned", "title:round", Some(1000), None, None, None)
+        .await
+        .expect("search");
+    assert_eq!(all["total_hits"].as_u64(), Some(252));
+    let gone = client
+        .search("pruned", "id:r0-1", Some(10), None, None, None)
+        .await
+        .expect("search");
+    assert_eq!(gone["total_hits"].as_u64(), Some(0));
+}
+
 /// A deleted document is gone from the key-value path at once, and from the index at the commit.
 ///
 /// Both halves matter and they are not the same moment. An `id:VALUE` query is answered from redb

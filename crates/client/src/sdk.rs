@@ -591,6 +591,18 @@ impl CameoClient {
             .await
     }
 
+    /// Merge each shard's segments of `index` into one, dropping its deleted documents.
+    ///
+    /// Returns once every shard has started; the merges finish in the background, and each
+    /// shard logs "Merge complete" with the size it ended at.
+    pub async fn admin_index_merge(&self, index: &str) -> Result<AdminIndexMergeResponse> {
+        let url = self
+            .base_url
+            .join(&format!("_admin/index/{}/merge", index))?;
+        self.send_json(self.http.post(url), "Admin index merge")
+            .await
+    }
+
     pub async fn admin_index_evict_writer(
         &self,
         index: &str,
@@ -773,6 +785,26 @@ pub struct AdminIndexCommitResponse {
     pub index: String,
     pub shards_total: usize,
     pub shards_committed: usize,
+    pub errors: Vec<ShardError>,
+}
+
+/// `#[serde(default)]` for the reason given on [`AdminWorkersResponse`]: the node may be a
+/// different version than this client.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AdminIndexMergeResponse {
+    pub index: String,
+    pub shards_total: usize,
+    /// Shards whose segments are now merging into one.
+    pub shards_merging: usize,
+    /// Shards with nothing to merge.
+    pub shards_unchanged: usize,
+    pub segments: usize,
+    pub live_docs: u64,
+    /// Deleted documents the merges drop.
+    pub deleted_docs: u64,
+    /// The merging shards' index files before the merge, in bytes.
+    pub bytes_before: u64,
     pub errors: Vec<ShardError>,
 }
 

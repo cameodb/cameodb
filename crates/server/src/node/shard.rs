@@ -75,6 +75,21 @@ pub(super) type RebuildCommand = (
     tokio::sync::oneshot::Sender<Result<u64, StoreError>>,
 );
 
+/// What a merge started from on one shard; see [`MicroshardActor::admin_merge_via_channel`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MergeSummary {
+    pub segments: usize,
+    pub live_docs: u64,
+    pub deleted_docs: u64,
+    pub bytes_before: u64,
+}
+
+/// Type alias for merges enqueued in the writer thread: (index, reply)
+pub(super) type MergeCommand = (
+    String,
+    tokio::sync::oneshot::Sender<Result<Option<storage::MergeStarted>, StoreError>>,
+);
+
 /// Type alias for tracking reply slices when coalescing batch writes
 pub(super) type BatchReplySegment = (
     usize,
@@ -747,6 +762,7 @@ pub(super) fn spawn_writer_thread(
                     let mut batch_groups: HashMap<String, Vec<BatchCommand>> = HashMap::new();
                     let mut commits: Vec<(String, tokio::sync::oneshot::Sender<Result<(), StoreError>>)> = Vec::new();
                     let mut evictions: Vec<(String, tokio::sync::oneshot::Sender<bool>)> = Vec::new();
+                    let mut merges: Vec<MergeCommand> = Vec::new();
                     let mut deletions: Vec<DeleteCommand> = Vec::new();
                     let mut rebuilds: Vec<RebuildCommand> = Vec::new();
                     let mut committed_indices: HashSet<String> = HashSet::new();
@@ -782,6 +798,7 @@ pub(super) fn spawn_writer_thread(
                     batch_groups.clear();
                     commits.clear();
                     evictions.clear();
+                    merges.clear();
                     deletions.clear();
                     rebuilds.clear();
                     let mut should_shutdown = false;
@@ -806,6 +823,9 @@ pub(super) fn spawn_writer_thread(
                             }
                             StorageCommand::EvictWriter { index, reply } => {
                                 evictions.push((index, reply));
+                            }
+                            StorageCommand::Merge { index, reply } => {
+                                merges.push((index, reply));
                             }
                             StorageCommand::DeleteIndex { index, delete_schema, reply } => {
                                 deletions.push((index, delete_schema, reply));
@@ -1095,6 +1115,20 @@ pub(super) fn spawn_writer_thread(
                             writer_store.commit_index(&index)
                         });
                         if res.is_ok() {
+                            committed_indices.insert(index.clone());
+                        }
+                        let _ = reply.send(res);
+                    }
+
+                    // Phase 5a: Start requested merges, after the commits and ahead of the
+                    // evictions, so a merge asked for in the same drain as an eviction starts on
+                    // the writer it was asked of. Starting one commits first and returns as soon
+                    // as Tantivy has taken the merge.
+                    for (index, reply) in merges.drain(..) {
+                        let res = guard_writer_op(&writer_store, &index, || {
+                            writer_store.start_full_merge(&index)
+                        });
+                        if matches!(res, Ok(Some(_))) {
                             committed_indices.insert(index.clone());
                         }
                         let _ = reply.send(res);
@@ -1580,6 +1614,82 @@ impl MicroshardActor {
         self.store
             .as_ref()
             .map_or((0, 0), |s| (s.open_index_count(), s.open_index_cap()))
+    }
+
+    /// Start merging `index` into one segment on this shard, and finish it in the background.
+    ///
+    /// Returns once Tantivy has taken the merge — `None` when there is nothing to merge — with
+    /// what it started from. A spawned task waits for the merge, reloads the reader so the
+    /// replaced segments' files are let go, and logs the result: a merge of large segments
+    /// takes minutes, and nothing that waits on this should wait that long.
+    pub(crate) async fn admin_merge_via_channel(
+        &self,
+        index: String,
+    ) -> Result<Option<MergeSummary>, OrchestratorError> {
+        let store = self.store.clone().ok_or_else(|| {
+            OrchestratorError::Io(std::io::Error::other("Shard store not attached"))
+        })?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.send_write_command(StorageCommand::Merge {
+            index: index.clone(),
+            reply: tx,
+        })
+        .await?;
+        let Some(started) = rx
+            .await
+            .map_err(|_| OrchestratorError::Io(std::io::Error::other("Writer dropped reply")))?
+            .map_err(OrchestratorError::Storage)?
+        else {
+            return Ok(None);
+        };
+
+        let summary = MergeSummary {
+            segments: started.segments,
+            live_docs: started.live_docs,
+            deleted_docs: started.deleted_docs,
+            bytes_before: started.bytes_before,
+        };
+        let shard_id = self.shard_id;
+        let began = std::time::Instant::now();
+        tokio::spawn(async move {
+            if let Err(e) = started.merge.await {
+                tracing::warn!(
+                    %shard_id,
+                    index = %index,
+                    error = %e,
+                    "Merge did not finish; the index keeps its segments, and asking again retries"
+                );
+                return;
+            }
+            let finished = {
+                let index = index.clone();
+                tokio::task::spawn_blocking(move || store.finish_merge(&index)).await
+            };
+            match finished {
+                Ok(Ok(bytes_after)) => tracing::info!(
+                    %shard_id,
+                    index = %index,
+                    segments = summary.segments,
+                    deleted_docs_dropped = summary.deleted_docs,
+                    live_docs = summary.live_docs,
+                    mb_before = summary.bytes_before / (1024 * 1024),
+                    mb_after = bytes_after / (1024 * 1024),
+                    elapsed_ms = began.elapsed().as_millis(),
+                    "Merge complete"
+                ),
+                Ok(Err(e)) => tracing::warn!(
+                    %shard_id,
+                    index = %index,
+                    error = %e,
+                    "Merge finished, but releasing the replaced segments failed; they go at the \
+                     next commit's cleanup"
+                ),
+                Err(e) => {
+                    tracing::warn!(%shard_id, index = %index, error = %e, "Merge finish task failed")
+                }
+            }
+        });
+        Ok(Some(summary))
     }
 
     pub(crate) async fn admin_evict_writer_via_channel(

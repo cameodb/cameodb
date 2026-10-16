@@ -756,6 +756,9 @@ async fn main() -> Result<()> {
         println!("  GET  /_admin/audit - Read the audit trail");
         println!("  POST /_admin/keys/reload - Reload API keys from config (also on SIGHUP)");
         println!("  POST /_admin/index/{{index}}/commit - Force index writer commit");
+        println!(
+            "  POST /_admin/index/{{index}}/merge - Merge segments, dropping deleted documents"
+        );
         println!("  POST /_admin/index/{{index}}/evict-writer - Evict index writer from cache");
     } else {
         println!("  (Admin endpoints are disabled)");

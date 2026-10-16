@@ -10,8 +10,9 @@
 #   retention-prune.sh review FILE                        checks of the id list (lines, unique, format, first/last)
 #   retention-prune.sh delete FILE [--execute] [...]      bulk delete; dry run unless --execute
 #
-# Deleting frees no disk by itself: the space stays inside the node's redb files. Stop the node
-# and run `cameodb compact -c <config>` to return it (`--dry-run` first reports how much).
+# Deleting frees no disk by itself. POST /_admin/index/<index>/merge returns the search index's
+# share while the node runs; the documents' share stays inside the node's redb files until the
+# node is stopped and `cameodb compact -c <config>` runs (`--dry-run` first reports how much).
 #
 # CUTOFF is --months N (retain N previous months + the current one, default 6) or an exact
 # --older-than YYYY-MM-DD. Further options are forwarded: retention_prune.py <command> -h.

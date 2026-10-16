@@ -514,6 +514,18 @@ impl RouterActor {
             })
     }
 
+    pub(crate) async fn admin_merge_index(
+        &self,
+        index: String,
+    ) -> Result<AdminIndexMergeReport, OrchestratorError> {
+        self.orchestrator
+            .ask(MergeAdminIndex { index })
+            .await
+            .map_err(|e| {
+                OrchestratorError::Io(std::io::Error::other(format!("Actor error: {}", e)))
+            })
+    }
+
     pub(crate) async fn admin_evict_index_writer(
         &self,
         index: String,

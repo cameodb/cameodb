@@ -370,8 +370,10 @@ def cmd_delete(a, api):
         api.call("POST", f"/_admin/index/{api.index}/commit")
         print("commit requested")
     if sent:
-        print("the files on disk keep their size: to return the space, stop the node and run "
-              "`cameodb compact -c <config>` (--dry-run first shows how much)")
+        print("the files on disk keep their size. To return the space: "
+              f"POST /_admin/index/{api.index}/merge for the search index, while the node runs; "
+              "then stop the node and run `cameodb compact -c <config>` for the documents "
+              "(--dry-run first shows how much)")
     return 0
 
 

@@ -3,7 +3,7 @@
 //! Contains:
 //! - Process/Jemalloc memory stats types and platform-specific readers
 //! - Admin message types (`GetAdminMemory`, `PurgeAdminMemory`, etc.)
-//! - Report types (`AdminMemoryReport`, `AdminIndexCommitReport`, etc.)
+//! - Report types (`AdminMemoryReport`, `AdminIndexCommitReport`, `AdminIndexMergeReport`, etc.)
 //! - `Message` implementations on `NodeOrchestrator`
 //! - Orchestrator helper methods for admin operations
 
@@ -106,6 +106,29 @@ pub struct AdminIndexCommitReport {
     pub errors: Vec<ShardError>,
 }
 
+/// Report returned by POST /_admin/index/{index}/merge: what was started, not what finished.
+///
+/// A merge of large segments runs for minutes, so the request returns once every shard has
+/// started its own, and each shard logs "Merge complete" with the size it ended at.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminIndexMergeReport {
+    pub index: String,
+    pub shards_total: usize,
+    /// Shards whose segments are now merging into one.
+    pub shards_merging: usize,
+    /// Shards with nothing to merge: already one segment with no deletes, or no such index.
+    pub shards_unchanged: usize,
+    /// Segments being merged, across the shards merging.
+    pub segments: usize,
+    /// Documents the merged segments will hold.
+    pub live_docs: u64,
+    /// Deleted documents the merges drop.
+    pub deleted_docs: u64,
+    /// The merging shards' Tantivy files before the merge, in bytes.
+    pub bytes_before: u64,
+    pub errors: Vec<ShardError>,
+}
+
 /// Report returned by POST /_admin/index/{index}/evict_writer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminIndexEvictWriterReport {
@@ -133,6 +156,11 @@ pub struct CommitAdminIndex {
 
 #[derive(Debug, Clone)]
 pub struct EvictAdminIndexWriter {
+    pub index: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct MergeAdminIndex {
     pub index: String,
 }
 
@@ -385,6 +413,18 @@ impl Message<CommitAdminIndex> for NodeOrchestrator {
     }
 }
 
+impl Message<MergeAdminIndex> for NodeOrchestrator {
+    type Reply = Result<AdminIndexMergeReport, OrchestratorError>;
+
+    async fn handle(
+        &mut self,
+        msg: MergeAdminIndex,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.orch_admin_merge_index(msg.index).await
+    }
+}
+
 impl Message<EvictAdminIndexWriter> for NodeOrchestrator {
     type Reply = Result<AdminIndexEvictWriterReport, OrchestratorError>;
 
@@ -441,6 +481,40 @@ impl NodeOrchestrator {
             shards_committed: committed,
             errors,
         })
+    }
+
+    pub(crate) async fn orch_admin_merge_index(
+        &self,
+        index: String,
+    ) -> Result<AdminIndexMergeReport, OrchestratorError> {
+        let mut report = AdminIndexMergeReport {
+            index,
+            shards_total: self.shards.len(),
+            shards_merging: 0,
+            shards_unchanged: 0,
+            segments: 0,
+            live_docs: 0,
+            deleted_docs: 0,
+            bytes_before: 0,
+            errors: Vec::new(),
+        };
+        for (shard_id, shard) in &self.shards {
+            match shard.admin_merge_via_channel(report.index.clone()).await {
+                Ok(Some(started)) => {
+                    report.shards_merging += 1;
+                    report.segments += started.segments;
+                    report.live_docs += started.live_docs;
+                    report.deleted_docs += started.deleted_docs;
+                    report.bytes_before += started.bytes_before;
+                }
+                Ok(None) => report.shards_unchanged += 1,
+                Err(e) => report.errors.push(ShardError {
+                    shard_id: shard_id.to_string(),
+                    error: e.to_string(),
+                }),
+            }
+        }
+        Ok(report)
     }
 
     pub(crate) async fn orch_admin_evict_index_writer(

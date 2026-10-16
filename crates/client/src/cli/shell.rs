@@ -589,7 +589,7 @@ impl IndexCompleter {
     }
 
     pub(crate) fn admin_index_operation_suggestions(&self, prefix: &str) -> Vec<Pair> {
-        let operations = vec!["commit", "evict-writer"];
+        let operations = vec!["commit", "merge", "evict-writer"];
         operations
             .into_iter()
             .filter(|op| op.starts_with(prefix))
@@ -1051,7 +1051,7 @@ impl Hinter for IndexCompleter {
                         }
                         let op = parts.next();
                         if op.is_none() {
-                            return Some(" <commit|evict-writer>".to_string());
+                            return Some(" <commit|merge|evict-writer>".to_string());
                         }
                         None
                     }
@@ -1183,8 +1183,9 @@ mod usage {
     pub(super) const ADMIN_MEMORY: &str = "admin memory <stats|purge>";
     pub(super) const ADMIN_MEMORY_STATS: &str = "admin memory stats";
     pub(super) const ADMIN_MEMORY_PURGE: &str = "admin memory purge [--force]";
-    pub(super) const ADMIN_INDEX: &str = "admin index <name> <commit|evict-writer>";
+    pub(super) const ADMIN_INDEX: &str = "admin index <name> <commit|merge|evict-writer>";
     pub(super) const ADMIN_INDEX_COMMIT: &str = "admin index <name> commit";
+    pub(super) const ADMIN_INDEX_MERGE: &str = "admin index <name> merge";
     pub(super) const ADMIN_INDEX_EVICT: &str = "admin index <name> evict-writer";
     pub(super) const ADMIN_WORKERS: &str = "admin workers";
     pub(super) const CONNECT: &str = "connect <host[:port]>";
@@ -1208,6 +1209,7 @@ const INTERACTIVE_USAGE: &[&str] = &[
     usage::ADMIN_MEMORY_STATS,
     usage::ADMIN_MEMORY_PURGE,
     usage::ADMIN_INDEX_COMMIT,
+    usage::ADMIN_INDEX_MERGE,
     usage::ADMIN_INDEX_EVICT,
     usage::ADMIN_WORKERS,
     usage::CONNECT,
@@ -1673,13 +1675,17 @@ pub(crate) async fn dispatch_interactive_command(
                             let result = session.client().admin_index_commit(index).await?;
                             print_json(&result)?;
                         }
+                        "merge" => {
+                            let result = session.client().admin_index_merge(index).await?;
+                            print_json(&result)?;
+                        }
                         "evict-writer" => {
                             let result = session.client().admin_index_evict_writer(index).await?;
                             print_json(&result)?;
                         }
                         other => {
                             return Err(anyhow!(
-                                "Unknown index operation '{}'. Use 'commit' or 'evict-writer'.",
+                                "Unknown index operation '{}'. Use 'commit', 'merge' or 'evict-writer'.",
                                 other
                             ));
                         }

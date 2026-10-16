@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each would give back and changes nothing. It refuses to run while the node holds the files.
   1 GB shards with 75% of their documents deleted went to 310 MB in about 1.5 s each.
   `retention-prune.sh` says so when a delete finishes.
+- **`POST /_admin/index/{index}/merge` returns the disk the search index holds for deleted
+  documents.** A delete only marks a document dead in its Tantivy segment, and the default merge
+  policy may never rewrite a large segment, so after a big delete the index kept its size or
+  grew. The endpoint commits the index and merges each shard's segments into one, on Tantivy's
+  merge threads: it returns at once with what it started, writes and searches carry on, and
+  each shard logs `Merge complete` with its size before and after. Also
+  `cameodb client admin index <name> merge`. 150 MB per shard with 40% deleted went to 95 MB in
+  about 2.4 s, inserts unaffected meanwhile.
 - **A restart after a crash opens each shard in milliseconds: `[storage] quick_repair`,
   default on.** A node killed rather than shut down — a crash, an OOM kill, a `SIGKILL` — left
   every shard's redb file to be repaired before the shard could open: up to three passes over

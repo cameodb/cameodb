@@ -902,8 +902,8 @@ pub struct GetShardStats {
 
 // Admin types re-exported from the dedicated admin module.
 pub use crate::admin::memory::{
-    AdminIndexCommitReport, AdminIndexEvictWriterReport, AdminMemoryReport, CommitAdminIndex,
-    EvictAdminIndexWriter, GetAdminMemory, PurgeAdminMemory,
+    AdminIndexCommitReport, AdminIndexEvictWriterReport, AdminIndexMergeReport, AdminMemoryReport,
+    CommitAdminIndex, EvictAdminIndexWriter, GetAdminMemory, MergeAdminIndex, PurgeAdminMemory,
 };
 
 /// Remote-friendly error type for cross-node microshard calls.
@@ -1514,6 +1514,13 @@ pub enum StorageCommand {
     EvictWriter {
         index: String,
         reply: tokio::sync::oneshot::Sender<bool>,
+    },
+    /// Commit an index, then start merging all of its segments into one; see
+    /// [`storage::HybridStore::start_full_merge`]. Only the start runs here: the merge itself is
+    /// on Tantivy's merge threads, so a large one does not hold up this shard's writes.
+    Merge {
+        index: String,
+        reply: tokio::sync::oneshot::Sender<Result<Option<storage::MergeStarted>, StoreError>>,
     },
     /// Drop an index's tables, caches and Tantivy directory.
     ///

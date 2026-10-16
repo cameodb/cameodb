@@ -183,6 +183,7 @@ mod tests {
             ("admin work", "workers"),
             ("admin memory stat", "stats"),
             ("admin index myindex commi", "commit"),
+            ("admin index myindex mer", "merge"),
             ("key sho", "show"),
             ("key clea", "clear"),
             ("admin memory purge --for", "--force"),

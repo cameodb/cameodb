@@ -47,6 +47,7 @@ Both return `{"error": …, "message": …}`. An unknown path answers `401` with
 | `GET` | `/_admin/audit` | `node-admin` |
 | `POST` | `/_admin/keys/reload` | `node-admin` |
 | `POST` | `/_admin/index/{index}/commit` | `node-admin` |
+| `POST` | `/_admin/index/{index}/merge` | `node-admin` |
 | `POST` | `/_admin/index/{index}/evict-writer` | `node-admin` |
 | `POST` `GET` `DELETE` | `/mcp` | `read` at the endpoint, then per tool |
 | `GET` `POST` | `/mcp/sse` | `read` at the endpoint, then per tool |
@@ -1246,6 +1247,51 @@ curl -s -X POST http://localhost:9480/_admin/index/books/commit
   "errors": []
 }
 ```
+
+#### Merge Index Segments
+Merge each shard's segments of the index into one, dropping the documents deleted from it. A
+delete only marks a document dead in its segment; its disk comes back when the segment is
+merged, and after a large delete the automatic merging may not get to it for a long time, or
+ever for segments past ten million documents.
+
+```bash
+POST /_admin/index/{index}/merge
+```
+
+**Example:**
+```bash
+curl -s -X POST http://localhost:9480/_admin/index/books/merge
+```
+
+**Response:**
+```json
+{
+  "index": "books",
+  "shards_total": 4,
+  "shards_merging": 4,
+  "shards_unchanged": 0,
+  "segments": 19,
+  "live_docs": 1300000,
+  "deleted_docs": 849894,
+  "bytes_before": 655756029,
+  "errors": []
+}
+```
+
+The request commits the index, starts a merge on every shard and returns: the report is what
+the merges started from. They finish in the background, on Tantivy's merge threads, so writes
+and searches carry on meanwhile; each shard logs `Merge complete` with `mb_before` and
+`mb_after` when its merge ends. `shards_unchanged` counts shards with nothing to merge — one
+segment with no deletes, or none of this index — so asking again until every shard is
+unchanged is how to wait for the merges from outside.
+
+A merge needs free disk for the merged segment while it runs, up to the size of the documents
+it keeps. A shard reported under `errors` was already merging some of those segments on its own;
+asking again once that merge ends merges the rest. Measured locally: 150 MB per shard with 40%
+of its documents deleted went to 95 MB in about 2.4 s, inserts unaffected meanwhile.
+
+This is the index files only. The documents themselves are held in redb, which never returns
+deleted space while the node runs; see `cameodb compact` in DEPLOYMENT.md.
 
 #### Evict Index Writer
 Evict the index writer from cache for the given index, freeing its memory.

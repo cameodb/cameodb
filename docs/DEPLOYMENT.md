@@ -427,8 +427,16 @@ while the node holds the files, rewrites each file in place so it needs no free 
 own, and took about 1.5 s per GB in testing (1,028 MB → 310 MB per shard after deleting 75%).
 A shard the node did not close cleanly is repaired first, which takes longer.
 
-The search index (`indices/`) is not affected by `compact`: deleted documents there are
-removed as its segments merge.
+The search index (`indices/`) is not affected by `compact`. Its deleted documents go when its
+segments merge, and that can be asked for while the node runs, per index:
+
+```bash
+curl -s -X POST http://localhost:9480/_admin/index/<index>/merge   # or: cameodb client admin index <index> merge
+```
+
+It returns at once, with what it started, and each shard logs `Merge complete` with its size
+before and after. It needs free disk for the merged segment while it runs. See the API
+reference for the report.
 
 For more details, see the [Docker README](../docker/README.md), which includes the latest swarm environment variables and configuration guidance.
 
