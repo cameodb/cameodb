@@ -409,5 +409,26 @@ cameodb client admin memory purge --force
 
 These endpoints are useful after large bulk ingestions to verify memory has been returned to the OS, or during memory pressure investigations.
 
+### Reclaiming Disk After a Large Delete
+
+Deleting documents does not shrink the data files. redb, which holds the documents, keeps the
+freed space inside each shard's `store.redb` and reuses it for later writes, but never returns
+it to the filesystem. Return it with the node stopped:
+
+```bash
+systemctl stop cameodb
+cameodb compact -c /etc/cameodb/cameodb.toml --dry-run   # what each file would give back
+cameodb compact -c /etc/cameodb/cameodb.toml
+systemctl start cameodb
+```
+
+Run it as the user that owns the data directory (`sudo -u cameodb …`). It refuses to start
+while the node holds the files, rewrites each file in place so it needs no free disk of its
+own, and took about 1.5 s per GB in testing (1,028 MB → 310 MB per shard after deleting 75%).
+A shard the node did not close cleanly is repaired first, which takes longer.
+
+The search index (`indices/`) is not affected by `compact`: deleted documents there are
+removed as its segments merge.
+
 For more details, see the [Docker README](../docker/README.md), which includes the latest swarm environment variables and configuration guidance.
 

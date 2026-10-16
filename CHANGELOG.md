@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`cameodb compact` returns the disk a delete frees.** A delete freed space inside a shard's
+  redb file but never gave it back: the files stayed at their largest size, however much was
+  deleted. With the node stopped, `cameodb compact -c <config>` shrinks every shard's
+  `store.redb`, and the node's `metadata.redb`, to the data they hold; `--dry-run` reports what
+  each would give back and changes nothing. It refuses to run while the node holds the files.
+  1 GB shards with 75% of their documents deleted went to 310 MB in about 1.5 s each.
+  `retention-prune.sh` says so when a delete finishes.
 - **A restart after a crash opens each shard in milliseconds: `[storage] quick_repair`,
   default on.** A node killed rather than shut down — a crash, an OOM kill, a `SIGKILL` — left
   every shard's redb file to be repaired before the shard could open: up to three passes over
