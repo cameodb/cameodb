@@ -1539,12 +1539,19 @@ Measured on Apple M5 Pro, file already in the page cache: a 1 GB shard took 0.4�
 against 5–8 ms to open cleanly, and a 4 GB file 1.57 s against 7 ms with `quick_repair`. A
 repair read from disk, at hundreds of gigabytes per shard, takes minutes per shard.
 
-The cost is on the write side: each durable commit is two-phase and flushes twice. Bulk-sized
-commits measured about 5% slower; single-record durable commits, which are bounded by the flush
-itself, fell from about 250/s to 140/s on macOS, where `F_FULLFSYNC` makes every flush
-expensive. Concurrent single writes share commits, so a node's single-write ceiling falls by less
-than that — measure it on your hardware with `cameodb-bench` if single-write throughput is what
-the node is for.
+The cost is on the write side: each durable commit is two-phase, flushes twice, and records the
+allocator state. Measured through the node with `cameodb-bench` and `wal_sync = true`, the same
+build with the setting off and on, on macOS (4 shards, three interleaved runs each):
+
+| Workload | `quick_repair = false` | `quick_repair = true` |
+|---|---|---|
+| Bulk, 500 documents per request, 4 concurrent | 48–61k docs/s | 34–41k docs/s |
+| Single writes, 16 concurrent | 578–1,003/s | 405–767/s |
+
+About 30% fewer durable writes, both ways. macOS is the expensive case — `F_FULLFSYNC` flushes
+the whole device on every sync — so a Linux host with a fast disk should pay less; measure it on
+your hardware with `cameodb-bench` if write throughput is what the node is for. With
+`wal_sync = false` most commits do not flush, and the cost is smaller.
 
 A repair is logged per shard — `Database was not closed cleanly; redb is repairing it`, progress,
 then `redb repair complete` with its duration — so a slow start after a crash is visible. The
