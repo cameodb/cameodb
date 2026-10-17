@@ -116,6 +116,35 @@ pub(crate) enum RewriteError {
 /// A rewrite has no such cost — its original is untouched until the copy is done — so Ctrl+C
 /// abandons the rewrites in progress too, and deletes their partial copies.
 pub async fn run(args: impl Iterator<Item = String>) -> Result<()> {
+    const USAGE: &str = "\
+cameodb compact — return the disk a delete freed inside the redb files
+
+Usage:
+  cameodb compact [-c <PATH>] [--dry-run] [--jobs <N>]
+  cameodb compact --rewrite [--keep] [-c <PATH>] [--dry-run] [--jobs <N>]
+
+Run it with the node stopped: redb locks its files, so it refuses to start while the node holds
+them. It works on every shard's store.redb and on metadata.redb under the configured data paths.
+
+Options:
+  -c, --config <PATH>   The node's config file, for its data paths
+  --dry-run             Report the size each file would come down to, and change nothing
+  --jobs <N>            Files worked on at once (default: every file; with --rewrite, 1)
+  --rewrite             Copy each file into a new one beside it, then switch to the copy.
+                        Needs free disk for the copy, about the size --dry-run reports, and
+                        checks for it before each file: one without room is left alone.
+  --keep                With --rewrite, keep each original as store.redb.old instead of
+                        deleting it. Nothing is freed on disk until those files are deleted.
+  -h, --help            Show this message
+
+Without --rewrite, compaction moves the data down inside the file and truncates the rest: no
+free disk needed. It ends at the size --dry-run reports unless a page it cannot move stops it;
+a file left well above that size is what --rewrite is for.
+
+Ctrl+C stops it cleanly. Compaction finishes the files in progress, starts no more, and lists
+the ones it did not reach. A rewrite abandons the copies in progress and deletes them; the
+originals are as they were. Running the command again continues either way.";
+
     let mut dry_run = false;
     let mut rewrite = false;
     let mut keep_old = false;
@@ -125,6 +154,10 @@ pub async fn run(args: impl Iterator<Item = String>) -> Result<()> {
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let value = match arg.as_str() {
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                return Ok(());
+            }
             "--dry-run" => {
                 dry_run = true;
                 continue;

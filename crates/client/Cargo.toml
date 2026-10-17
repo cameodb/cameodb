@@ -9,6 +9,9 @@ license = "MIT"
 # license change.
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow.workspace = true
 reqwest.workspace = true

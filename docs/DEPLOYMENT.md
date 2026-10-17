@@ -437,6 +437,44 @@ do them. Every step inside a file is a committed transaction, so nothing is lost
 killed outright — a second Ctrl+C stops at once — but a file stopped mid-compaction is
 repaired in full the next time anything opens it, `compact` or the node.
 
+**What to expect from a small delete.** `compact` ends a file at the size `--dry-run`
+reports: the pages still holding data. A delete of a few percent of a shard gives back about
+that few percent, and less while ingest keeps running, because new writes reuse the freed
+pages before compaction can return them. A shard of 1.6 TB with a few percent of its
+documents deleted came down by 0–6% per file. If a file ends well above its `--dry-run`
+size, the space is there but compaction could not move a page into it; that is the case for
+`--rewrite`, below. If it ends at its `--dry-run` size, the file holds that much data and
+neither form will make it smaller.
+
+#### `--rewrite`: copy each file into a new one
+
+```bash
+systemctl stop cameodb
+cameodb compact -c /etc/cameodb/cameodb.toml --rewrite --dry-run   # sizes, and which files have room
+cameodb compact -c /etc/cameodb/cameodb.toml --rewrite             # original deleted once the copy is in place
+cameodb compact -c /etc/cameodb/cameodb.toml --rewrite --keep      # original kept as store.redb.old
+systemctl start cameodb
+```
+
+`--rewrite` copies every table of a file into `store.redb.rewrite` beside it, checks each
+table's row count, compacts the copy, and renames it over `store.redb`. Until that rename the
+original is only read, so at every moment `store.redb` is one complete file or the other. It
+ends at the same size in-place compaction can reach, never smaller; what it does not depend on
+is how the old file's free space is laid out.
+
+- **Free disk.** Each copy needs about the size `--dry-run` reports, on the same filesystem as
+  the file. That is checked before each file starts, and a file without room is left alone
+  and named in the summary. Rewrites run one at a time unless `--jobs N` says otherwise;
+  several at once on one filesystem share its free space rather than each counting all of it.
+- **`--keep`.** The original stays as `store.redb.old` (a hard link, taking no extra space
+  until the rename), and goes on taking its full size until deleted: start the node, check
+  it, then `rm` the `.old` files. With `--keep` the disk fills as the run goes on, so a run over
+  many large files can stop for lack of room partway; delete the `.old` files kept so far, or
+  rerun without `--keep`. A `store.redb.old` left from an earlier run is never overwritten.
+- **Interrupting.** Ctrl+C abandons the copies in progress and deletes them; the originals are
+  as they were. A copy left by a killed run is deleted when the next rewrite of that file
+  starts.
+
 The search index (`indices/`) is not affected by `compact`. Its deleted documents go when its
 segments merge, and that can be asked for while the node runs, per index:
 

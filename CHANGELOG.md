@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`cameodb compact --rewrite` copies each redb file into a new one and switches to it.**
+  In-place compaction ends at the first page it finds no room below for; a rewrite does not
+  depend on how the old file's free space is laid out. Every table is copied beside the file,
+  row counts checked, the copy compacted and renamed over the original, which is only read
+  until then. The original is deleted, or with `--keep` stays as `store.redb.old`. Each copy
+  needs free disk about the size `--dry-run` reports, checked before it starts: a file without
+  room is left alone and counted in the summary. One file at a time by default; Ctrl+C
+  abandons copies in progress and deletes them. It ends where in-place compaction can, no
+  smaller: it is for a file compaction leaves well above its `--dry-run` size.
 - **`cameodb compact` returns the disk a delete frees.** A delete freed space inside a shard's
   redb file but never gave it back: the files stayed at their largest size, however much was
   deleted. With the node stopped, `cameodb compact -c <config>` shrinks every shard's
@@ -54,6 +63,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **No `unsafe` left outside `admin/memory.rs`.** The cluster key is wiped on drop with
+  `zeroize`, as API keys already were, and the tests' port lock uses the standard library's
+  file lock. Config tests pass their environment to the loader instead of setting it on the
+  process, which raced every test reading it in parallel. `unsafe_code` is now denied across
+  the workspace, `admin/memory.rs` (macOS process memory, jemalloc stats and purge) excepted.
 - **A node starts up to twice as many shards at once: `max(2, cores / 2)`, from `cores / 4`.**
   Opening a shard is bound by the disk — redb's open, a whole-file repair after a crash without
   `quick_repair` — and each shard's cache is its share of the memory limit, so more at once costs
@@ -98,6 +112,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`--help` on `compact`, `check-config` and `generate-config` describes the command.**
+  `compact --help` and `check-config --help` failed with "Unknown option", and
+  `generate-config --help` printed a sample config. `cameodb --help` points to them, and its
+  client example `cameodb client index list`, a command that never existed, is now
+  `cameodb client list indexes`.
+- **`cameodb admin …` runs the client's admin commands, as its own help says.** The
+  shortcut without `client` worked for every client command but `admin`, and was offered for
+  `index`, which the client does not have.
 - **0.3.6's Linux binary was built by Rust 1.95.0, not the 1.98.1 the repo pinned.** The musl
   builder image was cached under `:latest` and never rebuilt when the pin moved; the macOS and
   Windows binaries were 1.98.1. Builder images are now tagged with the compiler they carry, and

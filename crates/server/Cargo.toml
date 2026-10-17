@@ -10,6 +10,9 @@ license = "FSL-1.1-ALv2"
 publish = false
 description = "A high-performance distributed hybrid-search database"
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "cameodb"
 path = "src/main.rs"

@@ -6,6 +6,11 @@
 //! - Report types (`AdminMemoryReport`, `AdminIndexCommitReport`, `AdminIndexMergeReport`, etc.)
 //! - `Message` implementations on `NodeOrchestrator`
 //! - Orchestrator helper methods for admin operations
+//!
+//! The one place `unsafe` is allowed (the workspace denies it): the macOS process reader calls
+//! `proc_pidinfo`, and the jemalloc stats and purge call `mallctl`. Both are tested and working,
+//! and the crates that would wrap them make the same calls inside.
+#![allow(unsafe_code)]
 
 #[cfg(target_os = "linux")]
 use std::fs;

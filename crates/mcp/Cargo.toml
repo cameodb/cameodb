@@ -7,6 +7,9 @@ license = "Apache-2.0"
 publish = false
 description = "Model Context Protocol router and transport for CameoDB"
 
+[lints]
+workspace = true
+
 [dependencies]
 axum = { workspace = true }
 futures = { workspace = true }

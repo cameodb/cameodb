@@ -240,7 +240,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [M0](#m0--the-architecture-review-and-the-order-of-work) … [M8](#m8--re-decide-the-query-complexity-caps) | The 0.3.5 goal set — a node exposed on the internet serving several tenants from one process; M0 closed, the M1 blocker cleared, and M2–M8 done; M6's open-loop arms found and fixed [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) and [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput), and were confirmed on the cut binary 2026-09-27. The release cut remains | — | 2026-09-27 | ◐ |
 | [N1](#n1--head-requests-skip-authorization) … [N17](#n17--smaller-items-filed-so-they-are-not-lost) | Pre-0.3.6 whole-code review — ten defects (N1–N10) to close before the cut, then the duplication and structure behind them: one way to reach a peer, dead surface, `run_change`, typed boundaries, single owners, the `orchestrator.rs` split | — | 2026-10-07 | 📋 |
 | [F10](#f10--fast-field-projection-the-pages-fields-answered-from-the-columns) | Fast-field projection — the page's fields answered from the columns, and the fetch phase skipped when they can be; the last layer of the search-economics work opened by the TS5 outage — deferred: the gain over the two-phase search is small for today's workloads, and the design is filed so it can be picked up | — | 2026-10-09 | 💭 |
-| [F11](#f11--the-disk-a-delete-frees-was-never-returned) | The disk a delete frees was never returned — `cameodb compact` (redb, offline) and `POST /_admin/index/{index}/merge` (Tantivy, online) done; reclaiming deleted documents automatically, behind a setting, planned | — | 2026-10-16 | ◐ |
+| [F11](#f11--the-disk-a-delete-frees-was-never-returned) | The disk a delete frees was never returned — `cameodb compact` and `--rewrite` (redb, offline) and `POST /_admin/index/{index}/merge` (Tantivy, online) done; reclaiming deleted documents automatically, behind a setting, planned | — | 2026-10-16 | ◐ |
 
 ---
 
@@ -1953,6 +1953,14 @@ deleted to free disk, and the files kept their size.
 - `POST /_admin/index/{index}/merge` (`8647baf`), with the node running: commits, then merges each
   shard's segments into one on Tantivy's merge threads. It returns at once, and each shard logs
   `Merge complete`. Writes carried on at full rate during a merge of 850k deleted documents.
+- `cameodb compact --rewrite [--keep]` (`9741dc5`): copies each file into a new one and renames it
+  over the original, after checking the filesystem has room for the copy. Added after a
+  production node of 17 shards of 1.5–1.8 TB, a few percent of its documents deleted, came out
+  of 5–8 h of in-place compaction 0–6% smaller per file. The suspicion was in-place
+  compaction stopping at a large page with no free run below it. Not reproduced: a dense file
+  of mixed 2–72 KB documents with every 20th deleted compacted in place to its allocated size,
+  and a rewrite ends there too, never smaller. The deciding number is that node's `--dry-run`
+  size against its file size, not yet taken.
 
 **📋 Planned: reclaim deleted documents automatically, behind a setting.** Postponed on
 2026-10-16 in favour of the two manual tools above. Off by default, so a node that does not set

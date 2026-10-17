@@ -99,7 +99,8 @@ async fn main() -> Result<()> {
     if interactive_requested
         || matches!(
             subcommand,
-            "client" | "health" | "index" | "search" | "schema" | "data" | "list" | "delete"
+            // The client's own top-level commands, so each also runs without `client`.
+            "client" | "health" | "list" | "search" | "schema" | "data" | "delete" | "admin"
         )
     {
         return client::run_cli().await;
@@ -126,7 +127,21 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Asked of a subcommand, `--help` is answered by it, not by the node's help further down,
+    // which is reached only when nothing earlier has taken the arguments.
+    let wants_help = args.iter().skip(2).any(|arg| arg == "--help" || arg == "-h");
+
     if subcommand == "generate-config" {
+        if wants_help {
+            println!(
+                "cameodb generate-config — print a sample configuration file\n\n\
+                 Usage:\n  \
+                 cameodb generate-config > cameodb.toml\n\n\
+                 Every setting, at its default, as TOML. Check a file made from it with\n\
+                 `cameodb check-config -c <PATH>`."
+            );
+            return Ok(());
+        }
         println!("{}", CameoDbConfig::generate_sample_config()?);
         return Ok(());
     }
@@ -145,6 +160,23 @@ async fn main() -> Result<()> {
     // Posture check without starting the node: the manual equivalent of a CI gate, so a
     // config can be verified before it is deployed rather than by watching a server boot.
     if subcommand == "check-config" {
+        if wants_help {
+            println!(
+                "cameodb check-config — report the security posture of a config, without starting\n\
+                 the node\n\n\
+                 Usage:\n  \
+                 cameodb check-config [-c <PATH>] [--allow-unauthenticated] [OPTIONS]\n\n\
+                 Options:\n  \
+                 -c, --config <PATH>        The config file to check; without it, the one the node\n  \
+                 \u{20}                          would load\n  \
+                 --allow-unauthenticated    Accept a network-reachable node with no authentication,\n  \
+                 \u{20}                          which otherwise fails the check\n  \
+                 -h, --help                 Show this message\n\n\
+                 Any node option (see `cameodb --help`) is applied over the file, as at startup.\n\
+                 Prints the resolved limits and a pass/fail matrix; exits non-zero if a check fails."
+            );
+            return Ok(());
+        }
         // Logs to stderr, so the matrix on stdout stays parseable. Without a subscriber the
         // things this command exists to surface — which file was loaded, unknown settings,
         // a world-writable key file — were being discarded.
@@ -283,7 +315,7 @@ async fn main() -> Result<()> {
              cameodb generate-config\n  \
              cameodb check-config [-c <PATH>] [--allow-unauthenticated]\n  \
              cameodb keygen --role <admin|writer|reader>\n  \
-             cameodb compact [-c <PATH>] [--dry-run] [--jobs <N>]\n  \
+             cameodb compact [-c <PATH>] [--dry-run] [--jobs <N>] [--rewrite [--keep]]\n  \
              cameodb client <subcommand>\n\n\
              Options:\n\
              {}\n  \
@@ -298,11 +330,13 @@ async fn main() -> Result<()> {
              compact          With the node stopped, shrink its redb files to the data they hold.\n  \
              \u{20}                 A delete frees space inside a file but never returns it to disk;\n  \
              \u{20}                 --dry-run reports what each file would give back and changes nothing;\n  \
-             \u{20}                 every file at once unless --jobs N limits it\n  \
-             client           Run the bundled client CLI (health, index, search)\n\n\
+             \u{20}                 every file at once unless --jobs N limits it; --rewrite copies each\n  \
+             \u{20}                 file into a new one instead, --keep keeping the original\n  \
+             client           Run the bundled client CLI (health, list, search, schema, data, delete, admin)\n\n\
+             `cameodb <command> --help` describes each command.\n\n\
              Client examples:\n  \
              cameodb client health\n  \
-             cameodb client index list\n  \
+             cameodb client list indexes\n  \
              cameodb client search myindex \"foo bar\" --limit 5 --url http://host:9480\n\n\
              Configuration sources, highest precedence first: command-line options, then the\n  \
              CAMEODB_* environment variables shown above, then the config file, then defaults.",

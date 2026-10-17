@@ -6,6 +6,9 @@ license = "Apache-2.0"
 # Not published: consumed via path dependencies only.
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow = { workspace = true }
 redb = { workspace = true }

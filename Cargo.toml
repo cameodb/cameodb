@@ -7,6 +7,12 @@ members = ["crates/*"]
 # the whole workspace already says so explicitly (`--workspace`, `-p bench`).
 default-members = ["crates/server"]
 
+# `unsafe` is refused everywhere; the one exception, `crates/server/src/admin/memory.rs`
+# (macOS process memory, jemalloc stats and purge), allows it in that file and says why. A crate
+# opts in with `[lints] workspace = true`.
+[workspace.lints.rust]
+unsafe_code = "deny"
+
 [workspace.dependencies]
 anyhow = "1.0.102"
 arc-swap = "1"
