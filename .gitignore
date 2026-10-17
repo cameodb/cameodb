@@ -210,3 +210,7 @@ local.toml
 dev.toml
 cameodb.toml
 cameodb.yaml
+# …except the configs the packages install, which are sources: the .deb/.rpm ship the first,
+# the Windows installer the second, and a build fails without it.
+!crates/server/cameodb.toml
+!crates/server/windows/cameodb.toml

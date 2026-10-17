@@ -201,6 +201,38 @@ if [ -f "$WIN_EXE" ]; then
         info "to check it, run this on the Windows machine and copy the file over:"
         info "  cameodb.exe --version > cameodb.exe.version"
     fi
+
+    # The installer, from scripts/build/build-msi.ps1. Optional, but when present it has to be
+    # this release's, and it has to carry the very cameodb.exe published beside it: the MSI is
+    # built on the Windows machine from whatever binary was there, and nothing else here can
+    # look inside it. Its sidecar records what went in.
+    WIN_MSI="$DIST/windows/cameodb-$VERSION-x64.msi"
+    for msi in "$DIST"/windows/*.msi; do
+        [ -f "$msi" ] || continue
+        [ "$msi" = "$WIN_MSI" ] || die "windows/$(basename "$msi") is not this release's installer, cameodb-$VERSION-x64.msi"
+    done
+    if [ -f "$WIN_MSI" ]; then
+        case "$(file -b "$WIN_MSI")" in
+            *"MSI Installer"*) ok "$(basename "$WIN_MSI")  $(du -h "$WIN_MSI" | cut -f1)" ;;
+            *)                 die "windows/$(basename "$WIN_MSI") is not a Windows Installer package: $(file -b "$WIN_MSI")" ;;
+        esac
+        [ -f "$WIN_MSI.version" ] || die "no $(basename "$WIN_MSI").version beside the installer: build it with
+     scripts/build/build-msi.ps1, which records what it packaged, and copy the sidecar too"
+        msi_record="$(LC_ALL=C tr -d '\r\000\357\273\277\377\376' < "$WIN_MSI.version")"
+        msi_version="$(printf '%s\n' "$msi_record" | sed -n 1p)"
+        msi_exe_hash="$(printf '%s\n' "$msi_record" | sed -n 's/^cameodb\.exe sha256 //p')"
+        [ "$msi_version" = "cameodb $VERSION" ] \
+            || die "$(basename "$WIN_MSI") records '$msi_version', but this release is $VERSION"
+        exe_hash="$(shasum -a 256 "$WIN_EXE" | cut -d' ' -f1)"
+        [ "$msi_exe_hash" = "$exe_hash" ] \
+            || die "$(basename "$WIN_MSI") packages a cameodb.exe with SHA-256 ${msi_exe_hash:-(none recorded)},
+     not the windows/cameodb.exe staged beside it ($exe_hash). Copy both from the same
+     build-msi.ps1 run"
+        ok "packages the staged cameodb.exe"
+    else
+        warn "no windows/cameodb-$VERSION-x64.msi: Windows ships as the bare .exe only"
+        info "build it on the Windows machine with scripts/build/build-msi.ps1"
+    fi
     info "will be signed and hashed with the rest"
 else
     warn "no dist/$VERSION/windows/cameodb.exe"

@@ -1,0 +1,158 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  CameoDB's Windows installer, built with WiX Toolset v6 (or v4/v5, same schema) by
+  scripts/build/build-msi.ps1. What it does, against what the Linux packages do:
+
+    binary          C:\Program Files\CameoDB\cameodb.exe, that folder on the system PATH
+                    (Linux: /usr/local/bin/cameodb)
+    config          C:\ProgramData\CameoDB\cameodb.toml, never overwritten, never removed
+                    (Linux: /etc/cameodb/cameodb.toml, a conffile)
+    data, logs      C:\ProgramData\CameoDB\data and \logs, kept on uninstall
+                    (Linux: /var/lib/cameodb, removed only by purge)
+    account         NT SERVICE\CameoDB, a virtual account Windows creates with the service:
+                    no password, no user to manage (Linux: the cameodb system user)
+    service         CameoDB, automatic start, started on install, restarted on failure
+                    (Linux: cameodb.service, enabled and started, Restart=on-failure)
+    upgrade         stops the service, replaces the binary, starts it again; config and data
+                    are left as they are
+
+  Defines, passed by build-msi.ps1:
+    Version   the release, major.minor.patch
+    BinDir    the folder holding the cameodb.exe to package
+    RepoRoot  the repository root, for LICENSE
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="CameoDB"
+           Manufacturer="CameoDB Team"
+           Version="$(Version)"
+           UpgradeCode="A309A2E0-873F-485F-88B9-ACF298D8E43E"
+           Scope="perMachine"
+           Compressed="yes">
+
+    <!-- One CameoDB per machine: a newer package replaces an older one in place. -->
+    <MajorUpgrade DowngradeErrorMessage="A newer version of CameoDB is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Launch Condition="VersionNT64" Message="CameoDB needs 64-bit Windows." />
+
+    <Property Id="ARPURLINFOABOUT" Value="https://cameodb.com" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="CameoDB" />
+    </StandardDirectory>
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="DATAROOT" Name="CameoDB">
+        <Directory Id="DATADIR" Name="data" />
+        <Directory Id="LOGDIR" Name="logs" />
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="CameoDB" Level="1">
+      <ComponentGroupRef Id="Program" />
+      <ComponentGroupRef Id="State" />
+    </Feature>
+
+    <ComponentGroup Id="Program" Directory="INSTALLFOLDER">
+      <Component Id="CameoDbExe" Guid="65AF3927-2857-465A-A197-DC6FB6C48701" Bitness="always64">
+        <File Id="CameoDbExe" Source="$(BinDir)\cameodb.exe" KeyPath="yes" />
+
+        <!--
+          `service run` is the entry point that answers the service manager; a plain
+          `cameodb.exe` would be killed by it after 30 seconds (error 1053).
+        -->
+        <ServiceInstall Id="CameoDbService"
+                        Name="CameoDB"
+                        DisplayName="CameoDB"
+                        Description="CameoDB hybrid-search database server."
+                        Type="ownProcess"
+                        Start="auto"
+                        ErrorControl="normal"
+                        Account="NT SERVICE\CameoDB"
+                        Arguments="service run --config &quot;[DATAROOT]cameodb.toml&quot;"
+                        Vital="yes">
+          <!--
+            PreShutdownDelay: how long Windows waits for the service when the machine shuts
+            down. The node's own shutdown gives up at 120 s, flushing every shard on the way;
+            the Windows default would cut it short.
+          -->
+          <!--
+            FailureActionsWhen: the actions below also follow a stop the node reports as failed
+            (service-specific exit code 1), not only a crash, which is all Windows counts by
+            default. That is what Restart=on-failure does with a non-zero exit.
+          -->
+          <ServiceConfig OnInstall="yes" OnReinstall="yes"
+                         DelayedAutoStart="no"
+                         PreShutdownDelay="150000"
+                         ServiceSid="unrestricted"
+                         FailureActionsWhen="failedToStopOrReturnedError" />
+          <!-- Restart on failure, as Restart=on-failure does: 10 s, three times a day. -->
+          <ServiceConfigFailureActions OnInstall="yes" OnReinstall="yes" ResetPeriod="86400">
+            <Failure Action="restart" Delay="10000" />
+            <Failure Action="restart" Delay="10000" />
+            <Failure Action="restart" Delay="10000" />
+          </ServiceConfigFailureActions>
+        </ServiceInstall>
+        <ServiceControl Id="CameoDbServiceControl"
+                        Name="CameoDB"
+                        Start="install"
+                        Stop="both"
+                        Remove="uninstall"
+                        Wait="yes" />
+      </Component>
+
+      <Component Id="License" Guid="2A1DFD6F-B580-4936-919C-45A6130CF727" Bitness="always64">
+        <File Id="License" Source="$(RepoRoot)\LICENSE" Name="LICENSE.txt" KeyPath="yes" />
+      </Component>
+
+      <!-- `cameodb client …`, `cameodb compact …` from any shell. Removed on uninstall. -->
+      <Component Id="SystemPath" Guid="5F817C8E-BB02-45DB-89C9-8F0A753C8BBC" Bitness="always64">
+        <Environment Id="SystemPath"
+                     Name="PATH"
+                     Value="[INSTALLFOLDER]"
+                     Part="last"
+                     Action="set"
+                     System="yes"
+                     Permanent="no" />
+        <CreateFolder />
+      </Component>
+    </ComponentGroup>
+
+    <!--
+      Config, data and logs: Permanent, so neither an uninstall nor an upgrade removes them.
+
+      Access, by SID so that nothing is looked up before the service exists:
+        SY  SYSTEM, BA  Administrators: full control everywhere
+        S-1-5-80-3196691271-1903880709-56935160-284765964-990515363
+            NT SERVICE\CameoDB, the service's virtual account: SHA-1 of "CAMEODB" in UTF-16LE,
+            as Windows derives every service SID (`sc.exe showsid CameoDB` prints it). Read and
+            execute on the config folder, modify on data and logs.
+      PAI makes each list protected: ProgramData's own entries, which let every user create
+      files there, are not inherited. Other users cannot read the data, as with Linux's 0700.
+    -->
+    <ComponentGroup Id="State">
+      <Component Id="DataRoot" Directory="DATAROOT" Guid="5D28AC31-7F0D-47D0-9CC8-E17D4B9CD441" Permanent="yes" Bitness="always64">
+        <CreateFolder>
+          <PermissionEx Sddl="D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;S-1-5-80-3196691271-1903880709-56935160-284765964-990515363)" />
+        </CreateFolder>
+      </Component>
+
+      <Component Id="DataDir" Directory="DATADIR" Guid="E9EEC8F8-00E0-4AB8-9E43-A088AAC15377" Permanent="yes" Bitness="always64">
+        <CreateFolder>
+          <PermissionEx Sddl="D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;S-1-5-80-3196691271-1903880709-56935160-284765964-990515363)" />
+        </CreateFolder>
+      </Component>
+
+      <Component Id="LogDir" Directory="LOGDIR" Guid="B40B6990-1E4E-4B2D-81B3-F7DE2317432F" Permanent="yes" Bitness="always64">
+        <CreateFolder>
+          <PermissionEx Sddl="D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;S-1-5-80-3196691271-1903880709-56935160-284765964-990515363)" />
+        </CreateFolder>
+      </Component>
+
+      <!-- Installed once; an edited file is never replaced, by an upgrade or a repair. -->
+      <Component Id="Config" Directory="DATAROOT" Guid="C8DA55C2-7E25-4462-A63C-11782AD8C939" Permanent="yes" NeverOverwrite="yes" Bitness="always64">
+        <File Id="Config" Source="$(RepoRoot)\crates\server\windows\cameodb.toml" Name="cameodb.toml" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Package>
+</Wix>

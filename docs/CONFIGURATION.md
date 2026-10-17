@@ -243,6 +243,38 @@ label = "cameo-node-01"
 zone = "default"
 ```
 
+### Logging (`[logging]`)
+
+Where the log goes besides standard output, and what is in it. Under systemd, standard output
+is the journal and nothing here is needed. A Windows service has no standard output, so there
+the log file is the only log; the MSI's config sets it.
+
+```toml
+[logging]
+# A daily file, cameodb.YYYY-MM-DD.log, in this directory (default: none). Created if
+# missing; the node refuses to start if it cannot write here, rather than run with no log.
+directory = "/var/log/cameodb"
+# Days of files kept (default: 14). Older ones are deleted as a new day starts.
+max_files = 14
+# What is logged, as a RUST_LOG filter (default: none, which logs errors only). Applies to
+# standard output and the file alike. RUST_LOG, when set, takes precedence.
+level = "warn,cameodb=info,cameodb::http_server=warn"
+```
+
+`info` everywhere logs a line per bulk write request, which on a busy node comes to millions a
+day. The filter above keeps warnings from everywhere and the node's own start and stop
+messages, without them. The file has no colour codes, and is written as each line is logged,
+so a process that ends abruptly loses nothing it had already logged.
+
+The level and the file take effect after the config is read: anything logged while reading
+it — which file was chosen, an unknown setting — goes to standard output only, at `RUST_LOG`'s
+level. A config the node refuses is refused into the file too.
+
+| Flag | Environment variable |
+|---|---|
+| `--log-dir <PATH>` | `CAMEODB_LOG_DIR` |
+| `--log-level <FILTER>` | `CAMEODB_LOG_LEVEL` |
+
 ### Search Configuration
 
 ```toml
@@ -1249,7 +1281,11 @@ There is deliberately no `CAMEODB_API_KEY` on the server: a node never needs a k
 clear, only digests. That variable is read by the **client**.
 
 ### Storage Configuration
-- `CAMEODB_DATA_PATHS`: Colon-separated list of data paths
+- `CAMEODB_DATA_PATHS`: Data paths, separated as in `PATH`: `:`, or `;` on Windows
+
+### Logging
+- `CAMEODB_LOG_DIR`: Directory for a daily log file
+- `CAMEODB_LOG_LEVEL`: What is logged, as a `RUST_LOG` filter
 
 ### Limits
 - `CAMEODB_MAX_RECORD_SIZE_MB`: Largest single record; the other message sizes derive from it

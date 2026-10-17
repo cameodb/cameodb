@@ -440,6 +440,31 @@ max_response_bytes = 16777216
         assert!(sample.contains("data_paths"));
     }
 
+    /// `--data-paths` is split as `PATH` is, so a Windows drive letter is not a separator.
+    #[test]
+    fn data_paths_are_split_as_path_is() {
+        let paths = |value: &str| {
+            let overrides = cli(&["--data-paths", value]).with_environment(&[]);
+            CameoDbConfig::load_with_cli(&overrides)
+                .expect("data paths")
+                .storage
+                .data_paths
+        };
+        #[cfg(unix)]
+        assert_eq!(
+            paths("/srv/a:/srv/b"),
+            vec![PathBuf::from("/srv/a"), PathBuf::from("/srv/b")]
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            paths(r"C:\cameodb\a;D:\cameodb\b"),
+            vec![
+                PathBuf::from(r"C:\cameodb\a"),
+                PathBuf::from(r"D:\cameodb\b")
+            ]
+        );
+    }
+
     #[test]
     fn test_default_batch_size_setting() {
         // Set a specific batch size via environment variable

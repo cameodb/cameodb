@@ -69,6 +69,9 @@ pub enum ConfigError {
     #[error("MCP configuration error: {message}")]
     McpConfig { message: String },
 
+    #[error("Logging configuration error: {message}")]
+    LoggingConfig { message: String },
+
     #[error("{message}\n\nRun `cameodb --help` for the list of options.")]
     CommandLine { message: String },
 }
@@ -106,6 +109,10 @@ pub struct CameoDbConfig {
     /// The MCP transport: `[mcp]`.
     #[serde(default)]
     pub mcp: McpConfig,
+
+    /// Where the node's log goes besides standard output: `[logging]`.
+    #[serde(default)]
+    pub logging: LoggingConfig,
 
     /// Moved to `[limits] max_record_size_mb`. Read from here until 0.4.0.
     #[serde(default)]
@@ -184,6 +191,42 @@ impl Default for McpConfig {
             sse_keepalive_secs: default_sse_keepalive_secs(),
             legacy_sse_enabled: default_legacy_sse_enabled(),
             max_in_flight_per_session: default_max_in_flight_per_session(),
+        }
+    }
+}
+
+/// `[logging]` — a log file beside standard output, and the level both are written at.
+///
+/// Standard output is where a node under systemd logs, into the journal. A Windows service has
+/// no standard output at all, so there the file is the only log there is; anywhere else it is
+/// optional.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct LoggingConfig {
+    /// Directory for log files (default: none, standard output only).
+    ///
+    /// One file a day, `cameodb.YYYY-MM-DD.log`, created along with the directory if missing.
+    /// The node refuses to start if it cannot write here, rather than run with no log.
+    pub directory: Option<PathBuf>,
+
+    /// Days of log files kept (default: 14); older ones are deleted as a new day starts.
+    pub max_files: usize,
+
+    /// What is logged, as a `RUST_LOG` filter: `info`, or `warn,storage=debug` (default: none,
+    /// which logs errors only). `RUST_LOG` itself, when set, takes precedence.
+    pub level: Option<String>,
+}
+
+fn default_log_max_files() -> usize {
+    14
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            directory: None,
+            max_files: default_log_max_files(),
+            level: None,
         }
     }
 }
@@ -860,6 +903,13 @@ impl CameoDbConfig {
     /// The same order picks the config file itself: `--config` wins over `CAMEODB_CONFIG`.
     /// Every overridable setting has both a flag and an environment variable, defined once as
     /// a pair in [`OVERRIDES`], so the two layers can never drift apart.
+    ///
+    /// Node startup does the same in two steps, [`Self::load_unvalidated`] then
+    /// [`Self::validate`], to open its log file in between.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "node startup loads and validates in two steps")
+    )]
     pub fn load_with_cli(cli: &CliOverrides) -> Result<Self> {
         let config = Self::load_unvalidated(cli)?;
         config.validate()?;
@@ -868,9 +918,11 @@ impl CameoDbConfig {
 
     /// Resolve the configuration from all sources without validating it.
     ///
-    /// Only for tooling that needs to *report* on an invalid config — `check-config` has
-    /// to show which rules a bad file breaks, which it cannot do if loading refuses to
-    /// hand it over. Server startup always goes through [`Self::load_with_cli`].
+    /// For tooling that needs to *report* on an invalid config — `check-config` has to show
+    /// which rules a bad file breaks, which it cannot do if loading refuses to hand it over —
+    /// and for node startup, which opens its log file from `[logging]` before it calls
+    /// [`Self::validate`], so that a refusal is logged there. Startup never runs on a config
+    /// that has not passed it.
     pub fn load_unvalidated(cli: &CliOverrides) -> Result<Self> {
         // Start with defaults
         let mut config = Self::default();
@@ -1094,6 +1146,7 @@ impl CameoDbConfig {
         self.validate_network()?;
         self.validate_storage()?;
         self.validate_memory()?;
+        self.validate_logging()?;
 
         // A trail configured into uselessness — a zero-length buffer, a zero-slot queue —
         // is caught here rather than discovered empty during the incident it was turned on
@@ -1107,6 +1160,27 @@ impl CameoDbConfig {
         // usable, and this decides whether the combination is allowed where this node sits.
         self.check_posture()?;
 
+        Ok(())
+    }
+
+    fn validate_logging(&self) -> Result<()> {
+        let invalid = |message: String| ConfigError::LoggingConfig { message };
+        if self.logging.directory.is_some() && self.logging.max_files == 0 {
+            return Err(invalid(
+                "logging.max_files is 0, which would delete every log file as it is \
+                 written; keep at least 1 day"
+                    .to_string(),
+            )
+            .into());
+        }
+        if let Some(level) = &self.logging.level {
+            tracing_subscriber::EnvFilter::try_new(level).map_err(|e| {
+                invalid(format!(
+                    "logging.level {level:?} is not a filter like \"info\" or \
+                     \"warn,storage=debug\": {e}"
+                ))
+            })?;
+        }
         Ok(())
     }
 

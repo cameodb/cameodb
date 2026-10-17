@@ -486,5 +486,92 @@ It returns at once, with what it started, and each shard logs `Merge complete` w
 before and after. It needs free disk for the merged segment while it runs. See the API
 reference for the report.
 
+## 🪟 Windows: the MSI installer
+
+`cameodb-<version>-x64.msi` installs CameoDB as a Windows service, the way the `.deb` and `.rpm`
+install it under systemd. It needs 64-bit Windows and an administrator: it installs a service
+and writes to Program Files and ProgramData.
+
+```powershell
+msiexec /i cameodb-0.3.7-x64.msi                           # with a progress window
+msiexec /i cameodb-0.3.7-x64.msi /qn /l*v cameodb-install.log  # silent, logged
+```
+
+| | Windows | Linux packages |
+|---|---|---|
+| Program | `C:\Program Files\CameoDB\cameodb.exe`, on the system `PATH` | `/usr/local/bin/cameodb` |
+| Config | `C:\ProgramData\CameoDB\cameodb.toml` | `/etc/cameodb/cameodb.toml` |
+| Data | `C:\ProgramData\CameoDB\data` | `/var/lib/cameodb` |
+| Logs | `C:\ProgramData\CameoDB\logs\cameodb.YYYY-MM-DD.log`, 14 days | the journal |
+| Runs as | `NT SERVICE\CameoDB`, a virtual account: no password, no user to manage | the `cameodb` user |
+| Service | `CameoDB`: automatic start, restarted 10 s after a failure | `cameodb.service`, `Restart=on-failure` |
+| Listens on | `0.0.0.0:9480`, profile `internal` | `0.0.0.0:9480`, profile `internal` |
+
+The installed config is the Linux packages' own, with Windows paths and a log file. So, as on
+Linux, nothing authenticates a caller until `[security]` is enabled, and every route, including
+`/_admin/*`, is open to whoever can reach the port; the node starts and warns, and
+`cameodb check-config` fails until it is closed. On Windows the firewall also stands in the way:
+the port answers this machine only until a rule allows it (below).
+
+The data and log folders are readable by Administrators, SYSTEM and the service alone, as
+`/var/lib/cameodb` is `0700`; run the commands below from an elevated PowerShell.
+
+**The service.**
+
+```powershell
+Get-Service CameoDB
+Stop-Service CameoDB       # the same graceful shutdown as Ctrl+C; up to two minutes on a large node
+Start-Service CameoDB      # returns once the node is listening
+Restart-Service CameoDB
+Get-Content C:\ProgramData\CameoDB\logs\cameodb.$(Get-Date -Format yyyy-MM-dd).log -Wait
+```
+
+A node that fails to start says why in that log, including a config it refuses. A config that
+cannot be read at all fails before the log is opened; `cameodb check-config -c <PATH>` says what
+is wrong with it.
+
+**Configuration.** Edit `C:\ProgramData\CameoDB\cameodb.toml`, check it, restart:
+
+```powershell
+cameodb check-config -c C:\ProgramData\CameoDB\cameodb.toml
+Restart-Service CameoDB
+```
+
+**Serving other machines.** Mint a key and enable `[security]` first (see
+[Securing a Deployment](#-securing-a-deployment)), then open the port. The profile follows who
+can reach it, as on Linux: `internal` for a trusted network, `external` — which also requires
+TLS — for an untrusted one.
+
+```powershell
+New-NetFirewallRule -DisplayName "CameoDB" -Direction Inbound -Protocol TCP -LocalPort 9480 -Action Allow
+```
+
+To keep the node to this machine instead, set `profile = "local"` and
+`bind_address = "127.0.0.1"`.
+
+**Offline commands** such as `compact` need the files to themselves, so stop the service first:
+
+```powershell
+Stop-Service CameoDB
+cameodb compact -c C:\ProgramData\CameoDB\cameodb.toml --dry-run
+cameodb compact -c C:\ProgramData\CameoDB\cameodb.toml
+Start-Service CameoDB
+```
+
+**Upgrading.** Run the newer `.msi`. It stops the service, replaces the program, and starts it
+again; the config, data and logs are left as they are. An edited config is never overwritten, so
+a setting new in a release keeps its default until you add it.
+
+**Uninstalling.** From *Settings → Apps*, or `msiexec /x cameodb-<version>-x64.msi`. The program,
+the service and the `PATH` entry go; `C:\ProgramData\CameoDB` stays, with your config, data and
+logs. Delete that folder to remove everything.
+
+**Unsigned installers.** A build without an Authenticode signature installs and runs normally on
+an unmanaged machine, but Windows shows its publisher as *Unknown*: SmartScreen asks before it
+runs a downloaded `.msi` (*More info → Run anyway*). Machines under company policy — AppLocker,
+App Control for Business, Smart App Control, SmartScreen enforced — may refuse the installer or
+the program outright. A release meant for such machines needs a signed build; see
+[docs/BUILDING.md](BUILDING.md#building-the-windows-installer-msi).
+
 For more details, see the [Docker README](../docker/README.md), which includes the latest swarm environment variables and configuration guidance.
 

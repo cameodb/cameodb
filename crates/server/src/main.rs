@@ -20,12 +20,15 @@ mod compact;
 mod config;
 mod distributed;
 mod http_server;
+mod logging;
 mod mcp;
 mod node;
 mod posture;
 mod query;
 mod ratelimit;
 mod remote_peer_pool;
+#[cfg(windows)]
+mod service;
 mod state;
 mod swarm;
 
@@ -80,13 +83,31 @@ fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     install_crypto_provider();
-
-    // Handle CLI arguments for configuration utilities and client mode
     let args: Vec<String> = std::env::args().collect();
 
+    // Windows starts a service by running this command line and waiting for the process to
+    // hand its main thread to the service manager: before anything else, and before the node's
+    // runtime exists. The service then runs the node on a thread of its own.
+    #[cfg(windows)]
+    if args.get(1).map(String::as_str) == Some("service") {
+        return service::run(&args[0], &args[2..]);
+    }
+
+    runtime()?.block_on(run(args))
+}
+
+/// The node's async runtime: what `#[tokio::main]` built, here so the Windows service can build
+/// its own on the thread it is given.
+fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+}
+
+/// Everything `cameodb` does from its command line: a subcommand, or the node itself.
+async fn run(args: Vec<String>) -> Result<()> {
     // Subcommands are dispatched on the first argument only. Matching anywhere in the
     // argument list would let a server flag's *value* — `--node-label search`, say — hijack
     // the process into client mode.
@@ -129,7 +150,10 @@ async fn main() -> Result<()> {
 
     // Asked of a subcommand, `--help` is answered by it, not by the node's help further down,
     // which is reached only when nothing earlier has taken the arguments.
-    let wants_help = args.iter().skip(2).any(|arg| arg == "--help" || arg == "-h");
+    let wants_help = args
+        .iter()
+        .skip(2)
+        .any(|arg| arg == "--help" || arg == "-h");
 
     if subcommand == "generate-config" {
         if wants_help {
@@ -150,6 +174,14 @@ async fn main() -> Result<()> {
     // running node — it is a hashing utility, not a server operation.
     if subcommand == "keygen" {
         return auth::run_keygen(args.into_iter().skip(2));
+    }
+
+    #[cfg(not(windows))]
+    if subcommand == "service" {
+        anyhow::bail!(
+            "`cameodb service` is for Windows, where it runs the node as a service; on Linux \
+             the packages install a systemd unit, cameodb.service, instead"
+        );
     }
 
     // Offline: redb locks its files, so this refuses to run against a node that is up.
@@ -316,6 +348,7 @@ async fn main() -> Result<()> {
              cameodb check-config [-c <PATH>] [--allow-unauthenticated]\n  \
              cameodb keygen --role <admin|writer|reader>\n  \
              cameodb compact [-c <PATH>] [--dry-run] [--jobs <N>] [--rewrite [--keep]]\n  \
+             cameodb service run [OPTIONS]                (Windows)\n  \
              cameodb client <subcommand>\n\n\
              Options:\n\
              {}\n  \
@@ -332,6 +365,7 @@ async fn main() -> Result<()> {
              \u{20}                 --dry-run reports what each file would give back and changes nothing;\n  \
              \u{20}                 every file at once unless --jobs N limits it; --rewrite copies each\n  \
              \u{20}                 file into a new one instead, --keep keeping the original\n  \
+             service          Windows: what the installed CameoDB service runs; not for a console\n  \
              client           Run the bundled client CLI (health, list, search, schema, data, delete, admin)\n\n\
              `cameodb <command> --help` describes each command.\n\n\
              Client examples:\n  \
@@ -348,11 +382,18 @@ async fn main() -> Result<()> {
 
     // Initialize tracing before loading config, so that which config file was chosen — and
     // any complaint about it — is visible rather than swallowed.
-    tracing_subscriber::fmt::init();
+    let logging = logging::init();
 
     // Load configuration: command line over environment over file over defaults.
     let cli_overrides = config::CliOverrides::parse(args.into_iter().skip(1))?;
-    let cameodb_config = CameoDbConfig::load_with_cli(&cli_overrides)?;
+    let cameodb_config = CameoDbConfig::load_unvalidated(&cli_overrides)?;
+    // Its level and log file before it is validated, so that a config the node refuses is
+    // refused into the log file too — the only place a Windows service's errors can be read.
+    logging.apply(&cameodb_config.logging)?;
+    if let Err(e) = cameodb_config.validate() {
+        tracing::error!("Refusing to start: {e:#}");
+        return Err(e);
+    }
 
     // The live key ring, behind the handle `/_admin/keys/reload` and SIGHUP swap. The
     // overrides move into it — they are re-applied on every reload, which is how an
@@ -911,6 +952,9 @@ async fn main() -> Result<()> {
         })
     };
 
+    #[cfg(windows)]
+    service::node_started();
+
     // Wait for shutdown signal (Ctrl+C or systemctl stop)
     #[cfg(unix)]
     {
@@ -937,7 +981,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
         use tokio::signal::windows;
 
@@ -961,14 +1005,20 @@ async fn main() -> Result<()> {
                     tracing::warn!("Second CTRL_CLOSE received, forcing immediate exit");
                     std::process::exit(1);
                 }
-                tracing::info!("Received CTRL_CLOSE (service stop/console close), shutting down...");
+                tracing::info!("Received CTRL_CLOSE (console closed), shutting down...");
             }
             _ = sigshutdown.recv() => {
                 if SHUTDOWN_IN_PROGRESS.swap(true, Ordering::SeqCst) {
                     tracing::warn!("Second CTRL_SHUTDOWN received, forcing immediate exit");
                     std::process::exit(1);
                 }
-                tracing::info!("Received CTRL_SHUTDOWN (service stop), shutting down...");
+                tracing::info!("Received CTRL_SHUTDOWN (system shutting down), shutting down...");
+            }
+            // A service gets none of the console events above: Windows asks it to stop through
+            // the service manager instead.
+            _ = service::STOP.notified() => {
+                SHUTDOWN_IN_PROGRESS.store(true, Ordering::SeqCst);
+                tracing::info!("Windows asked the service to stop, shutting down...");
             }
         }
     }

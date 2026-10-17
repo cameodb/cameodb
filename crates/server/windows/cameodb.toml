@@ -1,0 +1,106 @@
+# CameoDB on Windows, as the MSI installs it: C:\ProgramData\CameoDB\cameodb.toml.
+#
+# The same settings the Linux packages ship, with Windows paths. Like them, this node listens on
+# every interface with profile "internal", and nothing authenticates a caller until [security]
+# is enabled below; Windows Firewall still blocks the port from other machines until a rule
+# allows it (docs/DEPLOYMENT.md, "Windows: the MSI installer").
+#
+# The installer never overwrites this file: an upgrade keeps your edits, and uninstalling leaves
+# it, with the data and logs, in C:\ProgramData\CameoDB. Paths are single-quoted, TOML's literal
+# strings, so their backslashes are taken as written.
+#
+# After editing: `cameodb check-config -c C:\ProgramData\CameoDB\cameodb.toml`, then
+# `Restart-Service CameoDB`.
+
+[node]
+label = "cameodb"
+zone = "default"
+# Security posture: local (loopback only) | internal (trusted network) | external (untrusted).
+# Describes reach, not a lifecycle stage — pick by who can reach bind_address below, not by
+# whether this node is for development, testing or production. "local" with bind_address
+# "127.0.0.1" keeps it to this machine.
+# Enforced at startup; run `cameodb check-config` to see the resolved rules.
+profile = "internal"
+
+[network.http]
+bind_address = "0.0.0.0"
+port = 9480
+# Request timeout. Unset, it is derived from limits.max_record_size_mb as
+# max(60, max_record_size_mb / 10) — 60s at the default record size.
+# request_timeout_secs = 60
+# Browser origins allowed to call this node. Empty means no cross-origin access.
+cors_allowed_origins = []
+# In-flight bodies are held in memory: this multiplied by the body ceiling has to fit inside
+# limits.total_memory_limit_mb below. 32 x 128 MB = 4096 MB. Raise them together.
+max_concurrent_requests = 32
+# Mount the /_admin/* routes. They are unauthenticated unless [security] is enabled, in
+# which case they require a key holding node-admin. Keep them off where the node is
+# reachable off-box and authentication is not on.
+admin_enabled = true
+
+# Authentication for the HTTP and MCP surface. Off by default so an upgrade cannot lock
+# an existing deployment out of its own data.
+[security]
+enabled = false
+
+# This node is reachable off-box — profile = "internal" with a non-loopback bind — so with
+# authentication off every route, including /_admin/*, is open to anyone who can reach the
+# port. The node starts and warns; `cameodb check-config` exits non-zero, so a deploy step
+# gates on it. To close it, mint a key:
+#   cameodb keygen --role admin --label ops `
+#     --hash-out C:\ProgramData\CameoDB\keys\ops --key-out $HOME\.cameodb\ops.key
+# then set enabled = true above and add the matching [[security.api_keys]] entry.
+
+# [[security.api_keys]]
+# key_hash_file = 'C:\ProgramData\CameoDB\keys\ops'
+# role = "admin"                         # admin | writer | reader
+# label = "ops"
+
+[limits]
+max_record_size_mb = 64
+# 0 derives it from max_record_size_mb (+64 MB for framing).
+max_body_size_mb = 0
+# The node's memory budget: the indexer pool is sized from it.
+total_memory_limit_mb = 4096
+
+[network.cluster]
+enabled = false
+bind_address = "0.0.0.0"
+cluster_port = 9580
+cluster_name = "cameodb-cluster"
+seed_nodes = []
+
+[storage]
+data_paths = ['C:\ProgramData\CameoDB\data']
+disk_usage_threshold_percent = 90
+wal_sync = true
+# Skip the full redb repair on a restart after a crash, at a second flush per commit.
+quick_repair = true
+wal_segment_size_mb = 64
+default_batch_size = 2000
+num_shards_init = 4
+max_shards_per_node = 8
+writer_core_affinity = true
+shard_affine_dispatch = false
+worker_core_affinity = false
+
+[search]
+indexer_memory_min_mb = 32
+indexer_memory_max_mb = 512
+memory_pressure_threshold_percent = 80
+search_threads = 8
+enable_streaming_search = true
+max_concurrent_shard_searches = 32
+max_concurrent_remote_searches = 8
+enable_early_termination = true
+commit_interval_ms = 2000
+supervisor_timeout_secs = 3
+default_search_limit = 10
+
+# A Windows service has no console: this file is its only log. One file a day, 14 kept.
+# Warnings from everywhere, and the node's own start and stop messages; the write path's
+# per-request lines stay out, which at "info" would come to millions a day on a busy node.
+[logging]
+directory = 'C:\ProgramData\CameoDB\logs'
+max_files = 14
+level = "warn,cameodb=info,cameodb::http_server=warn"

@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Windows installer: `cameodb-<version>-x64.msi` installs CameoDB as a Windows service,** as
+  the `.deb` and `.rpm` install it under systemd. The program goes to `C:\Program Files\CameoDB`
+  and onto the system `PATH`; config, data and logs to `C:\ProgramData\CameoDB`, kept across
+  upgrades and uninstalls, the config never overwritten. The service runs as the virtual account
+  `NT SERVICE\CameoDB`, the only one besides SYSTEM and Administrators that can read the data,
+  starts with Windows, and restarts 10 s after a failure. The installed config is the Linux
+  packages' own with Windows paths: `0.0.0.0`, profile `internal`, authentication off until
+  `[security]` is enabled, and Windows Firewall closed to the port until a rule opens it. Built on Windows by `scripts/build/build-msi.ps1` with WiX Toolset v6,
+  optionally Authenticode-signed; `scripts/release/build.sh` checks a staged `.msi` is this
+  release's and packages the `.exe` published beside it.
+- **`cameodb service run`, the node as a Windows service.** A console program registered as a
+  service is killed by Windows after 30 s (error 1053), and a service never receives the Ctrl+C
+  and console-close events the node shut down on. The entry point answers the service manager:
+  start pending, with progress, until the port is bound; a stop runs the same graceful shutdown
+  as Ctrl+C, with progress; a failure is logged and reported as a service-specific exit code.
+- **`[logging]`: a daily log file, and a log level from the config.** `directory` writes
+  `cameodb.YYYY-MM-DD.log` beside standard output, keeping `max_files` days (14); `level` takes
+  a `RUST_LOG` filter, which `RUST_LOG` itself still overrides. Also `--log-dir`/`--log-level`
+  and `CAMEODB_LOG_DIR`/`CAMEODB_LOG_LEVEL`. A Windows service has no standard output, so there
+  this is the only log; anywhere else it is optional. The config is now read before it is
+  validated, so that a config the node refuses is refused into the log file too.
 - **`cameodb compact --rewrite` copies each redb file into a new one and switches to it.**
   In-place compaction ends at the first page it finds no room below for; a rewrite does not
   depend on how the old file's free space is laid out. Every table is copied beside the file,
@@ -112,6 +133,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`--data-paths` and `CAMEODB_DATA_PATHS` split as `PATH` is: on `;` on Windows.** They split
+  on `:`, which on Windows is part of every drive letter, so `C:\data` became `C` and `\data`.
+  Unchanged on Linux and macOS.
 - **`--help` on `compact`, `check-config` and `generate-config` describes the command.**
   `compact --help` and `check-config --help` failed with "Unknown option", and
   `generate-config --help` printed a sample config. `cameodb --help` points to them, and its

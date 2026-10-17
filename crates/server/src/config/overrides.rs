@@ -91,8 +91,9 @@ pub(crate) const OVERRIDES: &[Override] = &[
     },
     Override {
         flag: "--data-paths", env: "CAMEODB_DATA_PATHS", kind: FlagKind::Value,
-        placeholder: "<PATHS>", help: "Colon-separated storage directories",
-        apply: |c, v| { c.storage.data_paths = v.split(':').map(PathBuf::from).collect(); Ok(()) },
+        placeholder: "<PATHS>", help: "Storage directories, separated as in PATH: ':', or ';' on Windows",
+        // As PATH is split: on Windows a ':' is part of every drive letter.
+        apply: |c, v| { c.storage.data_paths = std::env::split_paths(v).collect(); Ok(()) },
     },
     Override {
         flag: "--storage-wal-sync", env: "CAMEODB_STORAGE_WAL_SYNC", kind: FlagKind::Switch,
@@ -235,6 +236,16 @@ pub(crate) const OVERRIDES: &[Override] = &[
         kind: FlagKind::Value, placeholder: "<SECS>",
         help: "Seconds a liveness ping may go unanswered",
         apply: |c, v| { c.network.cluster.ping_timeout_secs = v.parse()?; Ok(()) },
+    },
+    Override {
+        flag: "--log-dir", env: "CAMEODB_LOG_DIR", kind: FlagKind::Value,
+        placeholder: "<PATH>", help: "Write a daily log file here, besides standard output",
+        apply: |c, v| { c.logging.directory = Some(PathBuf::from(v)); Ok(()) },
+    },
+    Override {
+        flag: "--log-level", env: "CAMEODB_LOG_LEVEL", kind: FlagKind::Value,
+        placeholder: "<FILTER>", help: "What is logged: info, debug, or a RUST_LOG filter (default: errors)",
+        apply: |c, v| { c.logging.level = Some(v.to_string()); Ok(()) },
     },
     Override {
         flag: "--cluster-psk", env: "CAMEODB_CLUSTER_PSK", kind: FlagKind::Value,

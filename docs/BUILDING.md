@@ -177,6 +177,68 @@ The binary will be available at:
 target\release\cameodb.exe
 ```
 
+### Building the Windows installer (MSI)
+
+`scripts\build\build-msi.ps1` builds `cameodb-<version>-x64.msi` from
+`crates\server\windows\cameodb.wxs` and stages it with the `.exe` for the release. Besides the
+Rust toolchain above it needs the .NET SDK (8 or later) and WiX Toolset v6:
+
+```powershell
+winget install Microsoft.DotNet.SDK.8
+dotnet tool install --global wix
+```
+
+Then, from the repository root:
+
+```powershell
+.\scripts\build\build-msi.ps1 -Build
+```
+
+It builds `target\release\cameodb.exe`, checks it reports this release's version, and writes to
+`dist\<version>\windows\`:
+
+| File | |
+|---|---|
+| `cameodb.exe` | the program, as the release publishes it |
+| `cameodb.exe.version` | what it reports, checked by `scripts/release/build.sh` |
+| `cameodb-<version>-x64.msi` | the installer |
+| `cameodb-<version>-x64.msi.version` | the version and the SHA-256 of the `cameodb.exe` inside it |
+
+Copy that folder to `dist/<version>/windows/` on the release machine. `build.sh` refuses an MSI
+whose recorded version is not the release's, or whose packaged `cameodb.exe` is not the one
+staged beside it, so the two have to come from the same run.
+
+**Signing.** With a code-signing certificate in the certificate store, or on its hardware token:
+
+```powershell
+.\scripts\build\build-msi.ps1 -Build -CertificateThumbprint <SHA-1 thumbprint>
+```
+
+It signs `cameodb.exe` before packaging it, so the program inside the installer is signed too —
+policies such as App Control check the program each time the service starts, not only the
+installer — then signs the `.msi`. Both signatures are SHA-256 and timestamped, so they stay
+valid after the certificate expires. It needs the Windows SDK's `signtool.exe`. The certificate
+has to come from an authority Windows trusts — a CA in Microsoft's root program, or Azure Trusted
+Signing — for Windows to name the publisher. Without one the installer works, and Windows shows
+the publisher as *Unknown*; see [DEPLOYMENT.md](DEPLOYMENT.md#-windows-the-msi-installer).
+
+**Checking an installed build** on a test machine, from an elevated PowerShell:
+
+```powershell
+msiexec /i dist\<version>\windows\cameodb-<version>-x64.msi /qn /l*v install.log
+Get-Service CameoDB                                  # Running
+sc.exe showsid CameoDB                               # S-1-5-80-3196691271-1903880709-56935160-284765964-990515363
+cameodb client health                                # from a new shell: PATH
+Get-ChildItem C:\ProgramData\CameoDB\logs
+Stop-Service CameoDB; Start-Service CameoDB          # graceful stop, then a start
+msiexec /x dist\<version>\windows\cameodb-<version>-x64.msi /qn
+Test-Path C:\ProgramData\CameoDB\cameodb.toml        # True: config and data stay
+```
+
+The SID is the one `cameodb.wxs` grants the data and log folders to. Windows derives it from the
+service name, so it changes only if the service is renamed — and then the installer's
+permissions have to follow.
+
 #### Troubleshooting Common Windows Build Issues
 
 **Linker.exe not found error:**

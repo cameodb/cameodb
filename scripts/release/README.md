@@ -189,7 +189,24 @@ valid, and any other is suffixed (`cameodb-aarch64`).
 
 ### Windows
 
-Built on the Windows machine, then copied to exactly this path:
+Built on the Windows machine with `scripts\build\build-msi.ps1 -Build` (see
+[docs/BUILDING.md](../../docs/BUILDING.md#building-the-windows-installer-msi)), which stages the
+program, the installer and their sidecars in `dist\<version>\windows\`. Copy that folder to
+exactly this path here:
+
+```
+dist/<version>/windows/cameodb.exe                    # e.g. dist/0.3.7/windows/cameodb.exe
+dist/<version>/windows/cameodb.exe.version
+dist/<version>/windows/cameodb-<version>-x64.msi
+dist/<version>/windows/cameodb-<version>-x64.msi.version
+```
+
+The installer is optional: without it Windows ships as the bare `.exe`, as before, and the build
+stage warns. With it, the build stage checks it is a Windows Installer package, that its sidecar
+names this release, and that the `cameodb.exe` it packages has the SHA-256 of the one staged
+beside it. Both are then signed with cosign, checksummed and published like any other artifact.
+
+Without the script, the bare `.exe` alone:
 
 ```
 dist/<version>/windows/cameodb.exe          # e.g. dist/0.3.0/windows/cameodb.exe
@@ -221,7 +238,8 @@ What the pipeline does and does not do for Windows:
 | ❌ | does not build it — no cross-compilation is attempted |
 | ❌ | no hardening validation; `validate/artifact.sh` reads ELF headers and does not apply to PE |
 | ❌ | no smoke test — the binary cannot run here |
-| ❌ | **no Authenticode signing.** The `.bundle` is a detached sigstore signature, good for `cosign verify-blob` but invisible to Windows itself. SmartScreen still treats the download as unsigned; that needs a code-signing certificate and `signtool`, which is out of scope here |
+| ✅ | the `.msi`, when staged: a Windows Installer package, this release's, packaging the staged `.exe` |
+| ❌ | **no Authenticode signing here.** The `.bundle` is a detached sigstore signature, good for `cosign verify-blob` but invisible to Windows itself. `build-msi.ps1 -CertificateThumbprint` signs both on the Windows machine, given a code-signing certificate; without one, SmartScreen treats the download as unsigned |
 
 `build.sh` validates and reports it; `sign.sh` warns if it is still missing, so a release cannot
 silently ship without it.
