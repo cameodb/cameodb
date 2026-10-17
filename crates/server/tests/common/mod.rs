@@ -47,19 +47,13 @@ struct PortLock(std::fs::File);
 #[cfg(unix)]
 impl PortLock {
     fn acquire() -> Self {
-        use std::os::fd::AsRawFd;
-
         let path = std::env::temp_dir().join("cameodb_test_port.lock");
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .expect("open port reservation lock file");
-        let fd = file.as_raw_fd();
-        let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
-        if rc != 0 {
-            panic!("failed to acquire port reservation lock");
-        }
+        file.lock().expect("acquire port reservation lock");
         Self(file)
     }
 }
@@ -67,10 +61,6 @@ impl PortLock {
 #[cfg(unix)]
 impl Drop for PortLock {
     fn drop(&mut self) {
-        use std::os::fd::AsRawFd;
-
-        unsafe {
-            let _ = libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
-        }
+        let _ = self.0.unlock();
     }
 }

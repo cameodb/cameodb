@@ -259,6 +259,11 @@ pub struct CliOverrides {
     pub config_path: Option<String>,
     /// `(flag, raw value)` in the order the flags appeared; a repeated flag keeps the last.
     values: Vec<(&'static str, String)>,
+    /// The environment the [`OVERRIDES`] are read from: the process's own unless a test gave
+    /// one. `CAMEODB_CONFIG`, which picks the file rather than overriding a setting, is
+    /// always the process's. Setting a variable on the process is unsafe while other threads
+    /// read it — which every parallel test does — so tests hand theirs in here instead.
+    environment: Option<Vec<(&'static str, String)>>,
 }
 
 impl CliOverrides {
@@ -316,6 +321,24 @@ impl CliOverrides {
     /// Whether the operator named a config file on the command line.
     pub(crate) fn has_explicit_config_path(&self) -> bool {
         self.config_path.is_some() || std::env::var_os("CAMEODB_CONFIG").is_some()
+    }
+
+    /// The override variable `name`, from [`Self::with_environment`] if a test set one.
+    pub(crate) fn env_var(&self, name: &str) -> Option<String> {
+        match &self.environment {
+            Some(vars) => vars
+                .iter()
+                .find(|(var, _)| *var == name)
+                .map(|(_, value)| value.clone()),
+            None => std::env::var(name).ok(),
+        }
+    }
+
+    /// Read environment overrides from `vars` alone, in place of the process environment.
+    #[cfg(test)]
+    pub(crate) fn with_environment(mut self, vars: &[(&'static str, &str)]) -> Self {
+        self.environment = Some(vars.iter().map(|(k, v)| (*k, v.to_string())).collect());
+        self
     }
 
     /// The raw value given for `flag`, if any.

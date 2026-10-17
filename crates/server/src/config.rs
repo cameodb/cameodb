@@ -1067,7 +1067,7 @@ impl CameoDbConfig {
     /// means. The command line is applied second and therefore wins.
     fn apply_overrides(mut config: Self, cli: &CliOverrides) -> Result<Self> {
         for entry in OVERRIDES {
-            if let Ok(value) = std::env::var(entry.env) {
+            if let Some(value) = cli.env_var(entry.env) {
                 (entry.apply)(&mut config, &value)
                     .with_context(|| format!("Invalid {}: {value:?}", entry.env))?;
             }
@@ -1620,11 +1620,9 @@ impl fmt::Debug for ClusterPsk {
 
 impl Drop for ClusterPsk {
     fn drop(&mut self) {
-        // Best-effort scrub. `write_volatile` is not elided by the optimizer the way a
-        // plain assignment to a soon-to-be-dead value can be.
-        for byte in self.0.iter_mut() {
-            unsafe { std::ptr::write_volatile(byte, 0) };
-        }
+        // Best-effort scrub. `zeroize` writes volatile, which the optimizer does not elide
+        // the way it can a plain assignment to a soon-to-be-dead value.
+        zeroize::Zeroize::zeroize(&mut self.0);
     }
 }
 

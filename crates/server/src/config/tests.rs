@@ -106,29 +106,34 @@ mod tests {
             .expect("write config");
         let path = file.to_str().expect("utf-8 path").to_string();
 
+        // Every step reads a fixed environment, empty unless it says otherwise.
+        let env = |cli: CliOverrides, vars| cli.with_environment(vars);
+
         // Defaults only.
-        let config = CameoDbConfig::load_with_cli(&CliOverrides::default()).expect("defaults");
+        let config =
+            CameoDbConfig::load_with_cli(&env(CliOverrides::default(), &[])).expect("defaults");
         assert_eq!(config.network.http.port, 9480);
 
         // File over defaults.
-        let from_file =
-            CameoDbConfig::load_with_cli(&cli(&["--config", &path])).expect("file config");
+        let from_file = CameoDbConfig::load_with_cli(&env(cli(&["--config", &path]), &[]))
+            .expect("file config");
         assert_eq!(from_file.network.http.port, 7001);
 
-        unsafe { std::env::set_var("CAMEODB_HTTP_PORT", "7002") };
+        let port = [("CAMEODB_HTTP_PORT", "7002")];
 
         // Environment over file.
-        let from_env =
-            CameoDbConfig::load_with_cli(&cli(&["--config", &path])).expect("env override");
+        let from_env = CameoDbConfig::load_with_cli(&env(cli(&["--config", &path]), &port))
+            .expect("env override");
         assert_eq!(from_env.network.http.port, 7002);
 
         // Command line over environment.
-        let from_cli =
-            CameoDbConfig::load_with_cli(&cli(&["--config", &path, "--http-port", "7003"]))
-                .expect("cli override");
+        let from_cli = CameoDbConfig::load_with_cli(&env(
+            cli(&["--config", &path, "--http-port", "7003"]),
+            &port,
+        ))
+        .expect("cli override");
         assert_eq!(from_cli.network.http.port, 7003);
 
-        unsafe { std::env::remove_var("CAMEODB_HTTP_PORT") };
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -438,18 +443,12 @@ max_response_bytes = 16777216
     #[test]
     fn test_default_batch_size_setting() {
         // Set a specific batch size via environment variable
-        unsafe {
-            std::env::set_var("CAMEODB_STORAGE_DEFAULT_BATCH_SIZE", "750");
-        }
+        let overrides = CliOverrides::default()
+            .with_environment(&[("CAMEODB_STORAGE_DEFAULT_BATCH_SIZE", "750")]);
 
         // Load config and verify the value
-        let config = CameoDbConfig::load_with_cli(&CliOverrides::default()).unwrap();
+        let config = CameoDbConfig::load_with_cli(&overrides).unwrap();
         assert_eq!(config.storage.default_batch_size, 750);
-
-        // Clean up
-        unsafe {
-            std::env::remove_var("CAMEODB_STORAGE_DEFAULT_BATCH_SIZE");
-        }
 
         println!("✅ Batch size configuration works!");
     }
