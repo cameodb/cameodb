@@ -4358,6 +4358,7 @@ dependencies = [
  "cluster",
  "core_affinity",
  "flate2",
+ "fs4",
  "futures",
  "getrandom 0.4.3",
  "hex",

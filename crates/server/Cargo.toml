@@ -54,6 +54,9 @@ xxhash-rust = { workspace = true }
 tokio-util = { workspace = true }
 chrono = { version = "0.4.44", features = ["serde"] }
 core_affinity = "0.8"
+# `compact --rewrite` reads the free disk for its copy: already built for tantivy, default
+# features as tantivy has them, and a safe call (raw syscalls on Linux, no unsafe of ours).
+fs4 = "0.13"
 libc = "0.2"
 # API key authentication (crates/server/src/auth.rs). All six were already in Cargo.lock as
 # transitive dependencies of rustls, libp2p, and reqwest, so nothing new enters the audit or
