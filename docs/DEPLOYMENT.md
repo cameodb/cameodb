@@ -573,5 +573,52 @@ App Control for Business, Smart App Control, SmartScreen enforced — may refuse
 the program outright. A release meant for such machines needs a signed build; see
 [docs/BUILDING.md](BUILDING.md#building-the-windows-installer-msi).
 
+**Running without installing.** On a development machine `cameodb.exe` runs in a terminal as it
+is: no installer, no service, no administrator. Put it in a folder of its own and start it there:
+
+```powershell
+mkdir C:\cameodb
+cd C:\cameodb
+copy <repository>\target\release\cameodb.exe .
+.\cameodb.exe                    # Ctrl+C stops it, with the same graceful shutdown as the service
+```
+
+and from a second terminal:
+
+```powershell
+cd C:\cameodb
+.\cameodb.exe client health      # the client defaults to http://localhost:9480
+```
+
+Without a config file the node runs on its defaults, which suit one machine:
+
+| | Default |
+|---|---|
+| Listens on | `127.0.0.1:9480`, this machine only, so its profile is `local` and the firewall does not ask |
+| Config | `cameodb.toml` (or `.yaml`, `.yml`) in the folder it is started from, then `config\cameodb.toml` there; none is needed |
+| Data | `.\data\cameodb`, under that folder |
+| Logs | the terminal |
+
+Both paths are relative to the folder the node is started from, so start it from the same one
+each time: from another, it finds no config and starts an empty node beside the first. For
+settings of your own, write a config there and check it:
+
+```powershell
+.\cameodb.exe generate-config > cameodb.toml
+.\cameodb.exe check-config
+```
+
+Write `.\cameodb.exe`, not `cameodb`: with the MSI also installed, `cameodb` on `PATH` is the
+installed program. The two cannot both listen on `9480` — stop the service first
+(`Stop-Service CameoDB`), or give this one another port and tell the client:
+
+```powershell
+.\cameodb.exe --http-port 9490
+.\cameodb.exe client --connect http://localhost:9490 health
+```
+
+An `.exe` copied from another machine, rather than built on this one, may carry Windows'
+downloaded-file mark and be stopped by SmartScreen; `Unblock-File .\cameodb.exe` removes it.
+
 For more details, see the [Docker README](../docker/README.md), which includes the latest swarm environment variables and configuration guidance.
 

@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NT SERVICE\CameoDB`, the only one besides SYSTEM and Administrators that can read the data,
   starts with Windows, and restarts 10 s after a failure. The installed config is the Linux
   packages' own with Windows paths: `0.0.0.0`, profile `internal`, authentication off until
-  `[security]` is enabled, and Windows Firewall closed to the port until a rule opens it. Built on Windows by `scripts/build/build-msi.ps1` with WiX Toolset v6,
+  `[security]` is enabled, and Windows Firewall closed to the port until a rule opens it. Built on Windows by `scripts/build/build-msi.ps1` with WiX Toolset v7,
   optionally Authenticode-signed; `scripts/release/build.sh` checks a staged `.msi` is this
   release's and packages the `.exe` published beside it.
 - **`cameodb service run`, the node as a Windows service.** A console program registered as a
@@ -65,7 +65,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the whole file, so the restart cost time in proportion to the data held, not to the writes in
   flight (0.4–0.7 s per gigabyte with the file in the page cache, minutes per shard read from
   disk). Every commit now records redb's allocator state, and the reopen loads it. The cost is a
-  second flush per durable commit, which lowers the single-write ceiling on a flush-bound disk;
+  second flush per durable commit: on a flush-bound disk about 30% fewer durable writes, bulk
+  and single alike (measured on macOS, and in a three-node Docker cluster on the same machine);
   `quick_repair = false` (or `--storage-quick-repair=false`) restores the old trade.
 - **A redb repair is reported.** A shard whose file needs one prints `Repairing <file>` on the
   console as it starts and `Repaired <file> in <time>` as it ends, whatever the log level — a

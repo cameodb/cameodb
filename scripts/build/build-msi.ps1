@@ -17,10 +17,14 @@
   scripts/release/build.sh there; it validates all four and the sign stage signs the .exe
   and .msi with cosign like every other artifact.
 
-  Needs: Rust (rust-toolchain.toml pins the version), the MSVC build tools (docs/BUILDING.md),
-  and WiX Toolset v6:  dotnet tool install --global wix
+  Needs: Rust through rustup (rust-toolchain.toml pins the version), the MSVC build tools, the
+  .NET SDK 8 or later (winget install Microsoft.DotNet.SDK.8), and WiX Toolset v6 or later
+  (dotnet tool install --global wix) — each step in docs/BUILDING.md.
   Signing needs Windows SDK's signtool and a code-signing certificate in the certificate store
   or on its token.
+
+  This script is not signed. If PowerShell refuses to run it, allow scripts for this shell only:
+    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 .PARAMETER Build
   Build target\release\cameodb.exe first. Without it, an existing build is used.

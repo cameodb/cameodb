@@ -131,6 +131,75 @@ Signed off by:
 
 <!-- Newest first. Append a filled-in template per release. -->
 
+## v0.3.7 — 2026-10-18 (in progress)
+
+Commit: `64b68cc`, `chore(release): 0.3.7`. Built from a clean tree; `MANIFEST.txt` records it.
+
+Built targets: macOS arm64 (31.8M, sha256
+`b0723d0e1f27bf03a6304fd21db56ddc4b88c38a633f9326405c3c66fe6d769c`, byte-identical to
+`target/release/cameodb`); x86_64-unknown-linux-musl (38M binary, built by rustc 1.99.0,
+`cameodb_0.3.7_amd64.deb` 12M, `cameodb-0.3.7-1.x86_64.rpm` 13M); SPDX (587 packages) and CycloneDX
+(586 components, against 586 in `Cargo.lock`). Built 2026-10-18 21:58. **Windows not yet built** —
+`cameodb.exe` and, new in this release, `cameodb-0.3.7-x64.msi`.
+
+What the validation covered, and on what:
+
+- **Host suites on the shipped binary,** `target/release/cameodb`, reporting `cameodb 0.3.7`
+  (2026-10-18 22:03:18 → 22:10:20):
+
+  ```
+  PASS deps
+  PASS unit
+  PASS posture
+  PASS auth
+  PASS tls
+  PASS remote-sources
+  PASS artifact
+  ```
+
+  `artifact` skipped one check, position independence on `target/aarch64-unknown-linux-musl`: a
+  local build since `build-musl.sh` defaults to the host architecture, not a shipped target. The
+  shipped x86_64 binary passed it (static-pie).
+- **Cluster suite** (`all.sh cluster`, image `cameodb:validate` built from `64b68cc`), 39/39 PASS
+  (22:10:41 → 22:21:33). Metrics: storm new-index writes 71 ok/s; cross mints 141/s, bulks 545/s,
+  searches 2,608/s, single writes 3,032/s; samemint 120/120; restarts converged in 0 s; a frozen peer
+  noticed in 33 s. Bulks −23%, mints −14% and single writes −12% against 0.3.6's run, explained by
+  two more runs on the same image: `quick_repair`, new and on by default, is the whole difference.
+
+  | Metric | 0.3.6 | 0.3.7 default, two runs | 0.3.7, `quick_repair = false` |
+  |---|---|---|---|
+  | cross bulks | 709/s | 545, 544 | 759 |
+  | cross single writes | 3,441/s | 3,032, 2,933 | 3,750 |
+  | cross mints | 163/s | 141, 125 | 168 |
+
+  With it off every write metric is back at or above 0.3.6 — about −28% bulk and −20% single
+  writes for it, as CONFIGURATION measured on 2026-10-16 when the default was chosen. Not O1: its
+  barrier does nothing with `wal_sync = true`, the default and the Docker config. Searches were
+  2,608 and 2,635/s on, 2,245/s off, which the setting does not touch; read as noise. All three
+  runs 39/39.
+- `check-config --allow-unauthenticated` on the three shipped configs — the root example,
+  `crates/server/cameodb.toml` (DEB/RPM) and, new, `crates/server/windows/cameodb.toml` (MSI) —
+  returns the same four accepted `internal`-profile warnings as 0.3.6 (tls, admin_api, auth, rate).
+
+Advisory exceptions reviewed: RUSTSEC-2026-0118, RUSTSEC-2026-0119, RUSTSEC-2024-0436, all
+review-by 2026-12-31, all still via kameo 0.22.2 pinning libp2p 0.56.
+
+Still to do:
+- Windows: build `cameodb.exe` and the MSI on the Windows machine (`scripts/build/build-msi.ps1`),
+  copy both with their `.version` sidecars into `dist/0.3.7/windows/`, re-run `--stage build`. The
+  MSI is new: install, upgrade over nothing and over itself, service start/stop, uninstall keeping
+  `C:\ProgramData\CameoDB`. **The first build, at `64b68cc` with WiX 7, failed to install:** its
+  service failure actions read `Action="restart"`, which `wix build` accepts as a formatted value
+  and the installer rejects at `MsiConfigureServices` ("invalid failure action"), rolling the
+  install back. Fixed to `restartService`; the MSI is to be rebuilt from the fix and the install
+  pass run on that build.
+- `remote-sources` on Windows and on musl (outstanding on musl since 0.3.6).
+- Sign, publish, commit the web project.
+
+Skipped checks and why: none yet.
+Known gaps acknowledged:
+Signed off by:
+
 ## v0.3.6 — 2026-10-08
 
 Commit: the `chore(release): 0.3.6` commit, which follows fa4854e, the search 404 — the fix is

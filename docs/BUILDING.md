@@ -112,13 +112,12 @@ cargo build --release
 Download and run the official rustup installer:
 
 ```powershell
-# Download and run the installer
-# Visit: https://rustup.rs/
-# Or use PowerShell:
-winget install Rustlang.Rust.MSVC
+winget install Rustlang.Rustup
 ```
 
-Or download `rustup-init.exe` directly from https://rustup.rs/
+Or download `rustup-init.exe` directly from https://rustup.rs/. Install rustup, not a standalone
+Rust (`Rustlang.Rust.MSVC`): `rust-toolchain.toml` pins the compiler, and only rustup reads it —
+the first `cargo` in the repository installs the pinned version.
 
 #### 2. Install Visual Studio Build Tools
 
@@ -150,7 +149,8 @@ cargo --version
 rustup toolchain list
 ```
 
-You should see the MSVC toolchain: `stable-x86_64-pc-windows-msvc`
+You should see an MSVC toolchain, `…-x86_64-pc-windows-msvc`. Run from inside the repository,
+`rustc --version` reports the version `rust-toolchain.toml` pins, installing it first if needed.
 
 #### 4. Additional MSVC Components (if needed)
 
@@ -180,19 +180,72 @@ target\release\cameodb.exe
 ### Building the Windows installer (MSI)
 
 `scripts\build\build-msi.ps1` builds `cameodb-<version>-x64.msi` from
-`crates\server\windows\cameodb.wxs` and stages it with the `.exe` for the release. Besides the
-Rust toolchain above it needs the .NET SDK (8 or later) and WiX Toolset v6:
+`crates\server\windows\cameodb.wxs` and stages it with the `.exe` for the release. A machine that
+already builds `cameodb.exe` (above) needs two more tools: the .NET SDK, which WiX is installed
+with, and WiX Toolset.
+
+**1. The .NET SDK, 8 or later.** The SDK, not the runtime: the runtime that comes with Windows
+has no `dotnet` command.
 
 ```powershell
 winget install Microsoft.DotNet.SDK.8
+```
+
+Without `winget`, take the x64 **SDK** installer from https://dotnet.microsoft.com/download.
+Open a new PowerShell — the installer changes `PATH`, and a shell already open keeps the old
+one — and check:
+
+```powershell
+dotnet --list-sdks        # 8.0.x or newer
+```
+
+**2. WiX Toolset**, v6 or later, as a .NET global tool. Without `--version` this installs the
+newest, v7:
+
+```powershell
 dotnet tool install --global wix
 ```
 
-Then, from the repository root:
+Open a new PowerShell again, for `%USERPROFILE%\.dotnet\tools` to be on `PATH`, and check:
+
+```powershell
+wix --version
+```
+
+`dotnet tool update --global wix` moves an older install to the newest.
+
+`cameodb.wxs` uses no WiX extensions, so there is nothing to `wix extension add`.
+
+> **Note: accept the WiX EULA once.** WiX 7 refuses to build until its EULA is accepted, and
+> `build-msi.ps1` fails at `wix build` with an error saying so. Accept it once per user on the
+> machine, then run the script again:
+>
+> ```powershell
+> wix eula accept wix7
+> ```
+>
+> The EULA is WiX's Open Source Maintenance Fee: an organisation that earns revenue with WiX is
+> expected to pay its maintainers a fee. Read it before accepting on your organisation's behalf.
+
+**3. Run the script** from the repository root, at the release commit:
 
 ```powershell
 .\scripts\build\build-msi.ps1 -Build
 ```
+
+**Execution policy.** The script is not Authenticode-signed, and Windows' default policy for
+PowerShell scripts may refuse it: *running scripts is disabled on this system*, or *is not
+digitally signed*. Allow it for the current shell only, which changes nothing once the window
+is closed:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\scripts\build\build-msi.ps1 -Build
+```
+
+or in one line, `powershell -ExecutionPolicy Bypass -File .\scripts\build\build-msi.ps1 -Build`.
+A checkout copied from another machine, rather than cloned, may also carry the downloaded-file
+mark; `Unblock-File .\scripts\build\build-msi.ps1` removes it.
 
 It builds `target\release\cameodb.exe`, checks it reports this release's version, and writes to
 `dist\<version>\windows\`:
