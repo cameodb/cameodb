@@ -18,8 +18,9 @@
   and .msi with cosign like every other artifact.
 
   Needs: Rust through rustup (rust-toolchain.toml pins the version), the MSVC build tools, the
-  .NET SDK 8 or later (winget install Microsoft.DotNet.SDK.8), and WiX Toolset v6 or later
-  (dotnet tool install --global wix) — each step in docs/BUILDING.md.
+  .NET SDK 8 or later (winget install Microsoft.DotNet.SDK.8), WiX Toolset v6 or later
+  (dotnet tool install --global wix) and its Util extension, at the toolset's version
+  (wix extension add -g WixToolset.Util.wixext/<wix --version>) — each step in docs/BUILDING.md.
   Signing needs Windows SDK's signtool and a code-signing certificate in the certificate store
   or on its token.
 
@@ -126,9 +127,18 @@ Sign $StagedExe
 $wix = Get-Command wix -ErrorAction SilentlyContinue
 if (-not $wix) { Fail "WiX Toolset not found: dotnet tool install --global wix" }
 
+# util:ServiceConfig sets the service's restart-on-failure; the extension's version follows the
+# toolset's. Installed once per user, into WiX's global extension cache.
+$wixVersion = ((wix --version | Out-String).Trim() -split '\+')[0]
+$UtilExt = "WixToolset.Util.wixext"
+if (-not ((wix extension list -g | Out-String) -match [regex]::Escape($UtilExt))) {
+    Fail "WiX extension $UtilExt not found: wix extension add -g $UtilExt/$wixVersion"
+}
+
 Step "wix build -> $(Split-Path $Msi -Leaf)"
 wix build "crates\server\windows\cameodb.wxs" `
     -arch x64 `
+    -ext $UtilExt `
     -d "Version=$Version" `
     -d "BinDir=$Dist" `
     -d "RepoRoot=$RepoRoot" `

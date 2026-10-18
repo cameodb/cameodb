@@ -181,8 +181,8 @@ target\release\cameodb.exe
 
 `scripts\build\build-msi.ps1` builds `cameodb-<version>-x64.msi` from
 `crates\server\windows\cameodb.wxs` and stages it with the `.exe` for the release. A machine that
-already builds `cameodb.exe` (above) needs two more tools: the .NET SDK, which WiX is installed
-with, and WiX Toolset.
+already builds `cameodb.exe` (above) needs three more things: the .NET SDK, which WiX is
+installed with, WiX Toolset, and its Util extension.
 
 **1. The .NET SDK, 8 or later.** The SDK, not the runtime: the runtime that comes with Windows
 has no `dotnet` command.
@@ -214,7 +214,18 @@ wix --version
 
 `dotnet tool update --global wix` moves an older install to the newest.
 
-`cameodb.wxs` uses no WiX extensions, so there is nothing to `wix extension add`.
+**3. The WiX Util extension**, at the same version as the toolset. `cameodb.wxs` sets the
+service's restart-on-failure with its `util:ServiceConfig`: Windows Installer's own service
+configuration cannot set a restart action (it fails the install with error 1939, access denied),
+and the extension's custom action, embedded in the MSI, can. Installed once per user:
+
+```powershell
+wix --version                                          # e.g. 7.0.0+…
+wix extension add -g WixToolset.Util.wixext/7.0.0      # the version wix printed, without +…
+wix extension list -g                                  # lists WixToolset.Util.wixext
+```
+
+`build-msi.ps1` checks for it and names the command when it is missing.
 
 > **Note: accept the WiX EULA once.** WiX 7 refuses to build until its EULA is accepted, and
 > `build-msi.ps1` fails at `wix build` with an error saying so. Accept it once per user on the
@@ -227,7 +238,7 @@ wix --version
 > The EULA is WiX's Open Source Maintenance Fee: an organisation that earns revenue with WiX is
 > expected to pay its maintainers a fee. Read it before accepting on your organisation's behalf.
 
-**3. Run the script** from the repository root, at the release commit:
+**4. Run the script** from the repository root, at the release commit:
 
 ```powershell
 .\scripts\build\build-msi.ps1 -Build

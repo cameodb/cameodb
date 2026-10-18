@@ -191,8 +191,13 @@ Still to do:
   `C:\ProgramData\CameoDB`. **The first build, at `64b68cc` with WiX 7, failed to install:** its
   service failure actions read `Action="restart"`, which `wix build` accepts as a formatted value
   and the installer rejects at `MsiConfigureServices` ("invalid failure action"), rolling the
-  install back. Fixed to `restartService`; the MSI is to be rebuilt from the fix and the install
-  pass run on that build.
+  install back. Fixed to `restartService` (`74ef358`); **that build failed too,** with error 1939
+  and Windows error 5 (access denied) setting the failure actions: Windows needs `SERVICE_START`
+  on the handle that sets a restart action, and Windows Installer's `MsiConfigureServices` opens it
+  without — every other service setting applied. The restarts move to `util:ServiceConfig` from
+  `WixToolset.Util.wixext`, whose custom action sets them, as WiX's build warning advised; the
+  extension is a new build requirement (BUILDING.md). The MSI is to be rebuilt from that and the
+  install pass run on it.
 - `remote-sources` on Windows and on musl (outstanding on musl since 0.3.6).
 - Sign, publish, commit the web project.
 

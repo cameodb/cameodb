@@ -21,7 +21,8 @@
     BinDir    the folder holding the cameodb.exe to package
     RepoRoot  the repository root, for LICENSE
 -->
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
   <Package Name="CameoDB"
            Manufacturer="CameoDB Team"
            Version="$(Version)"
@@ -88,14 +89,17 @@
                          FailureActionsWhen="failedToStopOrReturnedError" />
           <!--
             Restart on failure, as Restart=on-failure does: 10 s, three times a day.
-            restartService, not restart: Action also takes a formatted value, so wix build
-            accepts any word, and the installer then fails at MsiConfigureServices and rolls back.
+            util:ServiceConfig, from WixToolset.Util.wixext, not the native
+            ServiceConfigFailureActions: Windows requires SERVICE_START on the handle that sets
+            a restart action, and Windows Installer's MsiConfigureServices opens it without, so
+            the native element fails every install with error 1939 (access denied, error 5) even
+            for an administrator. The extension's custom action opens the handle itself.
           -->
-          <ServiceConfigFailureActions OnInstall="yes" OnReinstall="yes" ResetPeriod="86400">
-            <Failure Action="restartService" Delay="10000" />
-            <Failure Action="restartService" Delay="10000" />
-            <Failure Action="restartService" Delay="10000" />
-          </ServiceConfigFailureActions>
+          <util:ServiceConfig FirstFailureActionType="restart"
+                              SecondFailureActionType="restart"
+                              ThirdFailureActionType="restart"
+                              RestartServiceDelayInSeconds="10"
+                              ResetPeriodInDays="1" />
         </ServiceInstall>
         <ServiceControl Id="CameoDbServiceControl"
                         Name="CameoDB"
