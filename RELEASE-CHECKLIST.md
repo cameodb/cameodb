@@ -139,8 +139,12 @@ Built targets: macOS arm64 (31.8M, sha256
 `b0723d0e1f27bf03a6304fd21db56ddc4b88c38a633f9326405c3c66fe6d769c`, byte-identical to
 `target/release/cameodb`); x86_64-unknown-linux-musl (38M binary, built by rustc 1.99.0,
 `cameodb_0.3.7_amd64.deb` 12M, `cameodb-0.3.7-1.x86_64.rpm` 13M); SPDX (587 packages) and CycloneDX
-(586 components, against 586 in `Cargo.lock`). Built 2026-10-18 21:58. **Windows not yet built** —
-`cameodb.exe` and, new in this release, `cameodb-0.3.7-x64.msi`.
+(586 components, against 586 in `Cargo.lock`). Built 2026-10-18 21:58. Windows x86_64: `cameodb.exe` (41M, sidecar reads `cameodb 0.3.7`, built
+by rustc 1.99.0) and, new in this release, `cameodb-0.3.7-x64.msi` (15M), built on the Windows
+machine at `f02678a` with WiX 7 and `WixToolset.Util.wixext`; `--stage build` re-run at `8143ef6`
+found the MSI packaging the staged exe (sha256 `bdeb3814…517f`). That re-run rebuilt macOS, the
+Linux binary and the `.deb` byte-identical to the validated ones; the `.rpm` differs only in its
+header's build time — the binary inside it is the same `c201df9e…78b8`.
 
 What the validation covered, and on what:
 
@@ -213,7 +217,9 @@ Still to do:
   `dist\0.3.7\windows\cameodb.exe` from the `f02678a` build, run on the Windows machine as reported
   by goranc (output not attached): both real hosts fetched, the self-signed host refused, and
   `--insecure-source` relaxing it.
-- Sign, publish, commit the web project.
+- ~~Sign~~ **Signed 2026-10-19**: all eight artifacts (macOS, Linux binary, `.deb`, `.rpm`,
+  Windows `.exe` and `.msi`, both SBOMs), each verified against the published public key.
+- Publish, commit the web project.
 
 Skipped checks and why: none yet.
 Known gaps acknowledged:
