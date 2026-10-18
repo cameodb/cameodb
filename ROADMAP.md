@@ -61,7 +61,7 @@ on one.
 | L — Post-0.3.4 review: the refactor cycle | ✅ Done | All twenty closed — four defects, six security remainder items, three decompositions, six simplifications, and the retrospective (L20, run 2026-09-19) |
 | M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed; M1, M2, M3, M4, M5 and M7 done — the blocker is cleared, the surface is metered, and tenants are bounded and isolated per index. No feature build remains; M8 closed with the prefix floor and default-field cap, the clause cap deferred. M6 done: the open-loop arms show goodput degrading rather than collapsing on the bulk, single-write and read lanes, after fixing the two defects its arms found — [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) and [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput), and its confirmation run on 2026-09-27 found OB22 costs a single node nothing measurable. What is left is the release cut |
 | N — Pre-0.3.6 whole-code review | 📋 Planned | N1–N10 before the 0.3.6 cut: a `HEAD` authorization gap, batched writes that never learn a field, a peer's 400 answered as 503, node identity replaced silently, query rewrites by substring, three client errors, the first shard's memory budget, streaming broadcast, a storage shutdown race, flattened storage errors. N11–N17 after it: one way to reach a peer, dead surface, `run_change`, typed boundaries, single owners, the orchestrator split |
-| O — Post-0.3.6 review: the next-iteration base | ◐ Partial | O1 (the `wal_sync=false` durability barrier) and O2 (deadlines on every remote ask) done 2026-10-15. Left: O3, shard-map merges on a per-owner epoch (the prerequisite N15 does not name), and O4, the request budget on the wire. O5 folds Rust-surface items into N16/N17; O6 reconciles the architecture doc |
+| O — Post-0.3.6 review: the next-iteration base | ◐ Partial | O1 (the `wal_sync=false` durability barrier) and O2 (deadlines on every remote ask) done 2026-10-15. Left: O3, shard-map merges on a per-owner epoch (the prerequisite N15 does not name, and since 2026-10-18 the one [OB27](#ob27--a-replaced-node-never-leaves-the-cluster)'s `forget` needs), and O4, the request budget on the wire. O5 folds Rust-surface items into N16/N17; O6 reconciles the architecture doc |
 
 ## Reconciliation, 2026-08-26
 
@@ -231,7 +231,8 @@ first written down here, so the chronology stays visible under the cost ordering
 | [OB23](#ob23--recreating-an-index-after-dropping-its-schema-lost-most-of-what-was-written) | **Recreating an index after dropping its schema lost most of what was written** — the drop's record read as a schema, the node re-minted the index from every batch, and a retyped column killed the Tantivy writer, which stayed dead until restart. 1,030 of 16,559 documents landed; now all do, a dying writer is retired and replayed, and the loader counts every failure by its file line | — | 2026-09-27 | ✅ |
 | [OB24](#ob24--a-and-not-b-and-a-or-not-b-parsed-cleanly-and-answered-wrongly) | **`a AND NOT b` and `a OR NOT b` parsed cleanly and answered wrongly** — a `NOT` arm under `Must`/`Should` matched nothing and nothing reported it; rewritten to `a AND -b` / `a OR (* -b)` before the parser runs | — | 2026-10-05 | ✅ |
 | [OB25](#ob25--a-search-during-a-restart-answered-short-without-saying-so) | **A search during a restart answered short without saying so** — a rejoining node searched 5 of 9 shards and reported `failed: 0`; on one node, HTTP serves before the replayed tail is committed. Both fixed the same day | — | 2026-10-15 | ✅ |
-| [OB26](#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap) | **A restarted node waits on every expected peer before it leaves bootstrap** — with one peer down it never does, and its shard maps converge on the 10 s pull | — | 2026-10-15 | 📋 |
+| [OB26](#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap) | **A restarted node waits on every expected peer before it leaves bootstrap** — reproduced 2026-10-18: real, and invisible to clients, because the snapshot and any never-restarted peer carry the map. A day, mostly deleting code; with OB27 | — | 2026-10-15 | 📋 |
+| [OB27](#ob27--a-replaced-node-never-leaves-the-cluster) | **A replaced node never leaves the cluster** — a node rebuilt with an empty data directory leaves its old identity's shards on every ring for good: writes to their key ranges answer 500, and the new node cannot learn an existing schema (503). The 500 is independent; `forget` needs O3 | — | 2026-10-18 | 📋 |
 | [F9](#f9--commit-on-a-clock-not-a-count) | **Commit on a clock, not a count** — bulk ingest 1.8–6.6×, a trickle searchable within 2 s, single writes unchanged | — | 2026-09-26 | ✅ |
 | [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
@@ -3489,21 +3490,74 @@ them defects is that the answer claims to be whole.
 
 ### OB26 — A restarted node waits on every expected peer before it leaves bootstrap
 
-📋 **Planned.** Read from the code 2026-10-15, not yet reproduced. `bootstrap_complete` becomes
-true in `evaluate_and_transition_state` only when no expected node is inactive
-(`coordinator.rs:525–529`) — every node in the snapshot or the configuration, connected. Until then
-`PeerDiscovered` skips the actor push and pull of shard maps (`:1405`) and so does
-`RegisterLocalShards` (`:806`), leaving the node to the DHT records and the 10 s `SyncShardMaps`
-pull. A node restarted while any one peer is down therefore never leaves that mode, and every
-peer that does return is reintegrated on the 10–15 s tick rather than on its Identify event —
-the event-driven exchange [N15](#n15--per-index-state-and-node-state-each-with-one-owner) intends
-does not run at all. `MarkBootstrapComplete`, the override that would end the mode, is handled
-but nothing sends it (dead surface, for [N12](#n12--dead-surface-and-the-comments-that-no-longer-match)).
+📋 **Planned, low priority.** Read from the code 2026-10-15; reproduced in Docker 2026-10-18 at
+`7696b4a` — the mode is real, and no client sees it. `bootstrap_complete` becomes true in
+`evaluate_and_transition_state` only when no expected node is inactive (`coordinator.rs:510–513`) —
+every node in the snapshot or the configuration, connected. Until then `PeerDiscovered` skips the
+actor push and pull of shard maps (`:1388`) and so does `RegisterLocalShards` (`:789`), leaving the
+node to the DHT records and the 10 s `SyncShardMaps` pull. A node restarted while any one peer is
+down therefore never leaves that mode, and the event-driven exchange
+[N15](#n15--per-index-state-and-node-state-each-with-one-owner) intends does not run on it.
+`MarkBootstrapComplete`, the override that would end the mode, is a struct with no handler and no
+sender (dead surface, for [N12](#n12--dead-surface-and-the-comments-that-no-longer-match)).
+
+**Measured, three nodes, `cameodb.toml` listing all three:**
+
+| Scenario | Leaves bootstrap | Shard maps | Data |
+|---|---|---|---|
+| Fresh cluster, node3 never started | Neither node | Each other's shards after 12.7 s and 14.8 s, from the 10 s pull. The DHT step fetched node metadata only. Instant once node3 joined (the stability push) | Not reachable: creating an index needs every configured node to answer the schema canvass (503, *only 2 of 3 cluster nodes are connected*) |
+| node3 stopped, node2 restarted | node2 never (`Skipping actor-based shard exchange (discovery phase)`) | Whole at once: the snapshot restored them, and node1, never restarted, pushed and pulled 9 ms after Identify | Whole: node3's ids unavailable and reported (`failed: 1`), none misplaced or duplicated |
+| Whole cluster restarted, node3 down | No node; no exchange runs | Whole at once, from the snapshot | Whole, as above |
+
+So the snapshot carries the map across restarts, and any node that never restarted still pushes on
+Identify. The only delay is the fresh cluster, where nothing can be written anyway. The fix is still
+worth making because it deletes code and makes the exchange the one that actually runs, not because
+a client is waiting on it.
 
 The rule this should follow: bootstrap ends at the first peer connected, or on a deadline — a
-peer that is down is the steady state the cluster has to serve in, not a phase before it.
-Belongs with N15 and after [O3](#o3--shard-maps-merge-on-a-version-not-on-recency), whose epochs
-make the push safe to run against a partial view.
+peer that is down is the steady state the cluster has to serve in, not a phase before it. That
+means the actor push and pull run on every `PeerDiscovered` and `RegisterLocalShards`; the
+stability push in `evaluate_and_transition_state` then repeats what `PeerDiscovered` does and goes;
+`MarkBootstrapComplete` goes. Roughly a day with a `cluster.sh` phase for the restart-with-a-peer-down
+case. Today shard sets cannot change during a process's life, so pushing against a partial view
+risks only what the 10 s pull already risks ([O3](#o3--shard-maps-merge-on-a-version-not-on-recency)'s
+narrow live case); it no longer has to wait for O3. Best done together with
+[OB27](#ob27--a-replaced-node-never-leaves-the-cluster), which touches the same count of expected nodes.
+
+### OB27 — A replaced node never leaves the cluster
+
+📋 **Planned.** Found 2026-10-18 while reproducing OB26, at `7696b4a`. node3 of three was stopped, its
+data directory emptied, and started again on the same address: a new node identity, and the old
+one never returns. From then on, permanently:
+
+- **Every node's ring keeps the old identity's shards** — `cluster_total_shards` 16 for 12 real
+  shards — and `total_nodes` reads 4, so health stays yellow and every node restarted afterwards stays
+  in bootstrap ([OB26](#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap)).
+- **The old shards keep their key ranges.** A write whose id hashes there gets
+  `500 Write operation cannot be broadcast - routing failed` (9 of 50 ids) — unavailable, and a 500
+  where every other unreachable-owner path answers 503.
+- **The new node cannot learn an existing index's schema.** The canvass counts the old identity as
+  a node that must answer, so it refuses: `503 cannot establish the cluster schema for 'splitidx':
+  only 3 of 4 cluster nodes are connected` (10 of 50 ids). Every write landing on the new node's
+  shards fails.
+
+The cause is one rule applied in three places — bootstrap, the schema canvass, health: *every node
+ever seen must be connected*. `expected_nodes` grows from the snapshot, the configuration and every
+shard map, and nothing removes an entry; there is no admin operation that forgets a node. Rebuilding
+one node's disk therefore breaks the cluster until its metadata is edited by hand.
+
+**Change:**
+1. **The 500 becomes a 503** naming the unreachable owner, as for a lost peer. Small, independent.
+2. **`POST /_admin/cluster/nodes/{node_id}/forget`** (and the CLI): refused while the node is
+   connected; removes it from `expected_nodes` and its shards from the map, persists, and
+   propagates. Propagation is the hard part: a merge prunes only the *sender's* shards, so any other
+   node's push or pull would bring the forgotten shards back within 10 s. It needs
+   [O3](#o3--shard-maps-merge-on-a-version-not-on-recency)'s per-owner epochs plus a tombstone — an
+   owner entry with a final epoch and no shards, which no older entry can overwrite.
+3. **Decide what a node rebuilt on the same address means.** Either the operator forgets the old
+   identity (2), or a node may keep its identity file across a rebuilt data directory. Documented in
+   DEPLOYMENT either way. The data that lived on the old shards is gone in both — replication is
+   [D2](#d2--replication).
 
 ### F9 — Commit on a clock, not a count
 
@@ -6426,22 +6480,30 @@ the retry belongs to the exchange, not to the event handler.
 
 ### O3 — Shard maps merge on a version, not on recency
 
-**Planned.**
+**Planned.** Re-read 2026-10-18 against `7696b4a` and the OB26 runs; now the prerequisite of
+[OB27](#ob27--a-replaced-node-never-leaves-the-cluster)'s `forget`, which makes it the next cluster item
+rather than a Phase 15 one.
 
 Three defects share one cause — the cluster's only notion of shard-map currency is "whatever
 arrived last":
 
 - `MergeRemoteShards` rewrites every entry it carries, including shards owned by third nodes
-  (`coordinator.rs:2158–2164`); only the *sender's own* shards are pruned. Node A's stale view
-  of node C overwrites node B's fresher one until the next tick flips it back. Latent while
-  shards are only created, never moved or deleted; **Phase 15 makes it live** — a migrated
-  shard is precisely two views of one owner disagreeing.
-- The "data identical, skip" short-circuit (`:1976`) compares a checksum that hashes
-  `document_count` and `storage_bytes` (`:303–315`) — under write load it never matches, so
-  every push is a full merge over 256 vnode tokens per shard — while the merge itself
-  correctly treats only routing changes as state (`:2154`). `PeerShardDiscovered` bumps the
-  generation on a doc-count change (`:1915`): a third definition of what changed.
-- The periodic pull that papers over the first two is O(N²) full-map transfers every 10 s.
+  (`coordinator.rs:2088–2116`); only the *sender's own* shards are pruned. Node A's stale view
+  of node C overwrites node B's fresher one until the next tick flips it back. A node's shard set
+  cannot change during its process's life — `RegisterLocalShards` is sent once, at startup — so
+  this is live only when a set shrinks across a restart (a shard that fails to hydrate, a shard
+  directory removed): third nodes re-add the missing shard on every pull, the owner removes it on
+  its own, and the ring flips every 10 s. **Phase 15 makes it common** — a migrated shard is
+  precisely two views of one owner disagreeing — and OB27 cannot remove a node without it.
+- *Corrected 2026-10-18:* this bullet said the checksum (`:293–319`), which hashes
+  `document_count` and `storage_bytes`, never matches under write load. Both fields are always 0 —
+  `NodeOrchestrator::shard_metadata` is the only producer and hard-codes them — so the checksum is
+  stable and the push's "identical, skip" does skip. Still three definitions of what changed: the
+  checksum, the merge's routing-only test (`:2104`) and `PeerShardDiscovered`'s count test
+  (`:1860`), and the first and third start meaning something the day counts are filled in.
+- The periodic pull that papers over the first is O(N²) full-map transfers every 10 s, and it
+  bypasses the short-circuit: it sends checksum 0, so every pull is a full merge — observed
+  2026-10-18, every node merging every peer's whole map each tick.
 
 **Change, one item:** each node owns a monotonic `epoch: u64` for *its own* shard set — bumped
 on any change to its shards, persisted in the snapshot; the wire map becomes
