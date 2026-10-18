@@ -135,10 +135,16 @@ if (-not ((wix extension list -g | Out-String) -match [regex]::Escape($UtilExt))
     Fail "WiX extension $UtilExt not found: wix extension add -g $UtilExt/$wixVersion"
 }
 
+# -sw1149: WiX warns against the native ServiceConfig (MsiServiceConfig), which the Windows
+# Installer SDK calls unreliable. Its known failure is restart actions, which go through
+# util:ServiceConfig instead; the four settings it still carries — delayed start, the failure-
+# actions flag, the service SID and the pre-shutdown delay — applied on install (0.3.7, checked
+# with sc.exe qfailure and qsidtype), and util:ServiceConfig cannot set them.
 Step "wix build -> $(Split-Path $Msi -Leaf)"
 wix build "crates\server\windows\cameodb.wxs" `
     -arch x64 `
     -ext $UtilExt `
+    -sw1149 `
     -d "Version=$Version" `
     -d "BinDir=$Dist" `
     -d "RepoRoot=$RepoRoot" `

@@ -196,9 +196,23 @@ Still to do:
   on the handle that sets a restart action, and Windows Installer's `MsiConfigureServices` opens it
   without — every other service setting applied. The restarts move to `util:ServiceConfig` from
   `WixToolset.Util.wixext`, whose custom action sets them, as WiX's build warning advised; the
-  extension is a new build requirement (BUILDING.md). The MSI is to be rebuilt from that and the
-  install pass run on it.
-- `remote-sources` on Windows and on musl (outstanding on musl since 0.3.6).
+  extension is a new build requirement (BUILDING.md). **The MSI built at `f02678a` installs:** the
+  service runs, `sc.exe qfailure CameoDB` shows three restarts 10 s apart with a 86,400 s reset,
+  and `sc.exe qsidtype CameoDB` shows the unrestricted SID. WIX1149, WiX's warning against the
+  native `ServiceConfig` that still carries the delayed start, failure-actions flag, SID and
+  pre-shutdown delay, is silenced in `build-msi.ps1` on that evidence; it does not change the MSI.
+  The rest of the install pass on the same MSI, as reported by goranc: the program on `PATH` in a
+  new shell, health answered, the service stopped and started, the MSI installed over itself with
+  the service still running, and uninstalled — service gone, `C:\ProgramData\CameoDB\cameodb.toml`
+  kept.
+- ~~`remote-sources` on musl~~ **PASS, 4/4**: `dist/0.3.7/linux/cameodb` in
+  `cameo-builder-base-amd64:1.99.0` (Debian 13, x86-64 emulated, its `/etc/ssl/certs`; curl added
+  for the script's network check, which otherwise skips the suite) — both hosts fetched, the
+  self-signed host refused, `--insecure-source` relaxing it. Outstanding since 0.3.6, now closed.
+  **On Windows: PASS**, against
+  `dist\0.3.7\windows\cameodb.exe` from the `f02678a` build, run on the Windows machine as reported
+  by goranc (output not attached): both real hosts fetched, the self-signed host refused, and
+  `--insecure-source` relaxing it.
 - Sign, publish, commit the web project.
 
 Skipped checks and why: none yet.
