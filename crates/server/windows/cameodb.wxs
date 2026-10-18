@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  CameoDB's Windows installer, built with WiX Toolset v6 (or v4/v5, same schema) by
+  CameoDB's Windows installer, built with WiX Toolset v7 (or v4–v6, same schema) by
   scripts/build/build-msi.ps1. What it does, against what the Linux packages do:
 
     binary          C:\Program Files\CameoDB\cameodb.exe, that folder on the system PATH
@@ -86,11 +86,15 @@
                          PreShutdownDelay="150000"
                          ServiceSid="unrestricted"
                          FailureActionsWhen="failedToStopOrReturnedError" />
-          <!-- Restart on failure, as Restart=on-failure does: 10 s, three times a day. -->
+          <!--
+            Restart on failure, as Restart=on-failure does: 10 s, three times a day.
+            restartService, not restart: Action also takes a formatted value, so wix build
+            accepts any word, and the installer then fails at MsiConfigureServices and rolls back.
+          -->
           <ServiceConfigFailureActions OnInstall="yes" OnReinstall="yes" ResetPeriod="86400">
-            <Failure Action="restart" Delay="10000" />
-            <Failure Action="restart" Delay="10000" />
-            <Failure Action="restart" Delay="10000" />
+            <Failure Action="restartService" Delay="10000" />
+            <Failure Action="restartService" Delay="10000" />
+            <Failure Action="restartService" Delay="10000" />
           </ServiceConfigFailureActions>
         </ServiceInstall>
         <ServiceControl Id="CameoDbServiceControl"
