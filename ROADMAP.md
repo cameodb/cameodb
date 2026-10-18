@@ -18,7 +18,8 @@ of the released 0.3.6, read as a database-systems pass, is filed as
 2026-10-15 crash-recovery review, measured on a single node and a three-node cluster, is recorded
 under [Reconciliation, 2026-10-15](#reconciliation-2026-10-15): it corrected Phase 16's premise
 about redb, closed [E6](#e6--a-crash-restart-repaired-every-shards-redb-file), and filed OB25 and
-OB26.
+OB26. Features agreed for the iterations after the 0.3.7 release are filed as
+[P. Post-0.3.7 features](#p-post-037-features--planned).
 
 ## How to read this file
 
@@ -62,6 +63,7 @@ on one.
 | M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed; M1, M2, M3, M4, M5 and M7 done — the blocker is cleared, the surface is metered, and tenants are bounded and isolated per index. No feature build remains; M8 closed with the prefix floor and default-field cap, the clause cap deferred. M6 done: the open-loop arms show goodput degrading rather than collapsing on the bulk, single-write and read lanes, after fixing the two defects its arms found — [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) and [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput), and its confirmation run on 2026-09-27 found OB22 costs a single node nothing measurable. What is left is the release cut |
 | N — Pre-0.3.6 whole-code review | 📋 Planned | N1–N10 before the 0.3.6 cut: a `HEAD` authorization gap, batched writes that never learn a field, a peer's 400 answered as 503, node identity replaced silently, query rewrites by substring, three client errors, the first shard's memory budget, streaming broadcast, a storage shutdown race, flattened storage errors. N11–N17 after it: one way to reach a peer, dead surface, `run_change`, typed boundaries, single owners, the orchestrator split |
 | O — Post-0.3.6 review: the next-iteration base | ◐ Partial | O1 (the `wal_sync=false` durability barrier) and O2 (deadlines on every remote ask) done 2026-10-15. Left: O3, shard-map merges on a per-owner epoch (the prerequisite N15 does not name, and since 2026-10-18 the one [OB27](#ob27--a-replaced-node-never-leaves-the-cluster)'s `forget` needs), and O4, the request budget on the wire. O5 folds Rust-surface items into N16/N17; O6 reconciles the architecture doc |
+| P — Post-0.3.7 features | 📋 Planned | P1, a cap on how many elements of each array a search hit carries — a node default, a node maximum, and `array N` per request, the way hits are bounded today |
 
 ## Reconciliation, 2026-08-26
 
@@ -242,6 +244,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [N1](#n1--head-requests-skip-authorization) … [N17](#n17--smaller-items-filed-so-they-are-not-lost) | Pre-0.3.6 whole-code review — ten defects (N1–N10) to close before the cut, then the duplication and structure behind them: one way to reach a peer, dead surface, `run_change`, typed boundaries, single owners, the `orchestrator.rs` split | — | 2026-10-07 | 📋 |
 | [F10](#f10--fast-field-projection-the-pages-fields-answered-from-the-columns) | Fast-field projection — the page's fields answered from the columns, and the fetch phase skipped when they can be; the last layer of the search-economics work opened by the TS5 outage — deferred: the gain over the two-phase search is small for today's workloads, and the design is filed so it can be picked up | — | 2026-10-09 | 💭 |
 | [F11](#f11--the-disk-a-delete-frees-was-never-returned) | The disk a delete frees was never returned — `cameodb compact` and `--rewrite` (redb, offline) and `POST /_admin/index/{index}/merge` (Tantivy, online) done; reclaiming deleted documents automatically, behind a setting, planned | — | 2026-10-16 | ◐ |
+| [P1](#p1--a-hits-arrays-are-capped-the-way-its-hits-are) | A hit's arrays are capped the way its hits are — `[search] default_array_limit`, `[security.limits] max_array_limit`, `array N` per request; found validating 0.3.7 on the threat-intel dataset, where one field carries a few hundred thousand addresses | — | 2026-10-19 | 📋 |
 
 ---
 
@@ -6684,6 +6687,102 @@ fast after the data), and a document deleted after the commit. `two_phase_test.r
 workload whose projections are column-coverable — a large `limit` over a few scalar fields, the
 TS5 shape — measured on a real index with the fields declared `fast`, not on a synthetic bench.
 Until then `fast` stays what it is today: a sort and range column.
+
+## P. Post-0.3.7 features 📋 Planned
+
+Features agreed after the 0.3.7 release, for the iterations that follow it. Each is scoped against
+the code as it stands at `1cf4f66`, so the paths and line numbers below are where the work starts,
+not a promise they will not move.
+
+### P1 — A hit's arrays are capped the way its hits are
+
+📋 **Planned.** Opened 2026-10-19, validating 0.3.7 against the threat-intel dataset. Some of its
+fields are arrays of a few hundred thousand elements — `string_ipv4` and the other networking
+fields — and a search returns every element of every one. A page of ten such hits is tens of MB,
+which floods HTTP clients and every agent context. The MCP `max_response_bytes` trim
+(`server/src/mcp/search.rs:87`) does not help: it drops whole hits, so the caller gets *fewer*
+hits rather than *shorter* ones, and on this data often none.
+
+The number of hits is bounded by a node default, a node maximum and a per-request value. The
+elements of an array get the same three, with the same rules.
+
+**The surface.**
+
+| | Hits (today) | Array elements (this item) |
+|---|---|---|
+| Node default, used when the request names none | `[search] default_search_limit = 10` | `[search] default_array_limit = 1000` |
+| Node maximum, a request above it refused with `400` | `[security.limits] max_search_limit = 10000` | `[security.limits] max_array_limit = 100000` |
+| HTTP body | `"limit": N` | `"array": N` |
+| Inline keyword | `... limit N` | `... array N` |
+| MCP | `limit`, with `maximum` advertised | `array` on `search_index` and on each `search_across_indexes` entry, with `maximum` advertised |
+
+The default is finite on purpose: the dataset that prompted this is the normal case for threat
+intelligence, not an outlier. Both numbers are first guesses, to be checked against that dataset
+before release. A request above the maximum is refused, not clamped, exactly as `limit` is: an
+operator who wants whole arrays raises `max_array_limit`. Startup validation matches
+`config.rs:1191–1222` — `max_array_limit = 0` is refused, and a default above the maximum is
+refused. The runtime override in `config/overrides.rs` matches `default_search_limit`'s. The
+request check goes in `crates/mcp/src/tools/limits.rs` beside `checked_search_window`, so the
+bound the tool schema advertises and the bound HTTP enforces stay one rule.
+
+**What a capped hit looks like.**
+
+- The first N elements are kept, in stored order. The cap applies at every depth, including arrays
+  inside objects and arrays of objects; an array of objects is capped at its own level, and each
+  object it keeps is capped in turn.
+- Every hit that lost elements says so, and how many it had, in the `_`-prefixed metadata that
+  projection already carries through (`storage/src/projection.rs:31`):
+  `"_truncated_arrays": {"string_ipv4": 312455}`. Absent when nothing was cut. The key is the
+  field's dotted path, and the value is the array's original length, so a caller knows what it
+  did not get and can ask again with a larger `array`.
+- `array 0` is allowed and returns each array empty with its length reported: the sizes without
+  the payload.
+- The document key, its shadow name, and the sort field are never capped. The single-phase merge
+  reads the sort value off the document, and a capped sort array would change the order.
+
+**Where it goes.** `HybridStore::fetch_documents` (`storage/src/search.rs:1228`) is the one place
+every hit's body is built: decoded from redb, shadow fields rebuilt, then projected
+(`:1284`). That covers both search phases, the `id:VALUE` lookup, `search/stream` and both MCP
+tools. The cap is applied right after the projection, as `SearchOptions::array_limit`, so it runs
+on the shard and a peer never sends the coordinator a 5 MB array it is about to discard. The
+string-sort branch calls `fetch_documents` to order its candidates (`:1153`) and passes no cap.
+
+The value travels the way `fields` does: `ClientOp::Search` → `SearchRequest` and
+`FetchDocsRequest` (`server/src/node/mod.rs:884`, `:1152`) → `SearchOptions`. Each takes
+`#[serde(default)] array_limit: Option<usize>`. The wire is `rmp_serde::to_vec_named`, so a peer
+on an older build ignores the field and sends whole arrays. The coordinator therefore applies the
+same cap once more after the merge. That pass is idempotent, cuts nothing an up-to-date shard
+already cut, and keeps the shard's `_truncated_arrays`, so a mixed-version cluster still answers
+within the cap.
+
+The inline keyword joins `MODIFIER_KEYWORDS` in `server/src/query.rs:12` and follows the existing
+parsing rules: a keyword only counts where it opens a run of modifiers that reaches the end of the
+query, so `ip array 5` is a modifier and `array of addresses` stays query text. One consequence
+to document: because an inline `return` list runs to the next keyword, a field literally named
+`array` cannot appear in it. The body's `fields` is unaffected.
+
+**Out of scope, filed here so they are not lost.**
+
+- *Decode cost.* The shard still parses the whole stored record (`serde_json::from_slice`,
+  `search.rs:1270`) and allocates every element before the cap discards most of them. This item
+  saves the network, merge, serialization and client cost, not the shard's decode. A seeded
+  deserializer that skips elements past N (`IgnoredAny`) is contained in `fetch_documents`.
+  Reopen when `stats.timings_ms.build` dominates a capped search on this dataset.
+- *Showing the element that matched.* `string_ipv4:1.2.3.4` can match an element far past the
+  first N, so the hit shows none of what made it a hit. Keeping matching elements alongside the
+  head needs per-element term matching, which is closer to highlighting than to projection.
+- *Paging inside an array* (`array_offset`). A caller who needs all 300k elements is doing an
+  export, not a search.
+- *A per-field cap* (`{"string_ipv4": 50, "*": 1000}`). One number first; a map can be added
+  later without breaking the scalar form.
+
+**Tests.** Storage: the cap helper on nested arrays, arrays of objects, `array 0`, exempt key and
+sort fields, idempotence, and its ordering after projection. Server: the HTTP body and inline
+keyword, refusal above the maximum on HTTP and MCP, the MCP schema's advertised `maximum`, config
+validation, and a two-node search over a document with a 300k-element array that asserts the
+answer and `_truncated_arrays`. **Docs:** `docs/CONFIGURATION.md`, `docs/API_REFERENCE.md`, the MCP
+syntax reference (`crates/mcp/src/syntax.rs`) and guidance, `cameodb.example.toml`, and a
+`CHANGELOG.md` entry naming the new default, since existing callers start receiving shorter arrays.
 
 ---
 
