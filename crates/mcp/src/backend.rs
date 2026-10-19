@@ -98,6 +98,20 @@ impl<'de> Deserialize<'de> for McpIndexSearchRequest {
     }
 }
 
+/// How much of an answer a search call asked for: how many hits, from where, and how many
+/// elements of each array in them.
+///
+/// One value rather than three arguments because all three are `Option<usize>` and sit side by
+/// side — `limit` and `offset` mean opposite things, and `array` is a third number of the same
+/// type, so a positional call is one transposition away from paging by the array cap. `None` in
+/// each is "the call did not say", which the host resolves against its own defaults.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct McpSearchBounds {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub array: Option<usize>,
+}
+
 /// Why an operation failed, classified by whose problem it is.
 ///
 /// A `String` cannot carry this, and the difference decides what the caller is told: a refusal
@@ -169,16 +183,14 @@ pub trait McpBackend: Clone + Send + Sync + 'static {
         &self,
         index: McpIndexSearchRequest,
         query: String,
-        limit: Option<usize>,
-        offset: Option<usize>,
+        bounds: McpSearchBounds,
     ) -> BoxFuture<'_, Result<JsonValue, ToolError>>;
 
     fn search_across_indexes(
         &self,
         indexes: Vec<McpIndexSearchRequest>,
         query: String,
-        limit: Option<usize>,
-        offset: Option<usize>,
+        bounds: McpSearchBounds,
     ) -> BoxFuture<'_, Result<JsonValue, ToolError>>;
 
     fn describe_index(&self, index: String) -> BoxFuture<'_, Result<JsonValue, ToolError>>;
@@ -245,6 +257,26 @@ pub trait McpBackend: Clone + Send + Sync + 'static {
     /// means ten.
     fn default_search_limit(&self) -> usize {
         crate::tools::schema::DEFAULT_SEARCH_LIMIT
+    }
+
+    /// The largest `array` a search tool may be asked for.
+    ///
+    /// The host's for the reason [`Self::max_search_limit`] is: `limit` bounds how many hits a
+    /// response holds and this bounds how large one hit can be, and only the node knows what
+    /// it can afford to send. Advertised as each search schema's `array` maximum and enforced
+    /// by the dispatcher.
+    ///
+    /// The default is [`DEFAULT_MAX_ARRAY_LIMIT`](crate::DEFAULT_MAX_ARRAY_LIMIT).
+    fn max_array_limit(&self) -> usize {
+        crate::tools::schema::DEFAULT_MAX_ARRAY_LIMIT
+    }
+
+    /// The `array` a search runs with when the call names none.
+    ///
+    /// Needed here so the dispatcher can check the value a call will actually run with, as it
+    /// does for `limit`. The default matches the schema descriptions.
+    fn default_array_limit(&self) -> usize {
+        crate::tools::schema::DEFAULT_ARRAY_LIMIT
     }
 
     /// May this caller invoke another tool right now, at this cost?
@@ -314,7 +346,7 @@ pub(crate) mod testing {
     use futures::future::BoxFuture;
     use serde_json::{Value as JsonValue, json};
 
-    use super::{McpBackend, McpIndexSearchRequest, ToolError};
+    use super::{McpBackend, McpIndexSearchRequest, McpSearchBounds, ToolError};
     use crate::authz::McpAuthzRef;
 
     /// Answers every operation with an empty object — or with the failure it was built with.
@@ -322,13 +354,14 @@ pub(crate) mod testing {
     /// The dispatcher tests are about the JSON-RPC envelope — which messages get a reply, what
     /// an error carries — so what a tool *returns* is deliberately uninteresting here.
     ///
-    /// The two bounds are settable because they are what a host supplies that this crate both
+    /// The bounds are settable because they are what a host supplies that this crate both
     /// advertises and enforces: a stub fixed at the defaults could not tell a bound that
     /// follows the host from a constant compiled in here.
     #[derive(Clone, Default)]
     pub(crate) struct StubBackend {
         max_search_limit: Option<usize>,
         max_federated_indexes: Option<usize>,
+        max_array_limit: Option<usize>,
         failure: Option<StubFailure>,
     }
 
@@ -353,6 +386,14 @@ pub(crate) mod testing {
         pub(crate) fn narrowed(max_federated_indexes: usize) -> Self {
             Self {
                 max_federated_indexes: Some(max_federated_indexes),
+                ..Self::default()
+            }
+        }
+
+        /// A host whose array bound is not the default one.
+        pub(crate) fn array_capped(max_array_limit: usize) -> Self {
+            Self {
+                max_array_limit: Some(max_array_limit),
                 ..Self::default()
             }
         }
@@ -388,12 +429,16 @@ pub(crate) mod testing {
                 .unwrap_or(crate::tools::schema::DEFAULT_MAX_SEARCH_LIMIT)
         }
 
+        fn max_array_limit(&self) -> usize {
+            self.max_array_limit
+                .unwrap_or(crate::tools::schema::DEFAULT_MAX_ARRAY_LIMIT)
+        }
+
         fn search_index(
             &self,
             _index: McpIndexSearchRequest,
             _query: String,
-            _limit: Option<usize>,
-            _offset: Option<usize>,
+            _bounds: McpSearchBounds,
         ) -> BoxFuture<'_, Result<JsonValue, ToolError>> {
             self.outcome()
         }
@@ -402,8 +447,7 @@ pub(crate) mod testing {
             &self,
             _indexes: Vec<McpIndexSearchRequest>,
             _query: String,
-            _limit: Option<usize>,
-            _offset: Option<usize>,
+            _bounds: McpSearchBounds,
         ) -> BoxFuture<'_, Result<JsonValue, ToolError>> {
             self.outcome()
         }

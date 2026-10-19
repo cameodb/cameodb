@@ -141,11 +141,14 @@ Execute full-text search on a single CameoDB index.
 - `limit` (integer, optional): Maximum number of results to return, up to the node's configured ceiling (`[security.limits] max_search_limit`, 10000 by default). The tool's own `inputSchema` carries that number as its `maximum`, so read it there rather than assuming the default. Pass `0` for count-only mode (returns `total_hits` without document data). If omitted, defaults to 10. A larger value is refused, whether it arrives as this argument or as an inline `limit` modifier in the query.
 - `offset` (integer, optional): How many hits to skip before the first one returned. With `limit` as the page size, page N is `offset = N * limit`; there are more results when `offset + hits_returned < total_hits`. Defaults to 0. **The ceiling applies to `offset + limit`**, not to either alone: the engine fetches the whole window from the front of every shard and takes the page after merging them, so a deep page costs what a large limit costs and is refused the same way. An offset at or past `total_hits` is answered with an empty page and a `_warning` saying so, rather than an error — see [Paging](#paging).
 - `fields` (array of strings, optional): Field names to include in results (field projection)
+- `array` (integer, optional): Most elements kept of each array in a hit — the first ones, in stored order, at any depth. If omitted, the node's `[search] default_array_limit` applies (1000 by default); a value past `[security.limits] max_array_limit` (100000 by default, advertised as the schema's `maximum`) is refused, as this argument or as an inline `array` modifier. A hit that lost elements carries `_truncated_arrays`, naming each shortened array by its path with the length it had. `0` returns the lengths without the elements.
 - `sort` (object, optional): Sort results by a field — the same object `search_across_indexes` takes per index. Takes precedence over an inline `sort` clause in the query.
   - `field` (string, required): Field name to sort by (u64, i64, f64, date, or text/string for alphabetic sort)
   - `order` (string, optional): `asc` or `desc` (defaults to `asc`)
 
 **Returns:** JSON array of matching documents with relevance scores.
+
+A hit can be large on its own: one field of a threat-intelligence record may hold hundreds of thousands of addresses. Each array is capped at `array` elements before the hit leaves the shard, so `_truncated_arrays` — `{"string_ipv4": 312455}` — is the signal that a field is longer than what came back. Ask again with a larger `array`, or project the field away with `fields` if it is not needed.
 
 A response larger than the largest single message the node is configured to carry — its HTTP body size, 128 MB by default, overridable as `[limits] max_response_bytes` — is trimmed to fit and carries `_truncated: true`, `_omitted_hits: N` and a `_warning` naming the figure it hit. The hits returned are the highest ranked, in order; `total_hits` still reports everything that matched. Treat the flag as instruction to narrow the query rather than reading the trimmed set as the whole result.
 
@@ -183,6 +186,7 @@ Execute federated search across multiple CameoDB indexes with optional per-index
 - `query` (string, required): Search query applied to all specified indexes
 - `limit` (integer, optional): Maximum total results across all indexes, up to the node's configured ceiling — see `search_index` above. Pass `0` for count-only mode (returns `total_hits` without document data). If omitted, defaults to 10.
 - `offset` (integer, optional): How many hits to skip, applied **once, to the merged order** — so page N of a federated search is page N of the combined result, not page N of each index. Each index is asked for `offset + limit` hits from the front and the skip happens after the merge; the same ceiling bounds the sum. Defaults to 0.
+- `array` (integer, optional): Most elements kept of each array in a hit, the same for every index — see `search_index` above.
 
 **Returns:** Combined results merged by relevance score (or by the sort field if specified). Each hit includes an `_index_source` field indicating its origin index. The response contains only the merged `hits` array — per-index results are not duplicated, keeping token usage proportional to the limit.
 
@@ -476,9 +480,10 @@ schema, and the table below, which is generated and checked against the tables b
 | `limit N` | Cap the number of results. `limit 0` is count-only: `total_hits` and no hits, skipping the key-value store, which is the cheapest way to ask how many documents match. | `title:rust limit 5` |
 | `offset K` | Skip the first K results — the page, where `limit` is the page size. `offset + limit` is bounded by the same maximum `limit` is. | `title:rust limit 10 offset 20` |
 | `sort field:desc` | Order by a field. See the sorting rules. | `title:rust sort year:desc` |
+| `array N` | Keep at most N elements of each array in a hit, the first ones in stored order, at any depth. A hit that lost elements carries `_truncated_arrays`, naming each shortened array by its path with the length it had; `array 0` is the lengths without the elements. Without it the node's default applies, and N is bounded by a maximum the way `limit` is. | `string_ipv4:10.0.0.1 array 50` |
 
 - A modifier counts only where it opens an unbroken run of clauses reaching the end of the query, with query text left in front of it. Anything else is searched for, so `find tax return forms` is four terms and `* limit 10` is how to ask for a bare limit.
-- A field list needs a comma between names, a limit needs a number, and a sort order must be exactly `asc` or `desc`. A clause that does not parse stays in the query rather than being applied in part.
+- A field list needs a comma between names, a limit or an array needs a number, and a sort order must be exactly `asc` or `desc`. A clause that does not parse stays in the query rather than being applied in part.
 - A modifier naming a field the index does not have is reported as a dropped clause, since a projection would otherwise return documents with no fields.
 
 **Rules**

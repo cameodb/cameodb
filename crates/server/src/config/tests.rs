@@ -507,6 +507,58 @@ max_response_bytes = 16777216
         );
     }
 
+    /// The array bound is configured the way the hit bound is: finite by default, a ceiling
+    /// of zero refused, and a default above the ceiling refused naming both numbers.
+    #[test]
+    fn the_array_limit_follows_the_rules_the_search_limit_does() {
+        let config = CameoDbConfig::default();
+        assert_eq!(config.search.default_array_limit, 1_000);
+        assert_eq!(config.security.limits.max_array_limit, 100_000);
+        assert!(config.validate().is_ok());
+
+        let mut config = CameoDbConfig::default();
+        config.security.limits.max_array_limit = 0;
+        config.search.default_array_limit = 0;
+        assert!(
+            config.validate().is_err(),
+            "an array ceiling of zero was accepted"
+        );
+
+        let mut config = CameoDbConfig::default();
+        config.security.limits.max_array_limit = 500;
+        config.search.default_array_limit = 500;
+        assert!(
+            config.validate().is_ok(),
+            "a default at the ceiling is within it"
+        );
+        config.search.default_array_limit = 501;
+        let err = config
+            .validate()
+            .expect_err("an array default above the ceiling was accepted")
+            .to_string();
+        assert!(
+            err.contains("501") && err.contains("500"),
+            "the refusal does not name both numbers: {err}"
+        );
+    }
+
+    /// Both settings are read from the files an operator writes and from the environment.
+    #[test]
+    fn the_array_limits_load_from_toml_and_the_environment() {
+        let config = CameoDbConfig::parse_config_content(
+            "[search]\ndefault_array_limit = 250\n[security.limits]\nmax_array_limit = 5000\n",
+            "arrays.toml",
+        )
+        .expect("parse");
+        assert_eq!(config.search.default_array_limit, 250);
+        assert_eq!(config.security.limits.max_array_limit, 5000);
+
+        let overrides =
+            CliOverrides::default().with_environment(&[("CAMEODB_DEFAULT_ARRAY_LIMIT", "40")]);
+        let config = CameoDbConfig::load_with_cli(&overrides).unwrap();
+        assert_eq!(config.search.default_array_limit, 40);
+    }
+
     /// A response ceiling of zero would describe every response as truncated rather than
     /// refusing any, since one hit always survives the trim.
     #[test]

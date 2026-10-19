@@ -13,7 +13,8 @@ mod schema;
 mod search;
 
 use cameodb_mcp::{
-    McpAuthzRef, McpBackend, McpIndexSearchRequest, RateLimitVerdict, ToolCall, ToolError,
+    McpAuthzRef, McpBackend, McpIndexSearchRequest, McpSearchBounds, RateLimitVerdict, ToolCall,
+    ToolError,
 };
 use futures::future::BoxFuture;
 use serde_json::Value as JsonValue;
@@ -33,20 +34,18 @@ impl McpBackend for AppState {
         &self,
         index: McpIndexSearchRequest,
         query: String,
-        limit: Option<usize>,
-        offset: Option<usize>,
+        bounds: McpSearchBounds,
     ) -> BoxFuture<'_, Result<JsonValue, ToolError>> {
-        search::search_index(self.clone(), index, query, limit, offset)
+        search::search_index(self.clone(), index, query, bounds)
     }
 
     fn search_across_indexes(
         &self,
         indexes: Vec<McpIndexSearchRequest>,
         query: String,
-        limit: Option<usize>,
-        offset: Option<usize>,
+        bounds: McpSearchBounds,
     ) -> BoxFuture<'_, Result<JsonValue, ToolError>> {
-        search::search_across_indexes(self.clone(), indexes, query, limit, offset)
+        search::search_across_indexes(self.clone(), indexes, query, bounds)
     }
 
     fn describe_index(&self, index: String) -> BoxFuture<'_, Result<JsonValue, ToolError>> {
@@ -98,6 +97,16 @@ impl McpBackend for AppState {
     /// an operator who raised the default does not open a gap of that size above the ceiling.
     fn default_search_limit(&self) -> usize {
         self.router.default_search_limit()
+    }
+
+    /// This node's `[security.limits] max_array_limit`.
+    fn max_array_limit(&self) -> usize {
+        self.max_array_limit
+    }
+
+    /// This node's `[search] default_array_limit`, which is what an omitted `array` becomes.
+    fn default_array_limit(&self) -> usize {
+        self.default_array_limit
     }
 
     fn check_tool_rate(&self, authz: McpAuthzRef, tool: &str, cost: u32) -> RateLimitVerdict {

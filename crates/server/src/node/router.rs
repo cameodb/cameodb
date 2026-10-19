@@ -129,6 +129,7 @@ pub(super) fn widen_broadcast_op(op: ClientOp, window: SearchWindow) -> ClientOp
             query,
             fields,
             sort,
+            array_limit,
             ..
         } => ClientOp::Search {
             index,
@@ -137,6 +138,7 @@ pub(super) fn widen_broadcast_op(op: ClientOp, window: SearchWindow) -> ClientOp
             offset: None,
             fields,
             sort,
+            array_limit,
         },
         other => other,
     }
@@ -652,6 +654,12 @@ impl RouterActor {
         // remote, streaming-buffered), so strip that metadata here before returning — unless
         // the caller is itself a merge and asked to keep it.
         let is_search = strip_sort_keys_on_exit && matches!(op, ClientOp::Search { .. });
+        // Applied on the way out whether or not the caller merges: a merge across these calls
+        // only reorders hits, so capping each response before it is the same as capping after.
+        let array_limit = match &op {
+            ClientOp::Search { array_limit, .. } => *array_limit,
+            _ => None,
+        };
 
         // Resolve locally before asking anyone. The ring and the shard placement are both
         // published lock-free and already in hand, and between them they answer the only
@@ -717,8 +725,13 @@ impl RouterActor {
             }
         };
 
-        if is_search && let Ok(response) = result.as_mut() {
-            strip_sort_keys(response);
+        if let Ok(response) = result.as_mut() {
+            if is_search {
+                strip_sort_keys(response);
+            }
+            if let Some(max) = array_limit {
+                cap_hit_arrays(response, max);
+            }
         }
 
         result

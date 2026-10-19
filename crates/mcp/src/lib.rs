@@ -29,7 +29,8 @@ mod transport;
 
 pub use authz::{McpAuthz, McpAuthzRef, McpCapability, McpUnrestricted, tool_capability};
 pub use backend::{
-    McpBackend, McpIndexSearchRequest, RateLimitVerdict, SortOrder, SortSpec, ToolCall, ToolError,
+    McpBackend, McpIndexSearchRequest, McpSearchBounds, RateLimitVerdict, SortOrder, SortSpec,
+    ToolCall, ToolError,
 };
 pub use protocol::MCP_SESSION_ID_HEADER;
 pub use session::McpShutdownHandle;
@@ -37,6 +38,9 @@ pub use session::McpShutdownHandle;
 // host applies the same rule to the window a search runs with, which is not always the
 // argument a client sent — importing both is what keeps the advertised bound and the enforced
 // one from becoming two spellings.
-pub use tools::limits::checked_search_window;
-pub use tools::schema::{DEFAULT_MAX_FEDERATED_INDEXES, DEFAULT_MAX_SEARCH_LIMIT};
+pub use tools::limits::{checked_array_limit, checked_search_window};
+pub use tools::schema::{
+    DEFAULT_ARRAY_LIMIT, DEFAULT_MAX_ARRAY_LIMIT, DEFAULT_MAX_FEDERATED_INDEXES,
+    DEFAULT_MAX_SEARCH_LIMIT,
+};
 pub use transport::{McpTransportConfig, mcp_router};

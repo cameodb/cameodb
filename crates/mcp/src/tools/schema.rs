@@ -48,11 +48,28 @@ pub const DEFAULT_SEARCH_LIMIT: usize = 10;
 /// only the answer for a host that does not.
 pub const DEFAULT_MAX_FEDERATED_INDEXES: usize = 20;
 
+/// The most elements of each array a search hit may be asked to keep, when the host names no
+/// other number.
+///
+/// The other dimension of a response's size. `limit` bounds how many hits come back; a single
+/// hit can still carry a field of a few hundred thousand network addresses, megabytes on its
+/// own. A hundred thousand short strings is a couple of megabytes per field — past it, a
+/// caller wants an export, not a search. The host owns the number through
+/// [`McpBackend::max_array_limit`](crate::McpBackend::max_array_limit).
+pub const DEFAULT_MAX_ARRAY_LIMIT: usize = 100_000;
+
+/// The most elements of each array a search hit keeps when the call names no `array`.
+///
+/// Finite on purpose: the data that prompted the cap — threat intelligence, with whole subnets
+/// of addresses in one field — is the normal case for this database, not an outlier. A hit
+/// that lost elements says so in `_truncated_arrays`, so the default is never silent.
+pub const DEFAULT_ARRAY_LIMIT: usize = 1_000;
+
 /// The bounds the tool schemas advertise and the dispatcher enforces.
 ///
-/// Carried as one value rather than two arguments because both are read from the host in the
-/// same breath and both are `usize`. Two positional numbers of the same type can be passed the
-/// wrong way round, and nothing would report it: the catalogue would simply advertise a
+/// Carried as one value rather than separate arguments because they are read from the host in
+/// the same breath and all are `usize`. Two positional numbers of the same type can be passed
+/// the wrong way round, and nothing would report it: the catalogue would simply advertise a
 /// federated cap of ten thousand and a search ceiling of twenty, both of them enforced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToolLimits {
@@ -60,6 +77,8 @@ pub struct ToolLimits {
     pub max_search_limit: usize,
     /// The most indexes one federated search may name.
     pub max_federated_indexes: usize,
+    /// The largest `array` a search tool may be asked for.
+    pub max_array_limit: usize,
 }
 
 /// The bounds for a host that configures neither.
@@ -71,6 +90,7 @@ impl Default for ToolLimits {
         Self {
             max_search_limit: DEFAULT_MAX_SEARCH_LIMIT,
             max_federated_indexes: DEFAULT_MAX_FEDERATED_INDEXES,
+            max_array_limit: DEFAULT_MAX_ARRAY_LIMIT,
         }
     }
 }
@@ -86,6 +106,7 @@ impl ToolLimits {
         Self {
             max_search_limit: backend.max_search_limit(),
             max_federated_indexes: backend.max_federated_indexes(),
+            max_array_limit: backend.max_array_limit(),
         }
     }
 }
@@ -102,6 +123,9 @@ pub(crate) struct SearchIndexArgs {
     pub(crate) offset: Option<usize>,
     #[serde(default)]
     pub(crate) fields: Option<Vec<String>>,
+    /// Most elements kept of each array in a hit.
+    #[serde(default)]
+    pub(crate) array: Option<usize>,
     /// The same structured sort the federated tool takes per index.
     ///
     /// One index is the common case, so this is where a sort is most often wanted; the
@@ -121,6 +145,9 @@ pub(crate) struct SearchAcrossIndexesArgs {
     /// How many ordered hits to skip before the first one returned (paging offset).
     #[serde(default)]
     pub(crate) offset: Option<usize>,
+    /// Most elements kept of each array in a hit, the same for every index searched.
+    #[serde(default)]
+    pub(crate) array: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -181,9 +208,23 @@ fn sort_schema() -> JsonValue {
     })
 }
 
+/// The `array` property both search schemas carry, bounded by the host's maximum.
+fn array_schema(max_array_limit: usize) -> JsonValue {
+    json!({
+        "type": "integer",
+        "minimum": 0,
+        "maximum": max_array_limit,
+        "description": format!(
+            "Most elements kept of each array in a hit, up to {max_array_limit}; the first ones, in stored order, at any depth. A hit that lost elements carries `_truncated_arrays`, naming each shortened array by its path with the length it had. Pass 0 for the lengths without the elements. If omitted, the node's configured default applies, which is 1000 unless an operator changed it."
+        )
+    })
+}
+
 pub(crate) fn search_index_input_schema(limits: ToolLimits) -> JsonValue {
     let ToolLimits {
-        max_search_limit, ..
+        max_search_limit,
+        max_array_limit,
+        ..
     } = limits;
     json!({
         "type": "object",
@@ -194,7 +235,7 @@ pub(crate) fn search_index_input_schema(limits: ToolLimits) -> JsonValue {
             },
             "query": {
                 "type": "string",
-                "description": "Search query string. Supports field:value, phrases, AND/OR/NOT, ranges, and inline 'return'/'limit'/'offset'/'sort' modifiers. Use 'limit 0' for count-only queries. Inline sort: 'sort field:asc' or 'sort field:desc'; inline paging: 'limit 10 offset 20'. An argument wins over the same modifier written inline."
+                "description": "Search query string. Supports field:value, phrases, AND/OR/NOT, ranges, and inline 'return'/'limit'/'offset'/'sort'/'array' modifiers. Use 'limit 0' for count-only queries. Inline sort: 'sort field:asc' or 'sort field:desc'; inline paging: 'limit 10 offset 20'. An argument wins over the same modifier written inline."
             },
             "limit": {
                 "type": "integer",
@@ -216,6 +257,7 @@ pub(crate) fn search_index_input_schema(limits: ToolLimits) -> JsonValue {
                 "items": { "type": "string" },
                 "description": "Field names to include in results (field projection). Fields are returned in the exact order specified. Metadata fields (like '_score') are always included automatically."
             },
+            "array": array_schema(max_array_limit),
             "sort": sort_schema()
         },
         "required": ["index", "query"],
@@ -227,6 +269,7 @@ pub(crate) fn search_across_indexes_input_schema(limits: ToolLimits) -> JsonValu
     let ToolLimits {
         max_search_limit,
         max_federated_indexes,
+        max_array_limit,
     } = limits;
     json!({
         "type": "object",
@@ -282,7 +325,8 @@ pub(crate) fn search_across_indexes_input_schema(limits: ToolLimits) -> JsonValu
                 "description": format!(
                     "How many hits to skip before the first one returned, applied once after merging across every index — so page N of a federated search is page N of the combined order, not of each index separately. With `limit` as the page size, page N is `offset = N * limit`. Each index is asked for offset + limit hits, so `offset + limit` must not exceed {max_search_limit}. Defaults to 0."
                 )
-            }
+            },
+            "array": array_schema(max_array_limit)
         },
         "required": ["indexes", "query"],
         "additionalProperties": false
@@ -506,6 +550,7 @@ mod tests {
         let hosts_own = ToolLimits {
             max_search_limit: 4_242,
             max_federated_indexes: 7,
+            max_array_limit: 313,
         };
         for (label, schema) in [
             ("search_index", search_index_input_schema(hosts_own)),
@@ -524,6 +569,11 @@ mod tests {
                     .as_str()
                     .is_some_and(|text| text.contains(&hosts_own.max_search_limit.to_string())),
                 "{label} describes a limit bound that is not the host's: {schema}"
+            );
+            assert_eq!(
+                schema["properties"]["array"]["maximum"],
+                json!(hosts_own.max_array_limit),
+                "{label} advertises an array bound that is not the host's"
             );
         }
 

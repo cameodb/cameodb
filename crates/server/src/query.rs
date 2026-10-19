@@ -1,4 +1,5 @@
-//! The inline modifiers a query may carry after its text: `return`, `limit`, `offset` and `sort`.
+//! The inline modifiers a query may carry after its text: `return`, `limit`, `offset`, `sort`
+//! and `array`.
 //!
 //! Shared by every surface — an HTTP search, an MCP tool call and the bundled client all accept
 //! the same query string, so they have to agree on where the query ends and the modifiers begin.
@@ -9,7 +10,7 @@
 use storage::{SortOrder, SortSpec};
 
 /// The keywords that open an inline modifier clause.
-const MODIFIER_KEYWORDS: [&str; 4] = ["return", "limit", "offset", "sort"];
+const MODIFIER_KEYWORDS: [&str; 5] = ["return", "limit", "offset", "sort", "array"];
 
 /// Whether a token has the shape of a field name, which rules out quoted text, groups and a
 /// `field:value` clause.
@@ -68,9 +69,10 @@ fn parse_field_list(tokens: &[&str]) -> Option<Vec<String>> {
 
 /// What a run of inline modifiers set, and the query left in front of them.
 ///
-/// A struct rather than a tuple because there are now four optional values and two of them are
-/// `Option<usize>` — `limit` and `offset` are adjacent, same-typed and mean opposite things, so a
-/// positional call site is one transposition away from paging by the page size.
+/// A struct rather than a tuple because there are five optional values and three of them are
+/// `Option<usize>` — `limit` and `offset` are adjacent, same-typed and mean opposite things, and
+/// `array` is a third of the same type, so a positional call site is one transposition away from
+/// paging by the page size.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct QueryModifiers {
     /// The query with its modifier run removed, or the whole query when there was none.
@@ -79,60 +81,56 @@ pub(crate) struct QueryModifiers {
     pub offset: Option<usize>,
     pub fields: Option<Vec<String>>,
     pub sort: Option<SortSpec>,
+    /// Most elements kept of each array in a hit.
+    pub array: Option<usize>,
 }
-
-/// What a run of inline modifiers set, before the query text is attached.
-type Modifiers = (
-    Option<usize>,
-    Option<usize>,
-    Option<Vec<String>>,
-    Option<SortSpec>,
-);
 
 /// Parse `tokens` as an unbroken run of modifier clauses, in any order and at most one of each.
 ///
 /// None unless every token belongs to a clause, which is what confines a keyword to a run that
-/// reaches the end of the query.
-fn parse_modifier_run(tokens: &[&str]) -> Option<Modifiers> {
-    let mut limit = None;
-    let mut offset = None;
-    let mut fields = None;
-    let mut sort = None;
+/// reaches the end of the query. The answer's `query` is left empty for the caller to fill.
+fn parse_modifier_run(tokens: &[&str]) -> Option<QueryModifiers> {
+    let mut run = QueryModifiers::default();
     let mut idx = 0;
 
     while idx < tokens.len() {
         match tokens[idx] {
-            "limit" if limit.is_none() => {
-                limit = Some(tokens.get(idx + 1)?.parse().ok()?);
+            "limit" if run.limit.is_none() => {
+                run.limit = Some(tokens.get(idx + 1)?.parse().ok()?);
                 idx += 2;
             }
             // Parsed as `usize`, so `offset -1` fails to parse and stays query text, the same
             // way `limit -5` does.
-            "offset" if offset.is_none() => {
-                offset = Some(tokens.get(idx + 1)?.parse().ok()?);
+            "offset" if run.offset.is_none() => {
+                run.offset = Some(tokens.get(idx + 1)?.parse().ok()?);
                 idx += 2;
             }
-            "sort" if sort.is_none() => {
-                sort = Some(parse_sort_spec(tokens.get(idx + 1)?)?);
+            "array" if run.array.is_none() => {
+                run.array = Some(tokens.get(idx + 1)?.parse().ok()?);
                 idx += 2;
             }
-            "return" if fields.is_none() => {
+            "sort" if run.sort.is_none() => {
+                run.sort = Some(parse_sort_spec(tokens.get(idx + 1)?)?);
+                idx += 2;
+            }
+            "return" if run.fields.is_none() => {
                 // The field list runs to the next keyword, since only a keyword can end it.
                 let end = tokens[idx + 1..]
                     .iter()
                     .position(|token| MODIFIER_KEYWORDS.contains(token))
                     .map_or(tokens.len(), |rel| idx + 1 + rel);
-                fields = Some(parse_field_list(&tokens[idx + 1..end])?);
+                run.fields = Some(parse_field_list(&tokens[idx + 1..end])?);
                 idx = end;
             }
             _ => return None,
         }
     }
 
-    Some((limit, offset, fields, sort))
+    Some(run)
 }
 
-/// Split a query from its trailing inline modifiers — `return`, `limit`, `offset` and `sort`.
+/// Split a query from its trailing inline modifiers — `return`, `limit`, `offset`, `sort` and
+/// `array`.
 ///
 /// A keyword counts only where it opens a run of clauses that reaches the end of the query and
 /// leaves at least one token in front of it. Everything else is query text, so a keyword used as a
@@ -146,14 +144,11 @@ pub(crate) fn parse_query_keywords(query: &str) -> QueryModifiers {
     // `return a`.
     for start in 1..tokens.len() {
         if MODIFIER_KEYWORDS.contains(&tokens[start])
-            && let Some((limit, offset, fields, sort)) = parse_modifier_run(&tokens[start..])
+            && let Some(run) = parse_modifier_run(&tokens[start..])
         {
             return QueryModifiers {
                 query: tokens[..start].join(" "),
-                limit,
-                offset,
-                fields,
-                sort,
+                ..run
             };
         }
     }
@@ -684,5 +679,48 @@ mod tests {
         assert_eq!(fields, Some(vec!["title".to_string()]));
         assert_eq!(offset, Some(10));
         assert_eq!(limit, None);
+    }
+
+    #[test]
+    fn an_array_clause_is_a_modifier_in_any_position_of_the_run() {
+        let m = parse_query_keywords("string_ipv4:10.0.0.1 array 50");
+        assert_eq!(m.query, "string_ipv4:10.0.0.1");
+        assert_eq!(m.array, Some(50));
+
+        let m = parse_query_keywords("title:rust limit 5 array 0 return title,ips");
+        assert_eq!(m.query, "title:rust");
+        assert_eq!(m.limit, Some(5));
+        assert_eq!(m.array, Some(0));
+        assert_eq!(m.fields, Some(vec!["title".to_string(), "ips".to_string()]));
+
+        // `array` ends a `return` list the way any keyword does.
+        let m = parse_query_keywords("title:rust return title array 3");
+        assert_eq!(m.fields, Some(vec!["title".to_string()]));
+        assert_eq!(m.array, Some(3));
+    }
+
+    /// The word used as a word stays query text: not followed by a count, or not at the end.
+    #[test]
+    fn array_as_a_word_stays_in_the_query() {
+        for query in [
+            "array of addresses",
+            "an array of addresses",
+            "an array -1",
+            "array 5",
+            "find array 5 hosts",
+        ] {
+            let m = parse_query_keywords(query);
+            assert_eq!(m.query, query, "{query}");
+            assert_eq!(m.array, None, "{query}");
+        }
+    }
+
+    /// At most one of each clause per run, as for `limit`: a repeated `array` cannot be one run,
+    /// so only the last clause is a modifier and the one before it stays query text.
+    #[test]
+    fn a_repeated_array_clause_keeps_only_the_last_as_a_modifier() {
+        let m = parse_query_keywords("title:rust array 5 array 6");
+        assert_eq!(m.array, Some(6));
+        assert_eq!(m.query, "title:rust array 5");
     }
 }

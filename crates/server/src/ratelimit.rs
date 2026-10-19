@@ -96,6 +96,16 @@ pub struct McpLimitsConfig {
     #[serde(default = "default_max_federated_indexes")]
     pub max_federated_indexes: usize,
 
+    /// The largest `array` a search may ask for: the most elements kept of each array in a hit.
+    ///
+    /// `max_search_limit` bounds how many hits a search returns; this bounds how large one hit
+    /// can be, which no count of hits can — a single field of a few hundred thousand addresses
+    /// is megabytes on its own. Enforced on every surface, HTTP and MCP alike, and refused
+    /// rather than clamped past it. Always in force, and `0` is refused at load for the same
+    /// reason as `max_search_limit`.
+    #[serde(default = "default_max_array_limit")]
+    pub max_array_limit: usize,
+
     /// Shortest prefix, in characters, that `field:pre*` is expanded for. `0` expands any.
     ///
     /// A prefix becomes a range over the term dictionary, and a range walks every term it covers
@@ -190,6 +200,11 @@ fn default_max_federated_indexes() -> usize {
     cameodb_mcp::DEFAULT_MAX_FEDERATED_INDEXES
 }
 
+/// The array ceiling when an operator sets none. See [`cameodb_mcp::DEFAULT_MAX_ARRAY_LIMIT`].
+fn default_max_array_limit() -> usize {
+    cameodb_mcp::DEFAULT_MAX_ARRAY_LIMIT
+}
+
 /// Written out rather than derived, so that a config built in code and one parsed from an
 /// absent `[security.limits]` are the same config. A derived `Default` would leave
 /// `max_search_limit` and `max_federated_indexes` at zero, which is the one value each of them
@@ -203,6 +218,7 @@ impl Default for McpLimitsConfig {
             write_burst: 0,
             max_search_limit: default_max_search_limit(),
             max_federated_indexes: default_max_federated_indexes(),
+            max_array_limit: default_max_array_limit(),
             min_prefix_length: default_min_prefix_length(),
             expand_unqualified_prefix: default_expand_unqualified_prefix(),
             max_default_fields: default_max_default_fields(),

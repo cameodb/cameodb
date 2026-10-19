@@ -47,6 +47,7 @@ fn only(fields: &[String]) -> SearchOptions<'_> {
     SearchOptions {
         deadline: None,
         fields: Some(fields),
+        ..Default::default()
     }
 }
 
@@ -152,5 +153,91 @@ fn a_projection_on_a_shadow_index_answers_the_shadow_name() {
     assert!(
         hit.get("title").is_none(),
         "the projection trimmed the rest: {hit}"
+    );
+}
+
+/// The array cap rides the same fetch the projection does, so every way into a hit — a
+/// scored query, the `id:` lookup that skips Tantivy — comes back capped, and a projection
+/// that leaves the array out leaves nothing to account for.
+#[test]
+fn an_array_limit_caps_every_hit_and_reports_the_original_lengths() {
+    let temp = TempDir::new().unwrap();
+    let store = HybridStore::new(config(temp.path().to_path_buf()), 1).unwrap();
+
+    let mut fields = HashMap::new();
+    fields.insert("title".into(), field(TantivyFieldType::Text, true));
+    store
+        .store_schema_and_cache(
+            "intel",
+            &IndexSchema {
+                fields,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let addresses: Vec<String> = (0..5_000)
+        .map(|n| format!("10.0.{}.{}", n / 256, n % 256))
+        .collect();
+    store
+        .apply_write(
+            "intel",
+            WalOp::Put {
+                id: "d1".to_string(),
+                json_blob: Some(serde_json::json!({
+                    "title": "sample report",
+                    "string_ipv4": addresses,
+                    "dns": {"names": ["a.example", "b.example", "c.example", "d.example"]},
+                })),
+            },
+        )
+        .unwrap();
+    store.commit_index("intel").unwrap();
+
+    let capped = SearchOptions {
+        array_limit: Some(3),
+        ..Default::default()
+    };
+    for query in ["title:sample", "id:d1"] {
+        let outcome = store
+            .search_documents_with("intel", query, 10, None, &capped)
+            .unwrap();
+        assert_eq!(outcome.hits.len(), 1, "{query}");
+        let hit = &outcome.hits[0].1;
+        assert_eq!(
+            hit["string_ipv4"],
+            serde_json::json!(["10.0.0.0", "10.0.0.1", "10.0.0.2"]),
+            "{query}: the first elements, in stored order"
+        );
+        assert_eq!(hit["dns"]["names"].as_array().unwrap().len(), 3, "{query}");
+        assert_eq!(
+            hit[storage::TRUNCATED_ARRAYS_FIELD],
+            serde_json::json!({"string_ipv4": 5000, "dns.names": 4}),
+            "{query}"
+        );
+    }
+
+    let keep = vec!["title".to_string()];
+    let projected = SearchOptions {
+        fields: Some(&keep),
+        array_limit: Some(3),
+        ..Default::default()
+    };
+    let outcome = store
+        .search_documents_with("intel", "title:sample", 10, None, &projected)
+        .unwrap();
+    let hit = &outcome.hits[0].1;
+    assert!(
+        hit.get(storage::TRUNCATED_ARRAYS_FIELD).is_none(),
+        "a projected-away array was not cut, so nothing says it was: {hit}"
+    );
+
+    let whole = store
+        .search_documents_with("intel", "title:sample", 10, None, &SearchOptions::default())
+        .unwrap();
+    assert_eq!(
+        whole.hits[0].1["string_ipv4"].as_array().unwrap().len(),
+        5_000,
+        "no cap asked for, none applied"
     );
 }

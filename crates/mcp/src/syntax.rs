@@ -408,6 +408,14 @@ pub const INLINE_MODIFIERS: &[(&str, &str, &str)] = &[
         "Order by a field. See the sorting rules.",
         "title:rust sort year:desc",
     ),
+    (
+        "array N",
+        "Keep at most N elements of each array in a hit, the first ones in stored order, at any \
+         depth. A hit that lost elements carries `_truncated_arrays`, naming each shortened array \
+         by its path with the length it had; `array 0` is the lengths without the elements. \
+         Without it the node's default applies, and N is bounded by a maximum the way `limit` is.",
+        "string_ipv4:10.0.0.1 array 50",
+    ),
 ];
 
 /// How the inline modifiers are told apart from query text.
@@ -415,8 +423,8 @@ pub const MODIFIER_RULES: &[&str] = &[
     "A modifier counts only where it opens an unbroken run of clauses reaching the end of the \
      query, with query text left in front of it. Anything else is searched for, so `find tax \
      return forms` is four terms and `* limit 10` is how to ask for a bare limit.",
-    "A field list needs a comma between names, a limit needs a number, and a sort order must be \
-     exactly `asc` or `desc`. A clause that does not parse stays in the query rather than being \
+    "A field list needs a comma between names, a limit or an array needs a number, and a sort \
+     order must be exactly `asc` or `desc`. A clause that does not parse stays in the query rather than being \
      applied in part.",
     "A modifier naming a field the index does not have is reported as a dropped clause, since a \
      projection would otherwise return documents with no fields.",

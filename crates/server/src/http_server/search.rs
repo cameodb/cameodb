@@ -33,6 +33,9 @@ pub struct SearchPayload {
     pub fields: Option<Vec<String>>,
     /// Optional sort specification
     pub sort: Option<SortSpec>,
+    /// Most elements kept of each array in a hit. Absent is the node's
+    /// `[search] default_array_limit`; past `[security.limits] max_array_limit` is refused.
+    pub array: Option<usize>,
 }
 
 /// Handler for standard search operations
@@ -62,6 +65,9 @@ pub(super) async fn search_handler(
     let final_offset = payload.offset.or(inline.offset);
     let final_fields = payload.fields.or(inline.fields);
     let final_sort = payload.sort.or(inline.sort);
+    let array_limit = state
+        .checked_array_limit(payload.array.or(inline.array))
+        .map_err(AppError::bad_request)?;
 
     // The ceiling is enforced here, not only on the MCP tools. `max_search_limit` is the node's
     // bound on how much one search may fetch, and the HTTP surface can ask for exactly the same
@@ -78,8 +84,8 @@ pub(super) async fn search_handler(
     // `debug`, not `info`: one formatted line per search at the level operators run, and it
     // puts the caller's query text in the log — the request span already carries the route.
     debug!(
-        "Search request - index: {}, query: {}, limit: {}, offset: {}, fields: {:?}",
-        index, cleaned_query, window.limit, window.offset, final_fields
+        "Search request - index: {}, query: {}, limit: {}, offset: {}, fields: {:?}, array: {}",
+        index, cleaned_query, window.limit, window.offset, final_fields, array_limit
     );
 
     // Only the audit layer wants this, and only when configured to keep it — a clone of
@@ -98,6 +104,7 @@ pub(super) async fn search_handler(
         offset: Some(window.offset),
         fields: final_fields,
         sort: final_sort,
+        array_limit: Some(array_limit),
     };
 
     let result = state
@@ -153,6 +160,9 @@ pub(super) async fn search_stream_handler(
     let final_limit = payload.limit.or(inline.limit);
     let final_fields = payload.fields.or(inline.fields);
     let final_sort = payload.sort.or(inline.sort);
+    let array_limit = state
+        .checked_array_limit(payload.array.or(inline.array))
+        .map_err(AppError::bad_request)?;
 
     if let Some(offset) = payload.offset.or(inline.offset).filter(|off| *off > 0) {
         return Err(AppError::bad_request(format!(
@@ -184,6 +194,7 @@ pub(super) async fn search_stream_handler(
         offset: None,
         fields: final_fields,
         sort: final_sort,
+        array_limit: Some(array_limit),
     };
 
     // The search runs here, so a refusal answers with its own status; only the answer streams.

@@ -568,6 +568,75 @@ fn a_delete_entry_reads_as_a_bare_id_or_as_an_object() {
     );
 }
 
+/// A search from a peer that predates the array cap reads as "whole arrays", and a search that
+/// carries one keeps it through the widening every broadcast applies before it fans out.
+///
+/// Decoded through `serde_json`, which shares the missing-field rule with the
+/// `rmp_serde::to_vec_named` encoding kameo uses — see the `forwarded` test below.
+#[test]
+fn a_search_without_an_array_limit_reads_as_whole_arrays_and_one_with_it_keeps_it() {
+    let old: ClientOp = serde_json::from_str(
+        r#"{"Search":{"index":"i","query":"*","limit":10,"offset":null,"fields":null,"sort":null}}"#,
+    )
+    .expect("a Search from a peer that does not send `array_limit`");
+    assert!(matches!(
+        old,
+        ClientOp::Search {
+            array_limit: None,
+            ..
+        }
+    ));
+
+    let op = ClientOp::Search {
+        index: "i".to_string(),
+        query: "*".to_string(),
+        limit: Some(10),
+        offset: Some(20),
+        fields: None,
+        sort: None,
+        array_limit: Some(7),
+    };
+    let widened = super::router::widen_broadcast_op(
+        op,
+        SearchWindow {
+            offset: 20,
+            limit: 10,
+        },
+    );
+    assert!(
+        matches!(
+            widened,
+            ClientOp::Search {
+                limit: Some(30),
+                offset: None,
+                array_limit: Some(7),
+                ..
+            }
+        ),
+        "the widening dropped or changed the cap: {widened:?}"
+    );
+}
+
+/// The node's own pass over a merged response caps what an older peer sent whole, and leaves a
+/// hit an up-to-date shard already capped exactly as it was.
+#[test]
+fn the_exit_cap_shortens_an_old_peers_hit_and_keeps_a_capped_one() {
+    let mut response = json!({
+        "hits": [
+            {"id": "old", "ips": ["a", "b", "c", "d"]},
+            {"id": "new", "ips": ["a", "b"], "_truncated_arrays": {"ips": 9}},
+        ],
+        "total_hits": 2,
+    });
+    cap_hit_arrays(&mut response, 2);
+    assert_eq!(response["hits"][0]["ips"], json!(["a", "b"]));
+    assert_eq!(response["hits"][0]["_truncated_arrays"], json!({"ips": 4}));
+    assert_eq!(
+        response["hits"][1],
+        json!({"id": "new", "ips": ["a", "b"], "_truncated_arrays": {"ips": 9}})
+    );
+}
+
 /// An op from a peer that predates `forwarded` reads as a first hop.
 ///
 /// The flag is what stops two nodes disagreeing about a shard from passing one write between
@@ -2727,6 +2796,7 @@ fn a_fan_out_reads_the_page_off_the_operation() {
         offset,
         fields: None,
         sort: None,
+        array_limit: None,
     };
 
     assert_eq!(
@@ -3975,6 +4045,7 @@ fn only_what_a_worker_can_serve_leaves_the_mailbox() {
             offset: None,
             fields: None,
             sort: None,
+            array_limit: None,
         },
         // Asks the peers when the schema is not held here; see
         // `a_config_this_node_does_not_hold_is_asked_of_its_peers`.

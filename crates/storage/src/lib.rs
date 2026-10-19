@@ -50,7 +50,7 @@ mod tests;
 // list, on purpose, and everything else stays the crate's own business.
 pub use deadline::{DeadlineQuery, SearchDeadline};
 pub use merge::MergeStarted;
-pub use projection::apply_field_projection;
+pub use projection::{TRUNCATED_ARRAYS_FIELD, apply_field_projection, cap_document_arrays};
 pub use query::{FieldReference, field_references};
 pub use schema::{
     DropsCounted, FieldDef, IndexSchema, SchemaChange, SchemaFieldUpdate, SchemaFields,

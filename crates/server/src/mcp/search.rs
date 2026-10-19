@@ -3,7 +3,7 @@
 use futures::{StreamExt, future::BoxFuture, stream};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use cameodb_mcp::{McpIndexSearchRequest, ToolError};
+use cameodb_mcp::{McpIndexSearchRequest, McpSearchBounds, ToolError};
 
 use crate::cluster_coordinator::OperationType;
 use crate::mcp::diagnostics::{
@@ -141,6 +141,12 @@ fn effective_window(
     .map_err(ToolError::caller)
 }
 
+/// Resolve the array cap this search will run with, or refuse it — on the value the search will
+/// run with, inline clause included, for the reason [`effective_window`] checks the window.
+fn effective_array_limit(state: &AppState, array: Option<usize>) -> Result<usize, ToolError> {
+    state.checked_array_limit(array).map_err(ToolError::caller)
+}
+
 /// Say what a caller cannot read off the hits: why a page is empty, and when its order is only
 /// approximate.
 ///
@@ -223,8 +229,7 @@ pub(super) fn search_index(
     state: AppState,
     index: McpIndexSearchRequest,
     query: String,
-    limit: Option<usize>,
-    offset: Option<usize>,
+    bounds: McpSearchBounds,
 ) -> BoxFuture<'static, Result<JsonValue, ToolError>> {
     Box::pin(async move {
         let index_name = index.index.clone();
@@ -234,7 +239,12 @@ pub(super) fn search_index(
         let cleaned_query = inline.query;
 
         // Merge MCP-provided values with parsed values (MCP takes precedence for limit/fields)
-        let window = effective_window(&state, limit.or(inline.limit), offset.or(inline.offset))?;
+        let window = effective_window(
+            &state,
+            bounds.limit.or(inline.limit),
+            bounds.offset.or(inline.offset),
+        )?;
+        let array_limit = effective_array_limit(&state, bounds.array.or(inline.array))?;
         let final_fields = index.fields.or(inline.fields);
         // The argument wins over an inline `sort` clause, as `limit` and `fields` do: a caller
         // that passed a structured sort chose it deliberately, where the clause may be part of
@@ -251,6 +261,7 @@ pub(super) fn search_index(
                     offset: Some(window.offset),
                     fields: final_fields,
                     sort: final_sort,
+                    array_limit: Some(array_limit),
                 },
                 None,
                 OperationType::Read,
@@ -308,8 +319,7 @@ pub(super) fn search_across_indexes(
     state: AppState,
     indexes: Vec<McpIndexSearchRequest>,
     query: String,
-    limit: Option<usize>,
-    offset: Option<usize>,
+    bounds: McpSearchBounds,
 ) -> BoxFuture<'static, Result<JsonValue, ToolError>> {
     Box::pin(async move {
         // Preprocess query to extract return/limit/offset/sort modifiers (same as HTTP server)
@@ -321,7 +331,14 @@ pub(super) fn search_across_indexes(
         // One derivation, so that the window asked of each index, the window the merge takes,
         // and the window reported back are the same numbers — including when they come from an
         // inline clause or from this node's configured default.
-        let window = effective_window(&state, limit.or(inline.limit), offset.or(inline.offset))?;
+        let window = effective_window(
+            &state,
+            bounds.limit.or(inline.limit),
+            bounds.offset.or(inline.offset),
+        )?;
+        // One cap for every index, as one window is: the argument, else the inline clause, else
+        // this node's default.
+        let array_limit = effective_array_limit(&state, bounds.array.or(inline.array))?;
         let requested_limit = window.limit;
         let requested_offset = window.offset;
 
@@ -379,6 +396,7 @@ pub(super) fn search_across_indexes(
                                 offset: None,
                                 fields: final_fields,
                                 sort: storage_sort,
+                                array_limit: Some(array_limit),
                             },
                             None,
                             OperationType::Read,

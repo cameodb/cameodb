@@ -269,7 +269,7 @@ fn fetch_documents_answers_in_key_order_and_skips_the_unknown() {
     let ids = vec!["d2".to_string(), "missing".to_string(), "d0".to_string()];
     let fields = vec!["title".to_string()];
     let outcome = store
-        .fetch_documents("bench", &ids, Some(&fields), None)
+        .fetch_documents("bench", &ids, Some(&fields), None, None)
         .unwrap();
 
     let got: Vec<&str> = outcome.docs.iter().map(|(id, _)| id.as_str()).collect();

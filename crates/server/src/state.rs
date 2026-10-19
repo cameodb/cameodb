@@ -59,6 +59,17 @@ pub struct AppState {
     /// Advertised and enforced the same way `max_search_limit` is, and for the same reason: a
     /// caller must not be refused for exceeding a bound the catalogue did not show it.
     pub max_federated_indexes: usize,
+    /// Most elements kept of each array in a hit when a search names no `array`, from
+    /// `[search] default_array_limit`.
+    ///
+    /// Resolved at the surface, as `limit` is, so every layer below carries the number that
+    /// runs rather than an absence each would have to fill in the same way.
+    pub default_array_limit: usize,
+    /// Largest `array` a search may ask for, from `[security.limits] max_array_limit`.
+    ///
+    /// Enforced on HTTP and MCP alike, and advertised as the `maximum` of each MCP search
+    /// schema's `array`.
+    pub max_array_limit: usize,
     /// Largest MCP search response in bytes, from `[security.limits]`.
     ///
     /// Hits past it are left out and the response says so. The limit bounds how many hits are
@@ -91,4 +102,18 @@ pub struct AppState {
     /// abandoned as a 408 first, which is the failure the guard existed to prevent. The
     /// health endpoint derives its actor budget from this — see `health_actor_budget`.
     pub request_timeout: Duration,
+}
+
+impl AppState {
+    /// Resolve a request's `array` into the number the search will run with, or say why it
+    /// cannot be served.
+    ///
+    /// Every surface resolves it here — the HTTP routes and both MCP tools, from the argument
+    /// or the inline `array` clause — so an absent value means this node's default and a value
+    /// past the ceiling is refused the same way whichever door the request came through. The
+    /// rule is [`cameodb_mcp::checked_array_limit`], which the MCP dispatcher also applies to
+    /// the argument it advertised.
+    pub(crate) fn checked_array_limit(&self, array: Option<usize>) -> Result<usize, String> {
+        cameodb_mcp::checked_array_limit(array, self.default_array_limit, self.max_array_limit)
+    }
 }

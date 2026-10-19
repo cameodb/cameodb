@@ -22,11 +22,11 @@ use tantivy::{Index, IndexReader};
 use tracing::{debug, trace, warn};
 use walkdir::WalkDir;
 
-/// What `search_documents` needs beyond the query string: how long it may run, and which
-/// fields the answer has to carry.
+/// What `search_documents` needs beyond the query string: how long it may run, which
+/// fields the answer has to carry, and how many elements of each array.
 ///
-/// Both default to "as before" — no deadline, every field — so the plain call and the
-/// dozen tests on it change nothing.
+/// All default to "as before" — no deadline, every field, whole arrays — so the plain call
+/// and the dozen tests on it change nothing.
 #[derive(Default)]
 pub struct SearchOptions<'a> {
     /// The request's own budget, from the same clock the dequeue check measures against.
@@ -36,6 +36,9 @@ pub struct SearchOptions<'a> {
     /// Fields to project each hit down to, applied after sorting and reconstruction.
     /// `None` returns the whole document.
     pub fields: Option<&'a [String]>,
+    /// Most elements kept of each array in a hit, applied after the projection — see
+    /// [`cap_document_arrays`]. `None` returns every array whole.
+    pub array_limit: Option<usize>,
 }
 
 /// Wrap the parsed query so the segment walks it drives sample the deadline from inside.
@@ -482,7 +485,13 @@ impl HybridStore {
         let key_outcome = self.search_keys(index, query, limit, sort, opts)?;
 
         let ids: Vec<String> = key_outcome.hits.iter().map(|hit| hit.id.clone()).collect();
-        let fetch = self.fetch_documents(index, &ids, opts.fields, opts.deadline.as_ref())?;
+        let fetch = self.fetch_documents(
+            index,
+            &ids,
+            opts.fields,
+            opts.array_limit,
+            opts.deadline.as_ref(),
+        )?;
         let fetched_count = fetch.docs.len();
 
         // The keys fixed the order; the fetch answered the documents. Re-attach each
@@ -1151,10 +1160,13 @@ impl HybridStore {
             }
             let candidate_ids: Vec<String> = keyed.iter().map(|hit| hit.id.clone()).collect();
             let projected = [document_name.clone()];
+            // Uncapped: the sort reads the field's value off the whole document, and these
+            // bodies are dropped at the cut below — the page is fetched again, capped.
             let fetch = self.fetch_documents(
                 index,
                 &candidate_ids,
                 Some(&projected),
+                None,
                 opts.deadline.as_ref(),
             )?;
             timings.fetch_ms += fetch.fetch_ms;
@@ -1218,8 +1230,11 @@ impl HybridStore {
     }
 
     /// The second phase of [`search_documents_with`]: the documents behind a list of
-    /// document keys — one redb batch read, deserialize, shadow reconstruction, and the
-    /// caller's projection — answered in the order the keys were given.
+    /// document keys — one redb batch read, deserialize, shadow reconstruction, the
+    /// caller's projection and array cap — answered in the order the keys were given.
+    ///
+    /// Every hit a search returns is built here, whatever the surface or the route, which
+    /// is what makes this the one place `array_limit` has to be applied.
     ///
     /// Written for the window a scatter-gather kept: the keys arrive in final order and
     /// the answer preserves it, so assembling the page is a lookup rather than another
@@ -1230,6 +1245,7 @@ impl HybridStore {
         index: &str,
         ids: &[String],
         fields: Option<&[String]>,
+        array_limit: Option<usize>,
         deadline: Option<&SearchDeadline>,
     ) -> Result<FetchOutcome, StoreError> {
         if let Some(deadline) = deadline {
@@ -1283,6 +1299,10 @@ impl HybridStore {
             // the whole record.
             if let Some(field_list) = fields {
                 doc = apply_field_projection(doc, field_list);
+            }
+            // After the projection, so only the arrays the caller will see are walked.
+            if let Some(max) = array_limit {
+                cap_document_arrays(&mut doc, max);
             }
             docs.push((doc_id.clone(), doc));
         }

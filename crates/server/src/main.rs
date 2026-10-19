@@ -739,6 +739,8 @@ async fn run(args: Vec<String>) -> Result<()> {
         )),
         max_search_limit: cameodb_config.security.limits.max_search_limit,
         max_federated_indexes: cameodb_config.security.limits.max_federated_indexes,
+        default_array_limit: cameodb_config.search.default_array_limit,
+        max_array_limit: cameodb_config.security.limits.max_array_limit,
         max_response_bytes: cameodb_config.effective_max_response_bytes(),
         audit: Arc::clone(&audit_sink),
         keyring: Arc::clone(&keyring),

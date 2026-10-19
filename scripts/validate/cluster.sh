@@ -10,7 +10,8 @@
 #               minted on every node by single and by bulk writes, one index minted by every
 #               node at the same moment (exactly one mints, the rest adopt), and bulk writes
 #               whose shares cross between every pair of nodes; no request fails or stalls, and every node answers afterwards;
-#               an index none holds is a 404 through every node, one just written is found
+#               an index none holds is a 404 through every node, one just written is found;
+#               a hit's arrays are capped through every node, wherever the document lives
 #   restart     two of three nodes restarted together rejoin, converge and serve, and no
 #               committed document is lost
 #   frozen peer node3 paused: node1 keeps answering, and after it resumes the ring converges,
@@ -298,6 +299,10 @@ if [ -n "$samemint_prefix" ]; then
 fi
 check_cmd "a missing index is a 404 through every node, a new one is found through every node" \
     probe missing
+# One document's array of 300k addresses is megabytes; capped on the shard that holds it, it
+# never crosses to the node answering the caller whole.
+check_cmd "each hit's arrays are capped through every node, wherever the document lives" \
+    probe arrays crossarrays 6 300000
 check_cmd "every node writes and deletes right after the cross-node load" probe probe 30
 check_cmd "the ring is still converged after the cross-node load" probe converge 10
 

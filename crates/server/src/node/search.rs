@@ -208,6 +208,9 @@ pub(super) struct ScatterCtx<'a> {
 impl ScatterCtx<'_> {
     /// Ask every shard for the whole window from the front — any of them may hold all of it —
     /// then merge the pages under the requested order and answer the caller's slice.
+    ///
+    /// `array_limit` rides the fetch phase to the shards that own the page, so an array is
+    /// shortened where the document is built rather than after it has crossed to this node.
     pub(super) async fn gather(
         &self,
         index: &str,
@@ -215,6 +218,7 @@ impl ScatterCtx<'_> {
         window: SearchWindow,
         fields: Option<&[String]>,
         sort: Option<&SortSpec>,
+        array_limit: Option<usize>,
     ) -> Result<JsonValue, OrchestratorError> {
         let start = std::time::Instant::now();
         let schema = self.schema;
@@ -375,6 +379,7 @@ impl ScatterCtx<'_> {
                     index: index.to_string(),
                     ids,
                     fields: fields.map(|list| list.to_vec()),
+                    array_limit,
                 };
                 let shard = self.shards[&shard_id].clone();
                 async move { (shard_id, shard.handle_fetch_docs(req).await) }
@@ -1212,6 +1217,21 @@ pub(super) fn strip_sort_keys(response: &mut JsonValue) {
             if let Some(o) = hit.as_object_mut() {
                 o.remove(SORT_KEY_FIELD);
             }
+        }
+    }
+}
+
+/// Cap the arrays of every hit in a search response, in place. See
+/// [`storage::cap_document_arrays`].
+///
+/// The shards already cap what they build, so on a cluster of one build this changes nothing —
+/// the cap is idempotent and keeps the account the shard wrote. It is here for a peer on a
+/// build that predates the cap: it decodes the op's `array_limit` as absent and sends whole
+/// arrays, and the node that answers the caller is the one that owes the caller the bound.
+pub(super) fn cap_hit_arrays(response: &mut JsonValue, max: usize) {
+    if let Some(hits) = response.get_mut("hits").and_then(|h| h.as_array_mut()) {
+        for hit in hits.iter_mut() {
+            storage::cap_document_arrays(hit, max);
         }
     }
 }

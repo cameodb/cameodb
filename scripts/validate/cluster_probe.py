@@ -23,6 +23,10 @@ show the evidence. Nodes come from CLUSTER_NODES, a comma-separated list of base
                                            written through any node is found through every node
   fault <seconds> <from> <to> <index>      node1's health, searches and writes while a peer is
                                            faulted between <from> and <to>; prints METRIC lines
+  arrays <index> <count> <elements>        documents with an array of <elements> addresses, then
+                                           searches through every node: each hit's array capped
+                                           at the default or the asked-for number, with the
+                                           original length reported; past the maximum refused
 """
 import collections
 import json
@@ -423,6 +427,55 @@ def cmd_missing():
     return 0 if ok else 1
 
 
+def cmd_arrays(index, count, elements):
+    """A hit's arrays are capped on whichever node answers, whichever node holds the document.
+
+    The documents are written by id, so they spread across the nodes' shards; a search through
+    any node fans out to all of them, and every hit has to come back capped and say so."""
+    ok = True
+    addresses = [f"10.{n >> 16 & 255}.{n >> 8 & 255}.{n & 255}" for n in range(elements)]
+    for i in range(count):
+        node = NODES[i % len(NODES)]
+        status, _, _ = call("PUT", f"{node}/api/{index}/document",
+                            {"id": f"r{i}", "doc": {"title": "intel", "string_ipv4": addresses}},
+                            timeout=120)
+        ok &= status in (200, 201)
+    if not ok:
+        print(f"could not write {count} documents of {elements} addresses to '{index}'")
+        return 1
+
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        _, _, body = call("POST", f"{NODES[0]}/api/{index}/search", {"query": "title:intel", "limit": 0})
+        if isinstance(body, dict) and body.get("total_hits") == count:
+            break
+        time.sleep(1)
+
+    def check(node, request, want):
+        status, secs, body = call("POST", f"{node}/api/{index}/search", request, timeout=60)
+        hits = body.get("hits", []) if isinstance(body, dict) else []
+        lengths = {len(h.get("string_ipv4", [])) for h in hits}
+        reported = {h.get("_truncated_arrays", {}).get("string_ipv4") for h in hits}
+        size = len(json.dumps(body)) if body is not None else 0
+        good = (status == 200 and len(hits) == count and lengths == {want}
+                and reported == {elements})
+        print(f"  {node} {request.get('array', 'default')}: {status}, {len(hits)} hits, "
+              f"lengths {sorted(lengths)}, reported {sorted(r for r in reported if r)}, "
+              f"{size} bytes in {secs:.2f}s" + ("" if good else f"   <-- expected {want} each"))
+        return good
+
+    for node in NODES:
+        ok &= check(node, {"query": "title:intel", "limit": count}, 1000)
+        ok &= check(node, {"query": "title:intel", "limit": count, "array": 5}, 5)
+        status, _, _ = call("POST", f"{node}/api/{index}/search",
+                            {"query": "title:intel", "array": 100001})
+        ok &= status == 400
+        if status != 400:
+            print(f"  {node} array past the maximum: {status}   <-- expected 400")
+    print(f"every node capped all {count} hits" if ok else "a node returned an uncapped or unreported array")
+    return 0 if ok else 1
+
+
 def cmd_stats():
     """The swarm counters each node keeps, as METRIC lines. Always exits 0."""
     for node in NODES:
@@ -644,6 +697,8 @@ def main():
         return cmd_missing()
     if cmd == "fault":
         return cmd_fault(int(args[0]), int(args[1]), int(args[2]), args[3])
+    if cmd == "arrays":
+        return cmd_arrays(args[0], int(args[1]), int(args[2]))
     sys.exit(f"unknown subcommand: {cmd}")
 
 

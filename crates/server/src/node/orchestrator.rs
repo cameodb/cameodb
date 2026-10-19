@@ -2780,6 +2780,7 @@ impl OrchestratorEngine {
                 offset,
                 fields,
                 sort,
+                array_limit,
             } => WorkerOutcome::Done(
                 self.engine_search(
                     &index,
@@ -2790,6 +2791,7 @@ impl OrchestratorEngine {
                     },
                     fields.as_deref(),
                     sort.as_ref(),
+                    array_limit,
                 )
                 .await,
             ),
@@ -3121,6 +3123,7 @@ impl OrchestratorEngine {
         window: SearchWindow,
         fields: Option<&[String]>,
         sort: Option<&SortSpec>,
+        array_limit: Option<usize>,
     ) -> Result<JsonValue, OrchestratorError> {
         let shards = self.shards.load();
         if shards.is_empty() {
@@ -3140,7 +3143,7 @@ impl OrchestratorEngine {
             schema: &schema,
             max_concurrent_shard_searches: self.max_concurrent_shard_searches,
         }
-        .gather(index, query, window, fields, sort)
+        .gather(index, query, window, fields, sort, array_limit)
         .await
     }
 }
@@ -4997,6 +5000,7 @@ impl NodeOrchestrator {
                 offset,
                 fields,
                 sort,
+                array_limit,
             } => {
                 self.orch_search(
                     &index,
@@ -5007,6 +5011,7 @@ impl NodeOrchestrator {
                     },
                     fields.as_deref(),
                     sort.as_ref(),
+                    array_limit,
                 )
                 .await
             }
@@ -5712,6 +5717,7 @@ impl NodeOrchestrator {
         window: SearchWindow,
         fields: Option<&[String]>,
         sort: Option<&SortSpec>,
+        array_limit: Option<usize>,
     ) -> Result<JsonValue, OrchestratorError> {
         if self.shards.is_empty() {
             return Ok(
@@ -5730,7 +5736,7 @@ impl NodeOrchestrator {
             schema: &schema,
             max_concurrent_shard_searches: self.max_concurrent_shard_searches,
         }
-        .gather(index, query, window, fields, sort)
+        .gather(index, query, window, fields, sort, array_limit)
         .await
     }
 

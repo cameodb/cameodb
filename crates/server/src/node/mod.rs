@@ -888,6 +888,10 @@ pub struct SearchRequest {
     pub sort: Option<SortSpec>,
     #[serde(default)]
     pub fields: Option<Vec<String>>,
+    /// Most elements kept of each array in a hit; `None` keeps them whole, which is what a
+    /// peer on a build that predates the field means by sending none.
+    #[serde(default)]
+    pub array_limit: Option<usize>,
 }
 
 /// Message to delete an index and all its data
@@ -1154,6 +1158,9 @@ pub struct FetchDocsRequest {
     pub ids: Vec<String>,
     #[serde(default)]
     pub fields: Option<Vec<String>>,
+    /// Most elements kept of each array in a document; `None` keeps them whole.
+    #[serde(default)]
+    pub array_limit: Option<usize>,
 }
 
 /// What a shard's fetch phase answered: the documents it holds, in request order.
@@ -1188,6 +1195,12 @@ pub enum ClientOp {
         fields: Option<Vec<String>>,
         /// Optional sort specification
         sort: Option<SortSpec>,
+        /// Most elements kept of each array in a hit, already resolved against the node's
+        /// default and maximum by the surface that built the op. `None` keeps arrays whole —
+        /// which is what a peer on a build that predates the field sends, and why it is
+        /// defaulted rather than required.
+        #[serde(default)]
+        array_limit: Option<usize>,
     },
     /// The search an earlier build sent for a streamed request: the first `limit` hits, no
     /// offset. Never built here — the stream route builds a `Search` — and kept on the wire only
@@ -1436,6 +1449,7 @@ impl ClientOp {
                 offset: None,
                 fields,
                 sort,
+                array_limit: None,
             },
             other => other,
         }

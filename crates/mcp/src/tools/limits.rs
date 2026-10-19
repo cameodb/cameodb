@@ -5,7 +5,8 @@
 //! actually runs with — which is not always the argument a client sent, since the query
 //! string carries `limit`/`offset` clauses of its own. Both doors into a search call
 //! [`checked_search_window`], so the arithmetic and the refusal text cannot drift apart the
-//! way two per-surface spellings did.
+//! way two per-surface spellings did. The array bound, [`checked_array_limit`], is here for
+//! the same reason.
 
 /// Resolve a request's `limit` and `offset` into the window the search will run with, or say
 /// why it cannot be served.
@@ -51,9 +52,46 @@ pub fn checked_search_window(
     Ok((offset, limit))
 }
 
+/// Resolve a request's `array` into the most elements each array in a hit will keep, or say
+/// why it cannot be served.
+///
+/// The same rule `limit` follows, applied to the other dimension of a response's size: an
+/// absent value is the host's default, and a value past the maximum is refused rather than
+/// clamped, so the number a caller asked for is the number that runs or the call says why
+/// not. A caller who wants whole arrays of any length is asking the operator for a higher
+/// maximum, not the node for an exception.
+pub fn checked_array_limit(
+    array: Option<usize>,
+    default_array_limit: usize,
+    max_array_limit: usize,
+) -> Result<usize, String> {
+    let array = array.unwrap_or(default_array_limit);
+    if array > max_array_limit {
+        return Err(format!(
+            "array {array} is above the maximum of {max_array_limit}; ask for at most that \
+             many elements of each array, or project the field away with `fields` if it is \
+             not needed"
+        ));
+    }
+    Ok(array)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::checked_search_window;
+    use super::{checked_array_limit, checked_search_window};
+
+    #[test]
+    fn an_array_limit_past_the_maximum_is_refused_and_names_both_numbers() {
+        assert_eq!(checked_array_limit(Some(100), 10, 100), Ok(100));
+        assert_eq!(checked_array_limit(Some(0), 10, 100), Ok(0));
+        let err = checked_array_limit(Some(101), 10, 100).unwrap_err();
+        assert!(err.contains("101") && err.contains("100"), "{err}");
+    }
+
+    #[test]
+    fn an_absent_array_limit_is_the_hosts_default() {
+        assert_eq!(checked_array_limit(None, 1_000, 100_000), Ok(1_000));
+    }
 
     /// The vectors every surface agrees on — the point of the shared spelling is that these
     /// cannot pass on one side of the boundary and fail on the other.

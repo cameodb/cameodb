@@ -1800,6 +1800,7 @@ impl MicroshardActor {
         let index = request.index.clone();
         let sort = request.sort;
         let fields = request.fields;
+        let array_limit = request.array_limit;
 
         // The same clock the dequeue shed in `dispatch_read_pool` measures against: the
         // deadline covers everything the request has already spent, not just the walk
@@ -1821,6 +1822,7 @@ impl MicroshardActor {
                     &storage::SearchOptions {
                         deadline,
                         fields: fields.as_deref(),
+                        array_limit,
                     },
                 )
             })
@@ -1878,7 +1880,7 @@ impl MicroshardActor {
                     sort.as_ref(),
                     &storage::SearchOptions {
                         deadline,
-                        fields: None,
+                        ..Default::default()
                     },
                 )
             })
@@ -1913,6 +1915,7 @@ impl MicroshardActor {
         let index = request.index.clone();
         let ids = request.ids;
         let fields = request.fields;
+        let array_limit = request.array_limit;
 
         let deadline = self
             .read_budget
@@ -1920,7 +1923,13 @@ impl MicroshardActor {
 
         let outcome = self
             .spawn_on_read_pool(move || {
-                store.fetch_documents(&index, &ids, fields.as_deref(), deadline.as_ref())
+                store.fetch_documents(
+                    &index,
+                    &ids,
+                    fields.as_deref(),
+                    array_limit,
+                    deadline.as_ref(),
+                )
             })
             .await?
             .map_err(store_error_to_orchestrator)?;

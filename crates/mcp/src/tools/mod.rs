@@ -8,8 +8,8 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::{
     authz::{McpAuthzRef, McpCapability, tool_capability},
-    backend::{McpBackend, McpIndexSearchRequest, ToolError},
-    tools::limits::checked_search_window,
+    backend::{McpBackend, McpIndexSearchRequest, McpSearchBounds, ToolError},
+    tools::limits::{checked_array_limit, checked_search_window},
     tools::schema::{
         DescribeIndexArgs, GetCatalogStatsArgs, ListIndexesArgs, SearchAcrossIndexesArgs,
         SearchIndexArgs, ToolLimits, ValidateQueryArgs, describe_index_input_schema,
@@ -58,6 +58,19 @@ fn check_window(
     checked_search_window(limit, offset, default_search_limit, max_search_limit)
         .map(|_| ())
         .map_err(ToolError::caller)
+}
+
+/// Refuse an `array` past what the schema advertises, counted against the host's default where
+/// the call names none. The same promise [`check_window`] keeps for `limit`, through the rule
+/// the host's own surfaces share.
+fn check_array<S: McpBackend>(backend: &S, array: Option<usize>) -> Result<(), ToolError> {
+    checked_array_limit(
+        array,
+        backend.default_array_limit(),
+        backend.max_array_limit(),
+    )
+    .map(|_| ())
+    .map_err(ToolError::caller)
 }
 
 /// Refuse an index list that is empty, too long, or names an index twice.
@@ -131,6 +144,7 @@ where
                 backend.default_search_limit(),
                 backend.max_search_limit(),
             )?;
+            check_array(backend, args.array)?;
             check_index(authz, &args.index, required)?;
             backend
                 .search_index(
@@ -140,8 +154,11 @@ where
                         sort: args.sort,
                     },
                     args.query,
-                    args.limit,
-                    args.offset,
+                    McpSearchBounds {
+                        limit: args.limit,
+                        offset: args.offset,
+                        array: args.array,
+                    },
                 )
                 .await
         }
@@ -154,6 +171,7 @@ where
                 backend.default_search_limit(),
                 backend.max_search_limit(),
             )?;
+            check_array(backend, args.array)?;
             check_index_list(&args.indexes, backend.max_federated_indexes())?;
             // Refuse the whole call rather than quietly dropping the indexes this key may
             // not read: partial results that look complete are worse than an error.
@@ -161,7 +179,15 @@ where
                 check_index(authz, &request.index, required)?;
             }
             backend
-                .search_across_indexes(args.indexes, args.query, args.limit, args.offset)
+                .search_across_indexes(
+                    args.indexes,
+                    args.query,
+                    McpSearchBounds {
+                        limit: args.limit,
+                        offset: args.offset,
+                        array: args.array,
+                    },
+                )
                 .await
         }
         "describe_index" => {
@@ -286,7 +312,8 @@ fn search_index_description() -> String {
     format!(
         "Full-text search over one CameoDB index.\n\n\
          Results carry `_score` and, when a projection was requested, only the named fields in \
-         the order given. A query the engine cannot fully interpret fails rather than returning \
+         the order given. Each array in a hit keeps at most `array` elements; a hit that lost \
+         elements names them in `_truncated_arrays` with their original lengths. A query the engine cannot fully interpret fails rather than returning \
          partial results, and the error names the clause it could not use.\n\n\
          Call `describe_index` for an index's fields and their types before constructing a query \
          against unfamiliar data.\n\n{}",
@@ -685,6 +712,60 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    /// The array bound is advertised and enforced as one number, on both search tools, the
+    /// way the hit ceiling is.
+    #[tokio::test]
+    async fn an_array_past_the_hosts_maximum_is_refused_on_both_search_tools() {
+        let authz: McpAuthzRef = Arc::new(Scoped("docs"));
+        let backend = StubBackend::array_capped(50);
+
+        for tool in visible_tools(&authz, ToolLimits::of(&backend)) {
+            let name = tool["name"].as_str().unwrap_or("?");
+            if !name.starts_with("search") {
+                continue;
+            }
+            assert_eq!(
+                tool["inputSchema"]["properties"]["array"]["maximum"],
+                json!(50),
+                "{name} advertises an array bound the host did not set"
+            );
+        }
+
+        for (tool, over, at) in [
+            (
+                "search_index",
+                json!({"index": "docs", "query": "a", "array": 51}),
+                json!({"index": "docs", "query": "a", "array": 50}),
+            ),
+            (
+                "search_across_indexes",
+                json!({"indexes": ["docs"], "query": "a", "array": 51}),
+                json!({"indexes": ["docs"], "query": "a", "array": 50}),
+            ),
+        ] {
+            let params = ToolCallParams {
+                name: tool.to_string(),
+                arguments: over,
+            };
+            let err = call_tool(&backend, params, &authz)
+                .await
+                .expect_err("an array past the maximum was accepted");
+            assert!(
+                err.detail().contains("51") && err.detail().contains("50"),
+                "{tool}: the refusal does not name both numbers: {err}"
+            );
+
+            let params = ToolCallParams {
+                name: tool.to_string(),
+                arguments: at,
+            };
+            assert!(
+                call_tool(&backend, params, &authz).await.is_ok(),
+                "{tool}: the maximum itself was refused"
+            );
+        }
     }
 
     /// A host that lowers the ceiling lowers both halves of it.

@@ -4700,3 +4700,148 @@ max_shards_per_node = 1
         "the file is left for the operator"
     );
 }
+
+/// A hit's arrays are bounded the way the hits are: a default when the request names none, a
+/// number the request names in its body or inline, and a refusal past the node's maximum —
+/// on the paged route and the streaming one alike. A hit that lost elements names them, with
+/// the lengths they had.
+#[tokio::test]
+async fn a_hits_arrays_are_capped_by_default_on_request_and_never_past_the_maximum() {
+    // Appended inside the harness's own `[search]` table.
+    let node = TestNode::start(
+        r#"default_array_limit = 20
+
+[security.limits]
+max_array_limit = 500
+"#,
+    )
+    .await;
+    let client = node.client();
+    let addresses: Vec<String> = (0..2_000)
+        .map(|n| format!("10.0.{}.{}", n / 256, n % 256))
+        .collect();
+    client
+        .write_document(
+            "intel",
+            "r1",
+            &json!({"title": "report", "string_ipv4": addresses, "tags": ["a", "b"]}),
+            None,
+        )
+        .await
+        .expect("write");
+    client.admin_index_commit("intel").await.expect("commit");
+
+    let elements = |found: &serde_json::Value| {
+        found["hits"][0]["string_ipv4"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or_default()
+    };
+
+    // No `array`: the node's default, and the hit says what it lost.
+    let (status, found) =
+        post_json(&node, "/api/intel/search", json!({"query": "title:report"})).await;
+    assert_eq!(status, 200, "{found}");
+    assert_eq!(elements(&found), 20, "{found}");
+    assert_eq!(found["hits"][0]["string_ipv4"][0], json!("10.0.0.0"));
+    assert_eq!(
+        found["hits"][0]["_truncated_arrays"],
+        json!({"string_ipv4": 2000}),
+        "a short array is not reported, a cut one is with its length"
+    );
+    assert_eq!(found["hits"][0]["tags"], json!(["a", "b"]));
+
+    // The body names a number; inline names another; the body wins over the inline clause.
+    let (_, found) = post_json(
+        &node,
+        "/api/intel/search",
+        json!({"query": "title:report", "array": 300}),
+    )
+    .await;
+    assert_eq!(elements(&found), 300);
+    let (_, found) = post_json(
+        &node,
+        "/api/intel/search",
+        json!({"query": "title:report array 5"}),
+    )
+    .await;
+    assert_eq!(elements(&found), 5, "{found}");
+    let (_, found) = post_json(
+        &node,
+        "/api/intel/search",
+        json!({"query": "title:report array 5", "array": 7}),
+    )
+    .await;
+    assert_eq!(elements(&found), 7);
+
+    // Zero is the lengths without the elements.
+    let (_, found) = post_json(
+        &node,
+        "/api/intel/search",
+        json!({"query": "title:report", "array": 0}),
+    )
+    .await;
+    assert_eq!(found["hits"][0]["string_ipv4"], json!([]));
+    assert_eq!(found["hits"][0]["tags"], json!([]));
+    assert_eq!(
+        found["hits"][0]["_truncated_arrays"],
+        json!({"string_ipv4": 2000, "tags": 2})
+    );
+
+    // The `id:` lookup answers from the key-value store, and is capped the same way.
+    let (_, found) = post_json(
+        &node,
+        "/api/intel/search",
+        json!({"query": "id:r1", "array": 3}),
+    )
+    .await;
+    assert_eq!(elements(&found), 3, "{found}");
+
+    // Past the maximum is refused, naming both numbers — in the body or inline.
+    for body in [
+        json!({"query": "title:report", "array": 501}),
+        json!({"query": "title:report array 501"}),
+    ] {
+        let (status, refused) = post_json(&node, "/api/intel/search", body).await;
+        assert_eq!(status, 400, "{refused}");
+        let detail = refused["details"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("501") && detail.contains("500"),
+            "{refused}"
+        );
+    }
+    let (status, _) = post_json(
+        &node,
+        "/api/intel/search",
+        json!({"query": "title:report", "array": 500}),
+    )
+    .await;
+    assert_eq!(status, 200, "the maximum itself is allowed");
+
+    // The streaming route runs the same search, so the same cap and the same refusal.
+    with_tls_provider();
+    let streamed = reqwest::Client::new()
+        .post(format!("{}/api/intel/search/stream", node.url))
+        .json(&json!({"query": "title:report", "array": 4}))
+        .send()
+        .await
+        .expect("request")
+        .text()
+        .await
+        .expect("body");
+    let hit: serde_json::Value =
+        serde_json::from_str(streamed.lines().next().expect("a hit line")).expect("json");
+    assert_eq!(
+        hit["string_ipv4"].as_array().map(Vec::len),
+        Some(4),
+        "{hit}"
+    );
+    assert_eq!(hit["_truncated_arrays"], json!({"string_ipv4": 2000}));
+    let (status, _) = post_json(
+        &node,
+        "/api/intel/search/stream",
+        json!({"query": "title:report", "array": 501}),
+    )
+    .await;
+    assert_eq!(status, 400);
+}

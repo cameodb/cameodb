@@ -732,6 +732,16 @@ pub struct SearchConfig {
     #[serde(default = "default_search_limit")]
     pub default_search_limit: usize,
 
+    /// Most elements kept of each array in a hit when the request names no `array`
+    /// (default: 1000).
+    ///
+    /// Finite by default: a threat-intelligence record can carry a few hundred thousand
+    /// network addresses in one field, and returning them whole floods every client. A hit
+    /// that lost elements says so in `_truncated_arrays`. Bounded by
+    /// `[security.limits] max_array_limit`; `0` returns every array empty with its length.
+    #[serde(default = "default_array_limit")]
+    pub default_array_limit: usize,
+
     /// Seconds of write inactivity on an index before it is committed anyway (default: 3).
     ///
     /// The idle commit. While writes keep arriving, `commit_interval_ms` bounds how long one
@@ -1225,6 +1235,29 @@ impl CameoDbConfig {
             .into());
         }
 
+        // The array bound follows the hit bound exactly: zero would empty every array of every
+        // hit rather than mean "no ceiling", and a default above the ceiling would fill a request
+        // that names none with a number the ceiling refuses.
+        if self.security.limits.max_array_limit == 0 {
+            return Err(ConfigError::SecurityConfig {
+                message: "security.limits.max_array_limit is 0, which would empty every array \
+                          in every hit; set the most elements of each array a search may ask for"
+                    .to_string(),
+            }
+            .into());
+        }
+        if self.search.default_array_limit > self.security.limits.max_array_limit {
+            return Err(ConfigError::SecurityConfig {
+                message: format!(
+                    "search.default_array_limit ({}) is above \
+                     security.limits.max_array_limit ({}); a search that names no array \
+                     would exceed the ceiling every surface enforces",
+                    self.search.default_array_limit, self.security.limits.max_array_limit
+                ),
+            }
+            .into());
+        }
+
         // A fan-out of zero would refuse every federated search, and there is no reading of
         // "no bound" that is a number — the same trap as `max_search_limit` above.
         if self.security.limits.max_federated_indexes == 0 {
@@ -1642,6 +1675,7 @@ impl Default for SearchConfig {
             max_concurrent_remote_searches: default_max_concurrent_remote_searches(),
             enable_early_termination: default_enable_early_termination(),
             default_search_limit: default_search_limit(),
+            default_array_limit: default_array_limit(),
             supervisor_timeout_secs: default_supervisor_timeout_secs(),
             commit_interval_ms: default_commit_interval_ms(),
             stream_batch_size: default_stream_batch_size(),
@@ -1852,6 +1886,7 @@ config_defaults! {
         .unwrap_or(8)
         .max(2);
     default_search_limit -> usize = 10;
+    default_array_limit -> usize = cameodb_mcp::DEFAULT_ARRAY_LIMIT;
     default_indexer_num_threads -> usize = 1;
     default_merge_num_threads -> usize = 2;
     default_supervisor_timeout_secs -> u64 = 3;

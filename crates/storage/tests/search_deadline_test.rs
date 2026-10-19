@@ -85,6 +85,7 @@ fn expired() -> SearchOptions<'static> {
             Duration::from_millis(1),
         )),
         fields: None,
+        ..Default::default()
     }
 }
 
@@ -141,6 +142,7 @@ fn a_deadline_with_budget_answers_what_the_plain_search_does() {
     let opts = SearchOptions {
         deadline: Some(SearchDeadline::new(Instant::now(), Duration::from_secs(60))),
         fields: None,
+        ..Default::default()
     };
 
     for (label, limit, sort) in [

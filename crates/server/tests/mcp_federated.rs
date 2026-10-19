@@ -2974,3 +2974,129 @@ async fn a_narrowed_search_is_reported_and_not_refused() {
         "{result}"
     );
 }
+
+/// Both search tools cap each hit's arrays: the node's default when the call names none, the
+/// `array` argument or the inline clause when it does, and a refusal past the configured
+/// maximum — advertised as the schema's `maximum` and enforced at the same number.
+#[tokio::test]
+async fn both_search_tools_cap_each_hits_arrays_and_refuse_past_the_maximum() {
+    let node = TestNode::start_with(
+        r#"
+[search]
+default_array_limit = 10
+
+[security.limits]
+max_array_limit = 200
+"#,
+    )
+    .await;
+    for index in ["alpha", "beta"] {
+        node.create_index(index).await;
+        let addresses: Vec<String> = (0..1_000)
+            .map(|n| format!("10.1.{}.{}", n / 256, n % 256))
+            .collect();
+        let status = http()
+            .put(format!("{}/api/{index}/document", node.url))
+            .json(&json!({
+                "id": format!("{index}-1"),
+                "doc": {"title": "quarterly record", "string_ipv4": addresses},
+            }))
+            .send()
+            .await
+            .expect("write")
+            .status();
+        assert!(status.is_success(), "seeding {index} failed: {status}");
+        node.await_searchable(index, 1).await;
+    }
+
+    let listing = node
+        .rpc(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+        .await;
+    for tool in listing["result"]["tools"].as_array().expect("tools") {
+        let name = tool["name"].as_str().unwrap_or("?");
+        if name.starts_with("search") {
+            assert_eq!(
+                tool["inputSchema"]["properties"]["array"]["maximum"],
+                json!(200),
+                "{name} advertises an array bound the operator did not configure"
+            );
+        }
+    }
+
+    let lengths = |result: &Value| -> Vec<usize> {
+        result["hits"]
+            .as_array()
+            .expect("hits")
+            .iter()
+            .map(|hit| {
+                hit["string_ipv4"]
+                    .as_array()
+                    .map(Vec::len)
+                    .unwrap_or_default()
+            })
+            .collect()
+    };
+
+    let (is_error, result) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "alpha", "query": "title:record"}),
+        )
+        .await;
+    assert!(!is_error, "{result}");
+    assert_eq!(lengths(&result), [10], "the configured default: {result}");
+    assert_eq!(
+        result["hits"][0]["_truncated_arrays"],
+        json!({"string_ipv4": 1000})
+    );
+
+    let (_, result) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "alpha", "query": "title:record", "array": 150}),
+        )
+        .await;
+    assert_eq!(lengths(&result), [150]);
+
+    let (_, result) = node
+        .call_tool(
+            "search_across_indexes",
+            json!({"indexes": ["alpha", "beta"], "query": "title:record array 3"}),
+        )
+        .await;
+    assert_eq!(
+        lengths(&result),
+        [3, 3],
+        "the inline clause caps every index: {result}"
+    );
+    for hit in result["hits"].as_array().expect("hits") {
+        assert_eq!(
+            hit["_truncated_arrays"],
+            json!({"string_ipv4": 1000}),
+            "{hit}"
+        );
+    }
+
+    for (tool, arguments) in [
+        (
+            "search_index",
+            json!({"index": "alpha", "query": "title:record", "array": 201}),
+        ),
+        (
+            "search_index",
+            json!({"index": "alpha", "query": "title:record array 201"}),
+        ),
+        (
+            "search_across_indexes",
+            json!({"indexes": ["alpha", "beta"], "query": "title:record", "array": 201}),
+        ),
+    ] {
+        let (is_error, refusal) = node.call_tool(tool, arguments.clone()).await;
+        assert!(is_error, "{tool} accepted {arguments}: {refusal}");
+        let text = refusal.as_str().unwrap_or_default();
+        assert!(
+            text.contains("201") && text.contains("200"),
+            "{tool}: {refusal}"
+        );
+    }
+}
