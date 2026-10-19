@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A hit's arrays are capped the way its hits are.** One field of a threat-intelligence record
+  can hold a few hundred thousand network addresses, megabytes in a single hit, and a search
+  returned every element. Each array in a hit now keeps at most `array` elements — the first
+  ones, in stored order, at any depth — cut on the shard that holds the document, so the rest
+  never cross the network. `"array": N` in the HTTP search body, an inline `array N` in the
+  query, and an `array` argument on both MCP search tools; `[search] default_array_limit` (1000)
+  applies when a search names none, and a value past `[security.limits] max_array_limit`
+  (100000) is refused with `400`, as a `limit` past `max_search_limit` is. A hit that lost
+  elements carries `_truncated_arrays`, naming each shortened array by its path with the length
+  it had; `array 0` returns the lengths without the elements. `CAMEODB_DEFAULT_ARRAY_LIMIT` sets
+  the default from the environment.
+
+### Changed
+
+- **Existing callers receive arrays of at most 1000 elements** unless they ask for more, because
+  the cap is on by default. A hit that was cut says so in `_truncated_arrays`; set
+  `[search] default_array_limit` up to `max_array_limit` to restore longer arrays without
+  changing callers.
+
 ## [0.3.7] - 2026-10-18
 
 ### Added

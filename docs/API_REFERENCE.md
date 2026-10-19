@@ -148,7 +148,27 @@ curl -s -X POST http://localhost:9480/api/books/search \
 >
 > The JSON payload always wins over inline `return` clauses. Metadata keys (those starting with `_`, e.g. `_score`, `_id`, `shard_id`) are preserved automatically.
 >
-> A field list needs a comma between names, and the clause must sit in one run of `return`/`limit`/`offset`/`sort` at the end of the query with query text in front of it. Anywhere else the keyword is searched for as a word, so `find tax return forms` is four terms. A `return` naming a field the index does not have is reported in `_discarded_clauses`.
+> A field list needs a comma between names, and the clause must sit in one run of `return`/`limit`/`offset`/`sort`/`array` at the end of the query with query text in front of it. Anywhere else the keyword is searched for as a word, so `find tax return forms` is four terms. A `return` naming a field the index does not have is reported in `_discarded_clauses`.
+
+> **Array elements (`array`):** each array in a hit keeps at most `array` elements — the first
+> ones, in stored order, at any depth, including arrays inside objects and arrays of objects. One
+> field of a threat-intelligence record can hold hundreds of thousands of addresses, megabytes on
+> its own, so the cap is on by default: a search that names none gets the node's
+> `[search] default_array_limit` (1000). Supply it in the payload — `"array": 50` — or inline, as
+> `"query": "string_ipv4:10.0.0.1 array 50"`; the payload wins. A value past
+> `[security.limits] max_array_limit` (100000) is refused with `400` naming both numbers, the way a
+> `limit` past `max_search_limit` is; an operator who wants longer arrays raises the maximum.
+>
+> A hit that lost elements says so, with the length each array had:
+>
+> ```json
+> {"id": "r1", "string_ipv4": ["10.0.0.0", "10.0.0.1"], "_truncated_arrays": {"string_ipv4": 312455, "hosts[0].ports": 1200}}
+> ```
+>
+> Paths are dotted through objects and carry `[i]` through array elements. `_truncated_arrays` is
+> absent when nothing was cut, and `"array": 0` returns every array empty with its length — the
+> sizes without the payload. The cap runs on the shard that holds the document, after the field
+> projection, so a projected-away array is neither sent nor reported.
 
 > **Paging (`offset`):** `limit` is the page size and `offset` is where the page starts, so page N
 > is `offset = N * limit`. Supply it in the payload — `"offset": 20` — or inline, as
@@ -345,7 +365,8 @@ curl -s -X POST http://localhost:9480/api/books/search/stream \
 > silently dropped offset would return the first page for every page requested. Use
 > `POST /api/{index}/search` for a page, or read the stream and skip what you do not want.
 > `"offset": 0` is accepted, so a client that always sends the field needs no special case.
-> `limit` applies as usual and is bounded by `max_search_limit`.
+> `limit` applies as usual and is bounded by `max_search_limit`, and `array` caps each hit's arrays
+> exactly as it does on `POST /api/{index}/search`.
 
 > **Note:** Streaming search returns results as NDJSON for improved performance with large result sets.
 

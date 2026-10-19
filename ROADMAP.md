@@ -63,7 +63,7 @@ on one.
 | M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed; M1, M2, M3, M4, M5 and M7 done — the blocker is cleared, the surface is metered, and tenants are bounded and isolated per index. No feature build remains; M8 closed with the prefix floor and default-field cap, the clause cap deferred. M6 done: the open-loop arms show goodput degrading rather than collapsing on the bulk, single-write and read lanes, after fixing the two defects its arms found — [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) and [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput), and its confirmation run on 2026-09-27 found OB22 costs a single node nothing measurable. What is left is the release cut |
 | N — Pre-0.3.6 whole-code review | 📋 Planned | N1–N10 before the 0.3.6 cut: a `HEAD` authorization gap, batched writes that never learn a field, a peer's 400 answered as 503, node identity replaced silently, query rewrites by substring, three client errors, the first shard's memory budget, streaming broadcast, a storage shutdown race, flattened storage errors. N11–N17 after it: one way to reach a peer, dead surface, `run_change`, typed boundaries, single owners, the orchestrator split |
 | O — Post-0.3.6 review: the next-iteration base | ◐ Partial | O1 (the `wal_sync=false` durability barrier) and O2 (deadlines on every remote ask) done 2026-10-15. Left: O3, shard-map merges on a per-owner epoch (the prerequisite N15 does not name, and since 2026-10-18 the one [OB27](#ob27--a-replaced-node-never-leaves-the-cluster)'s `forget` needs), and O4, the request budget on the wire. O5 folds Rust-surface items into N16/N17; O6 reconciles the architecture doc |
-| P — Post-0.3.7 features | 📋 Planned | P1, a cap on how many elements of each array a search hit carries — a node default, a node maximum, and `array N` per request, the way hits are bounded today |
+| P — Post-0.3.7 features | ✅ Done | P1, a cap on how many elements of each array a search hit carries — a node default, a node maximum, and `array N` per request — done 2026-10-19 |
 
 ## Reconciliation, 2026-08-26
 
@@ -244,7 +244,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [N1](#n1--head-requests-skip-authorization) … [N17](#n17--smaller-items-filed-so-they-are-not-lost) | Pre-0.3.6 whole-code review — ten defects (N1–N10) to close before the cut, then the duplication and structure behind them: one way to reach a peer, dead surface, `run_change`, typed boundaries, single owners, the `orchestrator.rs` split | — | 2026-10-07 | 📋 |
 | [F10](#f10--fast-field-projection-the-pages-fields-answered-from-the-columns) | Fast-field projection — the page's fields answered from the columns, and the fetch phase skipped when they can be; the last layer of the search-economics work opened by the TS5 outage — deferred: the gain over the two-phase search is small for today's workloads, and the design is filed so it can be picked up | — | 2026-10-09 | 💭 |
 | [F11](#f11--the-disk-a-delete-frees-was-never-returned) | The disk a delete frees was never returned — `cameodb compact` and `--rewrite` (redb, offline) and `POST /_admin/index/{index}/merge` (Tantivy, online) done; reclaiming deleted documents automatically, behind a setting, planned | — | 2026-10-16 | ◐ |
-| [P1](#p1--a-hits-arrays-are-capped-the-way-its-hits-are) | A hit's arrays are capped the way its hits are — `[search] default_array_limit`, `[security.limits] max_array_limit`, `array N` per request; found validating 0.3.7 on the threat-intel dataset, where one field carries a few hundred thousand addresses | — | 2026-10-19 | 📋 |
+| [P1](#p1--a-hits-arrays-are-capped-the-way-its-hits-are) | A hit's arrays are capped the way its hits are — `[search] default_array_limit`, `[security.limits] max_array_limit`, `array N` per request; found validating 0.3.7 on the threat-intel dataset, where one field carries a few hundred thousand addresses | — | 2026-10-19 | ✅ |
 
 ---
 
@@ -6688,7 +6688,7 @@ workload whose projections are column-coverable — a large `limit` over a few s
 TS5 shape — measured on a real index with the fields declared `fast`, not on a synthetic bench.
 Until then `fast` stays what it is today: a sort and range column.
 
-## P. Post-0.3.7 features 📋 Planned
+## P. Post-0.3.7 features ✅ Done
 
 Features agreed after the 0.3.7 release, for the iterations that follow it. Each is scoped against
 the code as it stands at `1cf4f66`, so the paths and line numbers below are where the work starts,
@@ -6696,7 +6696,26 @@ not a promise they will not move.
 
 ### P1 — A hit's arrays are capped the way its hits are
 
-📋 **Planned.** Opened 2026-10-19, validating 0.3.7 against the threat-intel dataset. Some of its
+✅ **Done 2026-10-19.** `storage::cap_document_arrays` keeps the first N elements of every array
+at any depth and records each cut under `_truncated_arrays` by path — dotted through objects,
+`[i]` through elements — with the original length; idempotent, and an entry already recorded is
+kept. `fetch_documents` applies it after the projection from `SearchOptions::array_limit`; the
+string-sort candidate fetch passes none. The value is resolved once at the surface by
+`AppState::checked_array_limit` (through `cameodb_mcp::checked_array_limit`, which the MCP
+dispatcher also applies to the argument) and travels as `array_limit` on `ClientOp::Search` and
+`FetchDocsRequest` (and `SearchRequest`), each `#[serde(default)]`. The router caps the response
+again on its way out (`cap_hit_arrays`), which bounds what a peer on an older build sends whole.
+The MCP backend's search methods take `McpSearchBounds { limit, offset, array }` rather than a
+third positional `Option<usize>`. Two departures from the plan below: `array` on
+`search_across_indexes` is one top-level argument like `limit`, not per index entry — it is a
+size bound, and the inline clause already applies to every index; and no field is exempt, because
+the merge never reads the sort value off the document (see the corrected bullet). Covered by unit
+tests in `projection.rs`, `limits.rs`, `query.rs`, `config/tests.rs` and `node/tests.rs`, the
+storage test `projection_test.rs`, HTTP and MCP tests on a live node, and a cluster-suite probe
+(`probe arrays`) that writes six documents of 300k addresses across three nodes and searches
+through each.
+
+Opened 2026-10-19, validating 0.3.7 against the threat-intel dataset. Some of its
 fields are arrays of a few hundred thousand elements — `string_ipv4` and the other networking
 fields — and a search returns every element of every one. A page of ten such hits is tens of MB,
 which floods HTTP clients and every agent context. The MCP `max_response_bytes` trim
@@ -6714,7 +6733,7 @@ elements of an array get the same three, with the same rules.
 | Node maximum, a request above it refused with `400` | `[security.limits] max_search_limit = 10000` | `[security.limits] max_array_limit = 100000` |
 | HTTP body | `"limit": N` | `"array": N` |
 | Inline keyword | `... limit N` | `... array N` |
-| MCP | `limit`, with `maximum` advertised | `array` on `search_index` and on each `search_across_indexes` entry, with `maximum` advertised |
+| MCP | `limit`, with `maximum` advertised | `array` on `search_index` and `search_across_indexes`, with `maximum` advertised |
 
 The default is finite on purpose: the dataset that prompted this is the normal case for threat
 intelligence, not an outlier. Both numbers are first guesses, to be checked against that dataset
@@ -6737,8 +6756,11 @@ bound the tool schema advertises and the bound HTTP enforces stay one rule.
   did not get and can ask again with a larger `array`.
 - `array 0` is allowed and returns each array empty with its length reported: the sizes without
   the payload.
-- The document key, its shadow name, and the sort field are never capped. The single-phase merge
-  reads the sort value off the document, and a capped sort array would change the order.
+- No field needs an exemption. The document key and its shadow name are scalars, and the merge
+  never reads the sort value off the document: within a node it travels on the `KeyHit`, across
+  nodes as `_sort_key`, which is a scalar. *(Corrected at implementation: the plan exempted the
+  sort field on the belief that a single-phase merge read it from the document; no such merge
+  remains.)*
 
 **Where it goes.** `HybridStore::fetch_documents` (`storage/src/search.rs:1228`) is the one place
 every hit's body is built: decoded from redb, shadow fields rebuilt, then projected

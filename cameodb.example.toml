@@ -145,6 +145,8 @@ enabled = false
 # write_burst = 20000                   # an import is one burst; set this above the rate
 # max_search_limit = 10000              # largest `limit` an MCP search may ask for
 # max_federated_indexes = 20            # most indexes one search_across_indexes may name
+# max_array_limit = 100000              # largest `array` a search may ask for: elements kept of
+#                                       # each array in a hit
 # min_prefix_length = 2                 # shortest field:pre* expanded (0 = any); shorter
 #                                       # prefixes match the literal term and are reported
 # expand_unqualified_prefix = true      # false: a bare pre* matches the literal term instead
@@ -271,3 +273,6 @@ enable_early_termination = true
 commit_interval_ms = 2000
 supervisor_timeout_secs = 3
 default_search_limit = 10
+# Elements kept of each array in a hit when a search names no `array`; a hit that lost elements
+# carries `_truncated_arrays`. At most security.limits.max_array_limit.
+default_array_limit = 1000

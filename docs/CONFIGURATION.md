@@ -298,6 +298,11 @@ search_threads = 8
 # Note: Explicit limit 0 in queries means count-only mode (returns total_hits without documents)
 default_search_limit = 10
 
+# Most elements kept of each array in a hit when a search names no `array` (default: 1000).
+# A hit that lost elements carries `_truncated_arrays` with the length each array had.
+# Bounded by [security.limits] max_array_limit.
+default_array_limit = 1000
+
 # Longest a write waits to become searchable while writes to its index keep arriving, in
 # milliseconds (default: 2000). A commit is what makes writes visible to search and it is the
 # expensive half of a write, so this is also what a bulk load's commit cost is amortized over.
@@ -850,6 +855,7 @@ write_documents_per_minute = 5000 # the write surface, metered in documents; 0 d
 write_burst = 20000               # spendable at once; 0 means one minute's worth
 max_search_limit = 10000          # largest `limit` an MCP search may ask for
 max_federated_indexes = 20        # most indexes one `search_across_indexes` may name
+max_array_limit = 100000          # largest `array` a search may ask for
 min_prefix_length = 2             # shortest `field:pre*` expanded; 0 expands any
 expand_unqualified_prefix = true  # a bare `pre*` searches the default fields
 max_default_fields = 64           # most fields an unqualified term searches; 0 = all
@@ -984,6 +990,30 @@ than per call.
 - **A caller that wants the whole catalogue is asking a different question.** `list_indexes`
   answers it in one request.
 - **`0` is refused**, not read as unlimited.
+
+#### `max_array_limit` — how large one hit may be
+
+`max_search_limit` bounds how many hits come back; this bounds how large each one is. A single
+field of a threat-intelligence record can hold a few hundred thousand network addresses —
+megabytes in one hit, and a page of such hits floods any client or agent context. Every array in
+a hit keeps at most `array` elements: the first ones in stored order, at any depth, cut on the
+shard that holds the document so the rest never cross the network. It defaults to **100000**,
+past which a caller is asking for an export rather than a search.
+
+- **The cap is on by default.** A search naming no `array` gets `[search] default_array_limit`,
+  **1000** by default, and a hit that lost elements says so in `_truncated_arrays` — each
+  shortened array by its path, with the length it had — so the default is never silent.
+- **Enforced on every surface.** `POST /api/{index}/search`, the stream route and both MCP
+  search tools, as an argument or as an inline `array N`. A value past the ceiling is refused
+  with the two numbers named, not clamped; an operator who wants longer arrays raises this.
+- **Advertised** as the `maximum` of each MCP search schema's `array`.
+- **`search.default_array_limit` may not exceed it**, for the reason the search default may not
+  exceed `max_search_limit`.
+- **`0` is refused** here, not read as unlimited. A request's `array 0` is allowed: it returns
+  every array empty with its length.
+- **In a mixed-version cluster** a peer on an older build ignores the cap and sends whole
+  arrays; the node answering the caller caps the merged page again, so the response is bounded
+  either way — only the traffic from that peer is not.
 
 #### `min_prefix_length` — how short a prefix query may be
 
@@ -1297,6 +1327,7 @@ clear, only digests. That variable is read by the **client**.
 - `CAMEODB_INDEXER_MEMORY_MAX_MB`: Maximum indexer memory
 - `CAMEODB_MEMORY_PRESSURE_THRESHOLD_PERCENT`: Memory pressure threshold
 - `CAMEODB_DEFAULT_SEARCH_LIMIT`: Default search result limit
+- `CAMEODB_DEFAULT_ARRAY_LIMIT`: Elements kept of each array in a hit when a search names no `array`
 
 ## Multi-Disk Setup
 
