@@ -97,7 +97,7 @@ These are **dropped from the query rather than rejected**, so a search containin
 - `field:[* TO *]` — open at both ends, the same presence test. Bound it on one side: `year:[0 TO *]`, `tag:["" TO *]`.
 - `json_field:[a TO b]`, `json_field:>n` — a json field takes no range or comparison. Match a value: `json_field:value`.
 - `pre*` — a prefix needs a field name; without one `pre` is matched as a whole term. Name the field, or OR one clause per field.
-- `field.subfield:value` — paths into a json field are not queryable. A json field is searchable only as unstructured text, so `field:value` matches any key or value inside it.
+- `field.subfield:value` — paths into a json field are not queryable, whatever the clause. A json field is searchable only as unstructured text, so `field:value` matches any key or value inside it.
 - Regular expressions are disabled.
 
 ## Output Formatting

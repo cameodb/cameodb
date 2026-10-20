@@ -236,6 +236,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [OB26](#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap) | **A restarted node waits on every expected peer before it leaves bootstrap** — reproduced 2026-10-18: real, and invisible to clients, because the snapshot and any never-restarted peer carry the map. A day, mostly deleting code; with OB27 | — | 2026-10-15 | 📋 |
 | [OB27](#ob27--a-replaced-node-never-leaves-the-cluster) | **A replaced node never leaves the cluster** — a node rebuilt with an empty data directory leaves its old identity's shards on every ring for good: writes to their key ranges answer 500, and the new node cannot learn an existing schema (503). The 500 is independent; `forget` needs O3 | — | 2026-10-18 | 📋 |
 | [OB28](#ob28--two-range-shapes-were-dropped-without-a-word-or-failed-the-search) | **Two range shapes were dropped without a word or failed the search** — `field:[* TO *]` answered zero unreported, and a range on a json field was a 500; both are now reported dropped clauses, refused with 400 when nothing else is left | — | 2026-10-21 | ✅ |
+| [OB29](#ob29--what-verifying-ob28-over-mcp-found) | **What verifying OB28 over MCP found** — a query whose every clause was dropped ran as match-all, a json path matched nothing unreported, and `validate_query` called a path an unknown field | — | 2026-10-21 | ✅ |
 | [F9](#f9--commit-on-a-clock-not-a-count) | **Commit on a clock, not a count** — bulk ingest 1.8–6.6×, a trickle searchable within 2 s, single writes unchanged | — | 2026-09-26 | ✅ |
 | [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
@@ -3591,6 +3592,37 @@ query is refused with `400` as any is. Tests: `discarded_clauses_test.rs` (an un
 conjunction, alone and as a count; ranges and a comparison on a json field, alone and beside another
 clause) and an HTTP test that each shape is a `400` naming it and a one-sided range still answers.
 The MCP syntax reference, guidance and the API reference's list of causes name both forms.
+
+### OB29 — What verifying OB28 over MCP found
+
+✅ **Done 2026-10-21.** `validate_query` on `cells.amount:>3 AND year:[* TO *]` reported both OB28
+notes, a third — "clause was dropped: Invalid query: Only excluding terms given" — and
+`cells.amount` as an unknown field. Each led further than its symptom:
+
+- **The extra note was a match-all.** Tantivy leaves a group whose every clause it dropped empty,
+  and `all_negative` counts an empty group as exclusions only: it reports `AllButQueryForbidden` and
+  `make_non_negative` adds match-all. So `nosuch:x AND title:*` reported its two dropped clauses and
+  ran as `*`, every document — `nothing_survived` checked for `EmptyQuery` alone. Now
+  `match_all_substituted` reads the error beside another dropped clause as that substitution: the
+  query is emptied, both search paths run `EmptyQuery` for it, and the note is not reported. Alone,
+  the error is a query of exclusions only (`-tag:archived`), served as before. `screen_ranges`
+  (now `screen_clauses`) also takes a dropped leaf out of the AST instead of opening its bounds for
+  the parser to discard, so its own drops never reach that check.
+- **A json path matched nothing, unreported.** A json field is written as the text of its value
+  (`add_text` on the root), so no path holds a term: `cells.unit:kn` parsed, ran and answered 0 —
+  the silent zero OB28 removed for ranges. `screen_clauses` now drops every leaf on a path inside a
+  json field (value, phrase, set or range) with a note naming `field:value`.
+  `unresolvable_fields_test` had listed `meta.source:api` among valid queries without checking a
+  hit; it now asserts the path is reported and `meta:api` matches.
+- **`unknown_fields`.** `analyze_query` gives a path inside a json field the json hint instead of
+  an unknown-field entry and a "did you mean".
+
+Tests: `discarded_clauses_test.rs` (a conjunction dropped whole reports only its clauses and
+matches nothing; exclusions alone still run; every clause shape on a json path), the corrected
+`unresolvable_fields_test.rs`, a `diagnostics.rs` unit test, and the HTTP range test extended to a
+value on a path. The syntax reference, guidance and API reference say a path is dropped whatever the
+clause. Native json — paths, typed values and fast columns, which tantivy has — would make these
+clauses work rather than report them; that is a design decision of its own, not part of this fix.
 
 ### F9 — Commit on a clock, not a count
 

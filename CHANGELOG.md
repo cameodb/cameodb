@@ -53,6 +53,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so the search failed with `500 Internal Server Error`. Both are now dropped clauses like any
   other: named in `_discarded_clauses` — the first as the presence test it reads as, the second
   with the value form that works — and a query left with nothing else is refused with `400`.
+- **A query whose every clause was dropped could answer every document.** When the parser dropped
+  each clause of a conjunction — `nosuch:x AND title:*` — it read the empty remainder as a query
+  of exclusions only and added match-all to make it runnable: the dropped clauses were reported,
+  and the search ran as `*`. Such a query is now emptied, matches nothing and is refused with
+  `400`, and the parser's "Invalid query: Only excluding terms given" is no longer reported
+  beside the clauses that caused it. A query of exclusions alone, `-tag:archived`, runs as before.
+- **A clause on a path inside a json field matched nothing, unreported.** A json field is indexed
+  as the words of its value, so `cells.unit:kn` never matched; it is now a dropped clause naming
+  the form that works, `cells:value`. `validate_query` no longer lists such a path as an unknown
+  field with a "did you mean".
 - **`data load --id` read a field's record option from its tokenizer.** It now takes the one the
   node reports, so a `raw` text field with positions keeps them; against a node that reports
   none, `raw` still reads as `Basic`, the postings the loader gives its category columns.

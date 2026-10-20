@@ -530,6 +530,23 @@ pub(super) fn analyze_query(query_text: &str, field_infos: &[FieldInfo]) -> Json
                 "Field '{}' exists but is not indexed. Queries against it will not match.",
                 field_name
             ));
+        } else if let Some(json) = field_infos.iter().find(|info| {
+            info.field_type == "json"
+                && field_name
+                    .strip_prefix(info.name.as_str())
+                    .is_some_and(|path| path.starts_with('.'))
+        }) {
+            // A path inside a json field, not an unknown field: the field is there, the path is
+            // what cannot be queried, and the discarded clause says so. A "did you mean" here
+            // would be a second, contradicting verdict. The json hint says what the field takes.
+            field_hints.push(serde_json::json!({
+                "field": field_name,
+                "type": json.field_type,
+                "hint": json.field_type,
+            }));
+            hints
+                .entry(json.field_type.clone())
+                .or_insert_with(|| JsonValue::String(field_query_hint(json)));
         } else {
             unknown.push(field_name.clone());
         }
@@ -901,6 +918,32 @@ mod field_suggestion_tests {
             .into_iter()
             .map(|info| info.name.clone())
             .collect()
+    }
+
+    /// A path inside a json field is not an unknown field: no "did you mean" for it, and the
+    /// json field's hint in its place. Why the path cannot be queried is the discarded clause's.
+    #[test]
+    fn a_path_inside_a_json_field_is_not_an_unknown_field() {
+        let fields = vec![info("cells", "json"), info("year", "i64")];
+        let analysis = analyze_query("cells.amount:>3 AND nosuch:x", &fields);
+        assert_eq!(
+            analysis["unknown_fields"],
+            serde_json::json!(["nosuch"]),
+            "{analysis}"
+        );
+        assert!(
+            !analysis["suggestions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s.as_str().unwrap().contains("cells.amount")),
+            "{analysis}"
+        );
+        assert_eq!(
+            analysis["field_hints"][0],
+            serde_json::json!({"field": "cells.amount", "type": "json", "hint": "json"})
+        );
+        assert!(analysis["hints"]["json"].is_string(), "{analysis}");
     }
 
     #[test]

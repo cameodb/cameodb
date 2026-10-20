@@ -231,11 +231,9 @@ fn valid_queries_are_never_reported() {
         // after the field stopped being declared genuinely do not have it, so a query naming it
         // is an unknown-field query and reporting it is right. See the case below.
         "id:d1",
-        // JSON paths of any depth, which is what the absorbing field is legitimately for.
-        "meta.source:api",
-        "meta.nested.deep:value",
+        // A value on the json field itself: its keys and values are indexed as words.
         "meta:api",
-        "tag:active AND meta.source:api",
+        "tag:active AND meta:api",
     ] {
         let notes = discarded(&store, "clean", query);
         assert!(
@@ -405,4 +403,32 @@ fn a_clause_opening_straight_after_a_parenthesis_is_read_as_one() {
         let notes = discarded(&store, "parens", query);
         assert!(notes.is_empty(), "{query:?} was reported: {notes:?}");
     }
+}
+
+/// A path inside a json field is reported, not taken as valid. The field is written as the text of
+/// its value, so no path holds a term: `meta.source:api` used to pass this suite as a valid query
+/// while matching nothing, on a document whose `meta` is `{"source": "api"}`. The value on the
+/// field itself is the form that matches.
+#[test]
+fn a_path_inside_a_json_field_is_reported_and_the_field_matches() {
+    let temp = TempDir::new().unwrap();
+    let store = store(&temp, "paths");
+
+    for query in ["meta.source:api", "meta.nested.deep:value"] {
+        let outcome = store.search_documents("paths", query, 10, None).unwrap();
+        assert_eq!(outcome.total_hits, 0, "{query:?}");
+        assert!(
+            outcome
+                .discarded
+                .iter()
+                .any(|note| note.contains("is a path inside the json field `meta`")),
+            "{query:?}: {:?}",
+            outcome.discarded
+        );
+    }
+    let field = store
+        .search_documents("paths", "meta:api", 10, None)
+        .unwrap();
+    assert!(field.total_hits > 0, "the value on the field matches");
+    assert!(field.discarded.is_empty(), "{:?}", field.discarded);
 }

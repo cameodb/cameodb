@@ -382,10 +382,11 @@ fn an_unbounded_range_is_reported_as_a_presence_test() {
 }
 
 /// A range on a json field was accepted by the parser and refused by the shard building it, so
-/// the search failed with an internal error. It is dropped and reported like any clause the index
-/// cannot run: beside another clause the rest runs, and alone the query is emptied.
+/// the search failed with an internal error; a clause on a path inside one ran and matched
+/// nothing, unreported. Both are dropped and reported like any clause the index cannot run:
+/// beside another clause the rest runs, and alone the query is emptied.
 #[test]
-fn a_range_on_a_json_field_is_dropped_and_reported_not_failed() {
+fn a_range_or_a_path_on_a_json_field_is_dropped_and_reported() {
     let temp = TempDir::new().unwrap();
     let store = HybridStore::new(config(temp.path().to_path_buf()), 1).unwrap();
     let mut fields = HashMap::new();
@@ -412,20 +413,42 @@ fn a_range_on_a_json_field_is_dropped_and_reported_not_failed() {
     }
     store.commit_index("tables").unwrap();
 
-    for query in [
-        "cells:[\"\" TO *]",
-        "cells.amount:>3",
-        "cells.unit:[a TO z]",
+    // On the field a range is the fault; inside it, the path is, whatever the clause — a value on
+    // a path parsed and ran and matched nothing, since a json field is indexed as words, not paths.
+    for (query, says) in [
+        (
+            "cells:[\"\" TO *]",
+            "`cells` is a json field, which takes no range",
+        ),
+        ("cells:>3", "`cells` is a json field, which takes no range"),
+        (
+            "cells.amount:>3",
+            "`cells.amount` is a path inside the json field `cells`",
+        ),
+        (
+            "cells.unit:[a TO z]",
+            "`cells.unit` is a path inside the json field `cells`",
+        ),
+        (
+            "cells.unit:kn",
+            "`cells.unit` is a path inside the json field `cells`",
+        ),
+        (
+            "cells.unit:\"k n\"",
+            "`cells.unit` is a path inside the json field `cells`",
+        ),
+        (
+            "cells.unit: IN [kn eur]",
+            "`cells.unit` is a path inside the json field `cells`",
+        ),
     ] {
         let outcome = store
             .search_documents("tables", query, 10, None)
             .unwrap_or_else(|err| panic!("{query:?} failed instead of dropping: {err}"));
         assert!(outcome.emptied, "{query:?}: {:?}", outcome.discarded);
+        assert_eq!(outcome.total_hits, 0, "{query:?}");
         assert!(
-            outcome
-                .discarded
-                .iter()
-                .any(|note| note.contains("json field, which takes no range")),
+            outcome.discarded.iter().any(|note| note.contains(says)),
             "{query:?}: {:?}",
             outcome.discarded
         );
@@ -444,4 +467,45 @@ fn a_range_on_a_json_field_is_dropped_and_reported_not_failed() {
         .unwrap();
     assert_eq!(value.total_hits, 2);
     assert!(value.discarded.is_empty(), "{:?}", value.discarded);
+}
+
+/// When every clause of a conjunction is dropped, each is reported, and nothing else is: the
+/// parser's complaint about the emptied conjunction ("only excluding terms given") describes
+/// its own bookkeeping, not anything the query asked.
+#[test]
+fn a_conjunction_dropped_whole_reports_only_its_clauses() {
+    let temp = TempDir::new().unwrap();
+    let store = store_with_two_docs(&temp, "wholly");
+
+    for (query, clauses) in [
+        ("year:[* TO *] AND created:[* TO *]", 2),
+        ("nosuch:x AND title:*", 2),
+        ("year:[* TO *] AND title:*", 2),
+        ("+year:[* TO *] +nosuch:x", 2),
+    ] {
+        let outcome = store.search_documents("wholly", query, 10, None).unwrap();
+        assert!(outcome.emptied, "{query:?}: {:?}", outcome.discarded);
+        assert!(
+            !outcome
+                .discarded
+                .iter()
+                .any(|note| note.contains("Only excluding terms")),
+            "{query:?}: {:?}",
+            outcome.discarded
+        );
+        assert_eq!(
+            outcome.discarded.len(),
+            clauses,
+            "{query:?}: {:?}",
+            outcome.discarded
+        );
+        assert_eq!(outcome.total_hits, 0, "{query:?} ran as match-all");
+    }
+
+    // A query of exclusions alone is not an emptied one: it asks for everything but them.
+    for query in ["-tag:archived", "NOT tag:archived"] {
+        let outcome = store.search_documents("wholly", query, 10, None).unwrap();
+        assert!(!outcome.emptied, "{query:?}: {:?}", outcome.discarded);
+        assert_eq!(outcome.total_hits, 1, "{query:?}: {:?}", outcome.discarded);
+    }
 }

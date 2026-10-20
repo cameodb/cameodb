@@ -282,8 +282,8 @@ pub const NOT_SUPPORTED: &[NotSupported] = &[
     },
     NotSupported {
         syntax: "json_field:[a TO b]",
-        detail: "A json field takes no range or comparison, on the field or a path inside it; \
-                 the clause is dropped and reported. Match a value: `json_field:value`.",
+        detail: "A json field takes no range or comparison; the clause is dropped and reported. \
+                 Match a value: `json_field:value`.",
     },
     NotSupported {
         syntax: "pre*",
@@ -299,8 +299,9 @@ pub const NOT_SUPPORTED: &[NotSupported] = &[
     },
     NotSupported {
         syntax: "field.subfield:value",
-        detail: "Paths into a json field are not queryable. A json field is searchable only as \
-                 unstructured text, so `field:value` matches any key or value inside it.",
+        detail: "Paths into a json field are not queryable: a json field is indexed as the words \
+                 of its value, so a clause on a path — value, phrase, set or range — is dropped \
+                 and reported. `field:value` matches any key or value inside it.",
     },
     NotSupported {
         syntax: "field:/regex/",

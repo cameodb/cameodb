@@ -316,7 +316,8 @@ curl -s -X POST http://localhost:9480/api/books/search \
 > an agent presents rows as fact. Causes include an unknown or unindexed field name, a value that
 > does not match its field's type, an unsupported form such as `field:*` or `field:[* TO *]` (a
 > range open at both ends, which reads as the same presence test), a range or comparison on a json
-> field (it takes only values), a lowercase `to` or `in`
+> field (it takes only values), any clause on a path inside a json field (`cells.unit:kn` — a json
+> field is indexed as the words of its value, not by path), a lowercase `to` or `in`
 > where the keyword was meant, and an inline `return` or `sort` naming a field the index does not
 > have.
 >

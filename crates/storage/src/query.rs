@@ -678,14 +678,15 @@ pub(crate) fn prepare_query_parser(
     // Last, so every pass above has seen the ranges it rewrites — a date range's quoted bounds
     // are already bare by now — and only what the grammar cannot carry is held.
     let (text, held) = hold_quoted_ranges(&normalized_query);
-    // A json field takes no range unless it has a fast column, and tantivy says so only when a
-    // shard builds the query — too late to drop the clause, so the search failed outright.
-    let rangeless: HashSet<String> = fields
+    // The json fields, which take neither a range nor a path — see [`screen_clauses`].
+    let json_fields: HashSet<String> = fields
         .indexed_fields
         .iter()
         .filter(|(_, field)| {
-            let field_type = tantivy_schema.get_field_entry(**field).field_type();
-            field_type.is_json() && !field_type.is_fast()
+            tantivy_schema
+                .get_field_entry(**field)
+                .field_type()
+                .is_json()
         })
         .map(|(name, _)| name.clone())
         .collect();
@@ -696,7 +697,7 @@ pub(crate) fn prepare_query_parser(
         parser,
         narrowed,
         held,
-        rangeless,
+        json_fields,
     })
 }
 
@@ -710,13 +711,13 @@ pub(crate) struct PreparedQuery {
     pub(crate) parser: tantivy::query::QueryParser,
     pub(crate) narrowed: Option<NarrowedDefaultFields>,
     held: Vec<HeldRange>,
-    /// The fields a range cannot run against — see [`screen_ranges`].
-    rangeless: HashSet<String>,
+    /// The json fields, which a range or a path cannot run against — see [`screen_clauses`].
+    json_fields: HashSet<String>,
 }
 
 impl PreparedQuery {
     /// Parse leniently, as `QueryParser::parse_query_lenient` does, with each held range put back
-    /// where its placeholder parsed and every range screened ([`screen_ranges`]): the parser's
+    /// where its placeholder parsed and every leaf screened ([`screen_clauses`]): the parser's
     /// errors, and a note for each range clause dropped that the parser would not have reported.
     pub(crate) fn parse(
         &self,
@@ -736,7 +737,11 @@ impl PreparedQuery {
             })
             .collect();
         let mut notes = Vec::new();
-        let ast = screen_ranges(restore_ranges(ast, &self.held), &self.rangeless, &mut notes);
+        let ast = screen_clauses(
+            restore_ranges(ast, &self.held),
+            &self.json_fields,
+            &mut notes,
+        );
         let (query, mut built_errors) = self.parser.build_query_from_user_input_ast_lenient(ast);
         errors.append(&mut built_errors);
         (query, errors, notes)
@@ -923,70 +928,111 @@ fn restore_ranges(
     }
 }
 
-/// The range clauses tantivy would drop without a word, or fail on once a shard runs them, each
-/// dropped here with a note saying so.
+/// The clauses tantivy would drop without a word, match nothing with, or fail on once a shard
+/// runs them, each dropped here with a note saying so.
 ///
 /// * `field:[* TO *]` — both bounds open. The parser discards the leaf as useless and reports
 ///   nothing, so in a conjunction the query silently widened, and alone it matched nothing with
 ///   nothing to say why. It reads as a presence test, and is noted as one.
-/// * A range or comparison on a field in `rangeless` — a json field without a fast column. The
-///   parser accepts it and the shard refuses to build it, so the whole search failed. Its bounds
-///   are opened here, which the parser then drops like the first case, and it is noted.
+/// * A range or comparison on a json field. The parser accepts it and the shard refuses to build
+///   it — a json field has no fast column — so the whole search failed.
+/// * Any clause on a path inside a json field, `cells.unit:kn`. A json field is written as the
+///   text of its value (`add_text` on the field's root), so no path ever holds a term: the clause
+///   parsed, ran, and matched nothing, the zero reading as an answer.
 ///
 /// Either way the clause goes the way every dropped clause does: reported, and a query with
 /// nothing else left is refused as emptied rather than answered with a zero.
-fn screen_ranges(
+fn screen_clauses(
     ast: tantivy::query_grammar::UserInputAst,
-    rangeless: &HashSet<String>,
+    json_fields: &HashSet<String>,
     notes: &mut Vec<String>,
 ) -> tantivy::query_grammar::UserInputAst {
-    use tantivy::query_grammar::{UserInputAst, UserInputBound, UserInputLeaf};
+    screen_clause(ast, json_fields, notes)
+        .unwrap_or_else(|| tantivy::query_grammar::UserInputAst::Clause(Vec::new()))
+}
+
+/// [`screen_clauses`] on one node of the query: `None` when nothing of it is left to run.
+///
+/// A dropped leaf is taken out rather than handed on for the parser to discard. Handed on, a
+/// conjunction whose every clause went was left to the parser's own emptiness check, which reads
+/// what remains as "only excluding terms" and reports that as one more dropped clause — its
+/// bookkeeping, not anything the query asked. Taken out, an emptied group is an empty clause,
+/// which the parser builds as the empty query without a word.
+fn screen_clause(
+    ast: tantivy::query_grammar::UserInputAst,
+    json_fields: &HashSet<String>,
+    notes: &mut Vec<String>,
+) -> Option<tantivy::query_grammar::UserInputAst> {
+    use tantivy::query_grammar::{UserInputAst, UserInputLeaf};
     match ast {
-        UserInputAst::Clause(clauses) => UserInputAst::Clause(
-            clauses
+        UserInputAst::Clause(clauses) => {
+            let kept: Vec<_> = clauses
                 .into_iter()
-                .map(|(occur, clause)| (occur, screen_ranges(clause, rangeless, notes)))
-                .collect(),
-        ),
-        UserInputAst::Boost(inner, boost) => {
-            UserInputAst::Boost(Box::new(screen_ranges(*inner, rangeless, notes)), boost)
+                .filter_map(|(occur, clause)| {
+                    screen_clause(clause, json_fields, notes).map(|clause| (occur, clause))
+                })
+                .collect();
+            (!kept.is_empty()).then_some(UserInputAst::Clause(kept))
         }
-        UserInputAst::Leaf(leaf) => match *leaf {
-            UserInputLeaf::Range {
-                field: Some(field),
-                lower,
-                upper,
-            } => {
-                let note = range_note(&field, &lower, &upper, rangeless);
-                match note {
-                    Some(note) => {
-                        if !notes.contains(&note) {
-                            notes.push(note);
-                        }
-                        UserInputAst::Leaf(Box::new(UserInputLeaf::Range {
-                            field: Some(field),
-                            lower: UserInputBound::Unbounded,
-                            upper: UserInputBound::Unbounded,
-                        }))
+        UserInputAst::Boost(inner, boost) => screen_clause(*inner, json_fields, notes)
+            .map(|inner| UserInputAst::Boost(Box::new(inner), boost)),
+        UserInputAst::Leaf(leaf) => {
+            let note = match leaf.as_ref() {
+                UserInputLeaf::Literal(literal) => literal
+                    .field_name
+                    .as_deref()
+                    .and_then(|field| json_path_note(field, json_fields)),
+                UserInputLeaf::Set {
+                    field: Some(field), ..
+                } => json_path_note(field, json_fields),
+                UserInputLeaf::Range {
+                    field: Some(field),
+                    lower,
+                    upper,
+                } => json_path_note(field, json_fields)
+                    .or_else(|| range_note(field, lower, upper, json_fields)),
+                _ => None,
+            };
+            match note {
+                Some(note) => {
+                    if !notes.contains(&note) {
+                        notes.push(note);
                     }
-                    None => UserInputAst::Leaf(Box::new(UserInputLeaf::Range {
-                        field: Some(field),
-                        lower,
-                        upper,
-                    })),
+                    None
                 }
+                None => Some(UserInputAst::Leaf(leaf)),
             }
-            other => UserInputAst::Leaf(Box::new(other)),
-        },
+        }
     }
 }
 
-/// Why a range clause on `field` cannot run, when it cannot — see [`screen_ranges`].
+/// When `field` is a path inside a json field, why no clause on it can match.
+fn json_path_note(field: &str, json_fields: &HashSet<String>) -> Option<String> {
+    if json_fields.contains(field) {
+        return None;
+    }
+    json_fields
+        .iter()
+        .find(|name| {
+            field
+                .strip_prefix(name.as_str())
+                .is_some_and(|path| path.starts_with('.'))
+        })
+        .map(|name| {
+            format!(
+                "`{field}` is a path inside the json field `{name}`, which is indexed as the words \
+                 of its value, not by path; the clause was dropped. Match a value on the field \
+                 itself, `{name}:value`"
+            )
+        })
+}
+
+/// Why a range clause on `field` cannot run, when it cannot — see [`screen_clauses`].
 fn range_note(
     field: &str,
     lower: &tantivy::query_grammar::UserInputBound,
     upper: &tantivy::query_grammar::UserInputBound,
-    rangeless: &HashSet<String>,
+    json_fields: &HashSet<String>,
 ) -> Option<String> {
     use tantivy::query_grammar::UserInputBound;
     let open = |bound: &UserInputBound| matches!(bound, UserInputBound::Unbounded);
@@ -997,22 +1043,12 @@ fn range_note(
              `year:[0 TO *]`, `tag:[\"\" TO *]` — or match an explicit value"
         ));
     }
-    // Named by the json field, not the path: its keys and values are indexed as words, so the
-    // value form that works is on the field itself.
-    rangeless
-        .iter()
-        .find(|name| {
-            field == name.as_str()
-                || field
-                    .strip_prefix(name.as_str())
-                    .is_some_and(|path| path.starts_with('.'))
-        })
-        .map(|name| {
-            format!(
-                "`{name}` is a json field, which takes no range or comparison; the clause on \
-                 `{field}` was dropped. Match a value instead, `{name}:value`"
-            )
-        })
+    json_fields.contains(field).then(|| {
+        format!(
+            "`{field}` is a json field, which takes no range or comparison; the clause was \
+             dropped. Match a value instead, `{field}:value`"
+        )
+    })
 }
 
 /// Whether any clause of `query` names no field, and so goes to the default fields.
@@ -1080,8 +1116,29 @@ pub(crate) fn non_indexed_field_note(field: &str) -> String {
 /// Tantivy trims discarded clauses out of the AST and returns `EmptyQuery` when that removes
 /// every one of them. It matches no documents, which makes this the difference between having
 /// answered a different question and having asked nothing at all.
-pub(crate) fn nothing_survived(parsed: &dyn tantivy::query::Query) -> bool {
-    parsed.is::<tantivy::query::EmptyQuery>()
+pub(crate) fn nothing_survived(
+    parsed: &dyn tantivy::query::Query,
+    errors: &[tantivy::query::QueryParserError],
+) -> bool {
+    parsed.is::<tantivy::query::EmptyQuery>() || match_all_substituted(errors)
+}
+
+/// Whether the parser put "every document" in place of clauses it dropped.
+///
+/// A group whose clauses were all dropped is left empty, and the parser's check for a query of
+/// exclusions alone counts an empty group as one. Finding the query "all negative", it reports
+/// `AllButQueryForbidden` and adds a match-all clause to make it runnable — so `nosuch:x AND
+/// title:*` ran as `*` and answered every document. Beside another dropped clause, that error is
+/// this substitution: nothing the caller asked to match survived. Alone it is a query that really
+/// is exclusions only, `-tag:archived`, which the match-all serves as asked.
+pub(crate) fn match_all_substituted(errors: &[tantivy::query::QueryParserError]) -> bool {
+    use tantivy::query::QueryParserError as E;
+    errors
+        .iter()
+        .any(|err| matches!(err, E::AllButQueryForbidden))
+        && errors
+            .iter()
+            .any(|err| !matches!(err, E::AllButQueryForbidden) && !is_recovered_ambiguity(err))
 }
 
 pub(crate) fn describe_discarded(err: &tantivy::query::QueryParserError) -> String {
@@ -1130,10 +1187,13 @@ pub(crate) fn describe_discarded_all(
         from_schema.iter().any(|(name, _)| *name == field)
     };
 
+    // Beside the clauses the parser dropped, its "only excluding terms" is its own bookkeeping —
+    // see [`match_all_substituted`]; alone, it is the reason, and is kept.
+    let substituted = match_all_substituted(errors);
     let mut out: Vec<String> = Vec::new();
     for err in errors {
         use tantivy::query::QueryParserError as E;
-        if is_recovered_ambiguity(err) {
+        if is_recovered_ambiguity(err) || (substituted && matches!(err, E::AllButQueryForbidden)) {
             continue;
         }
         if matches!(err, E::FieldDoesNotExist(field) | E::FieldNotIndexed(field) if claimed(field))

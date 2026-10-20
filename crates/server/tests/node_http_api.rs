@@ -1627,7 +1627,8 @@ async fn a_range_the_index_cannot_run_is_a_bad_request_not_a_zero_or_a_failure()
     for (query, says) in [
         ("year:[* TO *]", "is a field-presence test"),
         ("cells:[a TO z]", "is a json field, which takes no range"),
-        ("cells.amount:>3", "is a json field, which takes no range"),
+        ("cells.amount:>3", "is a path inside the json field `cells`"),
+        ("cells.amount:5", "is a path inside the json field `cells`"),
     ] {
         let (status, body) = post_json(
             &node,

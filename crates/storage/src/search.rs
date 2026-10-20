@@ -592,7 +592,8 @@ impl HybridStore {
             let normalized_query = prepared.shown();
             let narrowed_default_fields = prepared.narrowed.clone();
 
-            let emptied = !discarded.is_empty() && nothing_survived(parsed_query.as_ref());
+            let emptied =
+                !discarded.is_empty() && nothing_survived(parsed_query.as_ref(), &parse_errors);
 
             if !discarded.is_empty() {
                 if emptied {
@@ -612,6 +613,13 @@ impl HybridStore {
                 }
             }
 
+            // Emptied is emptied whatever the parser built: it may have put match-all in place of
+            // the clauses it dropped (`match_all_substituted`), which would count every document.
+            let parsed_query: Box<dyn tantivy::query::Query> = if emptied {
+                Box::new(tantivy::query::EmptyQuery)
+            } else {
+                parsed_query
+            };
             let parsed_query = with_deadline(parsed_query, opts.deadline.as_ref());
             let count_collector = tantivy::collector::Count;
             let walk_start = Instant::now();
@@ -690,7 +698,8 @@ impl HybridStore {
         let normalized_query = prepared.shown();
         let narrowed_default_fields = prepared.narrowed.clone();
 
-        let emptied = !discarded.is_empty() && nothing_survived(parsed_query.as_ref());
+        let emptied =
+            !discarded.is_empty() && nothing_survived(parsed_query.as_ref(), &parse_errors);
 
         if !discarded.is_empty() {
             // A dropped clause does not move the result set one way: it widens a conjunction,
@@ -714,6 +723,13 @@ impl HybridStore {
             }
         }
 
+        // Emptied is emptied whatever the parser built: it may have put match-all in place of the
+        // clauses it dropped (`match_all_substituted`), which would answer every document.
+        let parsed_query: Box<dyn tantivy::query::Query> = if emptied {
+            Box::new(tantivy::query::EmptyQuery)
+        } else {
+            parsed_query
+        };
         // The deadline rides on the query from here on: every collector path below —
         // scored, sorted, count-only — walks segments through it.
         let parsed_query = with_deadline(parsed_query, opts.deadline.as_ref());
