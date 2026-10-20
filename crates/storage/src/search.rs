@@ -426,7 +426,7 @@ impl HybridStore {
 
         // The query itself is discarded: what is wanted is the error list, which is the half a
         // search throws away after deciding it can still run.
-        let (_parsed_query, parse_errors) = prepared.parse();
+        let (_parsed_query, parse_errors, range_notes) = prepared.parse();
 
         let syntax_errors: Vec<String> = parse_errors
             .iter()
@@ -446,6 +446,7 @@ impl HybridStore {
 
         let mut discarded = describe_discarded_all(&semantic_errors, query, &schema);
         discarded.extend(prepared.notes.iter().cloned());
+        discarded.extend(range_notes);
 
         Ok(Some(QueryValidation {
             normalized_query: prepared.shown(),
@@ -583,10 +584,11 @@ impl HybridStore {
             let parse_start = Instant::now();
             let prepared =
                 prepare_query_parser(tantivy_index, &fields, &schema, query, &self.config.query)?;
-            let (parsed_query, parse_errors) = prepared.parse();
+            let (parsed_query, parse_errors, range_notes) = prepared.parse();
             timings.parse_ms = parse_start.elapsed().as_millis() as u64;
             let mut discarded = describe_discarded_all(&parse_errors, query, &schema);
             discarded.extend(prepared.notes.iter().cloned());
+            discarded.extend(range_notes);
             let normalized_query = prepared.shown();
             let narrowed_default_fields = prepared.narrowed.clone();
 
@@ -680,10 +682,11 @@ impl HybridStore {
 
         // Lenient, so one bad clause does not fail the whole query; what it drops is reported
         // through `SearchOutcome::discarded` rather than swallowed.
-        let (parsed_query, parse_errors) = prepared.parse();
+        let (parsed_query, parse_errors, range_notes) = prepared.parse();
         timings.parse_ms = parse_start.elapsed().as_millis() as u64;
         let mut discarded = describe_discarded_all(&parse_errors, query, &schema);
         discarded.extend(prepared.notes.iter().cloned());
+        discarded.extend(range_notes);
         let normalized_query = prepared.shown();
         let narrowed_default_fields = prepared.narrowed.clone();
 

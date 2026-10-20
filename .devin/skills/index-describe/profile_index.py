@@ -10,8 +10,8 @@ marked as such.
     python3 profile_index.py --index narodne_novine --stratify unit_type --spread year \
         --json profile.json > profile.md
 
-Presence is a range from the lowest term of the field's type, because `field:*` is refused and
-`field:[* TO *]` matches nothing. On a text field the range starts at "0", so a value whose every term
+Presence is a range from the lowest term of the field's type, because `field:*` and `field:[* TO *]`
+are refused as presence tests. On a text field the range starts at "0", so a value whose every term
 sorts below it is missed; json, bytes, ip and facet fields have no range at all and are profiled from the
 sample only. Stdlib only.
 """

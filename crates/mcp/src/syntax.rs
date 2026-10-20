@@ -275,6 +275,17 @@ pub const NOT_SUPPORTED: &[NotSupported] = &[
                  dropped and reported. Use a bounded range, or match an explicit value.",
     },
     NotSupported {
+        syntax: "field:[* TO *]",
+        detail: "A range open at both ends is the same presence test, dropped and reported. \
+                 Bound it on one side from a value no document is below — `year:[0 TO *]`, \
+                 `tag:[\"\" TO *]`.",
+    },
+    NotSupported {
+        syntax: "json_field:[a TO b]",
+        detail: "A json field takes no range or comparison, on the field or a path inside it; \
+                 the clause is dropped and reported. Match a value: `json_field:value`.",
+    },
+    NotSupported {
         syntax: "pre*",
         detail: "A prefix with no field name searches the default fields, unless the node has \
                  turned `expand_unqualified_prefix` off; then the `*` is dropped, `pre` is matched \

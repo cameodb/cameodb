@@ -1595,6 +1595,62 @@ async fn declaring_the_same_schema_again_keeps_the_version() {
     assert!(moved.get("unchanged").is_none(), "{moved}");
 }
 
+/// Two range shapes the index cannot run are refused as emptied, naming what was wrong: an
+/// unbounded range, which the parser dropped without a word so the search answered zero, and a
+/// range on a json field, which a shard refused to build so the search failed with a 500.
+#[tokio::test]
+async fn a_range_the_index_cannot_run_is_a_bad_request_not_a_zero_or_a_failure() {
+    let node = TestNode::start("").await;
+    let (status, body) = put_config(
+        &node,
+        "tables",
+        &json!({"fields": {
+            "id": {"field_type": "text"},
+            "year": {"field_type": "i64"},
+            "cells": {"field_type": "json"}
+        }}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let client = node.client();
+    client
+        .write_document(
+            "tables",
+            "t1",
+            &json!({"year": 2024, "cells": {"amount": 5}}),
+            None,
+        )
+        .await
+        .expect("write");
+    client.admin_index_commit("tables").await.expect("commit");
+
+    for (query, says) in [
+        ("year:[* TO *]", "is a field-presence test"),
+        ("cells:[a TO z]", "is a json field, which takes no range"),
+        ("cells.amount:>3", "is a json field, which takes no range"),
+    ] {
+        let (status, body) = post_json(
+            &node,
+            "/api/tables/search",
+            json!({"query": query, "limit": 10}),
+        )
+        .await;
+        assert_eq!(status.as_u16(), 400, "{query}: {body}");
+        assert!(
+            body["error"].as_str().unwrap_or("").contains(says),
+            "{query}: {body}"
+        );
+    }
+    let (status, body) = post_json(
+        &node,
+        "/api/tables/search",
+        json!({"query": "year:[0 TO *]", "limit": 10}),
+    )
+    .await;
+    assert_eq!(status.as_u16(), 200, "{body}");
+    assert_eq!(body["total_hits"], 1, "{body}");
+}
+
 /// A schema read from the node is a schema the node takes back, unchanged.
 ///
 /// The index holds documents, so anything the read lost would be refused as a change to the

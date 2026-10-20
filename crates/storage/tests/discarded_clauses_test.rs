@@ -158,6 +158,7 @@ fn a_clause_dropped_from_a_conjunction_is_reported_rather_than_silently_widening
         ("unknown field", "tag:active AND nosuch:x"),
         ("non-indexed field", "tag:active AND hidden:invisible"),
         ("field-presence test", "tag:active AND title:*"),
+        ("unbounded range", "tag:active AND year:[* TO *]"),
         (
             "numeric field, text value",
             "tag:active AND year:notanumber",
@@ -349,4 +350,98 @@ fn the_kv_bypass_reports_nothing_because_it_never_reaches_the_parser() {
             outcome.discarded
         );
     }
+}
+
+/// `field:[* TO *]` is dropped by the parser without an error of its own; it is reported as the
+/// presence test it reads as, and alone it empties the query rather than answering zero.
+#[test]
+fn an_unbounded_range_is_reported_as_a_presence_test() {
+    let temp = TempDir::new().unwrap();
+    let store = store_with_two_docs(&temp, "unbounded");
+
+    for limit in [10, 0] {
+        let outcome = store
+            .search_documents("unbounded", "year:[* TO *]", limit, None)
+            .unwrap();
+        assert!(outcome.emptied, "limit {limit}: {:?}", outcome.discarded);
+        assert!(
+            outcome
+                .discarded
+                .iter()
+                .any(|note| note.contains("`year:[* TO *]` is a field-presence test")),
+            "limit {limit}: {:?}",
+            outcome.discarded
+        );
+    }
+    // A bound on one side is the form that works, and it reports nothing.
+    let bounded = store
+        .search_documents("unbounded", "year:[0 TO *]", 10, None)
+        .unwrap();
+    assert_eq!(bounded.total_hits, 2);
+    assert!(bounded.discarded.is_empty(), "{:?}", bounded.discarded);
+}
+
+/// A range on a json field was accepted by the parser and refused by the shard building it, so
+/// the search failed with an internal error. It is dropped and reported like any clause the index
+/// cannot run: beside another clause the rest runs, and alone the query is emptied.
+#[test]
+fn a_range_on_a_json_field_is_dropped_and_reported_not_failed() {
+    let temp = TempDir::new().unwrap();
+    let store = HybridStore::new(config(temp.path().to_path_buf()), 1).unwrap();
+    let mut fields = HashMap::new();
+    fields.insert("tag".into(), field(TantivyFieldType::String, false, true));
+    fields.insert("cells".into(), field(TantivyFieldType::Json, false, true));
+    let schema = IndexSchema {
+        fields,
+        ..Default::default()
+    };
+    store.store_schema_and_cache("tables", &schema).unwrap();
+    for (id, tag) in [("t1", "active"), ("t2", "archived")] {
+        store
+            .apply_write(
+                "tables",
+                WalOp::Put {
+                    id: id.to_string(),
+                    json_blob: Some(serde_json::json!({
+                        "tag": tag,
+                        "cells": {"amount": 5, "unit": "kn"}
+                    })),
+                },
+            )
+            .unwrap();
+    }
+    store.commit_index("tables").unwrap();
+
+    for query in [
+        "cells:[\"\" TO *]",
+        "cells.amount:>3",
+        "cells.unit:[a TO z]",
+    ] {
+        let outcome = store
+            .search_documents("tables", query, 10, None)
+            .unwrap_or_else(|err| panic!("{query:?} failed instead of dropping: {err}"));
+        assert!(outcome.emptied, "{query:?}: {:?}", outcome.discarded);
+        assert!(
+            outcome
+                .discarded
+                .iter()
+                .any(|note| note.contains("json field, which takes no range")),
+            "{query:?}: {:?}",
+            outcome.discarded
+        );
+    }
+
+    let beside = store
+        .search_documents("tables", "tag:active AND cells.amount:>3", 10, None)
+        .unwrap();
+    assert_eq!(beside.total_hits, 1, "the rest of the query runs");
+    assert!(!beside.emptied);
+    assert_eq!(beside.discarded.len(), 1, "{:?}", beside.discarded);
+
+    // A value on the json field is what it takes, and reports nothing.
+    let value = store
+        .search_documents("tables", "cells:kn", 10, None)
+        .unwrap();
+    assert_eq!(value.total_hits, 2);
+    assert!(value.discarded.is_empty(), "{:?}", value.discarded);
 }

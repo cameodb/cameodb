@@ -235,6 +235,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [OB25](#ob25--a-search-during-a-restart-answered-short-without-saying-so) | **A search during a restart answered short without saying so** — a rejoining node searched 5 of 9 shards and reported `failed: 0`; on one node, HTTP serves before the replayed tail is committed. Both fixed the same day | — | 2026-10-15 | ✅ |
 | [OB26](#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap) | **A restarted node waits on every expected peer before it leaves bootstrap** — reproduced 2026-10-18: real, and invisible to clients, because the snapshot and any never-restarted peer carry the map. A day, mostly deleting code; with OB27 | — | 2026-10-15 | 📋 |
 | [OB27](#ob27--a-replaced-node-never-leaves-the-cluster) | **A replaced node never leaves the cluster** — a node rebuilt with an empty data directory leaves its old identity's shards on every ring for good: writes to their key ranges answer 500, and the new node cannot learn an existing schema (503). The 500 is independent; `forget` needs O3 | — | 2026-10-18 | 📋 |
+| [OB28](#ob28--two-range-shapes-were-dropped-without-a-word-or-failed-the-search) | **Two range shapes were dropped without a word or failed the search** — `field:[* TO *]` answered zero unreported, and a range on a json field was a 500; both are now reported dropped clauses, refused with 400 when nothing else is left | — | 2026-10-21 | ✅ |
 | [F9](#f9--commit-on-a-clock-not-a-count) | **Commit on a clock, not a count** — bulk ingest 1.8–6.6×, a trickle searchable within 2 s, single writes unchanged | — | 2026-09-26 | ✅ |
 | [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
@@ -3563,6 +3564,33 @@ one node's disk therefore breaks the cluster until its metadata is edited by han
    identity (2), or a node may keep its identity file across a rebuilt data directory. Documented in
    DEPLOYMENT either way. The data that lived on the old shards is gone in both — replication is
    [D2](#d2--replication).
+
+### OB28 — Two range shapes were dropped without a word or failed the search
+
+✅ **Done 2026-10-21.** Found profiling `narodne_novine` for its descriptions, at `3815886`:
+
+- **`field:[* TO *]` answered zero.** On `year`, `act_date`, `klasa` and `heading` alike, with no
+  `_discarded_clauses`. Tantivy's parser drops a range open at both ends as useless and reports
+  nothing (`compute_logical_ast_lenient`, "there is no point emitting it"), so the search never
+  learned a clause was gone: alone the query was emptied and answered 0 as if nothing matched, and
+  `a AND year:[* TO *]` ran as `a`. `field:*` was already reported as a presence test.
+- **A range on a json field was a 500.** `cells:["" TO *]` →
+  `no shard could run this query against 'narodne_novine': tantivy error: An invalid argument was
+  passed: 'RangeQuery on JSON is only supported for fast fields currently'`. The parser accepts the
+  leaf; `RangeQuery::weight` refuses it on a shard, after the point where a clause can be dropped.
+  CameoDB builds no json fast column, so every such range failed.
+
+`PreparedQuery::parse` now always goes through the grammar's AST — `parse_query_lenient` is that
+plus `compute_logical_ast_lenient`, so nothing else changes — and `screen_ranges` walks it before the
+query is built. A range open at both ends is noted as a presence test; a range or comparison on a
+json field without a fast column (`PreparedQuery::rangeless`, from the tantivy schema), or on a path
+inside one, has its bounds opened so the parser drops it, and is noted naming the json field and the
+value form. The notes come back from `parse` beside the parser's errors and join
+`_discarded_clauses` at the three call sites — search, count and `validate_query` — so an emptied
+query is refused with `400` as any is. Tests: `discarded_clauses_test.rs` (an unbounded range in a
+conjunction, alone and as a count; ranges and a comparison on a json field, alone and beside another
+clause) and an HTTP test that each shape is a `400` naming it and a one-sided range still answers.
+The MCP syntax reference, guidance and the API reference's list of causes name both forms.
 
 ### F9 — Commit on a clock, not a count
 

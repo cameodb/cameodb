@@ -678,6 +678,17 @@ pub(crate) fn prepare_query_parser(
     // Last, so every pass above has seen the ranges it rewrites — a date range's quoted bounds
     // are already bare by now — and only what the grammar cannot carry is held.
     let (text, held) = hold_quoted_ranges(&normalized_query);
+    // A json field takes no range unless it has a fast column, and tantivy says so only when a
+    // shard builds the query — too late to drop the clause, so the search failed outright.
+    let rangeless: HashSet<String> = fields
+        .indexed_fields
+        .iter()
+        .filter(|(_, field)| {
+            let field_type = tantivy_schema.get_field_entry(**field).field_type();
+            field_type.is_json() && !field_type.is_fast()
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
     let parser = tantivy::query::QueryParser::for_index(tantivy_index, default_query_fields);
     Ok(PreparedQuery {
         text,
@@ -685,6 +696,7 @@ pub(crate) fn prepare_query_parser(
         parser,
         narrowed,
         held,
+        rangeless,
     })
 }
 
@@ -698,20 +710,21 @@ pub(crate) struct PreparedQuery {
     pub(crate) parser: tantivy::query::QueryParser,
     pub(crate) narrowed: Option<NarrowedDefaultFields>,
     held: Vec<HeldRange>,
+    /// The fields a range cannot run against — see [`screen_ranges`].
+    rangeless: HashSet<String>,
 }
 
 impl PreparedQuery {
     /// Parse leniently, as `QueryParser::parse_query_lenient` does, with each held range put back
-    /// where its placeholder parsed.
+    /// where its placeholder parsed and every range screened ([`screen_ranges`]): the parser's
+    /// errors, and a note for each range clause dropped that the parser would not have reported.
     pub(crate) fn parse(
         &self,
     ) -> (
         Box<dyn tantivy::query::Query>,
         Vec<tantivy::query::QueryParserError>,
+        Vec<String>,
     ) {
-        if self.held.is_empty() {
-            return self.parser.parse_query_lenient(&self.text);
-        }
         let (ast, grammar_errors) = tantivy::query_grammar::parse_query_lenient(&self.text);
         let mut errors: Vec<tantivy::query::QueryParserError> = grammar_errors
             .into_iter()
@@ -722,11 +735,11 @@ impl PreparedQuery {
                 ))
             })
             .collect();
-        let (query, mut built_errors) = self
-            .parser
-            .build_query_from_user_input_ast_lenient(restore_ranges(ast, &self.held));
+        let mut notes = Vec::new();
+        let ast = screen_ranges(restore_ranges(ast, &self.held), &self.rangeless, &mut notes);
+        let (query, mut built_errors) = self.parser.build_query_from_user_input_ast_lenient(ast);
         errors.append(&mut built_errors);
-        (query, errors)
+        (query, errors, notes)
     }
 
     /// The normalized query as it reads, held ranges written back.
@@ -908,6 +921,98 @@ fn restore_ranges(
             other => UserInputAst::Leaf(Box::new(other)),
         },
     }
+}
+
+/// The range clauses tantivy would drop without a word, or fail on once a shard runs them, each
+/// dropped here with a note saying so.
+///
+/// * `field:[* TO *]` — both bounds open. The parser discards the leaf as useless and reports
+///   nothing, so in a conjunction the query silently widened, and alone it matched nothing with
+///   nothing to say why. It reads as a presence test, and is noted as one.
+/// * A range or comparison on a field in `rangeless` — a json field without a fast column. The
+///   parser accepts it and the shard refuses to build it, so the whole search failed. Its bounds
+///   are opened here, which the parser then drops like the first case, and it is noted.
+///
+/// Either way the clause goes the way every dropped clause does: reported, and a query with
+/// nothing else left is refused as emptied rather than answered with a zero.
+fn screen_ranges(
+    ast: tantivy::query_grammar::UserInputAst,
+    rangeless: &HashSet<String>,
+    notes: &mut Vec<String>,
+) -> tantivy::query_grammar::UserInputAst {
+    use tantivy::query_grammar::{UserInputAst, UserInputBound, UserInputLeaf};
+    match ast {
+        UserInputAst::Clause(clauses) => UserInputAst::Clause(
+            clauses
+                .into_iter()
+                .map(|(occur, clause)| (occur, screen_ranges(clause, rangeless, notes)))
+                .collect(),
+        ),
+        UserInputAst::Boost(inner, boost) => {
+            UserInputAst::Boost(Box::new(screen_ranges(*inner, rangeless, notes)), boost)
+        }
+        UserInputAst::Leaf(leaf) => match *leaf {
+            UserInputLeaf::Range {
+                field: Some(field),
+                lower,
+                upper,
+            } => {
+                let note = range_note(&field, &lower, &upper, rangeless);
+                match note {
+                    Some(note) => {
+                        if !notes.contains(&note) {
+                            notes.push(note);
+                        }
+                        UserInputAst::Leaf(Box::new(UserInputLeaf::Range {
+                            field: Some(field),
+                            lower: UserInputBound::Unbounded,
+                            upper: UserInputBound::Unbounded,
+                        }))
+                    }
+                    None => UserInputAst::Leaf(Box::new(UserInputLeaf::Range {
+                        field: Some(field),
+                        lower,
+                        upper,
+                    })),
+                }
+            }
+            other => UserInputAst::Leaf(Box::new(other)),
+        },
+    }
+}
+
+/// Why a range clause on `field` cannot run, when it cannot — see [`screen_ranges`].
+fn range_note(
+    field: &str,
+    lower: &tantivy::query_grammar::UserInputBound,
+    upper: &tantivy::query_grammar::UserInputBound,
+    rangeless: &HashSet<String>,
+) -> Option<String> {
+    use tantivy::query_grammar::UserInputBound;
+    let open = |bound: &UserInputBound| matches!(bound, UserInputBound::Unbounded);
+    if open(lower) && open(upper) {
+        return Some(format!(
+            "`{field}:[* TO *]` is a field-presence test, which is not supported; the clause was \
+             dropped. Bound the range on one side, from a value no document is below — \
+             `year:[0 TO *]`, `tag:[\"\" TO *]` — or match an explicit value"
+        ));
+    }
+    // Named by the json field, not the path: its keys and values are indexed as words, so the
+    // value form that works is on the field itself.
+    rangeless
+        .iter()
+        .find(|name| {
+            field == name.as_str()
+                || field
+                    .strip_prefix(name.as_str())
+                    .is_some_and(|path| path.starts_with('.'))
+        })
+        .map(|name| {
+            format!(
+                "`{name}` is a json field, which takes no range or comparison; the clause on \
+                 `{field}` was dropped. Match a value instead, `{name}:value`"
+            )
+        })
 }
 
 /// Whether any clause of `query` names no field, and so goes to the default fields.

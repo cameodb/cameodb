@@ -47,6 +47,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   index by another id rewrites its schema, carrying over each field's type, tokenizer and
   description; the `default_fields` list was dropped, so bare terms went back to searching every
   text field. It is kept now, less a field the new id turns into its shadow.
+- **Two range shapes the index cannot run were not reported.** `field:[* TO *]` was dropped by
+  the parser without a word: alone it answered zero, beside another clause it widened the query.
+  A range or comparison on a json field was accepted and then refused by the shard building it,
+  so the search failed with `500 Internal Server Error`. Both are now dropped clauses like any
+  other: named in `_discarded_clauses` — the first as the presence test it reads as, the second
+  with the value form that works — and a query left with nothing else is refused with `400`.
 - **`data load --id` read a field's record option from its tokenizer.** It now takes the one the
   node reports, so a `raw` text field with positions keeps them; against a node that reports
   none, `raw` still reads as `Basic`, the postings the loader gives its category columns.

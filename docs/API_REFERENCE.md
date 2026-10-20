@@ -314,7 +314,9 @@ curl -s -X POST http://localhost:9480/api/books/search \
 > drop, which is refused with `400` instead: there are no hits to attach the note to, and the zero
 > it would otherwise report cannot be told apart from a search that ran and matched nothing. The MCP tools make the opposite choice and fail the call, since
 > an agent presents rows as fact. Causes include an unknown or unindexed field name, a value that
-> does not match its field's type, an unsupported form such as `field:*`, a lowercase `to` or `in`
+> does not match its field's type, an unsupported form such as `field:*` or `field:[* TO *]` (a
+> range open at both ends, which reads as the same presence test), a range or comparison on a json
+> field (it takes only values), a lowercase `to` or `in`
 > where the keyword was meant, and an inline `return` or `sort` naming a field the index does not
 > have.
 >
