@@ -751,6 +751,26 @@ documents in the way; one that could not reach every node answers `503` and says
 was stored. `shard_count` in a body is accepted and ignored: a node's shard count is its own
 configuration.
 
+**A schema read is a schema write.** The body may also be exactly what
+[`GET /api/{index}/_config`](#get-index-schema) returns: `fields` as a list of named fields rather
+than a map, `type` for `field_type`, `shadow` for `is_shadow`. The keys only a read carries —
+`name`, `version`, `thumbprint`, `field_count`, `held_here`, `default_fields_truncated`, and per
+field `searchable`, `sortable`, `default_search`, `returned_as` — are ignored; the node decides the
+version. A list naming a field twice, or a field without its name, is refused with `400`.
+
+So a read saved to a file restores the schema it was read from:
+
+```bash
+curl -s http://localhost:9480/api/books/_config > books.v3.json           # save
+curl -s -X PUT http://localhost:9480/api/books/_config \
+  -H "Content-Type: application/json" -d @books.v3.json                    # restore
+```
+
+Sent back to the index it came from, unchanged, it answers `"unchanged": true` at the same
+version. Restored anywhere else, the restored schema's `thumbprint` equal to the one in the file
+proves it is the same schema: the thumbprint covers every property that defines one, descriptions
+included.
+
 #### Get Index Schema
 Retrieve the current schema for an index.
 
@@ -784,6 +804,12 @@ curl -s http://localhost:9480/api/books/_config
 Every field carries the same keys, in the same spelling, here and in `GET /_indexes` — one index
 has one description. `fields` is ordered with `id` first, then alphabetically.
 
+The response is a complete definition: every property the thumbprint covers is in it, resolved
+the way the index is built — a tokenizer or record option a field never declared is reported as
+the default it took — so `PUT /_config` takes it back as it is (see
+[Create/Update Index Schema](#createupdate-index-schema)). The MCP `describe_index` tool returns the
+same block less each field's `index_record_option`, which no query can act on.
+
 `version` and `thumbprint` describe the schema as a whole rather than any field:
 
 | Key | Meaning |
@@ -791,6 +817,7 @@ has one description. `fields` is ordered with `id` first, then alphabetically.
 | `version` | Advances on every change to this schema the cluster agrees, starting at 1 — a `PUT /_config`, a `PATCH /_schema`, and the round that agrees on fields learned from writes. Once per change however many fields it touches; a node that has just learned a field holds it at the version it had until that round, so for a moment two nodes can report the same version with different thumbprints. Compare versions for order and never for how much happened. Adopting a schema that already exists elsewhere keeps the version it came with, and declaring or editing it to what it already is changes nothing — the answer carries `"unchanged": true` and the version stays. Two nodes reporting a different version or thumbprint for one index have not converged yet |
 | `default_fields` | Present only when declared, exactly as declared: the fields an unqualified term searches, in priority order. The one list of default fields a schema has, and part of the schema like its fields; under the name `PUT /_config` accepts. Absent when nothing is declared — nothing is generated in its place, since a list here would read as a declaration — and each field's `default_search` then says what a bare term searches |
 | `id_fields` | Present only when recorded: the fields whose values, joined in this order with a vertical bar, make each document's id |
+| `routing_field_name` | Present only when it is not `id`: the field a document is routed to its shard by |
 | `held_here` | Present, and `false`, when this node holds no copy of the schema and answered with the one its peers hold. A node takes an index's schema once one of its documents reaches it, so on a cluster a new index is held by some nodes before others. Its fields are then reported as declared: `searchable` when indexed, `sortable` when fast. Not found (`404`) only when every peer answered and none holds one; a peer that could not be asked is `503` |
 | `default_fields_truncated` | Present, and `true`, when the node's `[security.limits] max_default_fields` (default 64) cut what a bare term searches short. A bare term then misses the fields left out — their `default_search` is `false` — and a query naming a field reaches it at any width |
 | `thumbprint` | 16 hex digits over the **resolved** schema, so two nodes agree whenever they would build the same index. A declaration and the index built from it therefore match: it hashes what a field resolves to, not what was written, so an omitted tokenizer and the default it fills in are the same schema. Different thumbprints at the same `version` mean the two have genuinely diverged and no retry will settle it |
@@ -812,6 +839,9 @@ The per-field keys:
 | `shadow` | The field carries the identifier under its original name; queried through `id` |
 | `returned_as` | Present on `id` alone, and only on an index that has a shadow field: names the field hits carry the identifier under instead, since no hit on such an index carries an `id` |
 | `stored` | Kept in the search index as well as the document store |
+| `tokenizer` | On an indexed `text` or `string` field: how its values become terms, the default it took when none was declared — `default` for `text`, `raw` for `string` |
+| `index_record_option` | On an indexed `text` or `string` field: what its postings keep — `Basic`, `WithFreqs` or `WithFreqsAndPositions`. `WithFreqsAndPositions` for `text` unless declared otherwise, `Basic` for `string`. A field without positions matches no phrase; the CLI loader writes its category columns as `text` with `raw` and `Basic` |
+| `learned` | Present, and `true`, on a field added by a write rather than declared: not indexed, and its type widens to take each new value rather than refusing it |
 | `default_search` | Whether a term with no field in front of it searches this field. With `default_fields` declared: the declared fields the built index can search. Without: every field it can search as indexed text, string or json, other than `id` and a shadow, by name. Either way the first `max_default_fields` of them. Computed on each read, never stored |
 
 #### Change Field Indexing Flags

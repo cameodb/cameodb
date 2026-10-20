@@ -12,7 +12,9 @@ skill produces descriptions from evidence and a schema body that applies them.
 
 Scripts (stdlib Python, run with `python3 -I`):
 - `profile_index.py` — counts and a spread sample, as a readable report and JSON.
-- `schema_body.py` — the live schema plus new descriptions as a `PUT` body; checks lengths, shows the diff, `--apply` sends it.
+- `schema_body.py` — the live schema read (`GET /_config`, a complete definition the node takes back as
+  it is) with new descriptions, as a `PUT` body; checks lengths, shows the diff, `--apply` sends it and
+  confirms nothing but descriptions moved.
 
 ## 1. Find the node and the index
 
@@ -22,7 +24,8 @@ Scripts (stdlib Python, run with `python3 -I`):
 - **Save the complete schema first**: the whole `GET /api/{index}/_config` response, unedited, to
   `<index>.v<version>.<thumbprint>.json` in the project's schema history folder (create it beside the schema
   source when there is none). That file is the previous version once anything changes; nothing is applied
-  without it. `schema_body.py` does this on every run and again after `--apply`.
+  without it. `schema_body.py` does this on every run and again after `--apply`. A saved read restores
+  the index as it was (`PUT` it back); the restored index's `thumbprint` equal to the file's proves it.
 - Look for the project that loads the index: a schema source file (e.g. `schema.py`), loader, extractor
   docs. They say what each field was *meant* to be; the data says what it *is*. Where they disagree the
   data wins and the disagreement is reported.
@@ -96,8 +99,8 @@ change. Read the diff once more against the profile.
 
 Run every example query a description gives (`limit 0`): it must parse and match something.
 
-To prove the body applies in place without touching the real index: create a probe index from the project's
-schema source (its thumbprint in `stats.schema` must equal the live index's), write one document
+To prove the body applies in place without touching the real index: create a probe index by `PUT`ting the
+saved read of the live schema (its thumbprint must come out equal to the live index's), write one document
 (`PUT /api/<probe>/document` with `{"id": …, "doc": {…}}`), commit, `PUT` the body, check the document still
 answers, then `DELETE /api/<probe>?delete_schema=true`.
 

@@ -283,6 +283,8 @@ pub struct FieldDef {
     /// Field name — populated from the map key if not present in JSON
     #[serde(default)]
     pub name: String,
+    /// `type` is the name `GET /_config` reports it under, accepted so a read can be written back.
+    #[serde(alias = "type")]
     pub field_type: TantivyFieldType,
     /// Whether this field is indexed in Tantivy (default: true for user-defined schemas)
     #[serde(default = "default_true")]
@@ -305,8 +307,9 @@ pub struct FieldDef {
     pub fast: Option<bool>,
     /// Shadow field flag: true if this field preserves original field name when ID is copied to canonical "id" field
     /// Shadow fields are NOT indexed and NOT stored in Tantivy, but preserved in schema for query mapping
-    /// Default is false for backward compatibility with existing schemas
-    #[serde(default)]
+    /// Default is false for backward compatibility with existing schemas. `shadow` is the name
+    /// `GET /_config` reports it under.
+    #[serde(default, alias = "shadow")]
     pub is_shadow: bool,
     /// What this field means, in the operator's words.
     ///
@@ -1109,8 +1112,15 @@ fn text_analysis(field: &FieldDef) -> Option<(&str, IndexRecordOption)> {
 }
 
 /// Index schema definition for validation and evolution.
+///
+/// Read in either of two shapes: as declared and stored — `fields` a map keyed by name,
+/// `field_type`, `is_shadow` — or as `GET /api/{index}/_config` reports it — `fields` a list of
+/// named fields, `type`, `shadow`, beside keys only a read carries (`searchable`, `thumbprint`,
+/// …), which are ignored. So a schema read from a node is a schema that can be written to one, and
+/// a saved read restores the index it came from: the thumbprint says whether it did.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexSchema {
+    #[serde(deserialize_with = "fields_by_name")]
     pub fields: HashMap<String, FieldDef>,
     /// Whether this schema describes a live index or records that one was dropped.
     ///
@@ -1158,6 +1168,61 @@ pub struct IndexSchema {
     /// that does not say, which is every schema written before this field existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub id_fields: Vec<String>,
+}
+
+/// `fields` as a map keyed by name, or as a list of fields each carrying its name.
+///
+/// A visitor rather than an untagged enum, so a field that fails to read is reported for what is
+/// wrong with it, not as a body that matched neither shape. In a list every field must name itself,
+/// and once: a second field under one name would otherwise replace the first without a word.
+fn fields_by_name<'de, D>(deserializer: D) -> Result<HashMap<String, FieldDef>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct FieldsVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for FieldsVisitor {
+        type Value = HashMap<String, FieldDef>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a map of fields by name, or a list of fields each with a name")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut fields = HashMap::with_capacity(map.size_hint().unwrap_or(0));
+            while let Some((name, field)) = map.next_entry::<String, FieldDef>()? {
+                fields.insert(name, field);
+            }
+            Ok(fields)
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut fields = HashMap::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some(field) = seq.next_element::<FieldDef>()? {
+                if field.name.is_empty() {
+                    return Err(A::Error::custom(
+                        "a field in a list of fields needs its name",
+                    ));
+                }
+                if fields.contains_key(&field.name) {
+                    return Err(A::Error::custom(format!(
+                        "field '{}' is listed twice",
+                        field.name
+                    )));
+                }
+                fields.insert(field.name.clone(), field);
+            }
+            Ok(fields)
+        }
+    }
+
+    deserializer.deserialize_any(FieldsVisitor)
 }
 
 impl Default for IndexSchema {

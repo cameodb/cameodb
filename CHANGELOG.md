@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   elements carries `_truncated_arrays`, naming each shortened array by its path with the length
   it had; `array 0` returns the lengths without the elements. `CAMEODB_DEFAULT_ARRAY_LIMIT` sets
   the default from the environment.
+- **A schema read is a schema write.** `PUT /api/{index}/_config` takes exactly what
+  `GET /api/{index}/_config` returns — `fields` as a list, `type`, `shadow`, and the read-only keys
+  ignored — so a saved read restores the schema it came from, and its `thumbprint` proves it. The
+  read reports what it lacked for that: each `text` and `string` field's `index_record_option`
+  and resolved `tokenizer`, `learned: true` on a field added by a write, and `routing_field_name`
+  when it is not `id`. MCP `describe_index` leaves the record option out.
 
 ### Changed
 
@@ -41,6 +47,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   index by another id rewrites its schema, carrying over each field's type, tokenizer and
   description; the `default_fields` list was dropped, so bare terms went back to searching every
   text field. It is kept now, less a field the new id turns into its shadow.
+- **`data load --id` read a field's record option from its tokenizer.** It now takes the one the
+  node reports, so a `raw` text field with positions keeps them; against a node that reports
+  none, `raw` still reads as `Basic`, the postings the loader gives its category columns.
 
 ## [0.3.7] - 2026-10-18
 

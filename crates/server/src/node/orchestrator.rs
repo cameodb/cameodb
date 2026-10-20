@@ -3944,11 +3944,17 @@ impl NodeOrchestrator {
         searched: &[String],
     ) -> Vec<JsonValue> {
         let document_key = storage::document_key_field(schema);
+        // The tokenizer and record option each field resolves to — what the index is built with
+        // and the thumbprint hashes — rather than what was written: a field that declared none
+        // and one that declared the default are the same field, and a read that dropped the
+        // record option would restore a `raw` column with positions it never had.
+        let mut resolved = schema.clone();
+        resolved.normalize_after_deserialization();
         Self::sorted_field_names(schema)
             .into_iter()
             .filter(|name| name != "_seq")
             .filter_map(|name| {
-                let field = schema.fields.get(&name)?;
+                let field = resolved.fields.get(&name)?;
                 let mut entry = JsonMap::new();
                 entry.insert("name".to_string(), JsonValue::String(name.clone()));
                 entry.insert(
@@ -3992,6 +3998,16 @@ impl NodeOrchestrator {
                         JsonValue::String(tokenizer.clone()),
                     );
                 }
+                if let Some(option) = &field.index_record_option {
+                    entry.insert(
+                        "index_record_option".to_string(),
+                        JsonValue::String(option.clone()),
+                    );
+                }
+                // Added by a write, not declared: it accepts values a declared field refuses.
+                if field.learned {
+                    entry.insert("learned".to_string(), JsonValue::Bool(true));
+                }
                 Some(JsonValue::Object(entry))
             })
             .collect()
@@ -3999,9 +4015,11 @@ impl NodeOrchestrator {
 
     /// The schema as a caller reads it back.
     ///
-    /// Everything the schema carries belongs here, not only its fields. This response is not just
-    /// read: `PATCH /_schema` decodes it, edits what it was asked to change and writes the whole
-    /// thing back, so a property omitted here is a property erased by an unrelated edit.
+    /// Everything the schema carries belongs here, not only its fields: this response is a
+    /// complete definition, and `PUT /_config` takes it back as it is ([`IndexSchema`] reads this
+    /// shape). A property omitted here is one a caller restoring a saved read would lose without
+    /// a word, so every property the thumbprint covers is reported — resolved, as the thumbprint
+    /// hashes it — and the read-only keys beside them are ignored on the way back in.
     pub(super) fn schema_response(
         index: &str,
         schema: &IndexSchema,
@@ -4032,6 +4050,14 @@ impl NodeOrchestrator {
             map.insert(
                 "id_fields".to_string(),
                 JsonValue::from(schema.id_fields.clone()),
+            );
+        }
+        // Only when it is not `id`, which nothing in the product changes; the thumbprint covers
+        // it, so a definition without it would not restore an index that had another.
+        if schema.routing_field_name != "id" {
+            map.insert(
+                "routing_field_name".to_string(),
+                JsonValue::String(schema.routing_field_name.clone()),
             );
         }
         let (searched, truncated) =

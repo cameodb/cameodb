@@ -2226,6 +2226,82 @@ mod tests {
         );
     }
 
+    /// A schema as `GET /_config` reports it is a schema `PUT /_config` takes, and the same one.
+    ///
+    /// The read shape — `fields` a list, `type`, `shadow`, resolved tokenizers and record options,
+    /// and keys only a read carries — reads into the schema the declaration made, so the
+    /// thumbprint of a saved read is the thumbprint of the index it was read from. The column a
+    /// loader writes for a category, `text` with `raw` and `Basic`, is the case the record option
+    /// decides: read without it, it comes back with positions.
+    #[test]
+    fn a_schema_read_back_is_the_schema_declared() {
+        let declared: IndexSchema = serde_json::from_value(serde_json::json!({
+            "description": "hourly wifi",
+            "default_fields": ["body"],
+            "id_fields": ["mac"],
+            "routing_field_name": "mac",
+            "fields": {
+                "country": {"field_type": "text", "fast": true, "tokenizer": "raw",
+                            "index_record_option": "Basic", "description": "ISO code"},
+                "body": {"field_type": "text"},
+                "n": {"field_type": "i64"},
+                "mac": {"field_type": "text", "is_shadow": true, "indexed": false},
+                "seen": {"field_type": "f64", "indexed": false, "learned": true}
+            }
+        }))
+        .expect("declared");
+        let read: IndexSchema = serde_json::from_value(serde_json::json!({
+            "name": "wifi", "version": 7, "thumbprint": "0000000000000000", "field_count": 6,
+            "description": "hourly wifi",
+            "default_fields": ["body"],
+            "id_fields": ["mac"],
+            "routing_field_name": "mac",
+            "fields": [
+                {"name": "body", "type": "text", "indexed": true, "stored": false, "fast": false,
+                 "shadow": false, "searchable": true, "sortable": false, "default_search": true,
+                 "tokenizer": "default", "index_record_option": "WithFreqsAndPositions"},
+                {"name": "country", "type": "text", "indexed": true, "stored": false, "fast": true,
+                 "shadow": false, "searchable": true, "sortable": true, "default_search": false,
+                 "description": "ISO code", "tokenizer": "raw", "index_record_option": "Basic"},
+                {"name": "mac", "type": "text", "indexed": false, "stored": false, "fast": false,
+                 "shadow": true, "searchable": true, "sortable": false, "default_search": false},
+                {"name": "n", "type": "i64", "indexed": true, "stored": false, "fast": true,
+                 "shadow": false, "searchable": true, "sortable": true, "default_search": false},
+                {"name": "seen", "type": "f64", "indexed": false, "stored": false, "fast": true,
+                 "shadow": false, "searchable": false, "sortable": false, "default_search": false,
+                 "learned": true}
+            ]
+        }))
+        .expect("read");
+        assert_eq!(
+            read.calculate_fingerprint(),
+            declared.calculate_fingerprint()
+        );
+        assert_eq!(read.fields["mac"].name, "mac");
+        assert!(read.fields["mac"].is_shadow);
+
+        // Without the record option the category column is another column.
+        let mut lossy = read.clone();
+        lossy.fields.get_mut("country").unwrap().index_record_option = None;
+        assert_ne!(
+            lossy.calculate_fingerprint(),
+            declared.calculate_fingerprint()
+        );
+    }
+
+    /// In a list every field names itself, once.
+    #[test]
+    fn a_list_of_fields_names_each_once() {
+        let unnamed = serde_json::from_value::<IndexSchema>(serde_json::json!({
+            "fields": [{"type": "text"}]
+        }));
+        assert!(unnamed.unwrap_err().to_string().contains("needs its name"));
+        let twice = serde_json::from_value::<IndexSchema>(serde_json::json!({
+            "fields": [{"name": "a", "type": "text"}, {"name": "a", "type": "i64"}]
+        }));
+        assert!(twice.unwrap_err().to_string().contains("listed twice"));
+    }
+
     /// Free text is length-prefixed in the hash, so no two schemas collide by concatenation.
     ///
     /// The previous NUL-separated form was written for field names, which may not contain the

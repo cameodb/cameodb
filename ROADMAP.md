@@ -63,7 +63,7 @@ on one.
 | M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed; M1, M2, M3, M4, M5 and M7 done — the blocker is cleared, the surface is metered, and tenants are bounded and isolated per index. No feature build remains; M8 closed with the prefix floor and default-field cap, the clause cap deferred. M6 done: the open-loop arms show goodput degrading rather than collapsing on the bulk, single-write and read lanes, after fixing the two defects its arms found — [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) and [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput), and its confirmation run on 2026-09-27 found OB22 costs a single node nothing measurable. What is left is the release cut |
 | N — Pre-0.3.6 whole-code review | 📋 Planned | N1–N10 before the 0.3.6 cut: a `HEAD` authorization gap, batched writes that never learn a field, a peer's 400 answered as 503, node identity replaced silently, query rewrites by substring, three client errors, the first shard's memory budget, streaming broadcast, a storage shutdown race, flattened storage errors. N11–N17 after it: one way to reach a peer, dead surface, `run_change`, typed boundaries, single owners, the orchestrator split |
 | O — Post-0.3.6 review: the next-iteration base | ◐ Partial | O1 (the `wal_sync=false` durability barrier) and O2 (deadlines on every remote ask) done 2026-10-15. Left: O3, shard-map merges on a per-owner epoch (the prerequisite N15 does not name, and since 2026-10-18 the one [OB27](#ob27--a-replaced-node-never-leaves-the-cluster)'s `forget` needs), and O4, the request budget on the wire. O5 folds Rust-surface items into N16/N17; O6 reconciles the architecture doc |
-| P — Post-0.3.7 features | ✅ Done | P1, a cap on how many elements of each array a search hit carries — a node default, a node maximum, and `array N` per request — done 2026-10-19. P2, one declaration of an index's default fields — `searched_by_default` dropped, the `--id` reload keeps the list — done 2026-10-20 |
+| P — Post-0.3.7 features | ✅ Done | P1, a cap on how many elements of each array a search hit carries — a node default, a node maximum, and `array N` per request — done 2026-10-19. P2, one declaration of an index's default fields — `searched_by_default` dropped, the `--id` reload keeps the list — done 2026-10-20. P3, a schema read is a schema write — `PUT` takes a `GET`, which now reports every property the thumbprint covers — done 2026-10-21 |
 
 ## Reconciliation, 2026-08-26
 
@@ -246,6 +246,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [F11](#f11--the-disk-a-delete-frees-was-never-returned) | The disk a delete frees was never returned — `cameodb compact` and `--rewrite` (redb, offline) and `POST /_admin/index/{index}/merge` (Tantivy, online) done; reclaiming deleted documents automatically, behind a setting, planned | — | 2026-10-16 | ◐ |
 | [P1](#p1--a-hits-arrays-are-capped-the-way-its-hits-are) | A hit's arrays are capped the way its hits are — `[search] default_array_limit`, `[security.limits] max_array_limit`, `array N` per request; found validating 0.3.7 on the threat-intel dataset, where one field carries a few hundred thousand addresses | — | 2026-10-19 | ✅ |
 | [P2](#p2--one-declaration-of-an-indexs-default-fields) | One declaration of an index's default fields — `default_fields` is the only list, each field's `default_search` the effective set; `searched_by_default` dropped, and `data load --id` keeps a declared list | — | 2026-10-20 | ✅ |
+| [P3](#p3--a-schema-read-is-a-schema-write) | A schema read is a schema write — `PUT /_config` takes a `GET /_config` as it is, and the read reports the record option, `learned` and the routing field it lacked, so a saved read restores its index and the thumbprint proves it | — | 2026-10-21 | ✅ |
 
 ---
 
@@ -6852,6 +6853,47 @@ first.
   with neither list nor descriptions.
 - Docs: the `/_config` key table and example, `CONFIGURATION.md`'s cap section, a `CHANGELOG`
   entry under Changed (a response key removed) and one under Fixed (the `--id` reload).
+
+### P3 — A schema read is a schema write
+
+✅ **Done 2026-10-21.** Found keeping a history of `narodne_novine`'s schema: a saved
+`GET /_config` could not be sent back. `PUT` refused it outright — `fields` a list where it takes a
+map, `type` and `shadow` where it takes `field_type` and `is_shadow` — and the read was not a
+complete definition either. It never reported `index_record_option`, `learned` or
+`routing_field_name`, all three in the thumbprint. A missing property is filled with its default
+by `normalize_after_deserialization`, so a read rebuilds exactly only where every value is the
+default. `narodne_novine` does (its `raw` fields are `string`); a schema `data load` wrote does not:
+its category columns are `text` + `raw` + `Basic`. Measured on a probe: the index read
+`f3aa477f…`, the schema rebuilt from that read `e1da1e36…`, and the rebuild `PUT` back onto the
+populated index was refused, `country: index record option Basic → WithFreqsAndPositions`. The
+client worked around it with a guess (`raw` ⇒ `Basic` in `schema_for_new_id`), and the
+`index-describe` skill's body builder had the same hole.
+
+**What changed.**
+
+- storage: `IndexSchema` reads `fields` as a map or as a list of named fields
+  (`fields_by_name`, a visitor, so a bad field is still reported for what is wrong with it; a
+  list naming a field twice or a field without a name is refused); `FieldDef` takes `type` and
+  `shadow` as aliases. Read-only keys were already ignored, and the node already decides the
+  version, so a read is a declaration. Schemas travel between nodes and to disk as JSON, so the
+  wider reader is safe on every path.
+- server: `describe_fields` reports each field from a normalized copy — the tokenizer and record
+  option the index is built with — plus `learned: true` when set; `schema_response` reports
+  `routing_field_name` when it is not `id`. Its doc comment claimed `PATCH` decodes this response;
+  `PATCH` reads the stored schema through `FindSchemaInCluster`, and the comment says what the
+  response is for now.
+- MCP: `describe_index` drops `index_record_option` from each field — no query can act on it —
+  and its doc comment, which described a projection that no longer exists, says what it does.
+- client: `schema_for_new_id` takes the reported record option; the `raw` ⇒ `Basic` reading stays
+  only for a node that reports none.
+- skill: `schema_body.py` sends the read itself with descriptions replaced, and after `--apply`
+  compares the reads before and after, everything but descriptions.
+- tests: storage — a read-shaped and a declared schema hash the same, and without the record
+  option the category column does not; a list's names are checked. HTTP — a populated index with
+  a loader-style category column, a learned field and a routing field takes its own read back
+  `unchanged`, at the same version and thumbprint.
+- docs: the API reference's `PUT` section (save and restore with `curl`, the thumbprint as proof),
+  the `GET` key tables, and a `CHANGELOG` entry under Added and one under Fixed.
 
 ---
 

@@ -1164,11 +1164,19 @@ mod detect_tests {
                 json!({"name": "ssids", "type": "text", "tokenizer": "raw", "indexed": true,
                        "description": "SSIDs seen"}),
                 json!({"name": "extra", "type": "i64", "indexed": true}),
+                json!({"name": "notes", "type": "text", "tokenizer": "raw",
+                       "index_record_option": "WithFreqsAndPositions"}),
             ],
             ..Default::default()
         };
         let rebuilt = schema_for_new_id(&analysis(text, Some(&spec)), &existing).expect("schema");
         let fields = &rebuilt["fields"];
+        // The record option as reported wins; with none reported, `raw` reads as `Basic`.
+        assert_eq!(
+            fields["notes"]["index_record_option"],
+            json!("WithFreqsAndPositions")
+        );
+        assert_eq!(fields["ssids"]["index_record_option"], json!("Basic"));
         assert_eq!(rebuilt["id_fields"], json!(["mac", "Hr"]));
         // The old id's shadow is an ordinary field again; the edits survive.
         assert_eq!(fields["serial"]["is_shadow"], json!(false));

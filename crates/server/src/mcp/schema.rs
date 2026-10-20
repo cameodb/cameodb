@@ -134,19 +134,22 @@ pub(super) fn extract_field_names(value: &JsonValue) -> Vec<String> {
         .collect()
 }
 
-/// Turn `{index, stats, schema}` into the entry the discovery tools return.
-///
-/// Projects the schema's field map into a compact array — `field`, `type`, `indexed`, `fast`,
-/// `shadow`, and `description` where one exists — lifts the index description alongside it, adds
-/// one `query_hint` per field type present, and drops the schema it was built from. The
-/// projection is the point: the schema map carries tokenizers and record options that no caller
-/// writing a query can act on, and on a wide index they are most of the response.
+/// Turn an index's schema block into the entry `describe_index` returns: the block as
+/// `GET /_config` reports it, with one `query_hint` per field type present, and without each
+/// field's `index_record_option`. That one is in the block so a read restores the index it came
+/// from; a caller writing a query cannot act on it — the tokenizer already says `raw` is exact
+/// match only — and on a wide index it would be a line per field of an agent's context.
 /// [`enrich_index_entry`] for an entry held by reference.
 pub(super) fn enrich_index_entry_owned(entry: &JsonValue) -> JsonValue {
     enrich_index_entry(entry.clone())
 }
 
 pub(super) fn enrich_index_entry(mut entry: JsonValue) -> JsonValue {
+    if let Some(fields) = entry.get_mut("fields").and_then(JsonValue::as_array_mut) {
+        for field in fields.iter_mut().filter_map(JsonValue::as_object_mut) {
+            field.remove("index_record_option");
+        }
+    }
     let field_infos = extract_field_info(&entry);
 
     // One hint per distinct type rather than per field: the hint depends on nothing else, so on

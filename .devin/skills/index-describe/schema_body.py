@@ -4,14 +4,18 @@
     python3 schema_body.py --index narodne_novine --descriptions desc.json --out body.json
     python3 schema_body.py --index narodne_novine --descriptions desc.json --out body.json --apply
 
-`desc.json` is {"description": "...", "fields": {"<field>": "...", ...}}; a field it leaves out keeps the
-description it has, and "" clears one. Everything else — types, tokenizers, fast columns, default fields,
-id fields — is copied from `GET /_config`, so the body changes descriptions and nothing else. The live
-schema is saved first, complete as GET reports it (<index>.v<version>.<thumbprint>.json), and the new one after
---apply, so every version the node held is on record. A
-description is not a built column: a node accepts the body on an index holding documents and rebuilds
-nothing. The body is checked before it is written: lengths (index 512, field 200 characters), names the
-index does not have, and the old and new text of every change. `--apply` sends it.
+`desc.json` is {"description": "...", "fields": {"<field>": "...", ...}}; a field it leaves out keeps
+the description it has, and "" clears one. The body is the `GET /_config` read itself with the
+descriptions replaced: a read is a complete definition — types, tokenizers, record options, fast
+columns, default and id fields — and a node with ROADMAP P3 takes it back as it is, so the body
+changes descriptions and nothing else. A description is not a built column, so a node accepts the
+body on an index holding documents and rebuilds nothing.
+
+Before anything is written the body is checked: lengths (index 512, field 200 characters), names the
+index does not have, and the old and new text of every change. The live schema is saved first,
+complete as GET reports it (<index>.v<version>.<thumbprint>.json), and after --apply the new one too,
+so every version the node held is on record; the two reads are then compared, and anything but a
+description having moved is an error.
 """
 import argparse, json, os, sys, urllib.error, urllib.request
 
@@ -42,16 +46,12 @@ def save_version(live, directory, index):
     return path
 
 
-def put_field(f, description):
-    """A field as `PUT` takes it, from the shape `GET` reports it in."""
-    out = {'name': f['name'], 'field_type': f['type'], 'indexed': f.get('indexed', True),
-           'stored': f.get('stored', False), 'fast': f.get('fast', False), 'is_shadow': f.get('shadow', False)}
-    for k in ('tokenizer', 'index_record_option'):
-        if f.get(k):
-            out[k] = f[k]
-    if description:
-        out['description'] = description
-    return out
+def structure(schema):
+    """A read without its descriptions and the keys a read alone carries: what must not move."""
+    keep = {k: v for k, v in schema.items() if k not in ('description', 'version', 'thumbprint', 'fields')}
+    keep['fields'] = sorted(({k: v for k, v in f.items() if k != 'description'} for f in schema['fields']),
+                            key=lambda f: f['name'])
+    return keep
 
 
 def main():
@@ -81,20 +81,22 @@ def main():
     if index_desc != live.get('description'):
         changes.append(('(index)', live.get('description'), index_desc))
 
-    body_fields = {}
-    for name, f in fields.items():
+    # The body is the read itself with the descriptions replaced: a read is a complete definition
+    # and the node takes it back as it is, so nothing it does not describe can be dropped here.
+    body = json.loads(json.dumps(live))
+    body['description'] = index_desc
+    for f in body['fields']:
+        name = f['name']
         desc = new.get('fields', {}).get(name, f.get('description'))
         if desc and len(desc) > MAX_FIELD:
             problems.append(f'{name}: {len(desc)} characters, the limit is {MAX_FIELD}')
         if (desc or None) != f.get('description'):
             changes.append((name, f.get('description'), desc))
-        body_fields[name] = put_field(f, desc)
-
-    body = {'description': index_desc, 'fields': body_fields}
-    if live.get('default_fields'):
-        body['default_fields'] = live['default_fields']
-    if live.get('id_fields'):
-        body['id_fields'] = live['id_fields']
+        if desc:
+            f['description'] = desc
+        else:
+            f.pop('description', None)
+    body_fields = {f['name']: f for f in body['fields']}
 
     saved = save_version(live, args.history or os.path.dirname(os.path.abspath(args.out)), args.index)
     print(f'live schema saved as {saved}')
@@ -117,6 +119,9 @@ def main():
             sys.exit(1)
         _, after = call(args.url, 'GET', f'/api/{args.index}/_config', args.key)
         print(f'new schema saved as {save_version(after, args.history or os.path.dirname(os.path.abspath(args.out)), args.index)}')
+        if structure(after) != structure(live):
+            sys.exit('the schema changed beyond its descriptions: compare the two saved versions')
+        print('only descriptions changed')
 
 
 if __name__ == '__main__':

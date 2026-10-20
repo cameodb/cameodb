@@ -1595,6 +1595,71 @@ async fn declaring_the_same_schema_again_keeps_the_version() {
     assert!(moved.get("unchanged").is_none(), "{moved}");
 }
 
+/// A schema read from the node is a schema the node takes back, unchanged.
+///
+/// The index holds documents, so anything the read lost would be refused as a change to the
+/// built index. It holds what a read most easily loses: a category column the way the loader
+/// writes one (`text`, `raw`, `Basic` postings), a field learned from a write, and a routing field
+/// that is not `id`. The read reports each, the read sent back is `unchanged` at the same
+/// version, and the thumbprint is the one it had.
+#[tokio::test]
+async fn a_schema_read_back_is_taken_back_unchanged() {
+    let node = TestNode::start("").await;
+    let (status, body) = put_config(
+        &node,
+        "wifi",
+        &json!({
+            "description": "Hourly wifi scans.",
+            "routing_field_name": "mac",
+            "default_fields": ["notes"],
+            "fields": {
+                "id": {"field_type": "text"},
+                "country": {"field_type": "text", "fast": true, "tokenizer": "raw",
+                            "index_record_option": "Basic", "description": "ISO code"},
+                "notes": {"field_type": "text"},
+                "n": {"field_type": "i64"}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let client = node.client();
+    client
+        .write_document(
+            "wifi",
+            "w1",
+            &json!({"country": "HR", "notes": "scan", "n": 1, "seen_by": "probe-7"}),
+            None,
+        )
+        .await
+        .expect("write");
+    client.admin_index_commit("wifi").await.expect("commit");
+
+    let read = get_json(&node, "/api/wifi/_config").await;
+    let field = |name: &str| {
+        read["fields"]
+            .as_array()
+            .and_then(|f| f.iter().find(|f| f["name"] == name))
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} in {read}"))
+    };
+    assert_eq!(field("country")["index_record_option"], json!("Basic"));
+    assert_eq!(
+        field("notes")["index_record_option"],
+        json!("WithFreqsAndPositions"),
+        "resolved, though never declared"
+    );
+    assert_eq!(field("seen_by")["learned"], json!(true), "{read}");
+    assert_eq!(read["routing_field_name"], json!("mac"), "{read}");
+
+    let (status, again) = put_config(&node, "wifi", &read).await;
+    assert_eq!(status, 200, "{again}");
+    assert_eq!(again["unchanged"], json!(true), "{again}");
+    assert_eq!(again["version"], read["version"], "{again}");
+    let after = get_json(&node, "/api/wifi/_config").await;
+    assert_eq!(after["thumbprint"], read["thumbprint"], "{after}");
+}
+
 /// A field that first arrives after the index exists takes every value written to it: its type
 /// widens to hold them — `i64`, then `f64`, then `text` — instead of refusing the documents whose
 /// value did not fit the first one.

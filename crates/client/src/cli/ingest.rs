@@ -605,9 +605,13 @@ pub(crate) fn schema_for_new_id(
             .get("tokenizer")
             .and_then(JsonValue::as_str)
             .map(str::to_string);
-        if field.tokenizer.as_deref() == Some("raw") {
-            field.index_record_option = Some("Basic".to_string());
-        }
+        // The record option as the node reports it. A node from before it did reports none, and
+        // this loader writes `raw` columns with `Basic` postings, so that is the reading there.
+        field.index_record_option = declared
+            .get("index_record_option")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string)
+            .or_else(|| (field.tokenizer.as_deref() == Some("raw")).then(|| "Basic".to_string()));
         field.description = declared
             .get("description")
             .and_then(JsonValue::as_str)
