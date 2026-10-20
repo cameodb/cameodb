@@ -1176,6 +1176,35 @@ mod detect_tests {
         assert_eq!(fields["ssids"]["description"], json!("SSIDs seen"));
         assert_eq!(fields["extra"]["field_type"], json!("i64"));
         assert_eq!(rebuilt["description"], json!("hourly wifi"));
+        assert!(
+            rebuilt.get("default_fields").is_none(),
+            "nothing declared, nothing invented"
+        );
+    }
+
+    /// A declared list of default fields survives a change of id, less a field the new id makes
+    /// its shadow — which a bare term cannot search, so the node would refuse the list.
+    #[test]
+    fn declared_default_fields_survive_a_change_of_id() {
+        let text = "mac,serial,ssids\nAA,s1,x\nBB,s2,y\n";
+        let spec = IdSpec::parse("mac").expect("spec");
+        let existing = ExistingSchema {
+            id_fields: vec!["serial".to_string()],
+            shadow_field: Some("serial".to_string()),
+            default_fields: Some(vec![
+                "mac".to_string(),
+                "ssids".to_string(),
+                "serial".to_string(),
+            ]),
+            fields: vec![
+                json!({"name": "serial", "type": "text", "shadow": true}),
+                json!({"name": "ssids", "type": "text", "indexed": true}),
+            ],
+            ..Default::default()
+        };
+        let rebuilt = schema_for_new_id(&analysis(text, Some(&spec)), &existing).expect("schema");
+        assert_eq!(rebuilt["fields"]["mac"]["is_shadow"], json!(true));
+        assert_eq!(rebuilt["default_fields"], json!(["ssids", "serial"]));
     }
 
     /// A JSON source is profiled by its documents' values: `"12"` is a count, `"true"` a flag,

@@ -698,6 +698,10 @@ pub struct IndexConfigResponse {
     /// schema does not record them, as on a node from before it could.
     #[serde(default)]
     pub id_fields: Vec<String>,
+    /// The fields an unqualified term searches, in priority order, as the index declares them.
+    /// `None` when it declares none and the node's own choice applies.
+    #[serde(default)]
+    pub default_fields: Option<Vec<String>>,
     /// Raised by every change to the schema, and above a dropped index's when the name is
     /// reused. Defaulted, so an older node that does not send it still parses.
     #[serde(default)]

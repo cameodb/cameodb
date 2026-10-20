@@ -1074,8 +1074,9 @@ shard. Where each field holds its own vocabulary the other fields are dictionary
 - **Past the cap a bare term is narrowed, not refused.** It searches the index's declared
   `default_fields` in their order, or else its fields **by name**, up to the cap. By name because
   every shard has to pick the same fields, and each shard's own field order is an accident of how
-  its index was built. The index reports what a bare term searches under `searched_by_default`,
-  with `default_fields_truncated: true` when the cap cut it; each field carries `default_search`.
+  its index was built. Each field's `default_search` in `GET /api/{index}/_config` says whether a
+  bare term reaches it, and the index carries `default_fields_truncated: true` when the cap cut
+  the set; `default_fields` appears only when declared.
   A search it narrowed carries `_narrowed_default_fields` naming the fields reached, and the MCP
   tools add a `_warning` — advisory, as for an approximate sort, never a refusal.
 - **Choose the fields with `default_fields`** on the index, in `PUT /api/{index}/_config` or

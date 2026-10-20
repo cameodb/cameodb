@@ -27,6 +27,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the cap is on by default. A hit that was cut says so in `_truncated_arrays`; set
   `[search] default_array_limit` up to `max_array_limit` to restore longer arrays without
   changing callers.
+- **A schema lists its default fields once.** `GET /api/{index}/_config`, `GET /_indexes` and
+  the MCP `describe_index` no longer carry `searched_by_default`. It repeated `default_fields`
+  whenever one was declared, and each field's `default_search` already said the same thing.
+  `default_fields` is the one list: present when declared, exactly as declared, and never
+  generated when not. What a bare term searches is each field's `default_search`, and
+  `default_fields_truncated` still says when the node's cap cut it. A caller that read
+  `searched_by_default` takes the fields whose `default_search` is `true`.
+
+### Fixed
+
+- **`data load --id` kept an index's fields but not its declared default fields.** Loading an
+  index by another id rewrites its schema, carrying over each field's type, tokenizer and
+  description; the `default_fields` list was dropped, so bare terms went back to searching every
+  text field. It is kept now, less a field the new id turns into its shadow.
 
 ## [0.3.7] - 2026-10-18
 

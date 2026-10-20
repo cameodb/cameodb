@@ -770,12 +770,12 @@ curl -s http://localhost:9480/api/books/_config
   "version": 3,
   "thumbprint": "f69a0b9e2146f661",
   "description": "Library catalogue, one document per edition.",
-  "searched_by_default": ["author", "title"],
+  "default_fields": ["title", "author"],
   "field_count": 3,
   "fields": [
-    {"name": "id", "type": "text", "indexed": true, "stored": true, "fast": false, "shadow": false, "searchable": true, "sortable": false},
-    {"name": "author", "type": "text", "indexed": true, "stored": false, "fast": false, "shadow": false, "searchable": true, "sortable": false},
-    {"name": "title", "type": "text", "indexed": true, "stored": false, "fast": false, "shadow": false, "searchable": true, "sortable": false,
+    {"name": "id", "type": "text", "indexed": true, "stored": true, "fast": false, "shadow": false, "searchable": true, "sortable": false, "default_search": false},
+    {"name": "author", "type": "text", "indexed": true, "stored": false, "fast": false, "shadow": false, "searchable": true, "sortable": false, "default_search": true},
+    {"name": "title", "type": "text", "indexed": true, "stored": false, "fast": false, "shadow": false, "searchable": true, "sortable": false, "default_search": true,
      "description": "Title as printed on the edition."}
   ]
 }
@@ -789,11 +789,10 @@ has one description. `fields` is ordered with `id` first, then alphabetically.
 | Key | Meaning |
 |-----|---------|
 | `version` | Advances on every change to this schema the cluster agrees, starting at 1 — a `PUT /_config`, a `PATCH /_schema`, and the round that agrees on fields learned from writes. Once per change however many fields it touches; a node that has just learned a field holds it at the version it had until that round, so for a moment two nodes can report the same version with different thumbprints. Compare versions for order and never for how much happened. Adopting a schema that already exists elsewhere keeps the version it came with, and declaring or editing it to what it already is changes nothing — the answer carries `"unchanged": true` and the version stays. Two nodes reporting a different version or thumbprint for one index have not converged yet |
-| `default_fields` | Present only when declared: the fields an unqualified term searches, in priority order. Under the name `PUT /_config` accepts, so reading a schema and writing it back keeps the declaration |
+| `default_fields` | Present only when declared, exactly as declared: the fields an unqualified term searches, in priority order. The one list of default fields a schema has, and part of the schema like its fields; under the name `PUT /_config` accepts. Absent when nothing is declared — nothing is generated in its place, since a list here would read as a declaration — and each field's `default_search` then says what a bare term searches |
 | `id_fields` | Present only when recorded: the fields whose values, joined in this order with a vertical bar, make each document's id |
 | `held_here` | Present, and `false`, when this node holds no copy of the schema and answered with the one its peers hold. A node takes an index's schema once one of its documents reaches it, so on a cluster a new index is held by some nodes before others. Its fields are then reported as declared: `searchable` when indexed, `sortable` when fast. Not found (`404`) only when every peer answered and none holds one; a peer that could not be asked is `503` |
-| `searched_by_default` | What an unqualified term actually searches: the declared list, or every indexed text, string and JSON field by name — either way cut to the node's `[security.limits] max_default_fields` (default 64) |
-| `default_fields_truncated` | Present, and `true`, when the cap cut `searched_by_default` short. A bare term then misses the fields left out; a query naming a field reaches it at any width |
+| `default_fields_truncated` | Present, and `true`, when the node's `[security.limits] max_default_fields` (default 64) cut what a bare term searches short. A bare term then misses the fields left out — their `default_search` is `false` — and a query naming a field reaches it at any width |
 | `thumbprint` | 16 hex digits over the **resolved** schema, so two nodes agree whenever they would build the same index. A declaration and the index built from it therefore match: it hashes what a field resolves to, not what was written, so an omitted tokenizer and the default it fills in are the same schema. Different thumbprints at the same `version` mean the two have genuinely diverged and no retry will settle it |
 
 The pair is what makes divergence answerable from outside the process. Compare
@@ -813,7 +812,7 @@ The per-field keys:
 | `shadow` | The field carries the identifier under its original name; queried through `id` |
 | `returned_as` | Present on `id` alone, and only on an index that has a shadow field: names the field hits carry the identifier under instead, since no hit on such an index carries an `id` |
 | `stored` | Kept in the search index as well as the document store |
-| `default_search` | Whether a term with no field in front of it searches this field — see `searched_by_default` |
+| `default_search` | Whether a term with no field in front of it searches this field. With `default_fields` declared: the declared fields the built index can search. Without: every field it can search as indexed text, string or json, other than `id` and a shadow, by name. Either way the first `max_default_fields` of them. Computed on each read, never stored |
 
 #### Change Field Indexing Flags
 Turn a field's `indexed` flag on or off on an existing schema.

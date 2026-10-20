@@ -617,10 +617,34 @@ pub(crate) fn schema_for_new_id(
             serde_json::to_value(field).context("Failed to serialize a field")?,
         );
     }
+    // A declared list of default fields is the schema's own, so it is kept too: the names the
+    // new schema can still search with a bare term, which loses only a field the new id makes its
+    // shadow. The node refuses a list naming a field it cannot search.
+    if let Some(declared) = &existing.default_fields {
+        let kept: Vec<&String> = declared
+            .iter()
+            .filter(|name| fields.get(name.as_str()).is_some_and(searchable_by_default))
+            .collect();
+        if !kept.is_empty() {
+            schema["default_fields"] = json!(kept);
+        }
+    }
     if let Some(description) = &existing.description {
         schema["description"] = JsonValue::String(description.clone());
     }
     Ok(schema)
+}
+
+/// Whether a built schema field may stand in `default_fields`: indexed text, string or json,
+/// and not a shadow — what the node checks a declared list against.
+fn searchable_by_default(field: &JsonValue) -> bool {
+    let indexed = field.get("indexed").and_then(JsonValue::as_bool) != Some(false);
+    let shadow = field.get("is_shadow").and_then(JsonValue::as_bool) == Some(true);
+    let searchable_type = field
+        .get("field_type")
+        .and_then(|t| serde_json::from_value::<TantivyFieldType>(t.clone()).ok())
+        .is_some_and(|t| t.is_default_searchable());
+    indexed && !shadow && searchable_type
 }
 
 /// A row's id from its id columns' values: the one value, or each joined with `|` in the order
@@ -1704,6 +1728,8 @@ pub(crate) struct ExistingSchema {
     /// The fields the index records its ids are made of.
     pub(crate) id_fields: Vec<String>,
     pub(crate) description: Option<String>,
+    /// The fields an unqualified term searches, when the index declares them.
+    pub(crate) default_fields: Option<Vec<String>>,
     /// Each field as the node describes it, for carrying a person's edits into a schema rebuilt
     /// for another id.
     pub(crate) fields: Vec<JsonValue>,
@@ -1754,6 +1780,7 @@ pub(crate) async fn existing_schema(
     let mut existing = ExistingSchema {
         id_fields: config.id_fields.clone(),
         description: config.description.clone(),
+        default_fields: config.default_fields.clone(),
         fields: config.fields.clone(),
         ..Default::default()
     };

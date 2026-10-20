@@ -63,7 +63,7 @@ on one.
 | M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed; M1, M2, M3, M4, M5 and M7 done — the blocker is cleared, the surface is metered, and tenants are bounded and isolated per index. No feature build remains; M8 closed with the prefix floor and default-field cap, the clause cap deferred. M6 done: the open-loop arms show goodput degrading rather than collapsing on the bulk, single-write and read lanes, after fixing the two defects its arms found — [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) and [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput), and its confirmation run on 2026-09-27 found OB22 costs a single node nothing measurable. What is left is the release cut |
 | N — Pre-0.3.6 whole-code review | 📋 Planned | N1–N10 before the 0.3.6 cut: a `HEAD` authorization gap, batched writes that never learn a field, a peer's 400 answered as 503, node identity replaced silently, query rewrites by substring, three client errors, the first shard's memory budget, streaming broadcast, a storage shutdown race, flattened storage errors. N11–N17 after it: one way to reach a peer, dead surface, `run_change`, typed boundaries, single owners, the orchestrator split |
 | O — Post-0.3.6 review: the next-iteration base | ◐ Partial | O1 (the `wal_sync=false` durability barrier) and O2 (deadlines on every remote ask) done 2026-10-15. Left: O3, shard-map merges on a per-owner epoch (the prerequisite N15 does not name, and since 2026-10-18 the one [OB27](#ob27--a-replaced-node-never-leaves-the-cluster)'s `forget` needs), and O4, the request budget on the wire. O5 folds Rust-surface items into N16/N17; O6 reconciles the architecture doc |
-| P — Post-0.3.7 features | ✅ Done | P1, a cap on how many elements of each array a search hit carries — a node default, a node maximum, and `array N` per request — done 2026-10-19 |
+| P — Post-0.3.7 features | ✅ Done | P1, a cap on how many elements of each array a search hit carries — a node default, a node maximum, and `array N` per request — done 2026-10-19. P2, one declaration of an index's default fields — `searched_by_default` dropped, the `--id` reload keeps the list — done 2026-10-20 |
 
 ## Reconciliation, 2026-08-26
 
@@ -245,6 +245,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [F10](#f10--fast-field-projection-the-pages-fields-answered-from-the-columns) | Fast-field projection — the page's fields answered from the columns, and the fetch phase skipped when they can be; the last layer of the search-economics work opened by the TS5 outage — deferred: the gain over the two-phase search is small for today's workloads, and the design is filed so it can be picked up | — | 2026-10-09 | 💭 |
 | [F11](#f11--the-disk-a-delete-frees-was-never-returned) | The disk a delete frees was never returned — `cameodb compact` and `--rewrite` (redb, offline) and `POST /_admin/index/{index}/merge` (Tantivy, online) done; reclaiming deleted documents automatically, behind a setting, planned | — | 2026-10-16 | ◐ |
 | [P1](#p1--a-hits-arrays-are-capped-the-way-its-hits-are) | A hit's arrays are capped the way its hits are — `[search] default_array_limit`, `[security.limits] max_array_limit`, `array N` per request; found validating 0.3.7 on the threat-intel dataset, where one field carries a few hundred thousand addresses | — | 2026-10-19 | ✅ |
+| [P2](#p2--one-declaration-of-an-indexs-default-fields) | One declaration of an index's default fields — `default_fields` is the only list, each field's `default_search` the effective set; `searched_by_default` dropped, and `data load --id` keeps a declared list | — | 2026-10-20 | ✅ |
 
 ---
 
@@ -6805,6 +6806,52 @@ validation, and a two-node search over a document with a 300k-element array that
 answer and `_truncated_arrays`. **Docs:** `docs/CONFIGURATION.md`, `docs/API_REFERENCE.md`, the MCP
 syntax reference (`crates/mcp/src/syntax.rs`) and guidance, `cameodb.example.toml`, and a
 `CHANGELOG.md` entry naming the new default, since existing callers start receiving shorter arrays.
+
+### P2 — One declaration of an index's default fields
+
+✅ **Done 2026-10-20.** Found writing descriptions for `narodne_novine`: its `GET /_config` listed
+the same five fields under `default_fields` and under `searched_by_default`, and a third time as
+each field's `default_search`. Not an artifact of two periods — all three came in one commit,
+`ee5e76e` (M8): the declaration for a read-modify-write, the effective set for a reader, the
+flag per field. On an index that declares its list within the cap the second always equals the
+first.
+
+**The state.**
+
+1. *Stored.* `IndexSchema::default_fields` is the only declaration. Present, it is part of the
+   schema like its fields — set by `PUT /_config` or `PATCH /_schema`, versioned, no reindex.
+   Absent, nothing is declared and the algorithm below decides.
+2. *Effective, computed on each search and each read, never stored* (`select_default_fields`):
+   the candidates are the fields the built index can search with a bare term — indexed text,
+   string or json, not a shadow, not `id`. Declared: the declared names among them, in declared
+   order. Undeclared: all of them by name, so every shard picks the same. Then the first
+   `[security.limits] max_default_fields`.
+3. *Reported* (`GET /_config`, `GET /_indexes`, `describe_index`): `default_fields` only when
+   declared, exactly as declared — the one list. Nothing generated in its place: a list there
+   reads as a declaration, and written back it becomes one. The effective set is each field's
+   `default_search`; `default_fields_truncated: true` when the cap cut it. A search keeps its
+   own `_narrowed_default_fields`.
+4. *Written.* `PUT` with the key absent declares nothing, `[]` is refused, every name is checked.
+   `PATCH` `[]` clears, since an absent key there leaves the list alone. A `PUT` replaces the
+   whole schema, so a writer rebuilding the schema of an existing index carries the declaration
+   over as it carries descriptions.
+5. *Client.* `schema detect`, and `data load` into a new index, declare nothing. A load that
+   rebuilds an existing index's schema for another id keeps the declaration. `schema load`
+   replaces the schema with the one it is given: a schema file's own `default_fields` and
+   descriptions, or none from a data file.
+
+**What changed.**
+
+- `NodeOrchestrator::insert_default_search` no longer writes `searched_by_default`; the
+  effective set still feeds `describe_fields`, so `default_search` is unchanged. The HTTP test
+  reads the flags in its place and asserts the key is gone from `/_config` and the listing.
+- Client: `IndexConfigResponse::default_fields`, carried by `ExistingSchema`, and
+  `schema_for_new_id` keeps the names the rebuilt schema can still search with a bare term — it
+  drops only a field the new id makes its shadow, which the node would refuse.
+- `schema load` needed no change: it already sends a schema file as written and a detected one
+  with neither list nor descriptions.
+- Docs: the `/_config` key table and example, `CONFIGURATION.md`'s cap section, a `CHANGELOG`
+  entry under Changed (a response key removed) and one under Fixed (the `--id` reload).
 
 ---
 

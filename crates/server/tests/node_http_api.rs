@@ -4485,6 +4485,19 @@ async fn patch_schema_body(
 ///
 /// Three text fields `a`, `b`, `c`, each holding a word found nowhere else, on a node capped at
 /// two — so whether a bare word matches says which fields it was sent to.
+/// The fields of `entry` — a `GET /_config` body or a listing entry — a bare term searches,
+/// by each field's `default_search`, among `names`.
+fn searched_by_default(entry: &serde_json::Value, names: &[&str]) -> Vec<String> {
+    entry["fields"]
+        .as_array()
+        .expect("fields")
+        .iter()
+        .filter(|f| names.contains(&f["name"].as_str().unwrap()))
+        .filter(|f| f["default_search"].as_bool().unwrap())
+        .map(|f| f["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
 #[tokio::test]
 async fn default_fields_are_capped_declared_and_reported() {
     let node = TestNode::start("[security.limits]\nmax_default_fields = 2").await;
@@ -4560,12 +4573,13 @@ async fn default_fields_are_capped_declared_and_reported() {
     assert!(body.get("_narrowed_default_fields").is_none(), "{body}");
 
     let config = get_json(&node, "/api/wide/_config").await;
-    assert_eq!(config["searched_by_default"], json!(["a", "b"]), "{config}");
+    assert_eq!(searched_by_default(&config, &["a", "b", "c"]), ["a", "b"]);
     assert_eq!(config["default_fields_truncated"], true, "{config}");
     assert!(
         config.get("default_fields").is_none(),
-        "nothing declared: {config}"
+        "nothing declared, and nothing generated in its place: {config}"
     );
+    assert!(config.get("searched_by_default").is_none(), "{config}");
 
     // Declared by PATCH, no rebuild: the next search follows it.
     let (status, body) = patch_schema_body(&node, "wide", json!({"default_fields": ["c"]})).await;
@@ -4587,28 +4601,9 @@ async fn default_fields_are_capped_declared_and_reported() {
         json!(["c"]),
         "declared, for PUT to round-trip"
     );
-    assert_eq!(config["searched_by_default"], json!(["c"]));
+    assert!(config.get("searched_by_default").is_none(), "{config}");
     assert!(config.get("default_fields_truncated").is_none(), "{config}");
-    let default_search: Vec<(String, bool)> = config["fields"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|f| {
-            (
-                f["name"].as_str().unwrap().to_string(),
-                f["default_search"].as_bool().unwrap(),
-            )
-        })
-        .filter(|(name, _)| ["a", "b", "c"].contains(&name.as_str()))
-        .collect();
-    assert_eq!(
-        default_search,
-        [
-            ("a".to_string(), false),
-            ("b".to_string(), false),
-            ("c".to_string(), true)
-        ]
-    );
+    assert_eq!(searched_by_default(&config, &["a", "b", "c"]), ["c"]);
 
     // The listing reports the same.
     let listing = get_json(&node, "/_indexes").await;
@@ -4619,7 +4614,9 @@ async fn default_fields_are_capped_declared_and_reported() {
         .find(|i| i["name"] == "wide")
         .expect("listed")
         .clone();
-    assert_eq!(entry["searched_by_default"], json!(["c"]), "{entry}");
+    assert_eq!(entry["default_fields"], json!(["c"]), "{entry}");
+    assert!(entry.get("searched_by_default").is_none(), "{entry}");
+    assert_eq!(searched_by_default(&entry, &["a", "b", "c"]), ["c"]);
 
     // Refused: a name that is not a field, and un-indexing a listed field.
     let (status, body) =

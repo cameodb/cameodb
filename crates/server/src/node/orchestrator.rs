@@ -3914,22 +3914,21 @@ impl NodeOrchestrator {
         )
     }
 
-    /// Index-level keys describing default search: the declared list (under the name `PUT
-    /// /_config` accepts, so a read-modify-write keeps it), what a bare term actually searches,
-    /// and whether the cap narrowed it.
+    /// Index-level keys describing default search: the declared list, when there is one, and
+    /// whether the cap narrowed what a bare term searches.
+    ///
+    /// The declaration is the only list reported, under the name `PUT /_config` accepts, so a
+    /// read-modify-write keeps it. What a bare term actually searches is each field's
+    /// `default_search`: a list of it here would repeat the declaration whenever there is one,
+    /// and where there is none it would read as one — written back, it would become one.
     pub(super) fn insert_default_search(
         map: &mut JsonMap<String, JsonValue>,
         schema: &IndexSchema,
-        searched: &[String],
         truncated: bool,
     ) {
         if let Some(declared) = &schema.default_fields {
             map.insert("default_fields".to_string(), serde_json::json!(declared));
         }
-        map.insert(
-            "searched_by_default".to_string(),
-            serde_json::json!(searched),
-        );
         if truncated {
             map.insert(
                 "default_fields_truncated".to_string(),
@@ -4037,7 +4036,7 @@ impl NodeOrchestrator {
         }
         let (searched, truncated) =
             Self::searched_by_default(schema, searchable, max_default_fields);
-        Self::insert_default_search(&mut map, schema, &searched, truncated);
+        Self::insert_default_search(&mut map, schema, truncated);
         let fields = Self::describe_fields(schema, searchable, sortable, &searched);
         map.insert("field_count".to_string(), JsonValue::from(fields.len()));
         map.insert("fields".to_string(), JsonValue::Array(fields));
@@ -6472,12 +6471,7 @@ pub(super) async fn list_indexes(
                 }
                 let (searched, truncated) =
                     NodeOrchestrator::searched_by_default(&schema, &searchable, max_default_fields);
-                NodeOrchestrator::insert_default_search(
-                    &mut json_obj,
-                    &schema,
-                    &searched,
-                    truncated,
-                );
+                NodeOrchestrator::insert_default_search(&mut json_obj, &schema, truncated);
                 let fields =
                     NodeOrchestrator::describe_fields(&schema, &searchable, &sortable, &searched);
                 json_obj.insert("field_count".to_string(), JsonValue::from(fields.len()));
