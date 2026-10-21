@@ -63,7 +63,7 @@ on one.
 | M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed; M1, M2, M3, M4, M5 and M7 done — the blocker is cleared, the surface is metered, and tenants are bounded and isolated per index. No feature build remains; M8 closed with the prefix floor and default-field cap, the clause cap deferred. M6 done: the open-loop arms show goodput degrading rather than collapsing on the bulk, single-write and read lanes, after fixing the two defects its arms found — [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) and [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput), and its confirmation run on 2026-09-27 found OB22 costs a single node nothing measurable. What is left is the release cut |
 | N — Pre-0.3.6 whole-code review | 📋 Planned | N1–N10 before the 0.3.6 cut: a `HEAD` authorization gap, batched writes that never learn a field, a peer's 400 answered as 503, node identity replaced silently, query rewrites by substring, three client errors, the first shard's memory budget, streaming broadcast, a storage shutdown race, flattened storage errors. N11–N17 after it: one way to reach a peer, dead surface, `run_change`, typed boundaries, single owners, the orchestrator split |
 | O — Post-0.3.6 review: the next-iteration base | ◐ Partial | O1 (the `wal_sync=false` durability barrier) and O2 (deadlines on every remote ask) done 2026-10-15. Left: O3, shard-map merges on a per-owner epoch (the prerequisite N15 does not name, and since 2026-10-18 the one [OB27](#ob27--a-replaced-node-never-leaves-the-cluster)'s `forget` needs), and O4, the request budget on the wire. O5 folds Rust-surface items into N16/N17; O6 reconciles the architecture doc |
-| P — Post-0.3.7 features | ◐ Partial | P1, a cap on how many elements of each array a search hit carries — a node default, a node maximum, and `array N` per request — done 2026-10-19. P2, one declaration of an index's default fields — `searched_by_default` dropped, the `--id` reload keeps the list — done 2026-10-20. P3, a schema read is a schema write — `PUT` takes a `GET`, which now reports every property the thumbprint covers — done 2026-10-21. P4, ip fields queried the way addresses are — CIDR, bare addresses, IPv4-bounded ranges, a fast ip sort — done 2026-10-21. Left: P5, native json fields — paths, typed values and ranges, planned |
+| P — Post-0.3.7 features | ◐ Partial | P1, a cap on how many elements of each array a search hit carries — a node default, a node maximum, and `array N` per request — done 2026-10-19. P2, one declaration of an index's default fields — `searched_by_default` dropped, the `--id` reload keeps the list — done 2026-10-20. P3, a schema read is a schema write — `PUT` takes a `GET`, which now reports every property the thumbprint covers — done 2026-10-21. P4, ip fields queried the way addresses are — CIDR, bare addresses, IPv4-bounded ranges, a fast ip sort — done 2026-10-21. Left: P5, native json fields — paths, typed values and ranges, planned; P6, a hit says which array elements matched, planned |
 
 ## Reconciliation, 2026-08-26
 
@@ -251,6 +251,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [P3](#p3--a-schema-read-is-a-schema-write) | A schema read is a schema write — `PUT /_config` takes a `GET /_config` as it is, and the read reports the record option, `learned` and the routing field it lacked, so a saved read restores its index and the thumbprint proves it | — | 2026-10-21 | ✅ |
 | [P4](#p4--ip-fields-queried-the-way-addresses-are) | Ip fields queried the way addresses are — CIDR as its range, a bare address searching the ip fields, an open IPv4 range kept among IPv4, `fast` on ip for a sort by address, write refusals naming the value | — | 2026-10-21 | ✅ |
 | [P5](#p5--native-json-fields-paths-typed-values-ranges) | Native json fields — a json field indexes its object beside its text: paths and typed values match, ranges at a path run from the fast column it gets by default, RFC 3339 strings are dates; existing indexes unchanged until rebuilt | — | 2026-10-21 | 📋 |
+| [P6](#p6--a-hit-says-which-array-elements-matched) | A hit says which array elements matched — `_matched_elements` beside `_truncated_arrays`, a per-field matcher from the screened AST applied in the fetch phase before the cap, `matches N` per request; priority not yet decided | — | 2026-10-21 | 📋 |
 
 ---
 
@@ -6857,6 +6858,7 @@ to document: because an inline `return` list runs to the next keyword, a field l
 - *Showing the element that matched.* `string_ipv4:1.2.3.4` can match an element far past the
   first N, so the hit shows none of what made it a hit. Keeping matching elements alongside the
   head needs per-element term matching, which is closer to highlighting than to projection.
+  Filed with its design as [P6](#p6--a-hit-says-which-array-elements-matched).
 - *Paging inside an array* (`array_offset`). A caller who needs all 300k elements is doing an
   export, not a search.
 - *A per-field cap* (`{"string_ipv4": 50, "*": 1000}`). One number first; a map can be added
@@ -7057,6 +7059,103 @@ differs, so a cluster is upgraded before such a schema is applied.
 **Tests.** A path, a typed value, a date, and ranges at a path on a fast field; the bag of words
 unchanged; a `paths: false` field unchanged, notes included; arrays of objects; the thumbprint and
 `GET /_config` round trip with the new properties; the profiler's path report.
+
+### P6 — A hit says which array elements matched
+
+📋 **Planned.** Filed 2026-10-21; priority not yet decided. Picks up the second out-of-scope note
+of [P1](#p1--a-hits-arrays-are-capped-the-way-its-hits-are).
+
+**Today.** The P1 cap keeps the first N elements of each array in stored order. A clause such as
+`domains:"bad.example.com"` matches an element anywhere in the array, often far past N, so the
+hit shows none of what made it a hit. Ordering makes it worse: an array stored sorted returns its
+alphabetical head, so the matching element is reliably absent from a capped read. The match is
+still found — the search index sees the whole array — but the caller cannot tell which element it
+was without fetching the array whole, which past `max_array_limit` it cannot.
+
+**What a hit gains.** Beside `_truncated_arrays`, keyed by the same paths:
+
+```json
+"_matched_elements": {"domains": [{"index": 812345, "value": "bad.example.com"}]}
+```
+
+- The array itself is untouched: still the first N in stored order. Injecting matches into it
+  would break that contract and hide which elements were added.
+- Matches inside the head are reported too, so every hit names its evidence.
+- `array 0` with matches is the compact form: lengths, and only the elements that matched.
+- At most `matches` elements per array, the first found in stored order.
+
+**Where the facts are.**
+
+- *The fetch phase has no query.* `search_keys` parses and walks; `fetch_documents`
+  (`storage/src/search.rs`) builds every hit — redb read, shadow reconstruction, projection, cap —
+  and on a cluster runs on the owning shard from a `FetchDocsRequest` that carries only ids,
+  `fields` and `array_limit` (`server/src/node/mod.rs`).
+- *The built tantivy query is not enough.* `BooleanQuery::query_terms` visits `MustNot` clauses,
+  `RangeQuery` keeps its bounds private, and `PhraseQuery` has no slop getter. Walking it would
+  report `NOT` terms as matches and lose ranges, which is what a CIDR block becomes (P4).
+- *The screened AST is.* Inside `PreparedQuery::parse` (`storage/src/query.rs`) the AST after
+  `screen_clauses` carries occurrence, field, phrase, slop, prefix, ranges, sets and CIDR ranges.
+- *Elements are separate in the index.* tantivy leaves a position gap between the values of a
+  field (`POSITION_GAP`), so an exact phrase cannot span two elements: a term or phrase hit always
+  has one element that caused it.
+- *The coordinator caps again after the merge* (`cap_hit_arrays`, `server/src/node/search.rs`),
+  and `cap_document_arrays` skips only `_truncated_arrays` — a new metadata key holding arrays
+  would be cut by that second pass.
+
+**The approach.**
+
+1. *A matcher per field, from the screened AST,* built once per fetch batch. Positive leaves only;
+   a `MustNot` subtree is skipped. A bare term expands to the default fields the parser used.
+   - text and string: the literal and each element tokenized by the field's own analyzer
+     (`index.tokenizer_for_field`), so the matcher and the index agree; a term, an exact phrase as
+     contiguous tokens, a phrase with slop, a prefix on the last token;
+   - numeric, date and ip: typed equality, ranges and sets;
+   - `*` and presence: no element evidence, nothing reported.
+2. *Applied in `fetch_documents`, after the projection and before the cap,* so it sees each array
+   whole and only for fields the hit returns and the query names. A field projected away is not
+   scanned.
+3. *Cheap on large arrays.* For term and phrase leaves a case-folded substring prefilter
+   (`memchr::memmem`) rules out most elements before any tokenizing; the scan stops at the
+   per-array match limit. A short-string array of a million elements is a pass of tens of
+   milliseconds, not a tokenization of each element.
+4. *The query reaches the shard.* `#[serde(default)] match_query: Option<String>` on
+   `FetchDocsRequest` and on `SearchOptions`; the owning shard re-parses it, once per batch. A peer
+   on an older build ignores the field and reports no matches — the coordinator cannot make up for
+   it, since it only ever sees arrays already cut. Clean degradation, documented.
+5. *The cap leaves metadata alone.* `cap_document_arrays` skips every `_`-prefixed key, not only
+   `_truncated_arrays`.
+
+**The surface,** the same three layers as `array`:
+
+| | Array elements (P1) | Matched elements (this item) |
+|---|---|---|
+| Node default | `[search] default_array_limit = 1000` | `[search] default_match_limit` — proposed on, small (10) |
+| Node maximum | `[security.limits] max_array_limit = 100000` | `[security.limits] max_match_limit` |
+| HTTP body | `"array": N` | `"matches": N` |
+| Inline keyword | `... array N` | `... matches N` |
+| MCP | `array` | `matches`, with `maximum` advertised |
+
+`matches 0` turns it off. Whether it is on by default is the open decision: on gives every hit
+its evidence at the cost of one filtered scan per queried array field; off keeps today's
+responses byte-identical until a caller asks.
+
+**Limits to document.**
+
+- A phrase with slop can, rarely, match across two adjacent elements; that hit has no single
+  element to report.
+- Matching is the query's positive clauses per field, not a re-evaluation of the whole query: for
+  `A AND B` over two fields, each reports its own elements.
+- A json value or an array of objects is matched against the object's text, and the whole object
+  is reported.
+
+**Tests.** Storage: the matcher per leaf kind — term, phrase, slop, prefix, set, numeric and date
+ranges, a CIDR — `NOT` excluded, default-field expansion, the prefilter's agreement with the
+tokenizer, the per-array limit. Server: the HTTP body, inline keyword and MCP parameter, refusal
+above the maximum, a document whose 300k-element array matches at position 250,000, `array 0`
+with matches, a projected-away field reporting nothing, the coordinator's re-cap leaving
+`_matched_elements` whole, and a two-node search answered by the owning shard. **Docs:**
+`docs/API_REFERENCE.md`, `docs/CONFIGURATION.md`, the MCP syntax reference
+(`crates/mcp/src/syntax.rs`), `cameodb.example.toml`, and a `CHANGELOG.md` entry.
 
 ---
 
