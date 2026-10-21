@@ -302,6 +302,10 @@ pub enum SortKey {
     /// Epoch seconds, as the date fast column holds them.
     Date(i64),
     Str(String),
+    /// An ip address as 32 lowercase hex digits of its IPv6 value, IPv4 mapped. Text rather than
+    /// a `u128`, which a JSON number cannot carry exactly; fixed-width, so it orders as text in
+    /// the order the addresses do, and both merges compare it as they compare a string.
+    Ip(String),
 }
 
 impl SortKey {
@@ -314,7 +318,7 @@ impl SortKey {
             SortKey::F64(value) => serde_json::Number::from_f64(*value)
                 .map(JsonValue::Number)
                 .unwrap_or(JsonValue::Null),
-            SortKey::Str(value) => JsonValue::String(value.clone()),
+            SortKey::Str(value) | SortKey::Ip(value) => JsonValue::String(value.clone()),
         }
     }
 }

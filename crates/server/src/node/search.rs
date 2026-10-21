@@ -999,6 +999,16 @@ pub(super) fn unstorable_scalar(
         ));
     }
 
+    // Like a facet, decided by the value: every address is a string, and so is everything else.
+    // Named, since the type alone — "expected Ip, got Text" — does not say which value of a list
+    // or which of a thousand rows it was, and two near misses are common enough to name too.
+    if matches!(declared, TantivyFieldType::Ip) {
+        let address = value
+            .as_str()
+            .filter(|s| s.parse::<std::net::IpAddr>().is_ok());
+        return address.is_none().then(|| ip_mismatch(field, value));
+    }
+
     if matches!(declared, TantivyFieldType::Facet) {
         return match value.as_str() {
             Some(path) => {
@@ -1016,6 +1026,42 @@ pub(super) fn unstorable_scalar(
     }
 
     (!scalar_type_is_storable(declared, value)).then(|| type_mismatch(field, declared, value))
+}
+
+/// The wording for a value an ip field cannot hold: the value itself, and why where it is a
+/// near miss — a CIDR block, or an address with its port.
+pub(super) fn ip_mismatch(field: &str, value: &JsonValue) -> String {
+    let mut shown = value.to_string();
+    if shown.chars().count() > 80 {
+        shown = shown.chars().take(80).collect::<String>() + "…";
+    }
+    let why = match value.as_str().map(str::trim) {
+        Some(text) if looks_like_cidr(text) => {
+            " — a CIDR block is a query (`field:10.0.0.0/8`), not a value; write an address"
+        }
+        Some(text)
+            if text.rsplit_once(':').is_some_and(|(host, port)| {
+                port.parse::<u16>().is_ok()
+                    && host
+                        .trim_matches(|c| c == '[' || c == ']')
+                        .parse::<std::net::IpAddr>()
+                        .is_ok()
+            }) =>
+        {
+            " — write the address without its port"
+        }
+        Some(text) if text != value.as_str().unwrap_or_default() => {
+            " — it has whitespace around it"
+        }
+        _ => "",
+    };
+    format!("field '{field}': {shown} is not an IPv4 or IPv6 address, which an ip field holds{why}")
+}
+
+fn looks_like_cidr(text: &str) -> bool {
+    text.split_once('/').is_some_and(|(address, bits)| {
+        bits.parse::<u8>().is_ok() && address.parse::<std::net::IpAddr>().is_ok()
+    })
 }
 
 /// The one wording for a value whose type the field cannot hold.

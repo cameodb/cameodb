@@ -658,10 +658,11 @@ column is written when the index is built, so the declaration has to be in place
 is written; `GET /api/{index}/_config` reports what the caller declared as `fast` and what the
 built index actually carries as `sortable`.
 
-Only `text`, `string`, `i64`, `u64`, `f64` and `date` can carry a column. On a `boolean`, `bytes`,
-`ip`, `json` or `facet` field the request is accepted and `fast` reads back as `false`, because no
+Only `text`, `string`, `i64`, `u64`, `f64`, `date` and `ip` can carry a column. On a `boolean`,
+`bytes`, `json` or `facet` field the request is accepted and `fast` reads back as `false`, because no
 column is built for those types and reporting `true` would describe an index that does not exist. A
-sort naming one of them is refused with `400` saying so.
+sort naming one of them is refused with `400` saying so. An `ip` field has no column unless it
+declares `fast: true` — ranges run without one; a sort needs it.
 
 **Tokenizers.** `tokenizer` is optional on a `text` field and decides how its text becomes
 searchable terms. Index-time and query-time analysis use the same one, so a query is analysed
@@ -687,6 +688,22 @@ and irregular forms meet (`ljudi` → `čovjek`). Where a form belongs to two wo
 one wins: `mora` is read as *must* (`morati`), not *of the sea*. A passive participle reaches its
 verb (`određeni` → `odrediti`). A text in two languages is best split into a field per language,
 each with its own tokenizer.
+
+**IP addresses.** An `ip` field takes an IPv4 or IPv6 address as a string — `"10.1.2.3"`,
+`"2001:db8::1"`, `"::ffff:10.1.2.3"` — or a list of them. Each is held as IPv6, an IPv4 address in
+its mapped form, so `10.1.2.3` and `::ffff:10.1.2.3` are one value; the document keeps the address as
+written. Anything else is refused with `400` naming the value: a CIDR block (a query, not a value),
+an address with a port, one with whitespace around it, `n/a`. In a list every element must be an
+address.
+
+A query takes an address (`src:10.1.2.3`, `src:"2001:db8::1"`), a set (`src: IN [10.1.2.3
+10.1.2.4]`), a range (`src:[10.1.2.0 TO 10.1.2.255]`) or a CIDR block, which is that range exactly
+(`src:10.0.0.0/8`, `src:"2001:db8::/32"`). A range open at one end with an IPv4 bound stays among
+IPv4 addresses — `src:>10.1.2.3` does not reach `2001:db8::1`, which as IPv6 lies above every IPv4
+address; give an IPv6 bound to range over IPv6. A bare address or block, `8.8.8.8` or
+`10.0.0.0/8`, also searches every ip field, beside the default fields. A prefix (`src:10.1.*`) is
+dropped and reported with the CIDR block it stands for. Declared `fast`, an ip field sorts by
+address: `9.9.9.9` before `10.1.2.3`, IPv4 before IPv6.
 
 **Date values.** A `date` field takes a string in any of the shapes listed in the
 [date handling reference](../crates/server/README.md#71-write-path-date-normalization) — ISO 8601 /

@@ -1595,6 +1595,125 @@ async fn declaring_the_same_schema_again_keeps_the_version() {
     assert!(moved.get("unchanged").is_none(), "{moved}");
 }
 
+/// An ip field, end to end: a fast one sorts by address through the merge, a plain one is refused
+/// a sort with the declaration that would give it one, a pasted address and a CIDR block find what
+/// they name, and a value that is not an address is refused by its own text.
+#[tokio::test]
+async fn an_ip_field_sorts_finds_and_refuses_by_address() {
+    let node = TestNode::start("").await;
+    let (status, body) = put_config(
+        &node,
+        "net",
+        &json!({"fields": {
+            "id": {"field_type": "text"},
+            "seen": {"field_type": "ip", "fast": true},
+            "src": {"field_type": "ip"},
+            "note": {"field_type": "text"}
+        }}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let client = node.client();
+    for (id, seen) in [
+        ("a", "10.1.2.3"),
+        ("b", "9.9.9.9"),
+        ("c", "2001:db8::1"),
+        ("d", "10.200.0.1"),
+    ] {
+        client
+            .write_document(
+                "net",
+                id,
+                &json!({"seen": seen, "src": seen, "note": "host"}),
+                None,
+            )
+            .await
+            .expect("write");
+    }
+    client.admin_index_commit("net").await.expect("commit");
+
+    let config = get_json(&node, "/api/net/_config").await;
+    let field = |name: &str| {
+        config["fields"]
+            .as_array()
+            .and_then(|f| f.iter().find(|f| f["name"] == name))
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(
+        (
+            field("seen")["fast"].clone(),
+            field("seen")["sortable"].clone()
+        ),
+        (json!(true), json!(true))
+    );
+    assert_eq!(field("src")["sortable"], json!(false));
+
+    let order = |body: &serde_json::Value| -> Vec<String> {
+        body["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let (status, body) = post_json(
+        &node,
+        "/api/net/search",
+        json!({"query": "*", "sort": {"field": "seen", "order": "asc"}, "limit": 10}),
+    )
+    .await;
+    assert_eq!(status.as_u16(), 200, "{body}");
+    assert_eq!(
+        order(&body),
+        ["b", "a", "d", "c"],
+        "by address, not by spelling: {body}"
+    );
+    assert!(body["hits"][0].get("_sort_key").is_none(), "{body}");
+
+    let (status, body) = post_json(
+        &node,
+        "/api/net/search",
+        json!({"query": "*", "sort": {"field": "src", "order": "asc"}}),
+    )
+    .await;
+    assert_eq!(status.as_u16(), 400, "{body}");
+    assert!(
+        body["details"]
+            .as_str()
+            .unwrap_or("")
+            .contains("must be declared fast"),
+        "{body}"
+    );
+
+    for (query, hits) in [("9.9.9.9", 1), ("src:10.0.0.0/8", 2), ("src:>10.1.2.3", 1)] {
+        let (_, body) = post_json(
+            &node,
+            "/api/net/search",
+            json!({"query": query, "limit": 0}),
+        )
+        .await;
+        assert_eq!(body["total_hits"], hits, "{query}: {body}");
+    }
+
+    for (value, says) in [
+        ("10.0.0.0/8", "a CIDR block is a query"),
+        ("10.1.2.5:443", "without its port"),
+        (" 10.1.2.6", "whitespace"),
+        ("n/a", "\"n/a\" is not an IPv4 or IPv6 address"),
+    ] {
+        let (status, body) = put_document(&node, "net", "bad", &json!({"src": value})).await;
+        assert_eq!(status, 400, "{value}: {body}");
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(error.contains(says), "{value}: {body}");
+    }
+    let (status, body) =
+        put_document(&node, "net", "bad", &json!({"src": ["10.1.1.1", "n/a"]})).await;
+    assert_eq!(status, 400, "{body}");
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(error.contains("\"n/a\""), "the element named: {body}");
+}
+
 /// Two range shapes the index cannot run are refused as emptied, naming what was wrong: an
 /// unbounded range, which the parser dropped without a word so the search answered zero, and a
 /// range on a json field, which a shard refused to build so the search failed with a 500.
@@ -2662,8 +2781,7 @@ async fn a_type_that_can_carry_no_column_is_refused_rather_than_answered_empty()
                 "fields": {
                     "id": {"field_type": "text", "indexed": true, "stored": true},
                     "body": {"field_type": "text", "indexed": true, "stored": true},
-                    "flag": {"field_type": "boolean", "indexed": true, "fast": true},
-                    "addr": {"field_type": "ip", "indexed": true, "fast": true}
+                    "flag": {"field_type": "boolean", "indexed": true, "fast": true}
                 }
             }),
         )
@@ -2673,7 +2791,7 @@ async fn a_type_that_can_carry_no_column_is_refused_rather_than_answered_empty()
         .bulk_index(
             "unsortable",
             &[json!({"id": "d1", "doc": {
-                "id": "d1", "body": "page", "flag": true, "addr": "10.0.0.1"}})],
+                "id": "d1", "body": "page", "flag": true}})],
         )
         .await
         .expect("write");
@@ -2691,7 +2809,7 @@ async fn a_type_that_can_carry_no_column_is_refused_rather_than_answered_empty()
             .unwrap_or_else(|| panic!("field {name} in {config}"))
     };
 
-    for name in ["flag", "addr"] {
+    for name in ["flag"] {
         assert_eq!(
             field(name)["fast"],
             json!(false),

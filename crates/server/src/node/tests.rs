@@ -3292,9 +3292,9 @@ fn a_string_field_takes_every_string() {
 
 /// A declaration cannot make a column exist, and the refusal says which case it is.
 ///
-/// The guard reads the declaration, and for these five types the index builder never reads it
-/// back — `add_bool_field`, `add_bytes_field`, `add_ip_addr_field`, `add_json_field` and
-/// `add_facet_field` take no `fast`. So a declared `fast: true` passed the guard and was then
+/// The guard reads the declaration, and for these four types the index builder never reads it
+/// back — `add_bool_field`, `add_bytes_field`, `add_json_field` and `add_facet_field` take no
+/// `fast`. An ip field does carry one when declared, and sorts. So a declared `fast: true` passed the guard and was then
 /// refused by every shard, which a scatter-gather reports as `200` with an empty page. Refused
 /// here instead, with a reason that does not send the caller off to declare a flag that
 /// changes nothing.
@@ -3324,7 +3324,7 @@ fn a_declared_fast_on_a_type_with_no_column_is_still_refused() {
         )
     };
 
-    for field in ["flag", "addr", "blob", "category", "raw"] {
+    for field in ["flag", "blob", "category", "raw"] {
         let Some(OrchestratorError::UnsortableField { reason, .. }) = refusal(field) else {
             panic!("'{field}' declares a column its type cannot carry and must be refused");
         };
@@ -3337,6 +3337,10 @@ fn a_declared_fast_on_a_type_with_no_column_is_still_refused() {
     assert!(
         refusal("rank").is_none(),
         "a u64 field declared fast does carry a column and must still sort"
+    );
+    assert!(
+        refusal("addr").is_none(),
+        "an ip field declared fast carries a column and sorts"
     );
 }
 

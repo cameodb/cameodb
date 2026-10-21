@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   elements carries `_truncated_arrays`, naming each shortened array by its path with the length
   it had; `array 0` returns the lengths without the elements. `CAMEODB_DEFAULT_ARRAY_LIMIT` sets
   the default from the environment.
+- **Ip fields are queried the way addresses are.** A CIDR block is its exact range —
+  `src:10.0.0.0/8`, `src:"2001:db8::/32"` — where it was refused as a malformed address. A bare
+  address or block, `8.8.8.8`, also searches every ip field, which no bare term reached before. An
+  ip field may declare `fast: true` and then sorts by address (`9.9.9.9` before `10.1.2.3`, IPv4
+  before IPv6); without it a sort is refused naming the declaration that would allow one. A prefix
+  (`src:10.1.*`) is reported with the block it stands for.
 - **A schema read is a schema write.** `PUT /api/{index}/_config` takes exactly what
   `GET /api/{index}/_config` returns — `fields` as a list, `type`, `shadow`, and the read-only keys
   ignored — so a saved read restores the schema it came from, and its `thumbprint` proves it. The
@@ -63,6 +69,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as the words of its value, so `cells.unit:kn` never matched; it is now a dropped clause naming
   the form that works, `cells:value`. `validate_query` no longer lists such a path as an unknown
   field with a "did you mean".
+- **An open-ended IPv4 range on an ip field reached IPv6 addresses.** Every address is held as
+  IPv6, IPv4 in `::ffff:0:0/96`, so `src:>10.1.2.3` matched every IPv6 address above that block and
+  `src:<10.0.0.0` every one below it, `::1` included. An IPv4 bound now keeps such a range among
+  IPv4 addresses.
+- **A value an ip field could not hold was refused without saying which.** `expected Ip, got Text`
+  named neither the value nor the list element; the refusal now quotes it, and says why for a CIDR
+  block, an address with a port, and one with whitespace around it.
 - **`data load --id` read a field's record option from its tokenizer.** It now takes the one the
   node reports, so a `raw` text field with positions keeps them; against a node that reports
   none, `raw` still reads as `Basic`, the postings the loader gives its category columns.

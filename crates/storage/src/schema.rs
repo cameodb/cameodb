@@ -374,9 +374,9 @@ impl FieldDef {
 
     /// Whether a field of this type can carry a fast column at all.
     ///
-    /// Five types cannot, and the reason is in the index builder rather than in Tantivy: a
-    /// boolean, bytes, ip, json or facet field is added with `add_bool_field`, `add_bytes_field`,
-    /// `add_ip_addr_field`, `add_json_field` and `add_facet_field`, none of which consults `fast`
+    /// Four types cannot, and the reason is in the index builder rather than in Tantivy: a
+    /// boolean, bytes, json or facet field is added with `add_bool_field`, `add_bytes_field`,
+    /// `add_json_field` and `add_facet_field`, none of which consults `fast`
     /// — so a schema asking for a column on one gets no column, and a `fast: true` that reads back
     /// as `true` is a claim the index cannot honour. Text and string can: `set_fast` on them builds
     /// the string column an exact alphabetical sort orders on.
@@ -393,6 +393,7 @@ impl FieldDef {
                 | TantivyFieldType::U64
                 | TantivyFieldType::F64
                 | TantivyFieldType::Date
+                | TantivyFieldType::Ip
         )
     }
 

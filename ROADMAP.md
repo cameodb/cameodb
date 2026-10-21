@@ -63,7 +63,7 @@ on one.
 | M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed; M1, M2, M3, M4, M5 and M7 done — the blocker is cleared, the surface is metered, and tenants are bounded and isolated per index. No feature build remains; M8 closed with the prefix floor and default-field cap, the clause cap deferred. M6 done: the open-loop arms show goodput degrading rather than collapsing on the bulk, single-write and read lanes, after fixing the two defects its arms found — [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) and [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput), and its confirmation run on 2026-09-27 found OB22 costs a single node nothing measurable. What is left is the release cut |
 | N — Pre-0.3.6 whole-code review | 📋 Planned | N1–N10 before the 0.3.6 cut: a `HEAD` authorization gap, batched writes that never learn a field, a peer's 400 answered as 503, node identity replaced silently, query rewrites by substring, three client errors, the first shard's memory budget, streaming broadcast, a storage shutdown race, flattened storage errors. N11–N17 after it: one way to reach a peer, dead surface, `run_change`, typed boundaries, single owners, the orchestrator split |
 | O — Post-0.3.6 review: the next-iteration base | ◐ Partial | O1 (the `wal_sync=false` durability barrier) and O2 (deadlines on every remote ask) done 2026-10-15. Left: O3, shard-map merges on a per-owner epoch (the prerequisite N15 does not name, and since 2026-10-18 the one [OB27](#ob27--a-replaced-node-never-leaves-the-cluster)'s `forget` needs), and O4, the request budget on the wire. O5 folds Rust-surface items into N16/N17; O6 reconciles the architecture doc |
-| P — Post-0.3.7 features | ✅ Done | P1, a cap on how many elements of each array a search hit carries — a node default, a node maximum, and `array N` per request — done 2026-10-19. P2, one declaration of an index's default fields — `searched_by_default` dropped, the `--id` reload keeps the list — done 2026-10-20. P3, a schema read is a schema write — `PUT` takes a `GET`, which now reports every property the thumbprint covers — done 2026-10-21 |
+| P — Post-0.3.7 features | ✅ Done | P1, a cap on how many elements of each array a search hit carries — a node default, a node maximum, and `array N` per request — done 2026-10-19. P2, one declaration of an index's default fields — `searched_by_default` dropped, the `--id` reload keeps the list — done 2026-10-20. P3, a schema read is a schema write — `PUT` takes a `GET`, which now reports every property the thumbprint covers — done 2026-10-21. P4, ip fields queried the way addresses are — CIDR, bare addresses, IPv4-bounded ranges, a fast ip sort — done 2026-10-21 |
 
 ## Reconciliation, 2026-08-26
 
@@ -249,6 +249,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [P1](#p1--a-hits-arrays-are-capped-the-way-its-hits-are) | A hit's arrays are capped the way its hits are — `[search] default_array_limit`, `[security.limits] max_array_limit`, `array N` per request; found validating 0.3.7 on the threat-intel dataset, where one field carries a few hundred thousand addresses | — | 2026-10-19 | ✅ |
 | [P2](#p2--one-declaration-of-an-indexs-default-fields) | One declaration of an index's default fields — `default_fields` is the only list, each field's `default_search` the effective set; `searched_by_default` dropped, and `data load --id` keeps a declared list | — | 2026-10-20 | ✅ |
 | [P3](#p3--a-schema-read-is-a-schema-write) | A schema read is a schema write — `PUT /_config` takes a `GET /_config` as it is, and the read reports the record option, `learned` and the routing field it lacked, so a saved read restores its index and the thumbprint proves it | — | 2026-10-21 | ✅ |
+| [P4](#p4--ip-fields-queried-the-way-addresses-are) | Ip fields queried the way addresses are — CIDR as its range, a bare address searching the ip fields, an open IPv4 range kept among IPv4, `fast` on ip for a sort by address, write refusals naming the value | — | 2026-10-21 | ✅ |
 
 ---
 
@@ -6954,6 +6955,40 @@ client worked around it with a guess (`raw` ⇒ `Basic` in `schema_for_new_id`),
   `unchanged`, at the same version and thumbprint.
 - docs: the API reference's `PUT` section (save and restore with `curl`, the thumbprint as proof),
   the `GET` key tables, and a `CHANGELOG` entry under Added and one under Fixed.
+
+### P4 — Ip fields queried the way addresses are
+
+✅ **Done 2026-10-21.** Measured on a probe index before the change: exact match, sets and ranges
+worked for IPv4 and IPv6 alike (tantivy holds every address as IPv6, IPv4 mapped), but
+
+- a bare `8.8.8.8` found nothing in the ip field holding it — ip fields are never default fields,
+  since a bare term that is not an address would fail against each;
+- `src:10.0.0.0/8` was refused as a malformed address, and `src:10.1.*` likewise;
+- `src:>10.1.2.3` matched `2001:db8::1`: IPv4 sits in `::ffff:0:0/96`, so an open IPv4 range ran
+  on into IPv6, and `<10.0.0.0` down to `::1`;
+- an ip field could not sort: the builder added it without `FAST`, and `can_be_fast` said so;
+- a value the field could not hold was refused as `expected Ip, got Text`, naming no value.
+
+**What changed.** In `screen_clauses` (`query.rs`), `screen_ip_leaf`: a bare term that parses as an
+address or block becomes `(term OR ipfield:term …)` over the index's ip fields (`PreparedQuery::
+ip_fields`, sorted so every shard expands alike); CIDR on an ip field becomes its inclusive range
+(`cidr_range`, IPv4 and IPv6, host bits ignored); a trailing `*` on an ip field — the grammar leaves
+it in the phrase — is dropped with `ip_prefix_note` naming the block; an IPv4 bound against an open
+end clamps it to `0.0.0.0` or `255.255.255.255`. `describe_discarded` gives `IpFormatError` the
+forms an ip field takes. `FieldDef::can_be_fast` admits `Ip`, the builder adds `INDEXED | FAST` when
+declared (not by default — ranges need no column), and the sort reads the column through
+`TopDocs::order_by` with a closure, ranking each address so the collector keeps the order asked and a
+document without one last. `SortKey::Ip` carries the address as 32 hex digits rather than a `u128`,
+which a JSON number cannot hold exactly; fixed-width, it orders as text the way addresses do, in both
+merges. On write, `unstorable_scalar` asks an ip value of the parser the writer uses and
+`ip_mismatch` quotes it, with the reason for a CIDR block, a port, or whitespace. The policy is
+unchanged: a document with a value the field cannot hold is refused.
+
+Tests: `ip_test.rs` (bare addresses and blocks, CIDR for both families, the IPv4 clamp, prefix and
+non-address notes, a numeric sort with a missing value last), an HTTP test (sort through the merge,
+the refusal for a plain field, CIDR and a bare address, each write refusal by value), and the two
+no-column tests narrowed to the four types that still have none. Docs: the API reference's
+column-type list and an *IP addresses* section; the MCP ip type hint.
 
 ---
 

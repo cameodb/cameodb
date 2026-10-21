@@ -1485,7 +1485,14 @@ impl HybridStore {
                 }
                 TantivyFieldType::Boolean => schema_builder.add_bool_field(name, INDEXED),
                 TantivyFieldType::Bytes => schema_builder.add_bytes_field(name, INDEXED),
-                TantivyFieldType::Ip => schema_builder.add_ip_addr_field(name, INDEXED),
+                // Not fast by default: a column is an opt-in a sort needs; ranges run without one.
+                TantivyFieldType::Ip => {
+                    if field_def.is_fast() {
+                        schema_builder.add_ip_addr_field(name, INDEXED | FAST)
+                    } else {
+                        schema_builder.add_ip_addr_field(name, INDEXED)
+                    }
+                }
                 TantivyFieldType::Json => schema_builder.add_json_field(name, TEXT),
                 TantivyFieldType::Facet => schema_builder.add_facet_field(name, INDEXED),
             };

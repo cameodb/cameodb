@@ -238,15 +238,15 @@ fn a_shadow_field_is_never_fast_however_it_is_declared() {
 
 /// A type whose column is never built is never fast, whatever the schema declares.
 ///
-/// The index builder adds a boolean, bytes, ip, json or facet field with `add_bool_field` and
-/// friends, none of which reads `fast`. So a declared `true` on one of those was reported back by
+/// The index builder adds a boolean, bytes, json or facet field with `add_bool_field` and
+/// friends, none of which reads `fast`. (An ip field reads it: declared fast, it gets a column.) So a declared `true` on one of those was reported back by
 /// `_config` as `true` with no column behind it — and the sort guard, which reads the declaration,
 /// waved the sort through to be refused separately by every shard: a `200` with an empty page for a
 /// request that never ran. Resolving it to `false` here is what makes the config and the index
 /// agree, and what makes the guard refuse the sort itself.
 #[test]
 fn a_type_that_can_carry_no_column_is_never_fast() {
-    for type_name in ["boolean", "bytes", "ip", "json", "facet"] {
+    for type_name in ["boolean", "bytes", "json", "facet"] {
         let mut schema: IndexSchema = serde_json::from_value(json!({
             "fields": {
                 "asked": {"field_type": type_name, "indexed": true, "fast": true}
@@ -269,7 +269,7 @@ fn a_type_that_can_carry_no_column_is_never_fast() {
     }
 
     // The types that *can* carry one are untouched by the same rule.
-    for type_name in ["text", "string", "i64", "u64", "f64", "date"] {
+    for type_name in ["text", "string", "i64", "u64", "f64", "date", "ip"] {
         let mut schema: IndexSchema = serde_json::from_value(json!({
             "fields": {
                 "asked": {"field_type": type_name, "indexed": true, "fast": true}

@@ -459,7 +459,13 @@ pub const FIELD_TYPES: &[(&str, &str)] = &[
          `.` may replace `-` throughout, and a value with no zone is read as UTC.",
     ),
     (TYPE_BOOLEAN, "`true` or `false`."),
-    (TYPE_IP, "IPv4 or IPv6 address."),
+    (
+        TYPE_IP,
+        "IPv4 or IPv6 address. A CIDR block is its range: `src:10.0.0.0/8`, \
+         `src:\"2001:db8::/32\"` (quote IPv6). An IPv4 bound keeps an open range among IPv4 \
+         addresses. A bare address also searches every ip field. No prefixes: `src:10.1.*` is \
+         dropped — write `src:10.1.0.0/16`. Sorting needs the field declared fast.",
+    ),
     (
         TYPE_JSON,
         "Nested object, searchable only as unstructured text — its keys and values are indexed as \

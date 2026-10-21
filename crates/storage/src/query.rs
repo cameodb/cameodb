@@ -690,6 +690,20 @@ pub(crate) fn prepare_query_parser(
         })
         .map(|(name, _)| name.clone())
         .collect();
+    // The ip fields, which a bare address also searches and which take CIDR — see
+    // [`screen_clauses`]. Sorted, so every shard expands a bare address the same way.
+    let mut ip_fields: Vec<String> = fields
+        .indexed_fields
+        .iter()
+        .filter(|(_, field)| {
+            matches!(
+                tantivy_schema.get_field_entry(**field).field_type(),
+                tantivy::schema::FieldType::IpAddr(_)
+            )
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    ip_fields.sort();
     let parser = tantivy::query::QueryParser::for_index(tantivy_index, default_query_fields);
     Ok(PreparedQuery {
         text,
@@ -698,6 +712,7 @@ pub(crate) fn prepare_query_parser(
         narrowed,
         held,
         json_fields,
+        ip_fields,
     })
 }
 
@@ -713,6 +728,8 @@ pub(crate) struct PreparedQuery {
     held: Vec<HeldRange>,
     /// The json fields, which a range or a path cannot run against — see [`screen_clauses`].
     json_fields: HashSet<String>,
+    /// The ip fields, by name — see [`screen_clauses`].
+    ip_fields: Vec<String>,
 }
 
 impl PreparedQuery {
@@ -737,11 +754,11 @@ impl PreparedQuery {
             })
             .collect();
         let mut notes = Vec::new();
-        let ast = screen_clauses(
-            restore_ranges(ast, &self.held),
-            &self.json_fields,
-            &mut notes,
-        );
+        let screen = ScreenFields {
+            json: &self.json_fields,
+            ip: &self.ip_fields,
+        };
+        let ast = screen_clauses(restore_ranges(ast, &self.held), &screen, &mut notes);
         let (query, mut built_errors) = self.parser.build_query_from_user_input_ast_lenient(ast);
         errors.append(&mut built_errors);
         (query, errors, notes)
@@ -942,13 +959,21 @@ fn restore_ranges(
 ///
 /// Either way the clause goes the way every dropped clause does: reported, and a query with
 /// nothing else left is refused as emptied rather than answered with a zero.
+///
+/// Ip fields are rewritten here too, into what the caller meant — see [`screen_ip_leaf`].
 fn screen_clauses(
     ast: tantivy::query_grammar::UserInputAst,
-    json_fields: &HashSet<String>,
+    fields: &ScreenFields<'_>,
     notes: &mut Vec<String>,
 ) -> tantivy::query_grammar::UserInputAst {
-    screen_clause(ast, json_fields, notes)
+    screen_clause(ast, fields, notes)
         .unwrap_or_else(|| tantivy::query_grammar::UserInputAst::Clause(Vec::new()))
+}
+
+/// The fields [`screen_clauses`] treats apart from the rest.
+struct ScreenFields<'a> {
+    json: &'a HashSet<String>,
+    ip: &'a [String],
 }
 
 /// [`screen_clauses`] on one node of the query: `None` when nothing of it is left to run.
@@ -960,7 +985,7 @@ fn screen_clauses(
 /// which the parser builds as the empty query without a word.
 fn screen_clause(
     ast: tantivy::query_grammar::UserInputAst,
-    json_fields: &HashSet<String>,
+    fields: &ScreenFields<'_>,
     notes: &mut Vec<String>,
 ) -> Option<tantivy::query_grammar::UserInputAst> {
     use tantivy::query_grammar::{UserInputAst, UserInputLeaf};
@@ -969,41 +994,193 @@ fn screen_clause(
             let kept: Vec<_> = clauses
                 .into_iter()
                 .filter_map(|(occur, clause)| {
-                    screen_clause(clause, json_fields, notes).map(|clause| (occur, clause))
+                    screen_clause(clause, fields, notes).map(|clause| (occur, clause))
                 })
                 .collect();
             (!kept.is_empty()).then_some(UserInputAst::Clause(kept))
         }
-        UserInputAst::Boost(inner, boost) => screen_clause(*inner, json_fields, notes)
+        UserInputAst::Boost(inner, boost) => screen_clause(*inner, fields, notes)
             .map(|inner| UserInputAst::Boost(Box::new(inner), boost)),
         UserInputAst::Leaf(leaf) => {
+            let json = fields.json;
             let note = match leaf.as_ref() {
                 UserInputLeaf::Literal(literal) => literal
                     .field_name
                     .as_deref()
-                    .and_then(|field| json_path_note(field, json_fields)),
+                    .and_then(|field| json_path_note(field, json)),
                 UserInputLeaf::Set {
                     field: Some(field), ..
-                } => json_path_note(field, json_fields),
+                } => json_path_note(field, json),
                 UserInputLeaf::Range {
                     field: Some(field),
                     lower,
                     upper,
-                } => json_path_note(field, json_fields)
-                    .or_else(|| range_note(field, lower, upper, json_fields)),
+                } => json_path_note(field, json).or_else(|| range_note(field, lower, upper, json)),
                 _ => None,
             };
             match note {
                 Some(note) => {
-                    if !notes.contains(&note) {
-                        notes.push(note);
-                    }
+                    push_note(notes, note);
                     None
                 }
-                None => Some(UserInputAst::Leaf(leaf)),
+                None => screen_ip_leaf(*leaf, fields.ip, notes),
             }
         }
     }
+}
+
+fn push_note(notes: &mut Vec<String>, note: String) {
+    if !notes.contains(&note) {
+        notes.push(note);
+    }
+}
+
+/// An ip field's clauses, as the caller meant them. `None` when the leaf is dropped.
+///
+/// * A bare term that is an address or a CIDR block also searches every ip field. Ip fields are
+///   never default fields — a bare term that is not an address would fail against each — so a
+///   pasted `8.8.8.8` reached only the text fields, and missed the field that holds it.
+/// * CIDR on an ip field, `src:10.0.0.0/8`, is its range, `src:[10.0.0.0 TO 10.255.255.255]`:
+///   exact, for IPv4 and IPv6. The parser had refused it as a malformed address.
+/// * A prefix on an ip field, `src:10.1.*`, has no address to match; it is dropped and noted with
+///   the CIDR block it stands for where there is one.
+/// * A range open at one end, with an IPv4 bound, stays among IPv4 addresses. An ip field holds
+///   every address as IPv6, IPv4 inside `::ffff:0:0/96`, so `src:>10.1.2.3` matched every IPv6
+///   address above that block, and `src:<10.0.0.0` every one below it, `::1` included.
+fn screen_ip_leaf(
+    leaf: tantivy::query_grammar::UserInputLeaf,
+    ip_fields: &[String],
+    notes: &mut Vec<String>,
+) -> Option<tantivy::query_grammar::UserInputAst> {
+    use tantivy::query_grammar::{Occur, UserInputAst, UserInputBound, UserInputLeaf};
+    let is_ip = |field: &str| ip_fields.iter().any(|name| name == field);
+    let leaf_ast = |leaf: UserInputLeaf| Some(UserInputAst::Leaf(Box::new(leaf)));
+    match leaf {
+        UserInputLeaf::Literal(literal) if literal.slop == 0 => {
+            match literal.field_name.as_deref() {
+                Some(field) if is_ip(field) => {
+                    // The grammar leaves an unquoted wildcard in the phrase (`10.1.*`), and sets
+                    // `prefix` only for a quoted one.
+                    if literal.prefix || literal.phrase.ends_with('*') {
+                        let prefix = literal.phrase.trim_end_matches('*');
+                        push_note(notes, ip_prefix_note(field, prefix));
+                        return None;
+                    }
+                    match cidr_range(&literal.phrase) {
+                        Some((low, high)) => leaf_ast(UserInputLeaf::Range {
+                            field: Some(field.to_string()),
+                            lower: UserInputBound::Inclusive(low),
+                            upper: UserInputBound::Inclusive(high),
+                        }),
+                        None => leaf_ast(UserInputLeaf::Literal(literal)),
+                    }
+                }
+                None if !literal.prefix && !ip_fields.is_empty() => {
+                    let phrase = literal.phrase.trim();
+                    let block = cidr_range(phrase);
+                    if block.is_none() && phrase.parse::<std::net::IpAddr>().is_err() {
+                        return leaf_ast(UserInputLeaf::Literal(literal));
+                    }
+                    let mut either = vec![(
+                        Some(Occur::Should),
+                        UserInputAst::Leaf(Box::new(UserInputLeaf::Literal(literal.clone()))),
+                    )];
+                    for field in ip_fields {
+                        let clause = match &block {
+                            Some((low, high)) => UserInputLeaf::Range {
+                                field: Some(field.clone()),
+                                lower: UserInputBound::Inclusive(low.clone()),
+                                upper: UserInputBound::Inclusive(high.clone()),
+                            },
+                            None => {
+                                UserInputLeaf::Literal(tantivy::query_grammar::UserInputLiteral {
+                                    field_name: Some(field.clone()),
+                                    phrase: phrase.to_string(),
+                                    ..literal.clone()
+                                })
+                            }
+                        };
+                        either.push((Some(Occur::Should), UserInputAst::Leaf(Box::new(clause))));
+                    }
+                    Some(UserInputAst::Clause(either))
+                }
+                _ => leaf_ast(UserInputLeaf::Literal(literal)),
+            }
+        }
+        UserInputLeaf::Range {
+            field: Some(field),
+            lower,
+            upper,
+        } if is_ip(&field) => {
+            let v4 = |bound: &UserInputBound| match bound {
+                UserInputBound::Inclusive(value) | UserInputBound::Exclusive(value) => {
+                    value.trim().parse::<std::net::Ipv4Addr>().is_ok()
+                }
+                UserInputBound::Unbounded => false,
+            };
+            let (lower, upper) = match (lower, upper) {
+                (UserInputBound::Unbounded, upper) if v4(&upper) => {
+                    (UserInputBound::Inclusive("0.0.0.0".to_string()), upper)
+                }
+                (lower, UserInputBound::Unbounded) if v4(&lower) => (
+                    lower,
+                    UserInputBound::Inclusive("255.255.255.255".to_string()),
+                ),
+                bounds => bounds,
+            };
+            leaf_ast(UserInputLeaf::Range {
+                field: Some(field),
+                lower,
+                upper,
+            })
+        }
+        other => leaf_ast(other),
+    }
+}
+
+/// The first and last address of a CIDR block, `10.0.0.0/8` or `2001:db8::/32`, written as
+/// addresses. `None` for anything else. Host bits set below the prefix are ignored, as routers do:
+/// `10.1.2.3/8` is `10.0.0.0/8`.
+pub(crate) fn cidr_range(text: &str) -> Option<(String, String)> {
+    let (address, bits) = text.trim().split_once('/')?;
+    let bits: u32 = bits.parse().ok()?;
+    match address.parse::<std::net::IpAddr>().ok()? {
+        std::net::IpAddr::V4(address) if bits <= 32 => {
+            let mask = u32::MAX.checked_shl(32 - bits).unwrap_or(0);
+            let low = u32::from(address) & mask;
+            Some((
+                std::net::Ipv4Addr::from(low).to_string(),
+                std::net::Ipv4Addr::from(low | !mask).to_string(),
+            ))
+        }
+        std::net::IpAddr::V6(address) if bits <= 128 => {
+            let mask = u128::MAX.checked_shl(128 - bits).unwrap_or(0);
+            let low = u128::from(address) & mask;
+            Some((
+                std::net::Ipv6Addr::from(low).to_string(),
+                std::net::Ipv6Addr::from(low | !mask).to_string(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Note for a prefix on an ip field, naming the block it stands for when it reads as one.
+fn ip_prefix_note(field: &str, prefix: &str) -> String {
+    let octets: Vec<&str> = prefix.trim_end_matches('.').split('.').collect();
+    let block =
+        (1..=3).contains(&octets.len()) && octets.iter().all(|octet| octet.parse::<u8>().is_ok());
+    let instead = if block {
+        let mut address = octets.clone();
+        address.resize(4, "0");
+        format!("`{field}:{}/{}`", address.join("."), octets.len() * 8)
+    } else {
+        format!("a CIDR block, `{field}:10.1.0.0/16`, or a range")
+    };
+    format!(
+        "an ip field matches whole addresses, so the prefix `{field}:{prefix}*` was dropped; use \
+         {instead} instead"
+    )
 }
 
 /// When `field` is a path inside a json field, why no clause on it can match.
@@ -1160,6 +1337,12 @@ pub(crate) fn describe_discarded(err: &tantivy::query::QueryParserError) -> Stri
             "field '{field}' has no positions indexed, so the phrase clause against it was \
              dropped; phrase queries need a text field"
         ),
+        E::IpFormatError(_) => {
+            "a value on an ip field is not an IPv4 or IPv6 address, so the clause \
+             was dropped. An ip field takes an address (`10.1.2.3`, `2001:db8::1`), a CIDR block \
+             (`10.0.0.0/8`) or a range (`[10.0.0.0 TO 10.0.255.255]`)"
+                .to_string()
+        }
         E::ExpectedInt(_) | E::ExpectedFloat(_) | E::ExpectedBool(_) | E::ExpectedBase64(_) => {
             format!("a value did not match its field's type, so the clause was dropped: {err}")
         }

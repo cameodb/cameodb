@@ -859,6 +859,54 @@ impl HybridStore {
                         v.map(|d| SortKey::Date(d.into_timestamp_secs()))
                     })
                 }
+                // Tantivy has no typed collector for an ip column — its values are 128-bit, and
+                // `order_by_fast_field` takes a `FastValue` — so the column is read here. Each
+                // address is ranked so that the collector, which keeps the greatest, keeps them in
+                // the order asked; a document without one ranks below every address and comes last
+                // either way, as in every other sort. A list sorts by its first address.
+                tantivy::schema::FieldType::IpAddr(_) => {
+                    let descending = matches!(order, tantivy::Order::Desc);
+                    let name = column_name.to_string();
+                    let top_docs_collector = tantivy::collector::TopDocs::with_limit(limit)
+                        .order_by(move |segment: &tantivy::SegmentReader| {
+                            let column = segment.fast_fields().ip_addr(&name).ok();
+                            move |doc: tantivy::DocId| -> (bool, u128) {
+                                match column.as_ref().and_then(|column| column.first(doc)) {
+                                    Some(address) => {
+                                        let value = u128::from(address);
+                                        (true, if descending { value } else { u128::MAX - value })
+                                    }
+                                    None => (false, 0),
+                                }
+                            }
+                        });
+                    let count_collector = tantivy::collector::Count;
+                    let mut multi_collector = tantivy::collector::MultiCollector::new();
+                    let top_docs_handle = multi_collector.add_collector(top_docs_collector);
+                    let count_handle = multi_collector.add_collector(count_collector);
+
+                    let walk_start = Instant::now();
+                    let mut multi_fruit = deadline_or(
+                        searcher.search(&parsed_query, &multi_collector),
+                        opts.deadline.as_ref(),
+                    )?;
+                    timings.walk_ms += walk_start.elapsed().as_millis() as u64;
+                    let sorted: Vec<((bool, u128), tantivy::DocAddress)> =
+                        top_docs_handle.extract(&mut multi_fruit);
+                    let total_hits = count_handle.extract(&mut multi_fruit);
+                    let docs: Vec<(Option<SortKey>, tantivy::DocAddress)> = sorted
+                        .into_iter()
+                        .map(|((present, ranked), addr)| {
+                            let value = if descending {
+                                ranked
+                            } else {
+                                u128::MAX - ranked
+                            };
+                            (present.then(|| SortKey::Ip(format!("{value:032x}"))), addr)
+                        })
+                        .collect();
+                    (SearchResult::Sorted(docs), total_hits)
+                }
                 // A text field with a fast column is sorted by the column, in the collector,
                 // like any other sortable type. Tantivy keys this on the term ordinal, which
                 // its term dictionary holds in lexicographic order, so the result is a true
