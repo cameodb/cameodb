@@ -46,8 +46,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   generated when not. What a bare term searches is each field's `default_search`, and
   `default_fields_truncated` still says when the node's cap cut it. A caller that read
   `searched_by_default` takes the fields whose `default_search` is `true`.
+- **An index created before `_seq` was retired gets a new thumbprint, once.** The thumbprint no
+  longer hashes the legacy `_seq` entry such a schema still holds. Its version and stored schema
+  are unchanged. Nodes of one cluster compare thumbprints, so upgrade them together: a node on
+  the earlier build reports these indexes as diverged until it is upgraded too.
 
 ### Fixed
+
+- **A saved schema read could not reproduce the thumbprint of an older index.** A schema created
+  before `_seq` was retired keeps that field, which every read leaves out but the thumbprint
+  hashed, so a restored read never matched its source. The thumbprint now covers exactly what a
+  read reports.
 
 - **`data load --id` kept an index's fields but not its declared default fields.** Loading an
   index by another id rewrites its schema, carrying over each field's type, tokenizer and

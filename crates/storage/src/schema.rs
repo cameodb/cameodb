@@ -1410,7 +1410,13 @@ impl IndexSchema {
             buf.push(u8::from(value));
         }
 
-        let mut sorted_names: Vec<&String> = self.fields.keys().collect();
+        // `_seq` is left out. An index created before the field was retired still carries it in
+        // its stored schema, but no read reports it, so hashing it gave such an index a
+        // thumbprint no saved read could reproduce. It is engine bookkeeping, not part of the
+        // schema a caller declares, and whether a write stamps it depends on the built index's
+        // column, not on this entry.
+        let mut sorted_names: Vec<&String> =
+            self.fields.keys().filter(|name| *name != "_seq").collect();
         sorted_names.sort();
 
         let mut combined = Vec::new();

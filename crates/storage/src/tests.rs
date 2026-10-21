@@ -3247,6 +3247,34 @@ mod learned_field_tests {
         let json = serde_json::to_value(&declared).expect("serialize");
         assert!(json["fields"]["n"].get("learned").is_none(), "{json}");
     }
+
+    /// A schema created before `_seq` was retired still holds it, hidden from every read. Its
+    /// thumbprint is the one its read reproduces: the same as the schema without the field.
+    #[test]
+    fn a_legacy_seq_field_is_not_in_the_fingerprint() {
+        let mut current = IndexSchema::default();
+        current.fields.insert(
+            "id".to_string(),
+            FieldDef::new("id".to_string(), TantivyFieldType::Text),
+        );
+        current.fields.insert(
+            "title".to_string(),
+            FieldDef::new("title".to_string(), TantivyFieldType::Text),
+        );
+
+        let mut legacy = current.clone();
+        let mut seq = FieldDef::new("_seq".to_string(), TantivyFieldType::U64);
+        seq.indexed = false;
+        seq.stored = true;
+        seq.fast = Some(true);
+        legacy.fields.insert("_seq".to_string(), seq);
+
+        assert_eq!(
+            legacy.calculate_fingerprint(),
+            current.calculate_fingerprint(),
+            "a legacy _seq entry must not move the thumbprint"
+        );
+    }
 }
 
 /// `wal_sync = false` and the barrier that keeps Tantivy behind redb (ROADMAP O1).

@@ -1836,6 +1836,38 @@ async fn a_schema_read_back_is_taken_back_unchanged() {
     assert_eq!(after["thumbprint"], read["thumbprint"], "{after}");
 }
 
+/// An index whose schema still holds the retired `_seq` field restores from its own read with the
+/// same thumbprint: the read leaves `_seq` out, and so does the thumbprint.
+#[tokio::test]
+async fn a_legacy_seq_field_does_not_keep_a_read_from_restoring_its_thumbprint() {
+    let node = TestNode::start("").await;
+    let (status, body) = put_config(
+        &node,
+        "legacy",
+        &json!({
+            "fields": {
+                "id": {"field_type": "text"},
+                "title": {"field_type": "text"},
+                "_seq": {"field_type": "u64", "indexed": false, "stored": true, "fast": true}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let read = get_json(&node, "/api/legacy/_config").await;
+    assert!(
+        read["fields"]
+            .as_array()
+            .is_some_and(|f| f.iter().all(|f| f["name"] != "_seq")),
+        "{read}"
+    );
+
+    let (status, body) = put_config(&node, "restored", &read).await;
+    assert_eq!(status, 200, "{body}");
+    let restored = get_json(&node, "/api/restored/_config").await;
+    assert_eq!(restored["thumbprint"], read["thumbprint"], "{restored}");
+}
+
 /// A field that first arrives after the index exists takes every value written to it: its type
 /// widens to hold them — `i64`, then `f64`, then `text` — instead of refusing the documents whose
 /// value did not fit the first one.
