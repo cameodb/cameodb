@@ -63,7 +63,7 @@ on one.
 | M — The 0.3.5 goal set: multi-tenant exposure | ◐ Partial | M0 closed; M1, M2, M3, M4, M5 and M7 done — the blocker is cleared, the surface is metered, and tenants are bounded and isolated per index. No feature build remains; M8 closed with the prefix floor and default-field cap, the clause cap deferred. M6 done: the open-loop arms show goodput degrading rather than collapsing on the bulk, single-write and read lanes, after fixing the two defects its arms found — [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) and [OB15](#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput), and its confirmation run on 2026-09-27 found OB22 costs a single node nothing measurable. What is left is the release cut |
 | N — Pre-0.3.6 whole-code review | 📋 Planned | N1–N10 before the 0.3.6 cut: a `HEAD` authorization gap, batched writes that never learn a field, a peer's 400 answered as 503, node identity replaced silently, query rewrites by substring, three client errors, the first shard's memory budget, streaming broadcast, a storage shutdown race, flattened storage errors. N11–N17 after it: one way to reach a peer, dead surface, `run_change`, typed boundaries, single owners, the orchestrator split |
 | O — Post-0.3.6 review: the next-iteration base | ◐ Partial | O1 (the `wal_sync=false` durability barrier) and O2 (deadlines on every remote ask) done 2026-10-15. Left: O3, shard-map merges on a per-owner epoch (the prerequisite N15 does not name, and since 2026-10-18 the one [OB27](#ob27--a-replaced-node-never-leaves-the-cluster)'s `forget` needs), and O4, the request budget on the wire. O5 folds Rust-surface items into N16/N17; O6 reconciles the architecture doc |
-| P — Post-0.3.7 features | ✅ Done | P1, a cap on how many elements of each array a search hit carries — a node default, a node maximum, and `array N` per request — done 2026-10-19. P2, one declaration of an index's default fields — `searched_by_default` dropped, the `--id` reload keeps the list — done 2026-10-20. P3, a schema read is a schema write — `PUT` takes a `GET`, which now reports every property the thumbprint covers — done 2026-10-21. P4, ip fields queried the way addresses are — CIDR, bare addresses, IPv4-bounded ranges, a fast ip sort — done 2026-10-21 |
+| P — Post-0.3.7 features | ◐ Partial | P1, a cap on how many elements of each array a search hit carries — a node default, a node maximum, and `array N` per request — done 2026-10-19. P2, one declaration of an index's default fields — `searched_by_default` dropped, the `--id` reload keeps the list — done 2026-10-20. P3, a schema read is a schema write — `PUT` takes a `GET`, which now reports every property the thumbprint covers — done 2026-10-21. P4, ip fields queried the way addresses are — CIDR, bare addresses, IPv4-bounded ranges, a fast ip sort — done 2026-10-21. Left: P5, native json fields — paths, typed values and ranges, planned |
 
 ## Reconciliation, 2026-08-26
 
@@ -250,6 +250,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [P2](#p2--one-declaration-of-an-indexs-default-fields) | One declaration of an index's default fields — `default_fields` is the only list, each field's `default_search` the effective set; `searched_by_default` dropped, and `data load --id` keeps a declared list | — | 2026-10-20 | ✅ |
 | [P3](#p3--a-schema-read-is-a-schema-write) | A schema read is a schema write — `PUT /_config` takes a `GET /_config` as it is, and the read reports the record option, `learned` and the routing field it lacked, so a saved read restores its index and the thumbprint proves it | — | 2026-10-21 | ✅ |
 | [P4](#p4--ip-fields-queried-the-way-addresses-are) | Ip fields queried the way addresses are — CIDR as its range, a bare address searching the ip fields, an open IPv4 range kept among IPv4, `fast` on ip for a sort by address, write refusals naming the value | — | 2026-10-21 | ✅ |
+| [P5](#p5--native-json-fields-paths-typed-values-ranges) | Native json fields — a json field indexes its object beside its text: paths and typed values match, ranges at a path run from the fast column it gets by default, RFC 3339 strings are dates; existing indexes unchanged until rebuilt | — | 2026-10-21 | 📋 |
 
 ---
 
@@ -6751,7 +6752,7 @@ workload whose projections are column-coverable — a large `limit` over a few s
 TS5 shape — measured on a real index with the fields declared `fast`, not on a synthetic bench.
 Until then `fast` stays what it is today: a sort and range column.
 
-## P. Post-0.3.7 features ✅ Done
+## P. Post-0.3.7 features ◐ Partial
 
 Features agreed after the 0.3.7 release, for the iterations that follow it. Each is scoped against
 the code as it stands at `1cf4f66`, so the paths and line numbers below are where the work starts,
@@ -6989,6 +6990,73 @@ non-address notes, a numeric sort with a missing value last), an HTTP test (sort
 the refusal for a plain field, CIDR and a bare address, each write refusal by value), and the two
 no-column tests narrowed to the four types that still have none. Docs: the API reference's
 column-type list and an *IP addresses* section; the MCP ip type hint.
+
+### P5 — Native json fields: paths, typed values, ranges
+
+📋 **Planned.** Filed 2026-10-21 from the json analysis behind OB28/OB29.
+
+**Today.** A `json` field is built as tantivy's json field (`add_json_field(name, TEXT)`,
+`store.rs`) but written as one string — the value serialized and `add_text` on the field's root
+(`schema.rs`). So it is a bag of words: `cells:kn` matches any key or value inside, a path
+(`cells.unit:kn`) never matches, a value has no type (`5` is the word "5"), and no range,
+comparison or sort can run. Since OB28/OB29 those clauses are reported as dropped rather than
+answered with a zero or a 500. The stored document is whole and returned unchanged.
+
+**Measured** with a throwaway tantivy test, one json field fed both the object and today's text:
+
+| Query | object + text | object + text, `fast` |
+|---|---|---|
+| `cells:kn`, `cells:unit` (bag of words, as today) | ✓ | ✓ |
+| `cells.unit:kn` (path) | ✓ | ✓ |
+| `cells.amount:5` (typed number) | ✓ | ✓ |
+| `cells.amount:>3`, `cells.amount:[1 TO 6]` | tantivy refuses | ✓ |
+| `cells.when:[2024-01-01T00:00:00Z TO *]` | tantivy refuses | 0 — an RFC 3339 string stays text |
+
+Feeding both keeps every existing `field:value` query meaning what it does. A value at a path is
+matched without a fast column; a range or comparison on a path needs one — `RangeQuery` on json
+runs only from the fast column.
+
+**Decided** (2026-10-21):
+
+1. A json field declared or inferred from here on indexes paths (`paths: true`). A stored schema
+   without the key reads as `paths: false`: today's text-only build, behaviour and thumbprint, until
+   the index opts in and is rebuilt.
+2. A string inside a json value that parses as RFC 3339 is written as a date, so date ranges at a
+   path work.
+3. A json field is `fast: true` by default, so ranges and comparisons at a path work — search
+   needs no column, ranges do. The cost is one column per distinct path: cheap for a small regular
+   object (a table row), large for a wide or irregular one (a threat-intel record); `fast: false`
+   declines it, and `schema detect` reports the path count it profiled so the choice is visible.
+
+**Design.**
+
+- *Schema.* `paths` (and `expand_dots`, tantivy's `expand_dots_enabled`, for keys holding a dot) on
+  a json field; `fast` admitted for json in `FieldDef::can_be_fast`. All built-column properties:
+  in the thumbprint, reported by `GET /_config` (P3), a change refused with `409` on a populated
+  index.
+- *Write.* A `paths` field gets the object (`add_field_value`) beside the flattened text; arrays of
+  objects index each element under its path; RFC 3339 strings at any depth as dates. The stored
+  document is unchanged.
+- *Build.* `JsonObjectOptions` from `TEXT`, `set_fast(Some("raw"))` when fast,
+  `set_expand_dots_enabled` when asked.
+- *Query.* `screen_clauses` keys on the field's mode rather than on "is json": on a `paths` field a
+  path takes values, phrases and sets, and ranges and comparisons when fast; a range on the whole
+  field stays dropped (no root value to range on); a `paths: false` field keeps today's notes.
+- *Discovery.* The client profiler records each json field's paths, their value types and coverage;
+  `schema detect` and `--report` print them; `describe_index` lists a field's leading paths (capped)
+  and `validate_query` checks a path against them; the MCP json hint and syntax reference say what
+  each mode takes; the API reference gets a *JSON fields* section.
+- *Sort on a path* (`sort: cells.amount`) reads the path's dynamic column, as the ip sort reads
+  its column (P4), the merge key typed by the column — after the rest.
+
+**Cost.** The json field's postings roughly double (paths beside text); fast adds a column per
+path; one more walk of each object on write. Existing indexes change only when they opt in and are
+rebuilt; a node on an older build reading a `paths` schema builds text-only and its thumbprint
+differs, so a cluster is upgraded before such a schema is applied.
+
+**Tests.** A path, a typed value, a date, and ranges at a path on a fast field; the bag of words
+unchanged; a `paths: false` field unchanged, notes included; arrays of objects; the thumbprint and
+`GET /_config` round trip with the new properties; the profiler's path report.
 
 ---
 
