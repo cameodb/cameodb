@@ -1,6 +1,6 @@
 ---
 name: index-describe
-description: Write or improve the index and field descriptions of a CameoDB index from its live data — profile the index, sample rows through the API or MCP tools, verify every claim, and produce a PUT /_config body that changes descriptions only. Use when asked to describe, document or enhance the schema of an index, or after `schema detect` / `data load` created one with no descriptions.
+description: Write or improve the index and field descriptions of a CameoDB index from its live data — profile the index (by exact counts, or from whole records sampled by id when it holds tens of millions of rows), verify every claim, write affirmative descriptions of what each field holds and is for, and produce a PUT /_config body that changes descriptions only. Use when asked to describe, document or enhance the schema of an index, or after `schema detect` / `data load` created one with no descriptions.
 ---
 
 # Describe a CameoDB index from its data
@@ -11,7 +11,10 @@ an index and build a query, so it has to be true of the data, not of the plan th
 skill produces descriptions from evidence and a schema body that applies them.
 
 Scripts (stdlib Python, run with `python3 -I`):
-- `profile_index.py` — counts and a spread sample, as a readable report and JSON.
+- `profile_index.py` — exact per-field counts and a spread sample, as a readable report and JSON. For
+  indexes up to a few million rows.
+- `sample_index.py` — whole records sampled per row kind and year, read by id from the key-value store,
+  with shares weighted by year and the real range of every fast field. For large indexes (§2b).
 - `schema_body.py` — the live schema read (`GET /_config`, a complete definition the node takes back as
   it is) with new descriptions, as a `PUT` body; checks lengths, shows the diff, `--apply` sends it and
   confirms nothing but descriptions moved.
@@ -29,8 +32,13 @@ Scripts (stdlib Python, run with `python3 -I`):
 - Look for the project that loads the index: a schema source file (e.g. `schema.py`), loader, extractor
   docs. They say what each field was *meant* to be; the data says what it *is*. Where they disagree the
   data wins and the disagreement is reported.
+- Ask the data owner what the data cannot say: which fields current processing writes and which it no longer
+  does (and what replaced them), what a default value stands for, what an opaque code means. Their answer is
+  a source like any other; the data still has to agree with it.
+- Pick the profiling path by size: up to a few million rows §2a, beyond that §2b. Time one presence count
+  on the largest text field first (`limit 0`); if it takes more than a few seconds, use §2b whatever the size.
 
-## 2. Profile
+## 2a. Profile a small index
 
 ```bash
 python3 -I profile_index.py --index <index> --stratify <row-kind field> --spread <year-like i64 field> \
@@ -51,6 +59,36 @@ Know its limits:
   Look up the rest in the project's vocabulary or extractor before listing values in a description.
 - Coverage bands are a share of *all* rows in the bucket. For a field on one row kind only (an act-level
   field), count it within that kind: `field:["" TO *] AND kind:act AND year:[a TO b]`.
+
+## 2b. Profile a large index
+
+A presence range on a text field walks every term the field holds. On hundreds of millions of rows one such
+count can run for minutes on a high-cardinality field (hashes, URLs), and §2a runs one per field: hours of
+load on a node others are using. Measure from whole records instead, and count only what stays cheap: term
+queries, ranges on fast fields, and sorted `limit 1` searches.
+
+```bash
+python3 -I sample_index.py --index <index> --spread <fast date/int field> \
+    --stratum <name>=<term query> [--stratum …] --json <scratch>/sample.json > <scratch>/sample.md
+```
+
+- **Whole records come from the store.** `id:<key>` alone (or `<shadow>:<key>`) skips the search index and
+  returns every stored value, not only stored/fast columns. A search with a `fields` list returns only
+  those; on an index where most fields are unstored, that list cannot show their values.
+- **Strata are term queries.** Find the row-kind field (record type, status, category) and its values
+  first, then pass one `--stratum` per kind, rare ones included. On a tokenized field a stored value
+  `Model64 Variant/Sub` is matched by `model64`, not `model`: read a few records before trusting a zero.
+- **Spread is a fast date or integer field**, one bucket per year (or value). The script counts each bucket,
+  so a load concentrated in a few years shows up in the report.
+- **Shares are weighted by the bucket counts.** The sample takes the same few rows from every year, so its
+  raw share over-represents sparse years. The weighted share is what to write ("about half the rows").
+- **Fast fields get exact ranges.** For each fast date or number: real min and max with the default value
+  left out (`[1970-01-02 TO *]`, `[1 TO *]`), and how many rows hold the default (`1970-01-01`, `0`).
+- **Settle each claim with a term count**, not a text range: `status:archived`,
+  `updated_at:[* TO 1970-01-02}`, `kind:"x" AND year:2020`. A count that times out is not zero: say so
+  and drop the claim.
+- Keep `--per-year` and `--per-cell` small (a few hundred records in all); one record read is cheap, a
+  thousand searches against a busy node are not.
 
 ## 3. Look at rows
 
@@ -78,14 +116,33 @@ how to read a record in order, which field searches which text, and what holds o
 4. How to query it when not obvious: exact quoted match on raw strings, list values, `sort` field pairs,
    the field to use instead.
 
+**Write affirmatively.** A description says what the field *is* and what it is *for*, as a statement the
+reader can act on. It is not a list of what is wrong with it.
+- Lead with meaning and purpose: "When the record was first received from any source", not "Created timestamp".
+- State the real range, without defaults and marginal values: "from 2010-12", "6–10", taken from the
+  real min/max (§2b), not from a 1970 placeholder or a single outlier.
+- Name a default value as the convention it is, once: "0 (1970-01-01) when not set". Not "warning", "bogus",
+  "placeholder", "noise".
+- A field that current processing no longer writes is described by what it holds and where the current
+  value lives: "Last update as recorded by earlier processing; the current value is in updated_at."
+- A field that is never queried directly says where to search instead: "Nested event objects; search
+  event_type for event kinds." An unindexed field says "Returned with the record;
+  search <x> for …", or simply what it holds when nothing searches it.
+- A field the sample never showed is described by what it holds and which rows carry it: "Line items, on
+  invoice records". No "none in the sample".
+- Mixed contents are described as contents: "Category names and their codes (Retail, C02)".
+- What only holds for part of the data is scope, stated plainly: "invoice records", "records with
+  attachments", "records processed before 2025".
+
 Rules:
 - Every statement is checked against the profile or a count. Copy nothing from an old description unchecked.
 - Values exactly as stored — case and diacritics matter on `raw` fields (`RJEŠENJE`, `A` vs `a`).
 - No counts that go stale with the next load: "about two thirds of acts", not "66,093". Ranges that only grow
   are written as "from 2015", not "2015–2026".
 - No history and no implementation (`nn_links.py` produced it) unless the reader needs it to trust the value.
-- A known data defect that changes results gets a short warning in the field's description; the defect
-  itself goes in the report to the user, not in the schema.
+- A data defect is a finding for the loader, reported to the user, not written into the schema. If it
+  changes query results, the description states the affirmative fact that lets a reader avoid it ("0 when
+  not set", "the current value is in X"), not the defect.
 - Describe `id` too: its pattern is what lets a reader parse or build keys.
 
 ## 5. Build, check and hand over
@@ -107,7 +164,8 @@ answers, then `DELETE /api/<probe>?delete_schema=true`.
 Then report to the user, before anything is applied:
 - the body's path and the diff;
 - claims of the old descriptions that the data contradicts;
-- data defects found on the way (they are findings for the loader or extractor, not for the schema).
+- data defects found on the way (they are findings for the loader or extractor, not for the schema);
+- questions for the data owner: fields whose purpose or current use the data alone did not settle.
 
 **Applying** (`--apply`, or `PUT` the body) needs the user's go-ahead, and the saved previous version: any
 other path that PUTs the schema (the project's own schema script, a loader's reset) saves the live schema the

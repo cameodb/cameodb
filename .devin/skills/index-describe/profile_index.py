@@ -44,6 +44,8 @@ class Node:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
             return {'error': e.read().decode(errors='replace')[:300], 'status': e.code}
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            return {'error': f'{type(e).__name__}: {e}'}
 
     def search(self, query, limit=0, fields=None, sort=None, array=None):
         body = {'query': query, 'limit': limit}
