@@ -96,6 +96,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   package is `cameodb` now, and its `preinst` creates the `cameodb` system user and group the
   unit runs as. The config is installed `root:cameodb` 640; an upgrade keeps the service enabled
   and restarts it only if it was running; `apt purge` also removes the user and `/etc/cameodb`.
+- **Tab in a shell `return` clause did not list the next field.** After `return` with no space
+  it offered nothing, after `title,` it offered `title` again, and after `title,a` nothing. The
+  keyword now completes first, then each Tab offers the fields not yet in the clause, whether the
+  list is written with commas alone or with spaces.
 
 ## [0.3.7] - 2026-10-18
 

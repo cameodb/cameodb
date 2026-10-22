@@ -372,6 +372,79 @@ mod tests {
         );
     }
 
+    /// The keyword under the cursor is finished first. Without a space after `return` there is no
+    /// clause yet, and its fields were looked up with `return` itself as the prefix — nothing.
+    #[test]
+    fn a_keyword_under_the_cursor_completes_as_the_keyword() {
+        let c = completer_with_index();
+        let history = MemHistory::new();
+        for (line, keyword) in [
+            ("search myindex title:rust return", "return "),
+            ("search myindex title:rust sort", "sort "),
+        ] {
+            let (_, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
+            assert_eq!(
+                pairs
+                    .iter()
+                    .map(|p| p.replacement.as_str())
+                    .collect::<Vec<_>>(),
+                [keyword],
+                "{line:?}"
+            );
+        }
+    }
+
+    /// The list is one token, so the field being completed is the part after its last comma, and
+    /// the fields already in the list are kept and not offered again.
+    #[test]
+    fn a_return_list_completes_its_next_field() {
+        let cache = Arc::new(RwLock::new(HashMap::new()));
+        cache.write().unwrap().insert(
+            "myindex".to_string(),
+            IndexMetadata {
+                fields: ["title", "author"]
+                    .map(|name| FieldInfo {
+                        name: name.to_string(),
+                        field_type: "text".to_string(),
+                    })
+                    .to_vec(),
+            },
+        );
+        let c = IndexCompleter::new(cache);
+        let history = MemHistory::new();
+        for line in [
+            "search myindex rust return title,",
+            "search myindex rust return title,a",
+        ] {
+            let (start, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
+            assert_eq!(start, "search myindex rust return ".len(), "{line:?}");
+            assert_eq!(
+                pairs
+                    .iter()
+                    .map(|p| p.replacement.as_str())
+                    .collect::<Vec<_>>(),
+                ["title,author,"],
+                "{line:?}"
+            );
+        }
+
+        // Written with spaces the earlier fields are tokens of their own, and still not offered.
+        for line in [
+            "search myindex rust return title, ",
+            "search myindex rust return title, a",
+        ] {
+            let (_, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
+            assert_eq!(
+                pairs
+                    .iter()
+                    .map(|p| p.replacement.as_str())
+                    .collect::<Vec<_>>(),
+                ["author,"],
+                "{line:?}"
+            );
+        }
+    }
+
     #[test]
     fn field_completion_replaces_partial_field_token() {
         let c = completer_with_index();

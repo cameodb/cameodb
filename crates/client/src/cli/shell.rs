@@ -298,18 +298,36 @@ impl IndexCompleter {
     /// Fields for a `return` clause, each completed with its trailing comma so that successive
     /// completions build one comma-separated list. A list without them is query text, not a
     /// projection.
-    pub(crate) fn return_field_suggestions(&self, index: &str, prefix: &str) -> Vec<Pair> {
+    ///
+    /// Only the part of `prefix` after its last comma is being completed; the fields before it
+    /// are kept in the replacement. A field already in the clause is not offered again, whether
+    /// it is in that token (`title,author,ye`) or in an earlier one of `entered`
+    /// (`title, author, ye`).
+    pub(crate) fn return_field_suggestions(
+        &self,
+        index: &str,
+        entered: &[&str],
+        prefix: &str,
+    ) -> Vec<Pair> {
         if let Ok(cache) = self.cache.read()
             && let Some(metadata) = cache.get(index)
         {
-            let clean_prefix = prefix.trim_end_matches(',');
+            let split = prefix.rfind(',').map_or(0, |i| i + 1);
+            let (listed, partial) = prefix.split_at(split);
+            let already: Vec<&str> = entered
+                .iter()
+                .chain(std::iter::once(&listed))
+                .flat_map(|token| token.split(','))
+                .filter(|f| !f.is_empty())
+                .collect();
             return metadata
                 .fields
                 .iter()
-                .filter(|field| field.name.starts_with(clean_prefix))
+                .filter(|field| field.name.starts_with(partial))
+                .filter(|field| !already.contains(&field.name.as_str()))
                 .map(|field| Pair {
                     display: field.name.clone(),
-                    replacement: format!("{},", field.name),
+                    replacement: format!("{}{},", listed, field.name),
                 })
                 .collect();
         }
@@ -790,7 +808,10 @@ impl IndexCompleter {
 
                 // Check if we're after a 'return' keyword to suggest fields
                 let query_tokens = &tokens[2..];
-                let after_return = query_tokens.iter().rposition(|t| *t == "return");
+                // The token under the cursor is still being written: `return` with no space after
+                // it is the keyword to finish, not a clause to complete fields for.
+                let settled = &query_tokens[..query_tokens.len() - 1];
+                let after_return = settled.iter().rposition(|t| *t == "return");
 
                 if let Some(return_pos) = after_return {
                     // We're after 'return', suggest fields (comma-separated)
@@ -801,13 +822,14 @@ impl IndexCompleter {
                     let after_sort = after_return_tokens.contains(&"sort");
 
                     if !after_limit && !after_sort {
-                        let suggestions = self.return_field_suggestions(index, current);
+                        let entered = &after_return_tokens[..after_return_tokens.len() - 1];
+                        let suggestions = self.return_field_suggestions(index, entered, current);
                         return Some(suggestions);
                     }
                 }
 
                 // Check if we're after a 'sort' keyword to suggest sortable fields
-                let after_sort = query_tokens.iter().rposition(|t| *t == "sort");
+                let after_sort = settled.iter().rposition(|t| *t == "sort");
 
                 if let Some(sort_pos) = after_sort {
                     // We're after 'sort', suggest sortable fields with :asc/:desc suffix
@@ -826,7 +848,7 @@ impl IndexCompleter {
                 // A modifier run has to leave query text in front of it, so a keyword is offered
                 // only once the query opens with something that is not one. The last of
                 // `query_tokens` is the token under the cursor, empty when it follows a space.
-                let query_written = query_tokens[..query_tokens.len() - 1]
+                let query_written = settled
                     .first()
                     .is_some_and(|token| !matches!(*token, "return" | "limit" | "sort"));
 
@@ -839,7 +861,7 @@ impl IndexCompleter {
                     let mut suggestions = Vec::new();
 
                     // Only suggest 'return' if not already in query
-                    if !query_tokens.contains(&"return") && "return".starts_with(current) {
+                    if !settled.contains(&"return") && "return".starts_with(current) {
                         suggestions.push(Pair {
                             display: "return <fields>".to_string(),
                             replacement: "return ".to_string(),
@@ -847,7 +869,7 @@ impl IndexCompleter {
                     }
 
                     // Only suggest 'limit' if not already in query
-                    if !query_tokens.contains(&"limit") && "limit".starts_with(current) {
+                    if !settled.contains(&"limit") && "limit".starts_with(current) {
                         suggestions.push(Pair {
                             display: "limit <n>".to_string(),
                             replacement: "limit ".to_string(),
@@ -855,7 +877,7 @@ impl IndexCompleter {
                     }
 
                     // Only suggest 'sort' if not already in query
-                    if !query_tokens.contains(&"sort") && "sort".starts_with(current) {
+                    if !settled.contains(&"sort") && "sort".starts_with(current) {
                         suggestions.push(Pair {
                             display: "sort <field:order>".to_string(),
                             replacement: "sort ".to_string(),
