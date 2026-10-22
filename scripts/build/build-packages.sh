@@ -1,6 +1,11 @@
 #!/bin/bash
 # Cross-compilation build script with persistent Docker caching
-# Builds binary + DEB/RPM packages for the specified architecture
+# Builds binary + DEB/RPM packages for the specified architecture, in Docker.
+#
+# Output layout, the same as build-musl.sh and a native build: target/<triple>/release/ on the
+# host. One profile (`release`), one directory per target, whether the compiler ran natively or
+# in a container. The container's own target dir is a volume; only the finished files are copied
+# out, so root-owned build products never land in the working tree.
 #
 # Usage:
 #   ./scripts/build/build-packages.sh              # Build amd64 (default)
@@ -82,8 +87,9 @@ for ARCH in "${ARCHS[@]}"; do
     TARGET=$(resolve_target "$ARCH")
     DEB_ARCH=$(deb_arch "$ARCH")
     RPM_ARCH=$(rpm_arch "$ARCH")
-    PROFILE="release-docker"
+    PROFILE="release"
     OUTPUT_DIR="target/${TARGET}/${PROFILE}"
+    mkdir -p "${PROJECT_ROOT}/${OUTPUT_DIR}"
     # Tagged with the compiler, like build-musl.sh's, so nothing falls back on a :latest
     # left over from an older one.
     ARCH_BUILDER_IMAGE="${BUILDER_IMAGE}-${ARCH}:$(rust_version)"
@@ -109,6 +115,7 @@ for ARCH in "${ARCHS[@]}"; do
       -v "$PROJECT_ROOT":/workspace \
       -v cameo-cargo-cache-${ARCH}:/usr/local/cargo/registry \
       -v cameo-target-cache-${ARCH}:/workspace/target \
+      -v "${PROJECT_ROOT}/${OUTPUT_DIR}":/out \
       -e RUST_LOG=info \
       -e SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
       -e CARGO_HTTP_CAINFO=/etc/ssl/certs/ca-certificates.crt \
@@ -135,6 +142,11 @@ for ARCH in "${ARCHS[@]}"; do
           -o ${OUTPUT_DIR}/cameodb-${VERSION}-1.${RPM_ARCH}.rpm \
           --set-metadata 'package.name=\"cameodb\"'
 
+        echo 'Copying artifacts to the host...'
+        cp ${OUTPUT_DIR}/cameodb \
+           ${OUTPUT_DIR}/cameodb_${VERSION}_${DEB_ARCH}.deb \
+           ${OUTPUT_DIR}/cameodb-${VERSION}-1.${RPM_ARCH}.rpm /out/
+
         echo 'Build completed for ${ARCH}!'
       "
 
@@ -148,7 +160,7 @@ echo ""
 echo -e "${BLUE}Artifact sizes:${NC}"
 for ARCH in "${ARCHS[@]}"; do
     TARGET=$(resolve_target "$ARCH")
-    ls -lh "target/${TARGET}/release-docker/cameodb"* 2>/dev/null || true
+    ls -lh "target/${TARGET}/release/cameodb"* 2>/dev/null || true
 done
 
 echo -e "${GREEN}Ready for distribution!${NC}"

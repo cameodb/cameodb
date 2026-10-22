@@ -116,10 +116,10 @@ generate_native_sbom() {
             target_dir="${PROJECT_ROOT}/target/x86_64-apple-darwin/release"
             ;;
         "Linux aarch64"|"Linux arm64")
-            target_dir="${PROJECT_ROOT}/target/aarch64-unknown-linux-musl/release-docker"
+            target_dir="${PROJECT_ROOT}/target/aarch64-unknown-linux-musl/release"
             ;;
         "Linux x86_64"|"Linux amd64")
-            target_dir="${PROJECT_ROOT}/target/x86_64-unknown-linux-musl/release-docker"
+            target_dir="${PROJECT_ROOT}/target/x86_64-unknown-linux-musl/release"
             ;;
         *)
             target_dir="${PROJECT_ROOT}/target/release"
@@ -136,7 +136,7 @@ generate_native_sbom() {
         echo ""
         echo -e "${YELLOW}Build first with:${NC}"
         echo "  cargo build --release  # macOS native"
-        echo "  cargo zigbuild --profile release-docker --target x86_64-unknown-linux-musl  # Linux cross-compile"
+        echo "  cargo zigbuild --release --target x86_64-unknown-linux-musl  # Linux cross-compile"
         exit 1
     fi
     echo -e "${BLUE}Generating SBOMs for native binary: ${binary_path}${NC}"

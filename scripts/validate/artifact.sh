@@ -262,8 +262,7 @@ check_binary() {
 TARGETS=("$@")
 if [ ${#TARGETS[@]} -eq 0 ]; then
     while IFS= read -r found; do TARGETS+=("$found"); done < <(
-        ls -1 target/*-unknown-linux-musl/release/cameodb \
-              target/*-unknown-linux-musl/release-docker/cameodb 2>/dev/null
+        ls -1 target/*-unknown-linux-musl/release/cameodb 2>/dev/null
     )
 fi
 

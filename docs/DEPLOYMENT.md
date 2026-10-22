@@ -51,7 +51,7 @@ Build optimized binaries and packages using Docker:
 ```
 
 **Outputs:**
-- Binary: `target/{triple}/release-docker/cameodb`
+- Binary: `target/{triple}/release/cameodb`
 - DEB package: `cameodb_{version}_{arch}.deb`
 - RPM package: `cameodb-{version}-1.{arch}.rpm`
 

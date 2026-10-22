@@ -50,6 +50,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer hashes the legacy `_seq` entry such a schema still holds. Its version and stored schema
   are unchanged. Nodes of one cluster compare thumbprints, so upgrade them together: a node on
   the earlier build reports these indexes as diverged until it is upgraded too.
+- **Linux builds land in `target/<triple>/release/`, natively or in Docker.**
+  `scripts/build/build-packages.sh` builds under the `release` profile, not `release-docker`, and
+  copies the binary, `.deb` and `.rpm` out of its Docker volume into that directory, where
+  `build-musl.sh` already put its binary.
 
 ### Fixed
 

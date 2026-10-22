@@ -13,10 +13,10 @@
 # dist/<version>/windows/ before running the sign stage; see scripts/release/README.md.
 #
 # The DEB and RPM deliberately wrap the *same* binary that ships standalone, via
-# `--no-build`. build-packages.sh instead rebuilds under the `release-docker` profile (thin LTO,
-# 4 codegen units), which meant the binary inside the packages was a different, less
-# optimized artifact than the one next to it in the same directory — invisible to anyone
-# comparing them, since both report the same --version.
+# `--no-build`. build-packages.sh rebuilds in Docker, which is the same `release` profile and
+# the same target/<triple>/release/ directory, but a second compile: use it for a quick package
+# for a server, not for a release, where the binary inside the packages must be the very one
+# that ships standalone.
 
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"

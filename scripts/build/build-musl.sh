@@ -3,7 +3,7 @@
 #
 #   ./scripts/build/build-musl.sh [profile] [arch]
 #
-#   profile   release (default) | dev | release-docker | any custom profile
+#   profile   release (default) | dev | any custom profile
 #   arch      this host's (default) | x86_64 | aarch64 | both
 #             The default builds natively; the other architecture runs emulated and is slow.
 #
@@ -42,7 +42,8 @@ esac
 
 # Cargo's built-in "dev" profile is the one exception to "output dir == profile name": it
 # builds into a directory literally called "debug" for historical reasons. Every other
-# profile (release, release-docker, custom ones) uses its own name.
+# profile (release, custom ones) uses its own name. The result is always
+# target/<triple>/<profile>/cameodb on the host, however it was built.
 OUT_DIR="$PROFILE"
 [ "$PROFILE" = "dev" ] && OUT_DIR="debug"
 

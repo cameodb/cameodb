@@ -58,10 +58,10 @@ the container path.** The zigbuild path always fails the PIE check — zig's lin
 for rehearsing the pipeline, not for shipping.
 
 The DEB and RPM wrap that same binary via `--no-build`. They are not rebuilt.
-`scripts/build/build-packages.sh` rebuilds under `release-docker` (thin LTO, 4 codegen units)
-instead, which meant the binary inside the packages was a different, less-optimized artifact
-than the standalone binary published beside it — indistinguishable afterwards, since both
-report the same `--version`.
+`scripts/build/build-packages.sh` rebuilds in Docker instead (same `release` profile, same
+`target/<triple>/release/` directory), which makes the binary inside the packages a second
+compile rather than the standalone binary published beside it. It is for a quick package, not
+for a release.
 
 ### sbom
 
