@@ -140,6 +140,9 @@ systemctl try-restart cameodb.service
 """
 
 [package.metadata.deb]
+# Without this the control file takes the crate name, so `dpkg -s` and `apt remove` say "server".
+# The binary, the unit, /etc/cameodb and /var/lib/cameodb are all `cameodb`; the package is too.
+name = "cameodb"
 maintainer = "CameoDB Team <team@cameodb.com>"
 copyright = "2026, CameoDB Team"
 license-file = ["../../LICENSE", "4"]

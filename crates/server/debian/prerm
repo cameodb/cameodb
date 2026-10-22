@@ -1,15 +1,10 @@
 #!/bin/sh
 set -e
 
-# Stop and disable service before removal
-if [ "$1" = "remove" ] || [ "$1" = "upgrade" ]; then
-    if systemctl is-active --quiet cameodb.service; then
-        systemctl stop cameodb.service
-    fi
-    
-    if systemctl is-enabled --quiet cameodb.service; then
-        systemctl disable cameodb.service
-    fi
+# Stop on remove only. An upgrade keeps the unit enabled and postinst restarts it.
+if [ "$1" = "remove" ] && [ -d /run/systemd/system ]; then
+    systemctl stop cameodb.service || true
+    systemctl disable cameodb.service || true
 fi
 
 exit 0

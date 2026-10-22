@@ -1,30 +1,28 @@
 #!/bin/sh
 set -e
 
-# Create data directory if it doesn't exist
-if [ ! -d /var/lib/cameodb ]; then
-    mkdir -p /var/lib/cameodb
-fi
-
-# Set proper ownership and permissions
-chown cameodb:cameodb /var/lib/cameodb
-chmod 700 /var/lib/cameodb
-
-# Enable and start service on fresh install
 if [ "$1" = "configure" ]; then
-    # Reload systemd daemon
-    systemctl daemon-reload
-    
-    # Enable service
-    systemctl enable cameodb.service
-    
-    # Check if this is a fresh install (package was never installed before)
-    if [ -z "$2" ]; then
-        # Fresh install - start the service
-        systemctl start cameodb.service
-    else
-        # Upgrade - restart the service if it was running
-        if systemctl is-active --quiet cameodb.service; then
+    # Data directory, owned by the service account. The config installed at
+    # /etc/cameodb/cameodb.toml points data_paths here.
+    install -d -o cameodb -g cameodb -m 700 /var/lib/cameodb
+
+    # The config is a conffile (dpkg keeps local edits across upgrades). It holds no secret
+    # by default, but may once keys are added, so it is readable by the service group only.
+    if [ -f /etc/cameodb/cameodb.toml ]; then
+        chown root:cameodb /etc/cameodb/cameodb.toml
+        chmod 640 /etc/cameodb/cameodb.toml
+    fi
+
+    # No systemd (a container, a chroot): the files are in place, nothing to start.
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+        systemctl enable cameodb.service
+
+        if [ -z "$2" ]; then
+            # Fresh install
+            systemctl start cameodb.service
+        elif systemctl is-active --quiet cameodb.service; then
+            # Upgrade of a running node
             systemctl restart cameodb.service
         fi
     fi

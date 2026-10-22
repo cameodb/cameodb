@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+# The service account must exist before the unit file (User=cameodb) and the config land.
+# Idempotent: an upgrade finds both already there.
+if [ "$1" = "install" ] || [ "$1" = "upgrade" ]; then
+    getent group cameodb >/dev/null || groupadd --system cameodb
+    getent passwd cameodb >/dev/null || \
+        useradd --system --gid cameodb --home-dir /var/lib/cameodb --no-create-home \
+            --shell /usr/sbin/nologin --comment "CameoDB User" cameodb
+fi
+
+exit 0

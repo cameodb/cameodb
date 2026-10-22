@@ -1,25 +1,15 @@
 #!/bin/sh
 set -e
 
-# Remove user and group on purge (but not on upgrade)
-if [ "$1" = "purge" ]; then
-    # Remove user if it exists
-    if getent passwd cameodb >/dev/null; then
-        userdel cameodb
-    fi
-    
-    # Remove group if it exists
-    if getent group cameodb >/dev/null; then
-        groupdel cameodb
-    fi
-    
-    # Remove data directory if it exists (only on purge)
-    if [ -d /var/lib/cameodb ]; then
-        rm -rf /var/lib/cameodb
-    fi
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
 fi
 
-# Reload systemd daemon
-systemctl daemon-reload
+# Purge only, never on remove or upgrade: this deletes the data.
+if [ "$1" = "purge" ]; then
+    rm -rf /var/lib/cameodb /etc/cameodb
+    getent passwd cameodb >/dev/null && userdel cameodb || true
+    getent group cameodb >/dev/null && groupdel cameodb || true
+fi
 
 exit 0
