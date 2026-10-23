@@ -48,7 +48,9 @@ enabled = false
 # gates on it. To close it, mint a key:
 #   cameodb keygen --role admin --label ops \
 #     --hash-out /etc/cameodb/keys/ops --key-out ~/.cameodb/ops.key
-# then set enabled = true above and add the matching [[security.api_keys]] entry.
+#   chgrp cameodb /etc/cameodb/keys/ops && chmod 640 /etc/cameodb/keys/ops
+# then set enabled = true above and add the matching [[security.api_keys]] entry. The package
+# creates /etc/cameodb/keys root:cameodb 0750, so the node reads the digest and cannot change it.
 
 # [[security.api_keys]]
 # key_hash_file = "/etc/cameodb/keys/ops"

@@ -294,6 +294,7 @@ Get-Service CameoDB                                  # Running
 sc.exe showsid CameoDB                               # S-1-5-80-3196691271-1903880709-56935160-284765964-990515363
 cameodb client health                                # from a new shell: PATH
 Get-ChildItem C:\ProgramData\CameoDB\logs
+(Get-Acl C:\ProgramData\CameoDB\keys).Access         # the service SID: ReadAndExecute only
 Stop-Service CameoDB; Start-Service CameoDB          # graceful stop, then a start
 msiexec /x dist\<version>\windows\cameodb-<version>-x64.msi /qn
 Test-Path C:\ProgramData\CameoDB\cameodb.toml        # True: config and data stay
@@ -845,6 +846,8 @@ Hardening flags explained:
 - **Service**: `/usr/lib/systemd/system/cameodb.service`
 - **User/Group**: `cameodb` (created automatically during install)
 - **Data Directory**: `/var/lib/cameodb` (created with proper permissions)
+- **Key digests**: `/etc/cameodb/keys` (`root:cameodb`, `0750`; for `key_hash_file`)
+- **Log directory**: `/var/log/cameodb` (`cameodb:cameodb`, `0750`; for `[logging]` and the audit file)
 
 ### DEB Package Contents
 
@@ -853,6 +856,8 @@ Hardening flags explained:
 - **Service**: `/lib/systemd/system/cameodb.service`
 - **User/Group**: `cameodb` (created automatically during install)
 - **Data Directory**: `/var/lib/cameodb` (created with proper permissions)
+- **Key digests**: `/etc/cameodb/keys` (`root:cameodb`, `0750`; for `key_hash_file`)
+- **Log directory**: `/var/log/cameodb` (`cameodb:cameodb`, `0750`; for `[logging]` and the audit file)
 
 ### Installation on Target System
 

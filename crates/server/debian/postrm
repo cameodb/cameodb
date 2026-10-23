@@ -7,7 +7,7 @@ fi
 
 # Purge only, never on remove or upgrade: this deletes the data.
 if [ "$1" = "purge" ]; then
-    rm -rf /var/lib/cameodb /etc/cameodb
+    rm -rf /var/lib/cameodb /etc/cameodb /var/log/cameodb
     getent passwd cameodb >/dev/null && userdel cameodb || true
     getent group cameodb >/dev/null && groupdel cameodb || true
 fi

@@ -8,7 +8,9 @@
     config          C:\ProgramData\CameoDB\cameodb.toml, never overwritten, never removed
                     (Linux: /etc/cameodb/cameodb.toml, a conffile)
     data, logs      C:\ProgramData\CameoDB\data and \logs, kept on uninstall
-                    (Linux: /var/lib/cameodb, removed only by purge)
+                    (Linux: /var/lib/cameodb and /var/log/cameodb, removed only by purge)
+    keys            C:\ProgramData\CameoDB\keys, for key_hash_file: the service reads, only
+                    Administrators write (Linux: /etc/cameodb/keys, root:cameodb 0750)
     account         NT SERVICE\CameoDB, a virtual account Windows creates with the service:
                     no password, no user to manage (Linux: the cameodb system user)
     service         CameoDB, automatic start, started on install, restarted on failure
@@ -46,6 +48,7 @@
       <Directory Id="DATAROOT" Name="CameoDB">
         <Directory Id="DATADIR" Name="data" />
         <Directory Id="LOGDIR" Name="logs" />
+        <Directory Id="KEYDIR" Name="keys" />
       </Directory>
     </StandardDirectory>
 
@@ -154,6 +157,16 @@
       <Component Id="LogDir" Directory="LOGDIR" Guid="B40B6990-1E4E-4B2D-81B3-F7DE2317432F" Permanent="yes" Bitness="always64">
         <CreateFolder>
           <PermissionEx Sddl="D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;S-1-5-80-3196691271-1903880709-56935160-284765964-990515363)" />
+        </CreateFolder>
+      </Component>
+
+      <!--
+        Key digests: read and execute for the service, as on the config folder, so the node
+        cannot rewrite its own key ring.
+      -->
+      <Component Id="KeyDir" Directory="KEYDIR" Guid="D2DEBED2-4DD4-4085-90B5-EBE8A1FE1436" Permanent="yes" Bitness="always64">
+        <CreateFolder>
+          <PermissionEx Sddl="D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;S-1-5-80-3196691271-1903880709-56935160-284765964-990515363)" />
         </CreateFolder>
       </Component>
 

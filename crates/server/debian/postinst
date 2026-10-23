@@ -6,6 +6,15 @@ if [ "$1" = "configure" ]; then
     # /etc/cameodb/cameodb.toml points data_paths here.
     install -d -o cameodb -g cameodb -m 700 /var/lib/cameodb
 
+    # Key digests for [[security.api_keys]] key_hash_file. Owned by root and only readable by
+    # the service, so the node cannot rewrite its own key ring. Created only when missing, so
+    # an operator's own ownership survives an upgrade.
+    [ -d /etc/cameodb/keys ] || install -d -o root -g cameodb -m 750 /etc/cameodb/keys
+
+    # For [logging] directory and [security.audit] file, both off in the shipped config. The
+    # node writes here as the service user.
+    [ -d /var/log/cameodb ] || install -d -o cameodb -g cameodb -m 750 /var/log/cameodb
+
     # The config is a conffile (dpkg keeps local edits across upgrades). It holds no secret
     # by default, but may once keys are added, so it is readable by the service group only.
     if [ -f /etc/cameodb/cameodb.toml ]; then

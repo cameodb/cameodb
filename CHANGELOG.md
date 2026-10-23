@@ -39,6 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cert_file` and `key_file` too: the next handshake presents the new certificate and open
   connections finish on the old one. A reload that cannot read the files logs a warning and
   keeps the certificate in use.
+- **The packages create the key and log directories.** The DEB and RPM create
+  `/etc/cameodb/keys`, `root:cameodb` `0750`, for `key_hash_file` digests the service reads and
+  cannot change, and `/var/log/cameodb`, `cameodb:cameodb` `0750`, for `[logging]` and the audit
+  file; each only when missing, so an operator's own ownership survives an upgrade. The RPM now
+  sets the config `root:cameodb` `0640`, as the DEB does, and a DEB purge removes
+  `/var/log/cameodb` too. The MSI creates `C:\ProgramData\CameoDB\keys`, readable by the service
+  and writable by Administrators only.
 
 ### Changed
 

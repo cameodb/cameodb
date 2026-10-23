@@ -230,16 +230,21 @@ See
 
 ### Key material on disk
 
-```bash
-sudo install -d -o cameodb -g cameodb -m 700 /etc/cameodb/keys
+The DEB and RPM create `/etc/cameodb/keys` owned by `root:cameodb`, mode `0750`: the service
+reads the digests and cannot change them. On another install, create it the same way with
+`sudo install -d -o root -g cameodb -m 750 /etc/cameodb/keys`.
 
+```bash
 # Writes the digest for the server, and the key for whoever will use it.
 # Both 0600; neither is ever overwritten.
-sudo -u cameodb cameodb keygen --role writer --label ingest \
+sudo cameodb keygen --role writer --label ingest --allowed-indexes logs \
   --hash-out /etc/cameodb/keys/ingest \
-  --key-out /tmp/ingest.key
+  --key-out /root/ingest.key
 
-# Hand /tmp/ingest.key to its owner over a channel you trust, then remove it.
+# The digest, readable by the service:
+sudo chgrp cameodb /etc/cameodb/keys/ingest && sudo chmod 640 /etc/cameodb/keys/ingest
+
+# Hand /root/ingest.key to its owner over a channel you trust, then remove it.
 ```
 
 ```toml
@@ -250,11 +255,13 @@ enabled = true
 key_hash_file = "/etc/cameodb/keys/ingest"
 role = "writer"
 label = "ingest"
+allowed_indexes = ["logs"]
 ```
 
 | File | Mode | Owner | Why |
 |------|------|-------|-----|
-| `/etc/cameodb/keys/*` | `600` | the service user | Read at startup. A digest is not secret, but a **writable** one lets anyone mint themselves a role — CameoDB warns if group or others can write it |
+| `/etc/cameodb/keys/` | `750` | root:cameodb | Created by the packages. The service lists and reads it, and cannot add to it |
+| `/etc/cameodb/keys/*` | `640` | root:cameodb | Read at startup and on reload. A digest is not secret, but a **writable** one lets anyone mint themselves a role — CameoDB warns if group or others can write it |
 | `/etc/cameodb/cameodb.toml` | `640` | root:cameodb | Holds digests and paths, never a key |
 | A client's key file | `600` | the human or service using it | This one *is* the credential. The client warns if anyone else can read it |
 
@@ -324,8 +331,9 @@ Operational points:
 
 - **The file is written by the node**, which creates the parent directory if needed and
   rotates in place. It needs write access to that directory as the user the service runs as
-  — for the packaged systemd unit that is `cameodb`, so `install -d -o cameodb -g cameodb
-  /var/log/cameodb` before first start.
+  — for the packaged systemd unit that is `cameodb`. The DEB and RPM create
+  `/var/log/cameodb` for it, `cameodb:cameodb` `0750`; elsewhere, `install -d -o cameodb -g
+  cameodb -m 750 /var/log/cameodb` before first start.
 - **Do not point `logrotate` at it.** Rotation is internal, by size; an external rotator that
   renames the active file leaves the node writing to a file nobody can find until restart.
 - **In a container, put it on a mounted volume.** A path inside the container's own
@@ -510,7 +518,8 @@ msiexec /i cameodb-0.3.7-x64.msi /qn /l*v cameodb-install.log  # silent, logged
 | Program | `C:\Program Files\CameoDB\cameodb.exe`, on the system `PATH` | `/usr/local/bin/cameodb` |
 | Config | `C:\ProgramData\CameoDB\cameodb.toml` | `/etc/cameodb/cameodb.toml` |
 | Data | `C:\ProgramData\CameoDB\data` | `/var/lib/cameodb` |
-| Logs | `C:\ProgramData\CameoDB\logs\cameodb.YYYY-MM-DD.log`, 14 days | the journal |
+| Logs | `C:\ProgramData\CameoDB\logs\cameodb.YYYY-MM-DD.log`, 14 days | the journal; `/var/log/cameodb` for `[logging]` and the audit file |
+| Key digests | `C:\ProgramData\CameoDB\keys`: the service reads, Administrators write | `/etc/cameodb/keys`, `root:cameodb` `0750` |
 | Runs as | `NT SERVICE\CameoDB`, a virtual account: no password, no user to manage | the `cameodb` user |
 | Service | `CameoDB`: automatic start, restarted 10 s after a failure | `cameodb.service`, `Restart=on-failure` |
 | Listens on | `0.0.0.0:9480`, profile `internal` | `0.0.0.0:9480`, profile `internal` |
