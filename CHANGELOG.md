@@ -116,6 +116,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `127.0.0.1`, behind a reverse proxy on the same host terminating TLS, and the `bind` rule on
   the line above passed it as loopback only. Plaintext on a loopback bind now passes, as it
   already did for `auth` and `admin_api`; `external` still requires TLS whatever the bind.
+- **The RPM installed as a package named `server`.** The build scripts passed
+  `--set-metadata 'package.name="cameodb"'`, which `cargo generate-rpm` ignores without a word:
+  the key in its table is `name`. The name is now set in the package metadata, so every way of
+  building gets `cameodb`. Its scriptlets also called `systemctl` unconditionally and failed
+  where there is no systemd, a container or a chroot; they are guarded now, as the DEB's are.
 
 ### Security
 

@@ -102,6 +102,9 @@ flate2 = "1.1"
 rcgen = "0.13"
 
 [package.metadata.generate-rpm]
+# As for the DEB: without it the package is named after the crate, "server". The build scripts'
+# `--set-metadata 'package.name="cameodb"'` never did this — it overrides keys of this table.
+name = "cameodb"
 release = "1"
 assets = [
     # NOTE: cargo-generate-rpm automatically resolves target/release/ to the correct
@@ -126,21 +129,24 @@ fi
 chown cameodb:cameodb /var/lib/cameodb
 chmod 700 /var/lib/cameodb
 
-if [ $1 -eq 1 ]; then
+# No systemd (a container, a chroot): the files are in place, nothing to enable.
+if [ $1 -eq 1 ] && [ -d /run/systemd/system ]; then
     systemctl daemon-reload
     systemctl preset cameodb.service
 fi
 """
 
 pre_uninstall_script = """
-if [ $1 -eq 0 ]; then
+if [ $1 -eq 0 ] && [ -d /run/systemd/system ]; then
     systemctl --no-reload disable --now cameodb.service
 fi
 """
 
 post_trans_script = """
-systemctl daemon-reload
-systemctl try-restart cameodb.service
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload
+    systemctl try-restart cameodb.service
+fi
 """
 
 [package.metadata.deb]

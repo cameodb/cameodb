@@ -139,8 +139,7 @@ for ARCH in "${ARCHS[@]}"; do
 
         echo 'Generating RPM package...'
         cargo generate-rpm -p crates/server --target ${TARGET} --profile ${PROFILE} --auto-req disabled \
-          -o ${OUTPUT_DIR}/cameodb-${VERSION}-1.${RPM_ARCH}.rpm \
-          --set-metadata 'package.name=\"cameodb\"'
+          -o ${OUTPUT_DIR}/cameodb-${VERSION}-1.${RPM_ARCH}.rpm
 
         echo 'Copying artifacts to the host...'
         cp ${OUTPUT_DIR}/cameodb \

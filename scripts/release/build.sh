@@ -143,8 +143,7 @@ for arch in $LINUX_ARCHS; do
     step "cargo generate-rpm → $rpm_name"
     cargo generate-rpm -p crates/server \
         --target "$triple" --profile release --auto-req disabled \
-        -o "$DIST/linux/$rpm_name" \
-        --set-metadata "package.name=\"cameodb\"" > /dev/null
+        -o "$DIST/linux/$rpm_name" > /dev/null
     ok "$rpm_name  $(du -h "$DIST/linux/$rpm_name" | cut -f1)"
 done
 
