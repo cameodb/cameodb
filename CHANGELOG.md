@@ -134,6 +134,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   start. The digest is now `0640` in the group of its directory, which in the packages'
   `/etc/cameodb/keys` is the service's, and the mode is set regardless of the umask. The key
   file stays `0600`. A digest the node cannot read is reported with the command that fixes it.
+- **A service that would not start failed the package install.** The DEB's `postinst` started
+  or restarted the service under `set -e`, so a config the unit's `check-config` refused left
+  dpkg half-configured until `dpkg --configure -a`. The install now completes and says the
+  service did not start, with the commands that show why and start it again; an RPM upgrade
+  whose restart fails says the same.
 
 ### Security
 

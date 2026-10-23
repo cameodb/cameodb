@@ -27,12 +27,21 @@ if [ "$1" = "configure" ]; then
         systemctl daemon-reload
         systemctl enable cameodb.service
 
+        # A node that will not start is a config to fix, not a package that failed to install:
+        # the unit's check-config refuses a config the node cannot run on, and failing here
+        # left dpkg half-configured until `dpkg --configure -a`. Report it and carry on.
         if [ -z "$2" ]; then
             # Fresh install
-            systemctl start cameodb.service
+            systemctl start cameodb.service || started=no
         elif systemctl is-active --quiet cameodb.service; then
             # Upgrade of a running node
-            systemctl restart cameodb.service
+            systemctl restart cameodb.service || started=no
+        fi
+        if [ "${started:-}" = no ]; then
+            echo "cameodb: installed, but the service did not start. See" >&2
+            echo "  cameodb check-config -c /etc/cameodb/cameodb.toml" >&2
+            echo "  journalctl -u cameodb -n 40" >&2
+            echo "then: systemctl reset-failed cameodb && systemctl start cameodb" >&2
         fi
     fi
 fi

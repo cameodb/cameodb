@@ -152,7 +152,11 @@ fi
 post_trans_script = """
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload
-    systemctl try-restart cameodb.service
+    systemctl try-restart cameodb.service || {
+        echo "cameodb: upgraded, but the service did not restart. See" >&2
+        echo "  cameodb check-config -c /etc/cameodb/cameodb.toml" >&2
+        echo "  journalctl -u cameodb -n 40" >&2
+    }
 fi
 """
 
