@@ -1284,6 +1284,27 @@ which is re-applied rather than read from the file. `tenants`, `limits`, `audit`
 `implicit_index_creation` do not — they are bound at startup, and the reload response names
 them under `not_applied` when the file changed them.
 
+### TLS certificate renewal
+
+With `[network.http.tls] enabled = true`, the certificate and key are read at startup and again on
+SIGHUP — the signal that reloads the key ring — so a renewed certificate takes effect without a
+restart. Point `cert_file` and `key_file` at the files the renewal tool rewrites, and have it send
+the signal when it is done:
+
+```bash
+# certbot: /etc/letsencrypt/renewal-hooks/deploy/cameodb
+cp /etc/letsencrypt/live/data.example.org/fullchain.pem /etc/cameodb/certs/cert.pem
+cp /etc/letsencrypt/live/data.example.org/privkey.pem   /etc/cameodb/certs/key.pem
+systemctl reload cameodb
+```
+
+The next handshake presents the new certificate; connections already open keep the one they began
+with. The paths are the ones read at startup, so changing them in the file still needs a restart.
+A reload that cannot read or parse the files is a warning in the log, and the certificate in use
+stays in use, so a renewal that went wrong does not take the node's HTTPS down. The reload
+checks nothing the startup does not: the node does not compare the new certificate with the
+domain, and a key that does not match its certificate is refused.
+
 ## Environment Variables
 
 CameoDB supports environment variable overrides for all major settings. Prefix variable names with `CAMEODB_`.

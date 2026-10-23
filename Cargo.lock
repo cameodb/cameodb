@@ -4368,6 +4368,7 @@ dependencies = [
  "libp2p",
  "num_cpus",
  "rayon",
+ "rcgen",
  "redb",
  "reqwest",
  "rustls",

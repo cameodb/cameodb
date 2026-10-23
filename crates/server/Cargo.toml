@@ -96,6 +96,10 @@ reqwest = { workspace = true }
 # pulls it in through `async-compression` — so it adds nothing to the dependency or
 # advisory surface, and being a dev-dependency it is not in the shipped binary at all.
 flate2 = "1.1"
+# Self-signed certificates for the TLS reload test, which has to hand the node two different ones.
+# Already in the lockfile as a dependency of libp2p's TLS, so it adds nothing to the dependency or
+# advisory surface, and being a dev-dependency it is not in the shipped binary.
+rcgen = "0.13"
 
 [package.metadata.generate-rpm]
 release = "1"

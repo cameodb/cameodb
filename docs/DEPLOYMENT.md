@@ -282,6 +282,14 @@ EnvironmentFile=/etc/cameodb/cameodb.env
 There is no `CAMEODB_API_KEY` on the server side on purpose: a node never needs a key in the
 clear. That variable belongs to the client.
 
+### TLS certificate renewal
+
+A node serving HTTPS itself (`[network.http.tls]`) re-reads its certificate and key on the same
+SIGHUP, so `systemctl reload cameodb` from the renewal tool's deploy hook installs a renewed
+certificate without a restart; see
+[TLS certificate renewal](CONFIGURATION.md#tls-certificate-renewal). Behind a proxy that holds
+the certificate, such as Caddy, the node has none to renew.
+
 ### Rotation
 
 Keys are read at startup and re-read on demand: `POST /_admin/keys/reload` (a `node-admin`

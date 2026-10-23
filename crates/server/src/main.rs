@@ -764,11 +764,24 @@ async fn run(args: Vec<String>) -> Result<()> {
     );
 
     // SIGHUP — `systemctl reload`, an operator's `kill -HUP` — runs the same reload the
-    // `POST /_admin/keys/reload` endpoint drives. A refused reload is a log line, never
-    // fatal: the ring that was already deciding requests keeps deciding them.
+    // `POST /_admin/keys/reload` endpoint drives, and re-reads the TLS certificate and key when
+    // the node serves HTTPS, so a renewed certificate (certbot's deploy hook, an internal CA's
+    // rotation) takes effect without a restart. A refused reload is a log line, never fatal:
+    // the ring and the certificate that were already in use stay in use.
     #[cfg(unix)]
     {
         let keys = Arc::clone(&keyring);
+        // The handle is shared with the listener, so a reload swaps what the next handshake
+        // presents; connections already open keep the certificate they began with.
+        let tls_reload = tls_config.clone().zip(
+            cameodb_config
+                .network
+                .http
+                .tls
+                .cert_file
+                .clone()
+                .zip(cameodb_config.network.http.tls.key_file.clone()),
+        );
         tokio::spawn(async move {
             use tokio::signal::unix;
             let mut sighup = match unix::signal(unix::SignalKind::hangup()) {
@@ -784,6 +797,18 @@ async fn run(args: Vec<String>) -> Result<()> {
                         tracing::info!(keys = %report.summary, "SIGHUP: key ring reloaded")
                     }
                     Err(err) => tracing::warn!("SIGHUP key reload refused: {err:#}"),
+                }
+                if let Some((tls, (cert_file, key_file))) = &tls_reload {
+                    match tls.reload_from_pem_file(cert_file, key_file).await {
+                        Ok(()) => tracing::info!(
+                            cert_file = %cert_file.display(),
+                            "SIGHUP: TLS certificate reloaded"
+                        ),
+                        Err(err) => tracing::warn!(
+                            cert_file = %cert_file.display(),
+                            "SIGHUP TLS reload refused, keeping the certificate in use: {err:#}"
+                        ),
+                    }
                 }
             }
         });

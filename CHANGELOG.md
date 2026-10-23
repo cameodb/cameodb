@@ -33,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and resolved `tokenizer`, `learned: true` on a field added by a write, and `routing_field_name`
   when it is not `id`. MCP `describe_index` leaves the record option out.
 
+- **A renewed TLS certificate is picked up on SIGHUP.** A node serving HTTPS read its certificate
+  and key once, so each renewal — every 60 to 90 days under Let's Encrypt — needed a restart.
+  `systemctl reload cameodb`, the signal that already reloads the key ring, now re-reads
+  `cert_file` and `key_file` too: the next handshake presents the new certificate and open
+  connections finish on the old one. A reload that cannot read the files logs a warning and
+  keeps the certificate in use.
+
 ### Changed
 
 - **Existing callers receive arrays of at most 1000 elements** unless they ask for more, because
