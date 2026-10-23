@@ -1244,7 +1244,8 @@ path — and can route or silence it independently of everything else the node s
 # Print the key to stdout and the config stanza to stderr
 cameodb keygen --role writer --label team-a --allowed-indexes docs,wiki
 
-# Or write both files directly (created 0600, never overwritten)
+# Or write both files directly, never overwritten: the key 0600, the digest 0640 in the
+# group of its directory (in /etc/cameodb/keys, the service's)
 cameodb keygen --role reader --label agent \
   --key-out ~/.cameodb/agent.key \          # for the client's --api-key-file
   --hash-out /etc/cameodb/keys/agent         # for key_hash_file above

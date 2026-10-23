@@ -307,8 +307,9 @@ The key is printed once to stdout and the `[[security.api_keys]]` stanza to stde
 roles bundle four capabilities — `admin` (everything), `writer` (read and write), `reader`
 (read only) — and `allowed_indexes` restricts a key to named indexes for every role.
 
-`--key-out` and `--hash-out` write the two files the rest of the design already expects,
-created `0600` and never overwritten:
+`--key-out` and `--hash-out` write the two files the rest of the design already expects, never
+overwritten: the key `0600`, and the digest `0640` in the group of its directory, so in the
+packages' `/etc/cameodb/keys` the service reads it with nothing more to do:
 
 ```bash
 cameodb keygen --role writer --label team-a \

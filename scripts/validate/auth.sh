@@ -540,9 +540,10 @@ fi
 file_mode() {
     stat -c '%a' "$1" 2>/dev/null || stat -f '%OLp' "$1"
 }
-for f in filed.key filed.hash; do
-    check_eq "keygen creates $f as 0600" "600" "$(file_mode "$WORK/$f")"
-done
+# The key is a credential, owner only. The digest is not secret and has to be readable by the
+# service, which is the group of the directory it lands in; writable by the owner alone.
+check_eq "keygen creates filed.key as 0600" "600" "$(file_mode "$WORK/filed.key")"
+check_eq "keygen creates filed.hash as 0640" "640" "$(file_mode "$WORK/filed.hash")"
 # The key must not also reach stdout: written and printed is two places to leak from.
 if "$BIN" keygen --role reader --key-out "$WORK/quiet.key" 2>/dev/null | grep -q 'cameo_v1_'; then
     fail "--key-out keeps the key off stdout"

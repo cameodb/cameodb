@@ -624,7 +624,7 @@ impl SecurityConfig {
 /// `create_new` rather than a check-then-write: it is atomic, and it means the answer to
 /// "what if the file is already there" is decided by the kernel rather than by a race. The
 /// mode is set at creation, so there is no window in which the file exists with a wider one.
-fn write_new_secret_file(path: &Path, contents: &str) -> Result<()> {
+fn write_new_secret_file(path: &Path, contents: &str, mode: u32) -> Result<()> {
     use std::io::Write;
 
     let mut options = std::fs::OpenOptions::new();
@@ -632,8 +632,10 @@ fn write_new_secret_file(path: &Path, contents: &str) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(mode);
     }
+    #[cfg(not(unix))]
+    let _ = mode;
 
     let mut file = options.open(path).map_err(|err| match err.kind() {
         std::io::ErrorKind::AlreadyExists => anyhow::anyhow!(
@@ -644,6 +646,14 @@ fn write_new_secret_file(path: &Path, contents: &str) -> Result<()> {
         _ => anyhow::anyhow!("cannot create {}: {err}", path.display()),
     })?;
     writeln!(file, "{contents}").with_context(|| format!("cannot write {}", path.display()))?;
+    // The mode at creation is narrowed by the umask: a shell with `umask 077` would turn a
+    // 0640 digest into 0600 and leave the service unable to read it. Set it outright.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("cannot set the mode of {}", path.display()))?;
+    }
 
     #[cfg(not(unix))]
     eprintln!(
@@ -655,13 +665,47 @@ fn write_new_secret_file(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
+/// Give a digest file the group of the directory it was written to, so the service reads it
+/// without a `chgrp` by hand: `keygen` runs as root, and in `/etc/cameodb/keys` (`root:cameodb`
+/// `0750`) that group is the service's. A digest is not a secret — only a writable one is a
+/// risk, and the file stays writable by its owner alone. Returns what to tell the operator
+/// when the group could not be given; an unprivileged caller may not belong to it.
+#[cfg(unix)]
+fn share_with_directory_group(path: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty())?;
+    let dir_gid = std::fs::metadata(dir).ok()?.gid();
+    if std::fs::metadata(path).ok()?.gid() == dir_gid {
+        return None;
+    }
+    std::os::unix::fs::chown(path, None, Some(dir_gid))
+        .err()
+        .map(|err| {
+            format!(
+                "could not give {} the group of {} (gid {dir_gid}): {err}. chgrp it to the \
+                 group the service runs as, or the node cannot read it",
+                path.display(),
+                dir.display()
+            )
+        })
+}
+
 fn read_key_hash_file(path: &Path) -> Result<String> {
     if !path.exists() {
         bail!("file not found: {}", path.display());
     }
     warn_if_key_hash_file_is_writable_by_others(path);
-    let contents = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let contents = std::fs::read_to_string(path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::PermissionDenied {
+            anyhow::anyhow!(
+                "failed to read {}: {err}. The user the node runs as has to be able to read it: \
+                 `chgrp <service group> {0} && chmod 640 {0}`",
+                path.display()
+            )
+        } else {
+            anyhow::anyhow!("failed to read {}: {err}", path.display())
+        }
+    })?;
     let hash = contents.trim();
     if hash.is_empty() {
         bail!("file is empty: {}", path.display());
@@ -1054,7 +1098,8 @@ Options:
   --allowed-indexes <A,B>   Restrict this key to these indexes (default: every index)
   --key-out <PATH>          Write the key to PATH (mode 0600) instead of stdout.
                             For `client --api-key-file`.
-  --hash-out <PATH>         Write the digest to PATH (mode 0600), for `key_hash_file`.
+  --hash-out <PATH>         Write the digest to PATH, for `key_hash_file`: mode 0640, in the
+                            group of its directory, so a service in that group reads it.
   -h, --help                Show this message
 
 Without --key-out the key is printed to stdout and everything else to stderr, so redirecting
@@ -1143,11 +1188,15 @@ is how a working node stops working.";
     // Files first. A key printed and then not written is a key the operator has to notice
     // was never saved; a key written and then printed is at worst printed twice.
     if let Some(path) = &hash_out {
-        write_new_secret_file(path, &digest.to_config_value())
+        write_new_secret_file(path, &digest.to_config_value(), 0o640)
             .with_context(|| format!("--hash-out {}", path.display()))?;
+        #[cfg(unix)]
+        if let Some(advice) = share_with_directory_group(path) {
+            eprintln!("⚠️  {advice}");
+        }
     }
     match &key_out {
-        Some(path) => write_new_secret_file(path, key.expose())
+        Some(path) => write_new_secret_file(path, key.expose(), 0o600)
             .with_context(|| format!("--key-out {}", path.display()))?,
         None => println!("{}", key.expose()),
     }
@@ -1171,8 +1220,8 @@ is how a working node stops working.";
     let config_advice = match &hash_out {
         Some(path) => format!(
             "{}\n\
-             If the node runs as another user, chown that file to it — the server reads it at \
-             startup.\n",
+             The digest is mode 0640 in the group of its directory: in /etc/cameodb/keys, the \
+             service's.\n",
             key_stanza(
                 &format!(
                     "key_hash_file = {}",
@@ -1259,6 +1308,41 @@ mod tests {
             role: Some(role),
             ..Default::default()
         }
+    }
+
+    /// The digest is read by the service and the key by its holder, so they get different
+    /// modes: a 0600 digest written by root was unreadable to the service until a `chgrp` and
+    /// `chmod` by hand, which is the step an install skipped and the node then refused to start.
+    #[cfg(unix)]
+    #[test]
+    fn keygen_writes_a_group_readable_digest_and_an_owner_only_key() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let hash = dir.path().join("reader");
+        let key = dir.path().join("reader.key");
+        run_keygen(
+            [
+                "--role",
+                "reader",
+                "--hash-out",
+                hash.to_str().unwrap(),
+                "--key-out",
+                key.to_str().unwrap(),
+            ]
+            .map(String::from),
+        )
+        .unwrap();
+
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&hash), 0o640);
+        assert_eq!(mode(&key), 0o600);
+        assert_eq!(
+            std::fs::metadata(&hash).unwrap().gid(),
+            std::fs::metadata(dir.path()).unwrap().gid(),
+            "the digest takes its directory's group"
+        );
+        // And the node accepts what keygen wrote.
+        assert!(read_key_hash_file(&hash).unwrap().starts_with("sha256:"));
     }
 
     /// The stanza `keygen` prints is what gets pasted into the config, so it has to describe the

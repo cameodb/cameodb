@@ -128,6 +128,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the key in its table is `name`. The name is now set in the package metadata, so every way of
   building gets `cameodb`. Its scriptlets also called `systemctl` unconditionally and failed
   where there is no systemd, a container or a chroot; they are guarded now, as the DEB's are.
+- **A digest written by `keygen --hash-out` was unreadable to the service.** It was created
+  `0600` by whoever ran `keygen`, root in practice, so every key needed a `chgrp` and `chmod`
+  by hand; one that missed it made `check-config` refuse the config and the node refuse to
+  start. The digest is now `0640` in the group of its directory, which in the packages'
+  `/etc/cameodb/keys` is the service's, and the mode is set regardless of the umask. The key
+  file stays `0600`. A digest the node cannot read is reported with the command that fixes it.
 
 ### Security
 

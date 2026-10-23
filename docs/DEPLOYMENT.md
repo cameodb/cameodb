@@ -235,14 +235,12 @@ reads the digests and cannot change them. On another install, create it the same
 `sudo install -d -o root -g cameodb -m 750 /etc/cameodb/keys`.
 
 ```bash
-# Writes the digest for the server, and the key for whoever will use it.
-# Both 0600; neither is ever overwritten.
+# Writes the digest for the server, and the key for whoever will use it; neither is ever
+# overwritten. The key is 0600. The digest is 0640 in the group of its directory — here
+# cameodb — so the service reads it as written.
 sudo cameodb keygen --role writer --label ingest --allowed-indexes logs \
   --hash-out /etc/cameodb/keys/ingest \
   --key-out /root/ingest.key
-
-# The digest, readable by the service:
-sudo chgrp cameodb /etc/cameodb/keys/ingest && sudo chmod 640 /etc/cameodb/keys/ingest
 
 # Hand /root/ingest.key to its owner over a channel you trust, then remove it.
 ```
