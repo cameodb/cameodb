@@ -107,6 +107,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it offered nothing, after `title,` it offered `title` again, and after `title,a` nothing. The
   keyword now completes first, then each Tab offers the fields not yet in the clause, whether the
   list is written with commas alone or with spaces.
+- **`keygen --hash-out` printed a stanza wider than the key it minted.** The `key_hash_file`
+  form named only the file and the role, leaving out `label` and `allowed_indexes`, so pasting
+  it as printed configured a key scoped to some indexes as one that reaches every index. Every
+  form `keygen` prints now carries both, and quotes labels and paths as TOML strings.
 
 ### Security
 

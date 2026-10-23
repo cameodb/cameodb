@@ -1152,17 +1152,12 @@ is how a working node stops working.";
         None => println!("{}", key.expose()),
     }
 
-    let mut stanza = String::new();
-    stanza.push_str("  [[security.api_keys]]\n");
-    stanza.push_str(&format!("  key_hash = \"{}\"\n", digest.to_config_value()));
-    stanza.push_str(&format!("  role = \"{}\"\n", role));
-    if let Some(label) = &label {
-        stanza.push_str(&format!("  label = \"{}\"\n", label));
-    }
-    if let Some(indexes) = &allowed_indexes {
-        let list: Vec<String> = indexes.iter().map(|i| format!("\"{i}\"")).collect();
-        stanza.push_str(&format!("  allowed_indexes = [{}]\n", list.join(", ")));
-    }
+    let stanza = key_stanza(
+        &format!("key_hash = {}", toml_string(&digest.to_config_value())),
+        role,
+        label.as_deref(),
+        allowed_indexes.as_deref(),
+    );
 
     let whereabouts = match &key_out {
         Some(path) => format!("The key was written to {} (mode 0600).", path.display()),
@@ -1171,28 +1166,48 @@ is how a working node stops working.";
     };
 
     // What to put in the config: the file that was just written, if there is one, or the
-    // literal hash and the command to put it in a file.
+    // literal hash and the command to put it in a file. Every form carries the label and the
+    // index list, so what is pasted is the key as it was minted, not a broader one.
     let config_advice = match &hash_out {
         Some(path) => format!(
-            "  [[security.api_keys]]\n  \
-             key_hash_file = \"{}\"\n  \
-             role = \"{role}\"\n\n\
+            "{}\n\
              If the node runs as another user, chown that file to it — the server reads it at \
              startup.\n",
-            path.display(),
-            role = role,
+            key_stanza(
+                &format!(
+                    "key_hash_file = {}",
+                    toml_string(&path.display().to_string())
+                ),
+                role,
+                label.as_deref(),
+                allowed_indexes.as_deref(),
+            ),
         ),
-        None => format!(
-            "{stanza}\n\
-             Or keep the hash out of the config file:\n\n  \
-             cameodb keygen --role {role} --hash-out /etc/cameodb/keys/{file}\n\n  \
-             [[security.api_keys]]\n  \
-             key_hash_file = \"/etc/cameodb/keys/{file}\"\n  \
-             role = \"{role}\"\n",
-            stanza = stanza,
-            role = role,
-            file = label.as_deref().unwrap_or("cameodb"),
-        ),
+        None => {
+            let file = format!(
+                "/etc/cameodb/keys/{}",
+                label.as_deref().unwrap_or("cameodb")
+            );
+            let mut command = format!("cameodb keygen --role {role}");
+            if let Some(label) = &label {
+                command.push_str(&format!(" --label {label}"));
+            }
+            if let Some(indexes) = &allowed_indexes {
+                command.push_str(&format!(" --allowed-indexes {}", indexes.join(",")));
+            }
+            format!(
+                "{stanza}\n\
+                 Or keep the hash out of the config file:\n\n  \
+                 {command} --hash-out {file}\n\n\
+                 {file_stanza}",
+                file_stanza = key_stanza(
+                    &format!("key_hash_file = {}", toml_string(&file)),
+                    role,
+                    label.as_deref(),
+                    allowed_indexes.as_deref(),
+                ),
+            )
+        }
     };
 
     eprintln!(
@@ -1209,6 +1224,31 @@ is how a working node stops working.";
     Ok(())
 }
 
+/// One `[[security.api_keys]]` stanza as `keygen` prints it, indented for the advice text.
+/// `source` is the line naming the digest, `key_hash = …` or `key_hash_file = …`.
+fn key_stanza(
+    source: &str,
+    role: Role,
+    label: Option<&str>,
+    allowed_indexes: Option<&[String]>,
+) -> String {
+    let mut stanza = format!("  [[security.api_keys]]\n  {source}\n  role = \"{role}\"\n");
+    if let Some(label) = label {
+        stanza.push_str(&format!("  label = {}\n", toml_string(label)));
+    }
+    if let Some(indexes) = allowed_indexes {
+        let list: Vec<String> = indexes.iter().map(|i| toml_string(i)).collect();
+        stanza.push_str(&format!("  allowed_indexes = [{}]\n", list.join(", ")));
+    }
+    stanza
+}
+
+/// A TOML string literal, quoted and escaped: a label with a quote in it, or a Windows path
+/// with backslashes, would otherwise print a stanza the config parser rejects.
+fn toml_string(value: &str) -> String {
+    toml::Value::String(value.to_string()).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1219,6 +1259,43 @@ mod tests {
             role: Some(role),
             ..Default::default()
         }
+    }
+
+    /// The stanza `keygen` prints is what gets pasted into the config, so it has to describe the
+    /// key that was minted. The `--hash-out` form left out the label and the index list, which
+    /// pasted an unrestricted key in place of a scoped one.
+    #[test]
+    fn a_printed_stanza_parses_to_the_key_as_minted() {
+        #[derive(serde::Deserialize)]
+        struct Pasted {
+            security: SecurityConfig,
+        }
+        let indexes = vec!["narodne_novine".to_string(), "istarske_novine".to_string()];
+        for source in [
+            format!("key_hash_file = {}", toml_string(r"C:\keys\sync")),
+            format!("key_hash = {}", toml_string("sha256:abc")),
+        ] {
+            let stanza = key_stanza(
+                &source,
+                Role::Writer,
+                Some("a \"quoted\" label"),
+                Some(&indexes),
+            );
+            let pasted: Pasted = toml::from_str(&format!("[security]\n{stanza}"))
+                .unwrap_or_else(|e| panic!("{stanza} does not parse: {e}"));
+            let key = &pasted.security.api_keys[0];
+            assert_eq!(key.role, Some(Role::Writer), "{stanza}");
+            assert_eq!(key.label.as_deref(), Some("a \"quoted\" label"), "{stanza}");
+            assert_eq!(key.allowed_indexes.as_ref(), Some(&indexes), "{stanza}");
+        }
+
+        // Without the options the stanza names neither, rather than an empty list, which the
+        // config refuses as "no index at all".
+        let bare = key_stanza("key_hash_file = \"/k\"", Role::Reader, None, None);
+        assert!(
+            !bare.contains("label") && !bare.contains("allowed_indexes"),
+            "{bare}"
+        );
     }
 
     #[test]
