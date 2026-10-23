@@ -279,6 +279,10 @@ pub fn evaluate(config: &CameoDbConfig) -> Result<Posture, String> {
                  cert_file and key_file"
                     .to_string(),
             ),
+            // The bind decides, as it does for `auth` and `admin_api`: plaintext that never
+            // leaves the machine has no path to be read on — the case of a reverse proxy on the
+            // same host terminating TLS in front of the node.
+            (_, false) if loopback => Outcome::Pass("plaintext (loopback only)".to_string()),
             (Profile::Internal, false) if config.security.enabled => Outcome::Warn(
                 "plaintext HTTP on a network-reachable bind; every API key travels in the clear \
                  and can be replayed by anyone on the path"
@@ -288,7 +292,10 @@ pub fn evaluate(config: &CameoDbConfig) -> Result<Posture, String> {
                 "plaintext HTTP on a network-reachable bind; traffic travels in the clear"
                     .to_string(),
             ),
-            (Profile::Local, false) => Outcome::Pass("plaintext (loopback only)".to_string()),
+            // `local` off loopback: the `bind` rule refuses it, and one refusal is enough.
+            (Profile::Local, false) => {
+                Outcome::Pass("plaintext (the bind rule refuses 'local' off loopback)".to_string())
+            }
         },
     );
 
@@ -968,6 +975,30 @@ mod tests {
         let mut external = config_for(Some(Profile::External), "0.0.0.0");
         external.network.http.cors_allowed_origins = vec![];
         assert!(auth_outcome(&external).is_fail());
+    }
+
+    /// Plaintext on loopback is not plaintext on a network. `internal` behind a reverse proxy
+    /// on the same host was warned "network-reachable" next to a `bind` line passing it as
+    /// loopback only. `external` still requires TLS: it is a declaration the node holds itself
+    /// to, whatever the bind.
+    #[test]
+    fn plaintext_is_warned_only_where_it_can_be_read() {
+        let tls = |profile, bind| {
+            let mut config = config_for(Some(profile), bind);
+            config.network.http.cors_allowed_origins = vec![];
+            with_key(&mut config, crate::auth::Role::Admin);
+            outcome_for(&config, "tls")
+        };
+        assert!(matches!(
+            tls(Profile::Internal, "127.0.0.1"),
+            Outcome::Pass(_)
+        ));
+        assert!(matches!(tls(Profile::Local, "127.0.0.1"), Outcome::Pass(_)));
+        assert!(matches!(
+            tls(Profile::Internal, "0.0.0.0"),
+            Outcome::Warn(_)
+        ));
+        assert!(tls(Profile::External, "127.0.0.1").is_fail());
     }
 
     /// The one warning `cameodb check-config` refuses to pass, while the node still starts.

@@ -111,6 +111,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   form named only the file and the role, leaving out `label` and `allowed_indexes`, so pasting
   it as printed configured a key scoped to some indexes as one that reaches every index. Every
   form `keygen` prints now carries both, and quotes labels and paths as TOML strings.
+- **`check-config` called a loopback bind network-reachable.** Under `profile = "internal"` the
+  `tls` rule warned that API keys travel in the clear even when the node listened on
+  `127.0.0.1`, behind a reverse proxy on the same host terminating TLS, and the `bind` rule on
+  the line above passed it as loopback only. Plaintext on a loopback bind now passes, as it
+  already did for `auth` and `admin_api`; `external` still requires TLS whatever the bind.
 
 ### Security
 
