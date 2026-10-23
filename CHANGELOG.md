@@ -108,6 +108,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keyword now completes first, then each Tab offers the fields not yet in the clause, whether the
   list is written with commas alone or with spaces.
 
+### Security
+
+- **rustls-webpki 0.103.15 → 0.103.16 and webpki-root-certs 1.0.9 → 1.0.11**, for
+  RUSTSEC-2026-0382 (certificate verification accepting distrusted intermediates) and
+  RUSTSEC-2026-0383 (the bundled roots trusting distrusted emSign intermediates). Both are in the
+  path of every outbound HTTPS connection and of the libp2p QUIC handshake. `ctutils` 0.4.3 →
+  0.4.5 for RUSTSEC-2026-0385, and the yanked `clipboard-win` and `inout` replaced.
+
 ## [0.3.7] - 2026-10-18
 
 ### Added
