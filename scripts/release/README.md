@@ -4,6 +4,7 @@ Builds, describes, signs and publishes a CameoDB release. Four stages, driven by
 `release.sh`, each also runnable on its own.
 
 ```bash
+scripts/release/bump.sh 0.3.8                    # set the version everywhere, before any stage
 scripts/release/release.sh --stage build         # mac + linux binaries, DEB, RPM
 scripts/release/release.sh --stage sbom          # SPDX + CycloneDX
 
@@ -27,6 +28,14 @@ run against: at 0.3.0 it would have produced a `cameodb_0.2.3_amd64.deb` whose b
 `--version` with 0.3.0, and nothing downstream compares the two.
 
 Override for a test run with `CAMEODB_VERSION=…`.
+
+`bump.sh <X.Y.Z>` is how the tree gets its version. It rewrites each crate's `version`, the
+version pinned beside every internal `path` dependency, the workspace members in `Cargo.lock`
+(`cargo update --workspace`, so no third-party dependency moves), the `**Version:**` line of
+`docs/ARCHITECTURE.md` and the MSI file name in the `docs/DEPLOYMENT.md` install examples. It
+refuses a version that is malformed or not newer, and a tree whose crates already disagree, and
+checks afterwards that all six manifests agree and no old pin is left. History (CHANGELOG,
+ROADMAP, the checklist) is not touched, and nor is `[Unreleased]`: that is a by-hand step.
 
 ## What each stage produces
 

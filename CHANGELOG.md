@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+**Upgrading from 0.3.7 or earlier: every configured API key digest has to be replaced once.**
+A key's digest is now SHA-256 of its 43-character body, not of the whole `cameo_v1_…` string, so
+a digest computed by an earlier `keygen` no longer matches its key. The node starts and
+`check-config` passes, and every request is then refused `401`, "the API key presented is not
+recognised". The keys themselves are unchanged: nothing is re-issued and no key file is edited.
+Replace the digests in `[[security.api_keys]]` `key_hash`, in each `key_hash_file`, and in
+`CAMEODB_API_KEY_HASH` or `--api-key-hash`, on each node together with its binary — a new digest
+does not match on the old build, and an old one does not match on the new — then reload
+(`systemctl reload cameodb`, SIGHUP, or `POST /_admin/keys/reload`). Keep the old digests until
+the upgrade is confirmed: a downgrade needs them back.
+
+With the keys at hand, `scripts/ops/key-rehash.sh <key-dir> [hash-dir]` rewrites the digest files
+in place and reports what it would change without `--write`; `scripts/ops/key-digest.sh
+<key-file>` prints one digest. Without the source tree, the same digest is
+`tr -d '[:space:]' < agent.key | sed 's/^cameo_v1_//' | sha256sum` (`shasum -a 256` on macOS),
+prefixed `sha256:`. A key's `key_id` in logs and in the audit trail changes with its digest.
+
 ### Added
 
 - **A hit's arrays are capped the way its hits are.** One field of a threat-intelligence record
@@ -50,11 +67,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **An API key's digest covers its 43-character body, not the `cameo_v1_` prefix.** The prefix
-  is still required and checked before anything is hashed; only what is hashed changed. Every
-  configured `key_hash` and `key_hash_file` has to be replaced once:
-  `scripts/ops/key-digest.sh <key-file>` prints the new `sha256:…` from an existing key file
-  without printing the key. Keys themselves are unchanged and stay valid. The `key_id` a key
-  logs under changes with its digest.
+  is still required and checked before anything is hashed; only what is hashed changed, so the
+  digest no longer depends on how the prefix is spelled. Configured digests have to be replaced
+  once: see the upgrade note at the top of this section. `scripts/ops/key-digest.sh <key-file>`
+  prints the new `sha256:…` without printing the key, and `scripts/ops/key-rehash.sh` replaces
+  a directory of digest files in place.
 - **Existing callers receive arrays of at most 1000 elements** unless they ask for more, because
   the cap is on by default. A hit that was cut says so in `_truncated_arrays`; set
   `[search] default_array_limit` up to `max_array_limit` to restore longer arrays without

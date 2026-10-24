@@ -7,14 +7,16 @@ box is a question that has not been answered, not a formality.
 ## Procedure
 
 1. **Set the version.** Every crate under `crates/` carries its own `version`, and the
-   internal path dependencies pin it too — a bump touches both in each manifest, then
-   `cargo check --workspace` to refresh `Cargo.lock`. Confirm with
-   `cargo run --bin cameodb -- --version`, which reads `CARGO_PKG_VERSION` and is the only
-   place the number is observable at runtime. It also appends `+fault-injection` on a build
-   carrying the panic-test seams, which is not something to ship — see step 4.
+   internal path dependencies pin it too. `bump.sh` changes both in each manifest, refreshes
+   the workspace members in `Cargo.lock`, and updates the two docs that name the version
+   (`docs/ARCHITECTURE.md`, and the MSI file name in `docs/DEPLOYMENT.md`); it refuses a
+   version that is not newer and checks that all six manifests agree afterwards.
    ```bash
-   grep -rn '^version = ' crates/*/Cargo.toml     # all six must agree
+   scripts/release/bump.sh 0.3.8
    ```
+   Confirm with `cargo run --bin cameodb -- --version`, which reads `CARGO_PKG_VERSION` and is
+   the only place the number is observable at runtime. It also appends `+fault-injection` on a
+   build carrying the panic-test seams, which is not something to ship — see step 4.
 2. **Move `[Unreleased]` to the new version in `CHANGELOG.md`**, dated, with a fresh empty
    `[Unreleased]` above it.
 3. **Build and describe every target you intend to ship.**
