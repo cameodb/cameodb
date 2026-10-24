@@ -230,6 +230,15 @@ debugging; use the pipeline for releases.
 - **Usage**: `./scripts/ops/key-digest.sh ~/.cameodb/agent.key`
 - **Audience**: operators replacing configured key digests
 
+#### `key-rehash.sh [--write] <key-dir> [hash-dir]`
+**Purpose**: Replace every whole-token digest (0.3.7 or earlier) in `hash-dir` with its
+body-only digest, once, on the node — matched by digest, not by file name
+- `hash-dir` defaults to `/etc/cameodb/keys`; without `--write` it only reports what it would
+  change. Files are rewritten in place, so owner, group and mode are kept; one the `cameodb`
+  service cannot read is flagged with the `chgrp`/`chmod` that fixes it. No key is printed
+- **Usage**: `sudo ./scripts/ops/key-rehash.sh --write /root/cameodb-keys && sudo systemctl reload cameodb`
+- **Audience**: operators upgrading a node whose keys are configured by `key_hash_file`
+
 ## Utility Scripts
 
 ### `setup/dev-info.sh`
