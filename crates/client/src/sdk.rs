@@ -73,9 +73,10 @@ impl Credential {
     }
 
     /// The same non-reversible fingerprint the server logs, so a refusal on this side can be
-    /// matched against the node's log without either end ever printing the key.
+    /// matched against the node's log without either end ever printing the key. Like the
+    /// server's digest it covers the body alone, not the prefix.
     pub fn key_id(&self) -> String {
-        Sha256::digest(self.0.as_bytes())
+        Sha256::digest(&self.0.as_bytes()[KEY_PREFIX.len()..])
             .iter()
             .take(4)
             .map(|byte| format!("{byte:02x}"))
@@ -994,9 +995,15 @@ mod tests {
             "hunter2",
             "cameo_v1_",
             "cameo_v1_tooshort",
-            "cameo_v2_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "cameodb_v2_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            // The right body under another prefix, or none.
+            "cameodb_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "cdb_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             // 43 characters, but '+' and '/' are base64, not base64url.
             "cameo_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+/",
+            // Padded, as standard base64 of 32 bytes would be.
+            "cameo_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             "3f8a1c2b-0000-4000-8000-000000000000",
         ] {
             assert!(
@@ -1024,7 +1031,7 @@ mod tests {
 
     #[test]
     fn key_id_matches_the_servers_fingerprint_of_the_same_key() {
-        // sha256("cameo_v1_AAA…A"), first four bytes — the same bytes the node logs as
+        // sha256("AAA…A"), the body, first four bytes — the same bytes the node logs as
         // key_id when it accepts this key. Fixed here so the two can never drift apart
         // silently.
         assert_eq!(Credential::parse(GOOD).unwrap().key_id().len(), 8);
@@ -1208,21 +1215,22 @@ mod tests {
 mod key_id_digest_tests {
     use super::Credential;
 
-    /// A `key_id` is the first four bytes of SHA-256 over the key, in hex, and a server stores
-    /// the whole digest in its configuration as `sha256:<hex>`. Both are on-disk contracts: if
+    /// A `key_id` is the first four bytes of SHA-256 over the key's 43-character body — not its
+    /// `cameo_v1_` prefix — in hex, and a server stores the whole digest in its configuration
+    /// as `sha256:<hex>`. Both are on-disk contracts: if
     /// what the hash produces ever changes, every deployed key stops matching its stored digest,
     /// and no round-trip test can see it because both sides move together. Pinned against a
     /// value computed outside this codebase:
     ///
     /// ```text
-    /// printf 'cameo_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' | shasum -a 256
-    /// 373ce68d26ee121548841ac21adf2706dbe4cb3e28e65b1574b4653a1ac9982a
+    /// printf 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' | shasum -a 256
+    /// 0f007385b6f9d4b7eeb2748605afe1a984a0a3bfa3f014d09e2a784ce9e5cd1a
     /// ```
     #[test]
     fn a_key_id_is_the_sha256_prefix_and_does_not_move_with_the_hash_crate() {
         let credential = Credential::parse(&format!("cameo_v1_{}", "A".repeat(43)))
             .expect("a well-formed key parses");
-        assert_eq!(credential.key_id(), "373ce68d");
+        assert_eq!(credential.key_id(), "0f007385");
     }
 }
 

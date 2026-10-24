@@ -158,6 +158,12 @@ check_eq "an unrecognised key is 401, not 403" "401" \
     "$(code 'cameo_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' "$BASE/_indexes")"
 check_eq "a key-shaped string is not enough" "401" \
     "$(code 'hunter2' "$BASE/_indexes")"
+# Only the body is hashed, but the prefix is the format marker: a real key's body under
+# another prefix, or under none, is not a key.
+check_eq "a real key under another prefix is refused" "401" \
+    "$(code "cameodb_v1_${READER_KEY#cameo_v1_}" "$BASE/_indexes")"
+check_eq "a real key's body without its prefix is refused" "401" \
+    "$(code "${READER_KEY#cameo_v1_}" "$BASE/_indexes")"
 # Even on the one public route. A presented credential that is not recognised is refused
 # rather than quietly downgraded to anonymous — otherwise a typo'd key reads as no key, and
 # the caller gets a thinner answer with no hint as to why.
@@ -544,6 +550,14 @@ file_mode() {
 # service, which is the group of the directory it lands in; writable by the owner alone.
 check_eq "keygen creates filed.key as 0600" "600" "$(file_mode "$WORK/filed.key")"
 check_eq "keygen creates filed.hash as 0640" "640" "$(file_mode "$WORK/filed.hash")"
+# The digest is SHA-256 over the 43-character body, not the prefix — computed here with
+# shasum, outside the codebase, and the same way scripts/ops/key-digest.sh recomputes it.
+check_eq "the digest is sha256 of the key body alone" \
+    "sha256:$(tr -d '[:space:]' < "$WORK/filed.key" | sed 's/^cameo_v1_//' | tr -d '\n' | shasum -a 256 | cut -d' ' -f1)" \
+    "$(tr -d '[:space:]' < "$WORK/filed.hash")"
+check_eq "scripts/ops/key-digest.sh agrees with keygen" \
+    "$(tr -d '[:space:]' < "$WORK/filed.hash")" \
+    "$("$(repo_root)/scripts/ops/key-digest.sh" "$WORK/filed.key" 2>/dev/null)"
 # The key must not also reach stdout: written and printed is two places to leak from.
 if "$BIN" keygen --role reader --key-out "$WORK/quiet.key" 2>/dev/null | grep -q 'cameo_v1_'; then
     fail "--key-out keeps the key off stdout"

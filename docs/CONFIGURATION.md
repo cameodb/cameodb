@@ -1251,9 +1251,19 @@ cameodb keygen --role reader --label agent \
   --hash-out /etc/cameodb/keys/agent         # for key_hash_file above
 ```
 
-Keys are `cameo_v1_` followed by 43 characters — 256 bits from the OS. Anything else is
-rejected before it is hashed, so a passphrase or a UUID can never authenticate regardless of
-what digest is configured.
+Keys are `cameo_v1_` followed by 43 base64url characters — 256 bits from the OS. Anything
+else is rejected before it is hashed, so a passphrase or a UUID can never authenticate
+regardless of what digest is configured. The digest is SHA-256 of the 43 characters after the
+prefix, not of the whole key; the prefix is the format and version marker and is checked, not
+hashed.
+
+Up to 0.3.7 the digest covered the whole key, prefix included, and such a digest no longer
+matches. The key itself is still good: replace its digest with the one this prints from the
+key file — the digest only, never the key:
+
+```bash
+scripts/ops/key-digest.sh ~/.cameodb/agent.key    # sha256:<64 hex>
+```
 
 If the node runs as its own user, `chown` any `key_hash_file` to it: the file is read at
 startup. CameoDB warns if a `key_hash_file` is writable by group or others — a digest is not

@@ -8,7 +8,8 @@
 //! An unsalted, unstretched SHA-256 is normally the wrong way to store a credential. It is
 //! the right way here because a key is not a password: [`ApiKey::generate`] is the only
 //! source of keys, every key is 256 bits of OS entropy, and [`KeyRing::authenticate`]
-//! refuses anything that is not shaped like one *before* hashing it. There is no guessable
+//! refuses anything that is not shaped like one *before* hashing it. What is hashed is the
+//! 43-character body alone; the prefix is checked and stripped first. There is no guessable
 //! input to protect, so a KDF would only add latency to every request. The format gate is
 //! what makes that argument hold — without it, someone could paste `sha256(<passphrase>)`
 //! into the config and reintroduce exactly the problem a KDF exists to solve.
@@ -133,7 +134,9 @@ impl fmt::Display for Role {
 ///
 /// It makes a leaked string recognisable as a CameoDB credential — secret scanners key off
 /// prefixes like this — and it versions the format, so a future scheme can be told apart
-/// from this one instead of being guessed at by length.
+/// from this one instead of being guessed at by length. It is not part of what is hashed:
+/// [`KeyDigest`] covers the body alone, so the digest of a key does not depend on how its
+/// prefix is spelled.
 const KEY_PREFIX: &str = "cameo_v1_";
 
 /// 32 bytes, base64url, unpadded.
@@ -175,7 +178,8 @@ impl ApiKey {
     }
 
     pub fn digest(&self) -> KeyDigest {
-        KeyDigest::of_token(&self.0)
+        let body = key_body(&self.0).expect("a minted key has the shape it was minted with");
+        KeyDigest::of_body(body)
     }
 }
 
@@ -191,26 +195,26 @@ impl Drop for ApiKey {
     }
 }
 
-/// True when `token` has the exact shape [`ApiKey::generate`] produces.
+/// The body of `token` when it has the exact shape [`ApiKey::generate`] produces, else `None`.
 ///
 /// This is the gate the security argument rests on: a passphrase, a UUID, or an empty
 /// string can never authenticate no matter whose digest sits in the config, so the only
 /// credentials this server will ever accept are 256-bit random ones. Checked before
 /// hashing, which also means a flood of junk tokens costs a length check rather than a
-/// SHA-256 each.
-fn has_key_shape(token: &str) -> bool {
-    let Some(body) = token.strip_prefix(KEY_PREFIX) else {
-        return false;
-    };
-    body.len() == KEY_BODY_LEN
+/// SHA-256 each. The prefix is required here even though it is not hashed: it is the format
+/// and version marker, and a body under any other prefix is refused.
+fn key_body(token: &str) -> Option<&str> {
+    let body = token.strip_prefix(KEY_PREFIX)?;
+    let shaped = body.len() == KEY_BODY_LEN
         && body
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    shaped.then_some(body)
 }
 
 const DIGEST_PREFIX: &str = "sha256:";
 
-/// SHA-256 of a key token — what the configuration stores.
+/// SHA-256 of a key's 43-character body, without its prefix — what the configuration stores.
 ///
 /// Not a secret. Against 256 bits of entropy a digest is not something to work backwards
 /// from, which is why it is safe to keep in a config file, print from `keygen`, and log the
@@ -221,9 +225,9 @@ const DIGEST_PREFIX: &str = "sha256:";
 pub struct KeyDigest([u8; 32]);
 
 impl KeyDigest {
-    fn of_token(token: &str) -> Self {
+    fn of_body(body: &str) -> Self {
         let mut hasher = Sha256::new();
-        hasher.update(token.as_bytes());
+        hasher.update(body.as_bytes());
         Self(hasher.finalize().into())
     }
 
@@ -881,11 +885,8 @@ impl KeyRing {
     /// [`ApiKey::generate`]-shaped token is ever hashed. And the loop does not exit early,
     /// so how long a rejection takes does not depend on which key nearly matched.
     pub fn authenticate(&self, presented: &str) -> Option<Arc<KeyEntry>> {
-        let token = presented.trim();
-        if !has_key_shape(token) {
-            return None;
-        }
-        let digest = KeyDigest::of_token(token);
+        let body = key_body(presented.trim())?;
+        let digest = KeyDigest::of_body(body);
         let mut matched: Option<&Arc<KeyEntry>> = None;
         for entry in &self.entries {
             if entry.digest == digest && matched.is_none() {
@@ -1403,10 +1404,15 @@ mod tests {
         );
 
         assert!(ring.authenticate("").is_none());
-        assert!(
-            ring.authenticate(key.expose().trim_start_matches("cameo_v1_"))
-                .is_none()
-        );
+        // The body is what is hashed, but it is not a key on its own or under any other
+        // prefix: the prefix is the format marker and is checked before anything is hashed.
+        let body = &key.expose()[KEY_PREFIX.len()..];
+        for other in ["", "cameodb_v1_", "cdb_v1_", "cameo_v2_", "CAMEO_V1_"] {
+            assert!(
+                ring.authenticate(&format!("{other}{body}")).is_none(),
+                "{other:?} prefix"
+            );
+        }
         assert!(ring.authenticate(&format!("{}x", key.expose())).is_none());
         let other = ApiKey::generate().unwrap();
         assert!(ring.authenticate(other.expose()).is_none());
@@ -1417,7 +1423,7 @@ mod tests {
         // The point of the shape gate: an operator who bypasses `keygen` and pastes the
         // digest of something guessable does not get a working credential out of it.
         let passphrase = "correct horse battery staple";
-        let digest = KeyDigest::of_token(passphrase);
+        let digest = KeyDigest::of_body(passphrase);
         let config = SecurityConfig {
             enabled: true,
             api_keys: vec![entry(&digest.to_config_value(), Role::Admin)],
@@ -1426,7 +1432,7 @@ mod tests {
         };
         let ring = config.load_keyring().unwrap();
         assert!(ring.authenticate(passphrase).is_none());
-        assert!(!has_key_shape(passphrase));
+        assert!(key_body(passphrase).is_none());
     }
 
     #[test]
@@ -1434,10 +1440,74 @@ mod tests {
         let key = ApiKey::generate().unwrap();
         assert!(key.expose().starts_with(KEY_PREFIX));
         assert_eq!(key.expose().len(), KEY_PREFIX.len() + KEY_BODY_LEN);
-        assert!(has_key_shape(key.expose()));
+        assert!(key_body(key.expose()).is_some());
         // Two keys in a row must not be related; a fixed key would pass every other test
         // in this file.
         assert_ne!(key.expose(), ApiKey::generate().unwrap().expose());
+    }
+
+    /// The digest is SHA-256 over the 43-character body and nothing else. Pinned against a value
+    /// computed outside this codebase, because the digest is an on-disk contract that a
+    /// round-trip test cannot see move — both sides would move together:
+    ///
+    /// ```text
+    /// printf 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' | shasum -a 256
+    /// 0f007385b6f9d4b7eeb2748605afe1a984a0a3bfa3f014d09e2a784ce9e5cd1a
+    /// ```
+    ///
+    /// The client pins the same value as its `key_id` (`key_id_digest_tests` in the sdk), so
+    /// the two sides cannot drift apart on what is hashed.
+    #[test]
+    fn the_digest_covers_the_key_body_and_not_its_prefix() {
+        const BODY_DIGEST: &str =
+            "sha256:0f007385b6f9d4b7eeb2748605afe1a984a0a3bfa3f014d09e2a784ce9e5cd1a";
+        let token = format!("{KEY_PREFIX}{}", "A".repeat(KEY_BODY_LEN));
+        let ring = SecurityConfig {
+            enabled: true,
+            api_keys: vec![entry(BODY_DIGEST, Role::Reader)],
+            override_key: None,
+            ..Default::default()
+        }
+        .load_keyring()
+        .unwrap();
+
+        let matched = ring
+            .authenticate(&token)
+            .expect("body digest accepts the key");
+        assert_eq!(matched.key_id(), "0f007385");
+        // A digest over the whole token — what was configured before the digest moved to the
+        // body — does not match.
+        let whole = KeyDigest::of_body(&token).to_config_value();
+        let ring = SecurityConfig {
+            enabled: true,
+            api_keys: vec![entry(&whole, Role::Reader)],
+            override_key: None,
+            ..Default::default()
+        }
+        .load_keyring()
+        .unwrap();
+        assert!(ring.authenticate(&token).is_none());
+    }
+
+    #[test]
+    fn only_43_base64url_characters_after_the_prefix_are_a_key() {
+        let a = "A".repeat(KEY_BODY_LEN);
+        assert_eq!(key_body(&format!("{KEY_PREFIX}{a}")), Some(a.as_str()));
+        for bad in [
+            KEY_PREFIX.to_string(),
+            format!("{KEY_PREFIX}{}", "A".repeat(KEY_BODY_LEN - 1)),
+            format!("{KEY_PREFIX}{}", "A".repeat(KEY_BODY_LEN + 1)),
+            // Padded: 44 characters ending '=' is standard base64 of 32 bytes.
+            format!("{KEY_PREFIX}{}=", "A".repeat(KEY_BODY_LEN)),
+            format!("{KEY_PREFIX}{}=", "A".repeat(KEY_BODY_LEN - 1)),
+            // '+' and '/' are base64, not base64url.
+            format!("{KEY_PREFIX}{}+/", "A".repeat(KEY_BODY_LEN - 2)),
+            format!("{KEY_PREFIX}{}.", "A".repeat(KEY_BODY_LEN - 1)),
+            format!("{KEY_PREFIX}{} ", "A".repeat(KEY_BODY_LEN - 1)),
+            format!("{KEY_PREFIX}{}é", "A".repeat(KEY_BODY_LEN - 2)),
+        ] {
+            assert!(key_body(&bad).is_none(), "{bad:?}");
+        }
     }
 
     #[test]
@@ -1478,7 +1548,7 @@ mod tests {
         let no_role = SecurityConfig {
             enabled: true,
             api_keys: vec![ApiKeyConfig {
-                key_hash: Some(KeyDigest::of_token("x").to_config_value()),
+                key_hash: Some(KeyDigest::of_body("x").to_config_value()),
                 ..Default::default()
             }],
             override_key: None,
@@ -1510,7 +1580,7 @@ mod tests {
 
     #[test]
     fn one_key_cannot_hold_two_roles() {
-        let hash = KeyDigest::of_token("shared").to_config_value();
+        let hash = KeyDigest::of_body("shared").to_config_value();
         let config = SecurityConfig {
             enabled: true,
             api_keys: vec![entry(&hash, Role::Reader), entry(&hash, Role::Admin)],
@@ -1527,7 +1597,7 @@ mod tests {
             enabled: true,
             api_keys: vec![ApiKeyConfig {
                 allowed_indexes: Some(vec![]),
-                ..entry(&KeyDigest::of_token("x").to_config_value(), Role::Reader)
+                ..entry(&KeyDigest::of_body("x").to_config_value(), Role::Reader)
             }],
             override_key: None,
             ..Default::default()
@@ -1565,7 +1635,7 @@ mod tests {
         let keys: Vec<ApiKeyConfig> = [Role::Reader, Role::Admin, Role::Reader]
             .into_iter()
             .enumerate()
-            .map(|(i, role)| entry(&KeyDigest::of_token(&i.to_string()).to_config_value(), role))
+            .map(|(i, role)| entry(&KeyDigest::of_body(&i.to_string()).to_config_value(), role))
             .collect();
         let ring = SecurityConfig {
             enabled: true,
@@ -1585,7 +1655,7 @@ mod tests {
         let ring = SecurityConfig {
             enabled: true,
             api_keys: vec![entry(
-                &KeyDigest::of_token("r").to_config_value(),
+                &KeyDigest::of_body("r").to_config_value(),
                 Role::Reader,
             )],
             override_key: None,
@@ -1600,7 +1670,7 @@ mod tests {
 
     #[test]
     fn an_unlabelled_key_gets_an_identity_derived_from_its_digest() {
-        let digest = KeyDigest::of_token("anonymous");
+        let digest = KeyDigest::of_body("anonymous");
         let ring = SecurityConfig {
             enabled: true,
             api_keys: vec![entry(&digest.to_config_value(), Role::Reader)],
@@ -1620,7 +1690,7 @@ mod tests {
     fn a_hash_file_is_read_and_a_bad_one_is_named() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ops");
-        let digest = KeyDigest::of_token("filed");
+        let digest = KeyDigest::of_body("filed");
         std::fs::write(&path, format!("{}\n", digest.to_config_value())).unwrap();
 
         let config = SecurityConfig {
@@ -1665,7 +1735,7 @@ mod tests {
 
     #[test]
     fn an_inline_hash_wins_over_a_file_the_way_the_psk_does() {
-        let inline = KeyDigest::of_token("inline");
+        let inline = KeyDigest::of_body("inline");
         let config = SecurityConfig {
             enabled: true,
             api_keys: vec![ApiKeyConfig {
@@ -1687,7 +1757,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        config.override_key_mut().key_hash = Some(KeyDigest::of_token("flag").to_config_value());
+        config.override_key_mut().key_hash = Some(KeyDigest::of_body("flag").to_config_value());
         // Half-configured: a hash with no role is the mistake this pair invites.
         let err = config.load_keyring().unwrap_err().to_string();
         assert!(err.contains("--api-key-hash"), "{err}");
@@ -1706,7 +1776,7 @@ mod tests {
     #[test]
     fn a_key_carries_its_tenant_and_a_blank_one_is_refused() {
         let with_tenant = ApiKeyConfig {
-            key_hash: Some(KeyDigest::of_token("t").to_config_value()),
+            key_hash: Some(KeyDigest::of_body("t").to_config_value()),
             role: Some(Role::Writer),
             label: Some("acme-writer".to_string()),
             tenant: Some("  acme  ".to_string()),
@@ -1728,7 +1798,7 @@ mod tests {
 
         // A key with no tenant spends against no budget, which is every key on an upgraded node.
         let untenanted = ApiKeyConfig {
-            key_hash: Some(KeyDigest::of_token("u").to_config_value()),
+            key_hash: Some(KeyDigest::of_body("u").to_config_value()),
             role: Some(Role::Writer),
             ..blank_key()
         };
@@ -1743,7 +1813,7 @@ mod tests {
 
         // An empty one is neither, so it is refused rather than read as either.
         let blank = ApiKeyConfig {
-            key_hash: Some(KeyDigest::of_token("b").to_config_value()),
+            key_hash: Some(KeyDigest::of_body("b").to_config_value()),
             role: Some(Role::Writer),
             tenant: Some("   ".to_string()),
             ..blank_key()

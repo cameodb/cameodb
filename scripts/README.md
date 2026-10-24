@@ -222,6 +222,14 @@ debugging; use the pipeline for releases.
 - **Exit Codes**: 0 = healthy, 1 = degraded
 - **Audience**: DevOps, monitoring systems, production operations
 
+#### `key-digest.sh <key-file>`
+**Purpose**: Print the `sha256:<hex>` digest of an API key file, for `key_hash` or
+`key_hash_file`, and nothing else — never the key
+- Hashes the 43-character body only, as the server does, so it recomputes the digest of a key
+  whose configured digest predates that (0.3.7 or earlier)
+- **Usage**: `./scripts/ops/key-digest.sh ~/.cameodb/agent.key`
+- **Audience**: operators replacing configured key digests
+
 ## Utility Scripts
 
 ### `setup/dev-info.sh`

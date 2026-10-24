@@ -7849,9 +7849,15 @@ HTTP search. Nothing has shipped with the old names.
 - **Key format is enforced at authentication time**: a presented token must match
   `cameo_v1_<43 base64url chars>` before it is hashed. This is what makes an unsalted
   SHA-256 defensible — a hand-chosen passphrase can never authenticate even if someone
-  pastes its digest into the config. Verification hashes the token and compares digests with
-  `subtle::ConstantTimeEq` across all entries; `sha2`, `subtle`, `zeroize`, `hex`, and `rand`
-  are already in `Cargo.lock` transitively, so `cargo deny` and `cargo audit` see nothing new.
+  pastes its digest into the config. Verification strips the prefix, hashes the 43-character
+  body, and compares digests with `subtle::ConstantTimeEq` across all entries; `sha2`,
+  `subtle`, `zeroize`, `hex`, and `rand` are already in `Cargo.lock` transitively, so
+  `cargo deny` and `cargo audit` see nothing new.
+  *2026-10-24:* the digest covered the whole token until this date and now covers the body
+  alone, so that a future prefix change needs no re-hash. Renaming the prefix to
+  `cameodb_v1_` was considered and dropped: `cameo_v1_` is unclaimed and self-descriptive, and
+  keeping it leaves every issued key valid. The prefix is still checked before hashing, so the
+  argument above is unchanged.
 - **Secrets follow the `ClusterPsk` precedent**: redacted `Debug`, never serialized, scrubbed
   on drop. `key_id` (first 8 hex of the digest) plus `label` are the log identity; the key
   itself never reaches a log line.

@@ -49,6 +49,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **An API key's digest covers its 43-character body, not the `cameo_v1_` prefix.** The prefix
+  is still required and checked before anything is hashed; only what is hashed changed. Every
+  configured `key_hash` and `key_hash_file` has to be replaced once:
+  `scripts/ops/key-digest.sh <key-file>` prints the new `sha256:…` from an existing key file
+  without printing the key. Keys themselves are unchanged and stay valid. The `key_id` a key
+  logs under changes with its digest.
 - **Existing callers receive arrays of at most 1000 elements** unless they ask for more, because
   the cap is on by default. A hit that was cut says so in `_truncated_arrays`; set
   `[search] default_array_limit` up to `max_array_limit` to restore longer arrays without
