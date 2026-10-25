@@ -507,8 +507,8 @@ install it under systemd. It needs 64-bit Windows and an administrator: it insta
 and writes to Program Files and ProgramData.
 
 ```powershell
-msiexec /i cameodb-0.3.7-x64.msi                           # with a progress window
-msiexec /i cameodb-0.3.7-x64.msi /qn /l*v cameodb-install.log  # silent, logged
+msiexec /i cameodb-0.3.8-x64.msi                           # with a progress window
+msiexec /i cameodb-0.3.8-x64.msi /qn /l*v cameodb-install.log  # silent, logged
 ```
 
 | | Windows | Linux packages |

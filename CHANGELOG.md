@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-10-25
+
 **Upgrading from 0.3.7 or earlier: every configured API key digest has to be replaced once.**
 A key's digest is now SHA-256 of its 43-character body, not of the whole `cameo_v1_…` string, so
 a digest computed by an earlier `keygen` no longer matches its key. The node starts and
