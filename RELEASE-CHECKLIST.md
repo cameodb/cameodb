@@ -133,6 +133,57 @@ Signed off by:
 
 <!-- Newest first. Append a filled-in template per release. -->
 
+## v0.3.8 — 2026-10-25
+
+Commit: `f791b99`, `chore(release): 0.3.8`. Built from a clean tree; `MANIFEST.txt` records it
+(built 2026-10-25 18:56 UTC, all eight artifacts signed by `https://dl.cameodb.com/cosign.pub`).
+
+Built targets, all by rustc 1.99.0 (`rust-toolchain.toml`):
+
+| Artifact | sha256 |
+|---|---|
+| `mac/cameodb` (arm64, 30M) | `87f362d6…14e1` |
+| `linux/cameodb` (x86_64-unknown-linux-musl, 38M) | `a77d6ce3…f063` |
+| `linux/cameodb_0.3.8_amd64.deb` (12M) | `baa83301…7fff` |
+| `linux/cameodb-0.3.8-1.x86_64.rpm` (13M) | `fbb8509e…dae` |
+| `windows/cameodb.exe` (41M, sidecar reads `cameodb 0.3.8`) | `b4c5ffa2…45ac` |
+| `windows/cameodb-0.3.8-x64.msi` (15M, packages the staged exe) | `0a359358…9cfa` |
+
+SPDX and CycloneDX SBOMs are scoped to `Cargo.lock`. Windows was built on the Windows machine with
+`scripts/build/build-msi.ps1 -Build` after the release commit, and `--stage build` accepted both
+files on the release machine.
+
+| Suite | Host build | musl | windows | notes |
+|-------|-----------|------|---------|-------|
+| deps           | PASS |  |  |  |
+| unit           | PASS |  |  |  |
+| posture        | PASS |  |  |  |
+| auth           | PASS |  |  |  |
+| tls            | PASS |  |  |  |
+| remote-sources | PASS | PASS | PASS | the one suite that does not transfer between platforms |
+| artifact       | PASS |  |  |  |
+
+Verification was run and reported as passed by goranc; this entry records that, not the individual
+run times or cluster metrics, which were not captured here.
+
+`check-config --allow-unauthenticated` passed on the shipped configs: the root example,
+`crates/server/cameodb.toml` (DEB/RPM) and `crates/server/windows/cameodb.toml` (MSI).
+
+Advisory exceptions reviewed: RUSTSEC-2026-0118, RUSTSEC-2026-0119, RUSTSEC-2024-0436, all
+review-by 2026-12-31, all still via kameo 0.22.2 pinning libp2p 0.56.
+
+Notes for this release: the key-digest change is breaking — every configured digest is replaced
+once on upgrade (`scripts/ops/key-rehash.sh`), and the CHANGELOG leads with it. Nodes of one
+cluster are upgraded together, because an index created before `_seq` was retired gets a new
+thumbprint and an older node reports it as diverged. tokio stays at 1.53.3 in `Cargo.lock`.
+
+The validation scripts ignore `CAMEODB_*` variables set in the shell, except `CAMEODB_BIN` and
+`CAMEODB_CA_CERT`.
+
+Skipped checks and why: none.
+Known gaps acknowledged: yes — the standing list above is unchanged.
+Signed off by: goranc
+
 ## v0.3.7 — 2026-10-18 (in progress)
 
 Commit: `64b68cc`, `chore(release): 0.3.7`. Built from a clean tree; `MANIFEST.txt` records it.

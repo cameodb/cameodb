@@ -6,6 +6,20 @@
 
 set -uo pipefail
 
+# The node and the client read CAMEODB_* from the environment, so an exported value changes
+# what a check measures. Drop them all except the suite's own inputs; report names, not values.
+_cameodb_env_dropped=()
+while IFS= read -r _v; do
+    case "$_v" in CAMEODB_BIN | CAMEODB_CA_CERT) continue ;; esac
+    _cameodb_env_dropped+=("$_v")
+    unset "$_v"
+done < <(compgen -e | grep '^CAMEODB_' || true)
+if [ "${#_cameodb_env_dropped[@]}" -gt 0 ]; then
+    printf 'note: ignoring %s from the environment; the suite runs without it\n' \
+        "${_cameodb_env_dropped[*]}" >&2
+fi
+unset _v
+
 PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0

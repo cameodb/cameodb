@@ -64,8 +64,11 @@ client moved to rustls.
 
 ## Environment
 
+Other `CAMEODB_*` variables in your shell are dropped when a suite starts, and named on stderr.
+
 | Variable | Effect |
 |----------|--------|
+| `CAMEODB_CA_CERT` | CA certificate the cluster suite gives the image build (kept) |
 | `CAMEODB_BIN` | Binary under test (default: `target/release/cameodb`, then `target/debug/cameodb`) |
 | `POSTURE_PORT` / `TLS_PORT` / `AUTH_PORT` | Ports for the probe servers (default 19490 / 19491 / 19492) |
 | `CLUSTER_IMAGE` | Image for the cluster suite (default: build `cameodb:validate` from the repo) |
