@@ -16,7 +16,7 @@ use tantivy::tokenizer::{
     TextAnalyzer,
 };
 
-pub(crate) use croatian::CroatianStemmer;
+pub(crate) use croatian::{CroatianStemmer, SerbianCyrillic};
 
 /// Longest token, in bytes, that the tokenizing analyzers keep.
 ///
@@ -107,9 +107,17 @@ pub(crate) fn register_tokenizers(index: &Index) {
             .build(),
     );
 
+    // Serbian Cyrillic is mapped to Latin right after the lower-caser, which it relies on for
+    // capitals, and ahead of everything that knows only Latin: the fold, which then takes `ђ`
+    // through `đ` to `d` as it takes the Latin letter, and the stemmer. The token cap is applied
+    // to the text as written, so a token at the cap whose `џ` becomes `dž` comes out a byte or
+    // two over it; the cap is there to keep long atoms, not to bound a term.
     manager.register(
         "hr_stem",
-        lowercased().filter(CroatianStemmer::plain()).build(),
+        lowercased()
+            .filter(SerbianCyrillic)
+            .filter(CroatianStemmer::plain())
+            .build(),
     );
     // Folded *before* stemming, into a model built from the corpus folded the same way: text and
     // a query typed without diacritics then take one path to one term. Folding after stemming
@@ -118,6 +126,7 @@ pub(crate) fn register_tokenizers(index: &Index) {
     manager.register(
         "hr_stem_fold",
         lowercased()
+            .filter(SerbianCyrillic)
             .filter(AsciiFoldingFilter)
             .filter(CroatianStemmer::folded())
             .build(),
@@ -216,6 +225,117 @@ mod tests {
             analyze("hr_stem_fold", "Člancima"),
             vec!["clanak".to_string()]
         );
+    }
+
+    #[test]
+    fn hr_analyzers_read_serbian_cyrillic() {
+        for (cyrillic, latin) in [
+            ("камен", "kamen"),
+            ("Камена каменом", "kamena kamenom"),
+            ("ћерка", "ćerka"),
+            ("ђак ђаци", "đak đaci"),
+            ("љубав", "ljubav"),
+            ("њива", "njiva"),
+            ("џеп", "džep"),
+            ("чаша", "čaša"),
+            ("шума", "šuma"),
+            ("жена", "žena"),
+            ("ЉУБЉАНА Џеп", "Ljubljana Džep"),
+            ("Народне песме", "narodne pesme"),
+        ] {
+            for tokenizer in ["hr_stem", "hr_stem_fold"] {
+                assert_eq!(
+                    analyze(tokenizer, cyrillic),
+                    analyze(tokenizer, latin),
+                    "{tokenizer}: {cyrillic} must find {latin}"
+                );
+            }
+        }
+        // `hr_stem` keeps the diacritics the mapping writes, so `ћ` and `ч` stay apart as `ć` and
+        // `č` do; `hr_stem_fold` joins them as it joins the Latin letters.
+        assert_ne!(analyze("hr_stem", "ћерка"), analyze("hr_stem", "черка"));
+        assert_eq!(
+            analyze("hr_stem_fold", "ћерка"),
+            analyze("hr_stem_fold", "черка")
+        );
+        // A token with a letter outside the Serbian alphabet is left whole, never half-mapped.
+        assert_eq!(analyze("hr_stem", "язык"), vec!["язык".to_string()]);
+        assert_eq!(
+            analyze("hr_stem_fold", "ѓавол"),
+            analyze("default", "ѓавол")
+        );
+    }
+
+    /// The Cyrillic mapping changes nothing for Latin text: every word of the stemmer's sample
+    /// analyzes as it did through the chain without it.
+    #[test]
+    fn hr_analyzers_analyze_latin_as_before() {
+        let before = |stemmer: CroatianStemmer, fold: bool| {
+            let chain = TextAnalyzer::builder(SimpleTokenizer::default())
+                .filter(RemoveLongFilter::limit(MAX_INDEXED_TOKEN_LEN + 1))
+                .filter(LowerCaser);
+            if fold {
+                chain.filter(AsciiFoldingFilter).filter(stemmer).build()
+            } else {
+                chain.filter(stemmer).build()
+            }
+        };
+        let terms = |analyzer: &mut TextAnalyzer, text: &str| {
+            let mut stream = analyzer.token_stream(text);
+            let mut tokens = Vec::new();
+            while stream.advance() {
+                tokens.push(stream.token().text.clone());
+            }
+            tokens
+        };
+        let words: Vec<&str> = include_str!("croatian/data/sample.tsv")
+            .lines()
+            .filter_map(|line| line.split('\t').next())
+            .collect();
+        assert!(words.len() > 3_000);
+        for (name, mut old) in [
+            ("hr_stem", before(CroatianStemmer::plain(), false)),
+            ("hr_stem_fold", before(CroatianStemmer::folded(), true)),
+        ] {
+            for word in &words {
+                assert_eq!(analyze(name, word), terms(&mut old, word), "{name}: {word}");
+            }
+        }
+    }
+
+    /// Measurement, not a check: Cyrillic text against the same text transliterated by hand.
+    ///
+    /// `HR_CYRILLIC_SAMPLE` names a JSON-lines file of `{"cyr": ..., "lat": ...}` pairs. Reports,
+    /// per analyzer, how many tokens reach a different term than their reference spelling (the
+    /// mapping's error, expected zero), and how many the stemmer changed at all.
+    #[test]
+    #[ignore = "measurement; needs HR_CYRILLIC_SAMPLE"]
+    fn measure_hr_cyrillic_against_a_reference() {
+        let path = std::env::var("HR_CYRILLIC_SAMPLE").expect("HR_CYRILLIC_SAMPLE");
+        let sample = std::fs::read_to_string(&path).expect("read the sample");
+        for tokenizer in ["hr_stem", "hr_stem_fold"] {
+            let (mut tokens, mut differ, mut stemmed) = (0usize, 0usize, 0usize);
+            for line in sample.lines().filter(|line| !line.trim().is_empty()) {
+                let pair: serde_json::Value = serde_json::from_str(line).expect("a JSON line");
+                let (cyr, lat) = (pair["cyr"].as_str().unwrap(), pair["lat"].as_str().unwrap());
+                let (from_cyr, from_lat) = (analyze(tokenizer, cyr), analyze(tokenizer, lat));
+                // Under `hr_stem_fold` "changed" counts the fold of a diacritic as well.
+                let plain = analyze("default", lat);
+                assert_eq!(from_cyr.len(), from_lat.len(), "token count: {cyr}");
+                tokens += from_cyr.len();
+                differ += from_cyr
+                    .iter()
+                    .zip(&from_lat)
+                    .filter(|(a, b)| a != b)
+                    .count();
+                stemmed += from_lat.iter().zip(&plain).filter(|(a, b)| a != b).count();
+            }
+            println!(
+                "{tokenizer}: {tokens} tokens, {differ} differ from the reference, \
+                 {stemmed} ({:.1}%) changed by the stemmer",
+                100.0 * stemmed as f64 / tokens.max(1) as f64
+            );
+        }
     }
 
     #[test]

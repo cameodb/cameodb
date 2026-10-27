@@ -137,7 +137,7 @@ Writes are durable only if committed to Redb. Tantivy is treated as a "View."
 * **Dynamic Indexing:** The ingest pipeline automatically detects and processes field types:
     * `id` -> Primary Key (Redb)
     * `routing_key` -> Sharding Key for consistent hashing
-    * `text_fields` -> Tantivy Text fields, tokenized by the analyzer the field names (`default`, a Snowball stemmer such as `it_stem` or `it_stem_fold`, or the Croatian `hr_stem` / `hr_stem_fold`); see the Tokenizers table in the API reference
+    * `text_fields` -> Tantivy Text fields, tokenized by the analyzer the field names (`default`, a Snowball stemmer such as `it_stem` or `it_stem_fold`, or the Croatian `hr_stem` / `hr_stem_fold`, which map Serbian Cyrillic to Latin before folding and stemming); see the Tokenizers table in the API reference
     * `numeric_fields` -> Tantivy FastField for range queries and aggregations
 
 ### 4.3. Search Result Serialization

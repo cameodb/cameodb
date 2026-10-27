@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`hr_stem` and `hr_stem_fold` read Serbian Cyrillic.** A word in Serbian Cyrillic is mapped to
+  its Latin spelling before it is folded and stemmed (`љ` → `lj`, `њ` → `nj`, `џ` → `dž`, `ђ` → `đ`,
+  `ћ` → `ć`), so `камен` and `kamen` reach one term and a query in either script finds text in
+  both. A word with any Cyrillic letter outside the Serbian alphabet (Russian, Bulgarian,
+  Ukrainian, Macedonian) is left as written. Latin text analyzes exactly as before.
+  **Reindex note:** a field under either analyzer that already holds Cyrillic text was indexed with
+  Cyrillic terms, while a Cyrillic query is now analyzed to Latin ones, so such a field finds
+  nothing for a Cyrillic query until its documents are written again. Fields holding only Latin
+  text are unaffected.
+
 ## [0.3.8] - 2026-10-25
 
 **Upgrading from 0.3.7 or earlier: every configured API key digest has to be replaced once.**

@@ -4403,6 +4403,58 @@ the refusal for a plain field, CIDR and a bare address, each write refusal by va
 no-column tests narrowed to the four types that still have none. Docs: the API reference's
 column-type list and an *IP addresses* section; the MCP ip type hint.
 
+## Q. Post-0.3.8 features — delivered items
+
+The introduction to this group and its open items are in [ROADMAP.md](../ROADMAP.md), under [Q. Post-0.3.8 features](../ROADMAP.md#q-post-038-features--partial).
+
+### Q2 — The Croatian analyzers read Serbian Cyrillic
+
+✅ **Done 2026-10-27.** `SerbianCyrillic` (`storage/src/analysis/croatian/cyrillic.rs`) is a token
+filter placed right after the lower-caser in both chains, so before the ASCII fold in
+`hr_stem_fold` and before the stemmer in both. It maps the 30 small letters of the Serbian
+alphabet — `љ`, `њ`, `џ` to `lj`, `nj`, `dž`; `ђ`, `ћ`, `ч`, `ш`, `ж` to `đ`, `ć`, `č`, `š`, `ž` — and
+the fold then takes `đ` to `d` as it does for Latin text. A token with no byte of the Cyrillic
+block is passed over in one scan. Filed to wait on Q1, which wants it: a ghost reads the source
+text as it was written, so a transliteration a writer does before sending the text has no place
+to happen.
+
+**Per token, decided 2026-10-27.** The filing said letters outside the Serbian alphabet pass
+through unchanged; per letter, that turns Russian `язык` into `яzыk`, a term of neither script. A
+token is mapped only when every Cyrillic letter in it is Serbian, and otherwise left whole —
+Russian, Bulgarian, Ukrainian and Macedonian words alike. Montenegrin `с́` and `з́` are out: the
+tokenizer splits a word at the combining accent before any filter sees it, and the model has no
+`ś` or `ź` either.
+
+**In the analyzers themselves, decided 2026-10-26.** No new name: a Cyrillic word used to reach the
+stemmer unchanged and be left as it was, so mapping it only adds matches. The one effect, in the
+CHANGELOG with a reindex note: a field that already holds Cyrillic text was indexed with Cyrillic
+terms, and a Cyrillic query is now analyzed to Latin ones. `rebuild_changes` compares analyzer
+names, not behaviour, so nothing refuses or reports it. (Filed and not taken: new names such as
+`hr_stem_cyr`.) A token at the 128-byte cap whose `џ` becomes `dž` comes out a byte or two over
+it; the cap keeps long atoms, it does not bound a term.
+
+**Measured** on the 3 Serbian Cyrillic texts of the multilingual sample (471 passages, 71,831
+tokens), against the same text transliterated letter for letter by the writer: 16 tokens differ,
+every one a Russian or Bulgarian word in a citation (`Уваровъ`, `Сборникъ`, `Пещерата`) that the
+reference half-mapped and the filter left whole. No Serbian word differs. The stemmer changes
+55.3% of the tokens under `hr_stem` (60.4% under `hr_stem_fold`, counting folds).
+
+**Found: the model is ijekavian.** The Serbian texts are ekavian, and an ekavian form meets its
+ijekavian word only where the corpus had it: `време` → `vrijeme`, `лепа` → `lijep`, `деца` → `dijete`,
+but `песма` stays `pesma`, `бела` stays `bela`, and the suffix rules send `река` to `reći` and `дете`
+to `dati`. The same with Latin input, so a lexicon matter, not a script one. Judged not worth an
+item, 2026-10-27: an index keeps ekavian and ijekavian text apart in practice, and a query in one
+variant against text in the other is rare.
+
+**Tests.** Every letter and digraph; Russian, Ukrainian and Macedonian tokens left whole; mixed
+and digit tokens; Cyrillic and Latin spellings of twelve phrases analyzing to one term under both
+analyzers, capitals included; `hr_stem` keeping `ћ` and `ч` apart where `hr_stem_fold` joins them;
+every word of the stemmer's 3,642-word sample analyzing as it did through the chain without the
+filter. An ignored test, `measure_hr_cyrillic_against_a_reference`, reads a JSON-lines file of
+Cyrillic and reference Latin pairs (`HR_CYRILLIC_SAMPLE`) and prints the figures above. Docs: the
+tokenizer table and the analyzer notes in `docs/API_REFERENCE.md`, `docs/ARCHITECTURE.md`, and a
+`CHANGELOG.md` entry with the reindex note.
+
 # Part II — Phase history, measurements and settled decisions
 
 ## Phases 1–9 — Foundations through advanced architecture ✅ Done

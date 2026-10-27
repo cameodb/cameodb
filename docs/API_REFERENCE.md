@@ -675,8 +675,8 @@ exactly as the documents were. Omitted, it is `default`.
 | `whitespace` | Splits on whitespace only; no lowercasing |
 | `en_stem` · `de_stem` · `fr_stem` · `es_stem` · `it_stem` | `default`, then the language's Snowball stemmer, so `regolamenti` finds `regolamento` |
 | `it_stem_fold` | `default` with accents removed, then the Italian stemmer, so `citta` finds `città` and `attivita` finds `attività`. Words whose accent carries grammar stem shorter than under `it_stem` (`sanità` → `san`) |
-| `hr_stem` | `default`, then each word to its dictionary form: `članka`, `člancima` → `članak`; `odlučila` → `odlučiti`; `Umagu` → `umag`. Terms keep their diacritics |
-| `hr_stem_fold` | The same with diacritics removed first, so `zupanija` finds `županije` and `fazana` finds `Fažana`. The usual choice for Croatian text people search |
+| `hr_stem` | `default`, then each word to its dictionary form: `članka`, `člancima` → `članak`; `odlučila` → `odlučiti`; `Umagu` → `umag`. Terms keep their diacritics. Serbian Cyrillic is read as its Latin spelling, so `камен` and `kamen` are one term |
+| `hr_stem_fold` | The same with diacritics removed first, so `zupanija` finds `županije` and `fazana` finds `Fažana`, and with Serbian Cyrillic read as Latin. The usual choice for Croatian text people search |
 
 Tokens longer than 128 bytes are dropped by every tokenizer but `raw` and `whitespace`. A name
 not in this table is refused with `400` naming the field: the node could not build the index.
@@ -686,8 +686,13 @@ misses. The Croatian analyzers are dictionary-based: 1.7 million word forms lear
 3-billion-word corpus, plus suffix rules for words the dictionary lacks, so terms are real words
 and irregular forms meet (`ljudi` → `čovjek`). Where a form belongs to two words, the more common
 one wins: `mora` is read as *must* (`morati`), not *of the sea*. A passive participle reaches its
-verb (`određeni` → `odrediti`). A text in two languages is best split into a field per language,
-each with its own tokenizer.
+verb (`određeni` → `odrediti`). Serbian, Bosnian and Montenegrin text reads well through them, in
+either script: a word in Serbian Cyrillic is mapped to Latin letter for letter (`љ` → `lj`,
+`џ` → `dž`, `ћ` → `ć`) before it is looked up, so a query in one script finds text in the other. A
+word holding any Cyrillic letter outside the Serbian alphabet — Russian, Bulgarian, Ukrainian,
+Macedonian — is left as written. The dictionary is Croatian and so ijekavian: an ekavian form often
+meets its ijekavian word (`vreme` → `vrijeme`), but not always (`pesma` stays `pesma`). A text in
+two languages is best split into a field per language, each with its own tokenizer.
 
 **IP addresses.** An `ip` field takes an IPv4 or IPv6 address as a string — `"10.1.2.3"`,
 `"2001:db8::1"`, `"::ffff:10.1.2.3"` — or a list of them. Each is held as IPv6, an IPv4 address in

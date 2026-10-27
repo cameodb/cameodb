@@ -22,6 +22,13 @@
 //! `hr_stem_fold` uses a second model built from the corpus with diacritics removed and reads its
 //! input folded, so `Fažani` and `fazani` reach the same term by construction rather than by a
 //! second lookup that could disagree.
+//!
+//! Both read Serbian Cyrillic too: [`SerbianCyrillic`] maps it to Latin ahead of the fold and the
+//! stemmer, so `камен` and `kamen` reach one term. The models themselves stay Latin only.
+
+mod cyrillic;
+
+pub(crate) use cyrillic::SerbianCyrillic;
 
 use std::collections::HashMap;
 use std::sync::LazyLock;

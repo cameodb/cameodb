@@ -22,7 +22,7 @@ under [Reconciliation, 2026-10-15](#reconciliation-2026-10-15): it corrected Pha
 about redb, closed [E6](docs/ROADMAP-ARCHIVE.md#e6--a-crash-restart-repaired-every-shards-redb-file), and filed OB25 and
 OB26. Features agreed for the iterations after the 0.3.7 release are filed as
 [P. Post-0.3.7 features](#p-post-037-features--partial), and those after 0.3.8 as
-[Q. Post-0.3.8 features](#q-post-038-features--planned).
+[Q. Post-0.3.8 features](#q-post-038-features--partial).
 
 ## How to read this file
 
@@ -258,7 +258,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [P5](#p5--native-json-fields-paths-typed-values-ranges) | Native json fields — a json field indexes its object beside its text: paths and typed values match, ranges at a path run from the fast column it gets by default, RFC 3339 strings are dates; existing indexes unchanged until rebuilt | — | 2026-10-21 | 📋 |
 | [P6](#p6--a-hit-says-which-array-elements-matched) | A hit says which array elements matched — `_matched_elements` beside `_truncated_arrays`, a per-field matcher from the screened AST applied in the fetch phase before the cap, `matches N` per request; priority not yet decided | — | 2026-10-21 | 📋 |
 | [Q1](#q1--ghost-fields-index-columns-derived-from-another-field-under-a-condition) | Ghost fields — an index column derived from another field's value, for every document or under an `in` / `not_in` condition on a discriminator field, indexed in Tantivy and never stored in redb; one copy of the text in redb instead of one per analyzer — about 38% less disk on a multilingual sample | — | 2026-10-26 | 📋 |
-| [Q2](#q2--the-croatian-analyzers-read-serbian-cyrillic) | The Croatian analyzers read Serbian Cyrillic — Cyrillic and Latin text and queries reach one term, inside `hr_stem` and `hr_stem_fold`; an index already holding Cyrillic text is reloaded | — | 2026-10-26 | 📋 |
+| [Q2](docs/ROADMAP-ARCHIVE.md#q2--the-croatian-analyzers-read-serbian-cyrillic) | The Croatian analyzers read Serbian Cyrillic — a word in Serbian Cyrillic is mapped to Latin inside `hr_stem` and `hr_stem_fold`, per token; a field already holding Cyrillic text is reloaded | — | 2026-10-26 | ✅ |
 
 ---
 
@@ -2904,12 +2904,14 @@ with matches, a projected-away field reporting nothing, the coordinator's re-cap
 
 ---
 
-## Q. Post-0.3.8 features 📋 Planned
+## Q. Post-0.3.8 features ◐ Partial
 
 Features agreed after the 0.3.8 release, for the iterations that follow it. Each is scoped against
 the code as it stands at `c04c63b`, so the paths below are where the work starts, not a promise
 they will not move. Both came out of loading a multilingual full-text corpus as a test (350,798
 passage rows, 376 MB of text, in 17 languages; "the sample" below).
+
+- ✅ [**Q2 — The Croatian analyzers read Serbian Cyrillic**](docs/ROADMAP-ARCHIVE.md#q2--the-croatian-analyzers-read-serbian-cyrillic)
 
 ### Q1 — Ghost fields: index columns derived from another field, under a condition
 
@@ -3116,7 +3118,7 @@ stops needing the source to be re-ingested.
 **Migrating an index that writes its text twice** is then one schema change and a change in the
 writer, no reload. Take an index that writes every row's text to `text_exact` and again to a field
 per language: `text_en`, `text_de`, … become ghosts of `text_exact` on `lang`, `text_hr` with
-`"in": ["hr", "sr", "sl", "bs", "cnr"]` (after [Q2](#q2--the-croatian-analyzers-read-serbian-cyrillic),
+`"in": ["hr", "sr", "sl", "bs", "cnr"]` (after [Q2](docs/ROADMAP-ARCHIVE.md#q2--the-croatian-analyzers-read-serbian-cyrillic),
 so a writer that transliterated Serbian before writing need not), a `text_other` field that repeated
 `text_exact` under the same `default` tokenizer for the languages without a stemmer leaves
 `default_fields`, and the writer stops sending the language fields from the same moment — a write
@@ -3173,47 +3175,6 @@ tokenizer table), `docs/ARCHITECTURE.md` (the write path), the MCP syntax and sc
 **Not in this item:** deriving a value by transformation (a transliteration, a lower-casing)
 rather than by analysis — the analyzer does that, and Q2 puts the Serbian one there; a
 ghost fed from several sources; a condition on more than one discriminator or on a range.
-
-### Q2 — The Croatian analyzers read Serbian Cyrillic
-
-📋 **Planned.** Filed 2026-10-26. Wanted by Q1: a ghost reads the source text as it was written,
-so a transliteration a writer does before sending the text (one way to make Serbian Cyrillic
-searchable today) has no place to happen.
-
-**Today.** `hr_stem` is a lower-caser and the Croatian stemmer's plain model; `hr_stem_fold` is a
-lower-caser, `AsciiFoldingFilter` and the stemmer's folded model (`storage/src/analysis/mod.rs`,
-`analysis/croatian/`). Serbian, Slovenian, Bosnian and
-Montenegrin text goes to them because the Croatian stemmer serves them well, but Serbian is also
-written in Cyrillic, and Cyrillic words reach the stemmer unchanged: a Latin query for `kamen`
-does not find `камен`, and neither is stemmed. A third of the Serbian and Slovenian texts in
-Q1's sample are Cyrillic.
-
-**The change.** A token filter, placed after the lower-caser in both chains (so before the ASCII fold
-in `hr_stem_fold`), mapping the Serbian Cyrillic alphabet to its Latin letters — the 30 letters, with `љ`, `њ` and `џ` to the
-digraphs `lj`, `nj` and `dž`, and `ђ`, `ћ`, `ч`, `ш`, `ж` to `đ`, `ć`, `č`, `š`, `ž` — so the stemmer, and
-in `hr_stem_fold` the fold, then see what they see for Latin text. `hr_stem` keeps the diacritics the
-mapping produces (`č`, `ć`, `đ`, `š`, `ž`), as it does for Latin text: Cyrillic is another spelling
-of the same language, and the mapping is all that separates the two. Cyrillic letters outside the Serbian
-alphabet (Russian, Bulgarian) pass through unchanged. The mapping is lossless in this direction,
-so the original script stays in the source column, which is why Q1 matters here.
-
-**It goes into `hr_stem` and `hr_stem_fold` themselves, decided 2026-10-26.** No new analyzer name. Today a Cyrillic
-word reaches the stemmer unchanged and is left as it is, so folding it can only add matches, and
-mixed-script text is unlikely in practice. The one effect to document: an index that already holds
-Cyrillic text was built with Cyrillic terms, and a query in Cyrillic is now analyzed to Latin ones,
-so such an index finds nothing in Cyrillic until it is reloaded. `rebuild_changes` compares
-analyzer names, not behaviour, so nothing refuses or reports this; the CHANGELOG entry and the
-tokenizer table say it. (The alternative, filed and not taken: a new name such as
-`hr_stem_cyr` and `hr_stem_fold_cyr`, which leaves every existing index as it is and is moved to by a rebuild.)
-
-**Tests.** The mapping per letter and per digraph; Cyrillic and Latin spellings of one word
-analyzing to the same terms, for a list of Serbian words in both scripts; Latin text analyzing
-exactly as it did before the change (a regression over the existing sample); mixed-script text; the
-existing `hr_stem_fold_matches_queries_written_without_diacritics` test unchanged; all of it for
-both analyzers, and `hr_stem` keeping `č` and `ć` apart where the folded one joins them. **Measure** the
-stemmer's coverage on the Cyrillic texts of the sample, transliterated, against the same text
-transliterated by hand. **Docs:** the tokenizer table in `docs/API_REFERENCE.md`,
-`docs/ARCHITECTURE.md`, and a `CHANGELOG.md` entry.
 
 ---
 
