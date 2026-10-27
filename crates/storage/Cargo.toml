@@ -18,6 +18,9 @@ thiserror = { workspace = true }
 tantivy = { workspace = true }
 # The fst crate tantivy itself depends on, same version: reads the Croatian analyzer data.
 tantivy-fst = "0.5"
+# The Snowball stemmers tantivy itself depends on, same version: the Italian analyzer runs one
+# directly, as it needs the word before stemming too.
+rust-stemmers = "1.2"
 tracing = { workspace = true }
 chrono = { version = "0.4.44", features = ["serde"] }
 walkdir = "2.5"

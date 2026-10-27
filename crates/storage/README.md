@@ -18,8 +18,9 @@ CameoDB's storage engine combines two complementary storage systems:
 - **Storage Strategy**: Index-only (except `id` field) - complete data retrieved from redb
 - **Text analysis**: a text field names its tokenizer; `src/analysis` holds the list a schema may
   name (anything else is refused where it is declared) and registers them on every index:
-  `default`, `raw`, `whitespace`, the Snowball stemmers `en_stem` · `it_stem` · `de_stem` ·
-  `fr_stem` · `es_stem`, `pt_stem` (plurals to the singular and feminines to the masculine, then Snowball), the accent-insensitive `it_stem_fold` · `es_stem_fold` ·
+  `default`, `raw`, `whitespace`, the Snowball stemmers `en_stem` · `de_stem` ·
+  `fr_stem` · `es_stem`, `it_stem` (Snowball with steps around it for short words, `-iano` and
+  `-trice`), `pt_stem` (plurals to the singular and feminines to the masculine, then Snowball), the accent-insensitive `it_stem_fold` · `es_stem_fold` ·
   `fr_stem_fold` · `pt_stem_fold` · `de_stem_fold` (`src/analysis/accents.rs`, `german.rs`), and `hr_stem` / `hr_stem_fold`, a Croatian lemmatizer whose data
   (`src/analysis/croatian/data`, 5.45 MB, embedded) is built by
   [`tools/hr-lexicon`](../../tools/hr-lexicon/README.md). The tokenizer decides the terms written,

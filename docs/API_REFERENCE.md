@@ -673,8 +673,9 @@ exactly as the documents were. Omitted, it is `default`.
 | `default` | Splits on anything not a letter or digit, lowercases. Matches the forms written |
 | `raw` | The whole value as one term; exact match only |
 | `whitespace` | Splits on whitespace only; no lowercasing |
-| `en_stem` · `de_stem` · `fr_stem` · `es_stem` · `it_stem` | `default`, then the language's Snowball stemmer, so `regolamenti` finds `regolamento` |
-| `it_stem_fold` | `default` with accents removed, then the Italian stemmer, so `citta` finds `città` and `attivita` finds `attività`. Words whose accent carries grammar stem shorter than under `it_stem` (`sanità` → `san`) |
+| `en_stem` · `de_stem` · `fr_stem` · `es_stem` | `default`, then the language's Snowball stemmer, so `concejales` finds `concejal` |
+| `it_stem` | `default`, then the Italian Snowball stemmer with the forms it leaves apart brought together, so `regolamenti` finds `regolamento`, `anni` finds `anno`, `italiane` finds `italiano` and `scrittrice` finds `scrittore` |
+| `it_stem_fold` | `default` with accents removed, then the stemmer of `it_stem`, so `citta` finds `città` and `attivita` finds `attività`. Words whose accent carries grammar stem shorter than under `it_stem` (`sanità` → `san`) |
 | `pt_stem` | `default`, then plurals to their singular, feminines to their masculine and the Portuguese Snowball stemmer, so `decisões` finds `decisão`, `municipais` finds `municipal` and `portuguesa` finds `português`. Terms keep their accents |
 | `es_stem_fold` · `fr_stem_fold` · `pt_stem_fold` | `default` with accents removed, then the language's stemmer (for Portuguese, after the plural step), so `informacion` finds `información`, `situee` finds `située` and `decisoes` finds `decisões`. Suffixes the stemmer reads only accented (`-ción`, `-ée`, `-ões`) get their accent back first, so forms still meet; the Spanish preterite and imperfect (`perdió`, `tenía`) stem apart from their infinitive more often than under `es_stem` |
 | `de_stem_fold` | `default`, then umlauts written `ae` `oe` `ue` read as the umlaut (`ue` not after a vowel or `q`), accents removed, and the German stemmer, so `Haeuser` finds `Häuser` and `Groesse` finds `Größe`. `de_stem` already finds `Hauser` |

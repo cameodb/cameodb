@@ -4596,6 +4596,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "redb",
+ "rust-stemmers",
  "serde",
  "serde_json",
  "sysinfo",

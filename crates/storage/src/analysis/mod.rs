@@ -11,6 +11,7 @@
 mod accents;
 mod croatian;
 mod german;
+mod italian;
 mod portuguese;
 
 use tantivy::Index;
@@ -22,6 +23,7 @@ use tantivy::tokenizer::{
 pub(crate) use accents::SuffixAccents;
 pub(crate) use croatian::{CroatianStemmer, SerbianCyrillic};
 pub(crate) use german::GermanSpelling;
+pub(crate) use italian::ItalianStemmer;
 pub(crate) use portuguese::PortuguesePlural;
 
 /// Longest token, in bytes, that the tokenizing analyzers keep.
@@ -63,13 +65,13 @@ pub(crate) const TOKENIZERS: &[&str] = &[
 ];
 
 /// The languages tantivy stems on its own, by tokenizer name. Croatian is not among them — see
-/// [`CroatianStemmer`] — and Portuguese takes a plural step first — see [`PortuguesePlural`].
+/// [`CroatianStemmer`] — Portuguese takes a plural step first — see [`PortuguesePlural`] — and
+/// Italian has steps around the stemmer — see [`ItalianStemmer`].
 const TANTIVY_STEMMED: &[(&str, Language)] = &[
     ("en_stem", Language::English),
     ("de_stem", Language::German),
     ("es_stem", Language::Spanish),
     ("fr_stem", Language::French),
-    ("it_stem", Language::Italian),
 ];
 
 /// Whether `name` is a tokenizer this engine can build an index with.
@@ -114,9 +116,10 @@ pub(crate) fn register_tokenizers(index: &Index) {
         "it_stem_fold",
         lowercased()
             .filter(AsciiFoldingFilter)
-            .filter(Stemmer::new(Language::Italian))
+            .filter(ItalianStemmer)
             .build(),
     );
+    manager.register("it_stem", lowercased().filter(ItalianStemmer).build());
 
     // Plurals reduced to the singular, and feminines to the masculine, before Snowball, which has
     // no plural step of its own and left `decisões`, `municipais` and `possíveis` apart from their
@@ -483,6 +486,10 @@ mod tests {
             // Not `delibera`/`delibere`: Snowball reads `-ere` as an infinitive (`delib`).
             ("it_stem", "regolamento", "regolamenti"),
             ("it_stem", "Consiglio", "consigli"),
+            ("it_stem", "anno", "anni"),
+            ("it_stem", "italiano", "italiane"),
+            ("it_stem_fold", "altro", "altre"),
+            ("it_stem_fold", "scrittore", "scrittrici"),
             ("de_stem", "Gemeinde", "Gemeinden"),
             ("fr_stem", "municipal", "municipaux"),
             ("es_stem", "concejal", "concejales"),

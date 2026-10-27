@@ -44,6 +44,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`it_stem` and `it_stem_fold` bring together forms Snowball left apart.** A word of four
+  letters or more that the stemmer left whole loses its final vowel as a longer word does, so
+  `anni` finds `anno` and `altre` finds `altro`; every form of an `-iano`/`-icano` adjective meets
+  the masculine (`italiane` → `italiano`); and `-trice` meets `-tore` (`scrittrice` →
+  `scrittore`). On the UD Italian treebank, plurals reaching their lemma's term rise from 90.7% to
+  95.5% and feminines from 89.3% to 98.0%; verbs analyze as before. **Reindex note:** fields under
+  either analyzer were indexed with the old terms, and a query is now analyzed to the new ones, so
+  such a field misses words like `anni` and `italiana` until its documents are written again.
 - **`hr_stem` and `hr_stem_fold` read Serbian Cyrillic.** A word in Serbian Cyrillic is mapped to
   its Latin spelling before it is folded and stemmed (`љ` → `lj`, `њ` → `nj`, `џ` → `dž`, `ђ` → `đ`,
   `ћ` → `ć`), so `камен` and `kamen` reach one term and a query in either script finds text in
