@@ -33,6 +33,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alone, and 97.6% of feminines reach the masculine's, against 89.2%; verbs analyze as Snowball
   does.
   Accents are kept, so a query must write them.
+- **`es_stem_fold`, `fr_stem_fold`, `pt_stem_fold` and `de_stem_fold`.** Accent-insensitive
+  variants, as `it_stem_fold` is for Italian: a query typed without accents finds the accented
+  word (`informacion` → `información`, `situee` → `située`, `decisoes` → `decisões`). Suffixes the
+  stemmer reads only with their accent get it back before stemming, so forms still meet: on the UD
+  treebanks, forms reaching their lemma's term fall from 90.8% to 90.6% (French), 94.0% to 93.7%
+  (Portuguese) and 92.6% to 90.6% (Spanish, where the preterite `-ió` and imperfect `-ía` look
+  like nouns once folded). `de_stem_fold` reads `ae`, `oe` and `ue` as umlauts, so `Haeuser`
+  finds `Häuser`; `de_stem` already finds `Hauser`. The plain analyzers are unchanged.
 
 ### Changed
 

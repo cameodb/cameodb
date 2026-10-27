@@ -8,7 +8,9 @@
 //! telling users which fields to reindex. Names say which language, not which algorithm
 //! (`hr_stem` is a dictionary lemmatizer, `it_stem` a Snowball stemmer): users pick by language.
 
+mod accents;
 mod croatian;
+mod german;
 mod portuguese;
 
 use tantivy::Index;
@@ -17,7 +19,9 @@ use tantivy::tokenizer::{
     TextAnalyzer,
 };
 
+pub(crate) use accents::SuffixAccents;
 pub(crate) use croatian::{CroatianStemmer, SerbianCyrillic};
+pub(crate) use german::GermanSpelling;
 pub(crate) use portuguese::PortuguesePlural;
 
 /// Longest token, in bytes, that the tokenizing analyzers keep.
@@ -45,13 +49,17 @@ pub(crate) const TOKENIZERS: &[&str] = &[
     "whitespace",
     "en_stem",
     "de_stem",
+    "de_stem_fold",
     "es_stem",
+    "es_stem_fold",
     "fr_stem",
+    "fr_stem_fold",
     "hr_stem",
     "hr_stem_fold",
     "it_stem",
     "it_stem_fold",
     "pt_stem",
+    "pt_stem_fold",
 ];
 
 /// The languages tantivy stems on its own, by tokenizer name. Croatian is not among them — see
@@ -118,6 +126,49 @@ pub(crate) fn register_tokenizers(index: &Index) {
         lowercased()
             .filter(PortuguesePlural)
             .filter(Stemmer::new(Language::Portuguese))
+            .build(),
+    );
+
+    // Folded first, as for `it_stem_fold`, then the accent written back on the suffixes the
+    // stemmer knows only accented (`negociacion`, `situee`, `situacoes`), and folded again after
+    // the stemmer, which can leave a restored accent in the stem. Without the restore, folding
+    // first cost 2-3 points of forms reaching their lemma's term; with it, 0.2-2.
+    let folded = |language, table| {
+        lowercased()
+            .filter(AsciiFoldingFilter)
+            .filter(SuffixAccents(table))
+            .filter(Stemmer::new(language))
+            .filter(AsciiFoldingFilter)
+    };
+    manager.register(
+        "es_stem_fold",
+        folded(Language::Spanish, accents::SPANISH).build(),
+    );
+    manager.register(
+        "fr_stem_fold",
+        folded(Language::French, accents::FRENCH).build(),
+    );
+    // The plural step reads the restored nasal endings (`decisoes` → `decisões` → `decisão`).
+    manager.register(
+        "pt_stem_fold",
+        lowercased()
+            .filter(AsciiFoldingFilter)
+            .filter(SuffixAccents(accents::PORTUGUESE))
+            .filter(PortuguesePlural)
+            .filter(Stemmer::new(Language::Portuguese))
+            .filter(AsciiFoldingFilter)
+            .build(),
+    );
+
+    // German needs no accent restore: its stemmer already drops the umlaut dots. What it misses is
+    // the `ae`/`oe`/`ue` spelling, taken to the plain vowel ahead of the fold (for loanwords'
+    // accents) and the stemmer.
+    manager.register(
+        "de_stem_fold",
+        lowercased()
+            .filter(GermanSpelling)
+            .filter(AsciiFoldingFilter)
+            .filter(Stemmer::new(Language::German))
             .build(),
     );
 
@@ -374,6 +425,56 @@ mod tests {
         );
         // `it_stem` keeps accents, so there the plain spelling can be another term.
         assert_ne!(analyze("it_stem", "sanita"), analyze("it_stem", "sanità"));
+    }
+
+    #[test]
+    fn fold_variants_match_queries_written_without_accents() {
+        for (tokenizer, plain, accented) in [
+            ("es_stem_fold", "informacion", "Información"),
+            ("es_stem_fold", "tenian", "tenían"),
+            ("es_stem_fold", "espana", "España"),
+            ("fr_stem_fold", "situee", "située"),
+            ("fr_stem_fold", "premiere", "Première"),
+            ("fr_stem_fold", "eleve", "élève"),
+            ("pt_stem_fold", "informacao", "informação"),
+            ("pt_stem_fold", "decisoes", "decisões"),
+            ("pt_stem_fold", "saude", "Saúde"),
+            ("de_stem_fold", "haeuser", "Häuser"),
+            ("de_stem_fold", "Groesse", "Größe"),
+            ("de_stem_fold", "ueber", "über"),
+        ] {
+            assert_eq!(
+                analyze(tokenizer, plain),
+                analyze(tokenizer, accented),
+                "{tokenizer}: {plain} must find {accented}"
+            );
+        }
+        // Without the fold, the accent-free spelling is another term.
+        assert_ne!(analyze("fr_stem", "situee"), analyze("fr_stem", "située"));
+        assert_ne!(analyze("de_stem", "haeuser"), analyze("de_stem", "Häuser"));
+    }
+
+    /// Folding before stemming hides the suffixes the stemmer knows only accented; the restore
+    /// step gives them back, so the fold variants still conflate what the plain stemmers do.
+    #[test]
+    fn fold_variants_still_conflate_forms() {
+        for (tokenizer, a, b) in [
+            ("es_stem_fold", "negociación", "negociaciones"),
+            ("es_stem_fold", "concejal", "concejales"),
+            ("fr_stem_fold", "située", "situé"),
+            ("fr_stem_fold", "dernière", "dernier"),
+            ("pt_stem_fold", "situação", "situações"),
+            ("pt_stem_fold", "questao", "questões"),
+            ("pt_stem_fold", "municipal", "municipais"),
+            ("de_stem_fold", "Gemeinde", "Gemeinden"),
+            ("de_stem_fold", "Haus", "Häuser"),
+        ] {
+            assert_eq!(
+                analyze(tokenizer, a),
+                analyze(tokenizer, b),
+                "{tokenizer}: {a} / {b}"
+            );
+        }
     }
 
     #[test]
