@@ -25,6 +25,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cluster, a schema with ghosts is refused while any node runs a build that does not know them —
   upgrade every node first.
 
+- **`pt_stem`, a Portuguese analyzer.** Plurals are reduced to their singular, and the feminines
+  Snowball leaves apart to their masculine, then the Portuguese Snowball stemmer runs, so
+  `decisões` finds `decisão`, `municipais` finds `municipal`, `obrigatórias` finds `obrigatório`
+  and `portuguesa` finds `português`. On the UD Portuguese treebank, 99.3% of plural nouns and
+  93.5% of plural adjectives reach their singular's term, against 80.9% and 71.8% for Snowball
+  alone, and 97.6% of feminines reach the masculine's, against 89.2%; verbs analyze as Snowball
+  does.
+  Accents are kept, so a query must write them.
+
 ### Changed
 
 - **`hr_stem` and `hr_stem_fold` read Serbian Cyrillic.** A word in Serbian Cyrillic is mapped to

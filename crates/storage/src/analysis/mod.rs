@@ -9,6 +9,7 @@
 //! (`hr_stem` is a dictionary lemmatizer, `it_stem` a Snowball stemmer): users pick by language.
 
 mod croatian;
+mod portuguese;
 
 use tantivy::Index;
 use tantivy::tokenizer::{
@@ -17,6 +18,7 @@ use tantivy::tokenizer::{
 };
 
 pub(crate) use croatian::{CroatianStemmer, SerbianCyrillic};
+pub(crate) use portuguese::PortuguesePlural;
 
 /// Longest token, in bytes, that the tokenizing analyzers keep.
 ///
@@ -49,10 +51,11 @@ pub(crate) const TOKENIZERS: &[&str] = &[
     "hr_stem_fold",
     "it_stem",
     "it_stem_fold",
+    "pt_stem",
 ];
 
-/// The languages tantivy stems itself, by tokenizer name. Croatian is not among them — see
-/// [`CroatianStemmer`].
+/// The languages tantivy stems on its own, by tokenizer name. Croatian is not among them — see
+/// [`CroatianStemmer`] — and Portuguese takes a plural step first — see [`PortuguesePlural`].
 const TANTIVY_STEMMED: &[(&str, Language)] = &[
     ("en_stem", Language::English),
     ("de_stem", Language::German),
@@ -104,6 +107,17 @@ pub(crate) fn register_tokenizers(index: &Index) {
         lowercased()
             .filter(AsciiFoldingFilter)
             .filter(Stemmer::new(Language::Italian))
+            .build(),
+    );
+
+    // Plurals reduced to the singular, and feminines to the masculine, before Snowball, which has
+    // no plural step of its own and left `decisões`, `municipais` and `possíveis` apart from their
+    // singulars, and `obrigatória` and `portuguesa` from their masculines.
+    manager.register(
+        "pt_stem",
+        lowercased()
+            .filter(PortuguesePlural)
+            .filter(Stemmer::new(Language::Portuguese))
             .build(),
     );
 
@@ -371,6 +385,21 @@ mod tests {
             ("de_stem", "Gemeinde", "Gemeinden"),
             ("fr_stem", "municipal", "municipaux"),
             ("es_stem", "concejal", "concejales"),
+            ("pt_stem", "informação", "informações"),
+            ("pt_stem", "decisão", "decisões"),
+            ("pt_stem", "municipal", "municipais"),
+            ("pt_stem", "possível", "possíveis"),
+            ("pt_stem", "fácil", "fáceis"),
+            ("pt_stem", "lei", "leis"),
+            ("pt_stem", "português", "portugueses"),
+            ("pt_stem", "Mulher", "mulheres"),
+            ("pt_stem", "árvore", "árvores"),
+            ("pt_stem", "hectare", "hectares"),
+            ("pt_stem", "próximo", "próximos"),
+            ("pt_stem", "ano", "anos"),
+            ("pt_stem", "obrigatório", "obrigatórias"),
+            ("pt_stem", "português", "portuguesas"),
+            ("pt_stem", "inúmero", "inúmeras"),
         ] {
             assert_eq!(
                 analyze(tokenizer, singular),
