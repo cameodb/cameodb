@@ -21,7 +21,8 @@ of the released 0.3.6, read as a database-systems pass, is filed as
 under [Reconciliation, 2026-10-15](#reconciliation-2026-10-15): it corrected Phase 16's premise
 about redb, closed [E6](docs/ROADMAP-ARCHIVE.md#e6--a-crash-restart-repaired-every-shards-redb-file), and filed OB25 and
 OB26. Features agreed for the iterations after the 0.3.7 release are filed as
-[P. Post-0.3.7 features](#p-post-037-features--partial).
+[P. Post-0.3.7 features](#p-post-037-features--partial), and those after 0.3.8 as
+[Q. Post-0.3.8 features](#q-post-038-features--planned).
 
 ## How to read this file
 
@@ -256,6 +257,8 @@ first written down here, so the chronology stays visible under the cost ordering
 | [P4](docs/ROADMAP-ARCHIVE.md#p4--ip-fields-queried-the-way-addresses-are) | Ip fields queried the way addresses are — CIDR as its range, a bare address searching the ip fields, an open IPv4 range kept among IPv4, `fast` on ip for a sort by address, write refusals naming the value | — | 2026-10-21 | ✅ |
 | [P5](#p5--native-json-fields-paths-typed-values-ranges) | Native json fields — a json field indexes its object beside its text: paths and typed values match, ranges at a path run from the fast column it gets by default, RFC 3339 strings are dates; existing indexes unchanged until rebuilt | — | 2026-10-21 | 📋 |
 | [P6](#p6--a-hit-says-which-array-elements-matched) | A hit says which array elements matched — `_matched_elements` beside `_truncated_arrays`, a per-field matcher from the screened AST applied in the fetch phase before the cap, `matches N` per request; priority not yet decided | — | 2026-10-21 | 📋 |
+| [Q1](#q1--ghost-fields-index-columns-derived-from-another-field-under-a-condition) | Ghost fields — an index column derived from another field's value, for every document or under an `in` / `not_in` condition on a discriminator field, indexed in Tantivy and never stored in redb; one copy of the text in redb instead of one per analyzer — about 38% less disk on a multilingual sample | — | 2026-10-26 | 📋 |
+| [Q2](#q2--the-croatian-analyzers-read-serbian-cyrillic) | The Croatian analyzers read Serbian Cyrillic — Cyrillic and Latin text and queries reach one term, inside `hr_stem` and `hr_stem_fold`; an index already holding Cyrillic text is reloaded | — | 2026-10-26 | 📋 |
 
 ---
 
@@ -2898,6 +2901,319 @@ with matches, a projected-away field reporting nothing, the coordinator's re-cap
 `_matched_elements` whole, and a two-node search answered by the owning shard. **Docs:**
 `docs/API_REFERENCE.md`, `docs/CONFIGURATION.md`, the MCP syntax reference
 (`crates/mcp/src/syntax.rs`), `cameodb.example.toml`, and a `CHANGELOG.md` entry.
+
+---
+
+## Q. Post-0.3.8 features 📋 Planned
+
+Features agreed after the 0.3.8 release, for the iterations that follow it. Each is scoped against
+the code as it stands at `c04c63b`, so the paths below are where the work starts, not a promise
+they will not move. Both came out of loading a multilingual full-text corpus as a test (350,798
+passage rows, 376 MB of text, in 17 languages; "the sample" below).
+
+### Q1 — Ghost fields: index columns derived from another field, under a condition
+
+📋 **Planned.** Filed 2026-10-26; revised 2026-10-27 against the code — a change to a ghost applies
+from the change on, ghosts leave hits at the shadow rewrite, and the read and write paths that had
+to know.
+
+**Today.** Every analyzer an index wants on a text costs a copy of the text in redb. A Tantivy
+column is fed from the document body, by field name (`SchemaFields::document`,
+`storage/src/schema.rs`), and redb keeps that body whole, so to search one text stemmed and exact,
+or stemmed by the language of its row, the document carries the text once per field. Measured on
+the sample, rows with only a parent key and `lang` beside the text, each variant loaded on its own
+fresh node and measured after the merges, allocated size:
+
+| Layout | redb | Tantivy | Total |
+|---|---|---|---|
+| text in a stemmed language field and in `text_exact` (what a schema needs today) | 1,055 MB | 350 MB | 1,407 MB |
+| the stemmed language field only | 524 MB | 180 MB | 705 MB |
+| `text_exact` only, no stemming | 524 MB | 190 MB | 715 MB |
+| **ghost: the text once, a stemmed column beside the exact one** | **about 524 MB** | **about 330–350 MB** | **about 860–875 MB** |
+
+The last row is derived, not measured: the Tantivy side is the same content as the first row (a
+column per analyzer), and the redb side is the second row's. It is 38% below today's layout and 22%
+above having no stemming at all.
+
+**The feature.** A field property, `ghost`, says where a column's values come from instead of the
+document body:
+
+```json
+"text_en": {
+  "type": "text", "tokenizer": "en_stem",
+  "ghost": {"source": "text_exact", "when": {"field": "lang", "in": ["en"]}}
+}
+```
+
+Written in prose as `ghost(text_exact, lang, ["en"])`, `ghost(text_exact, lang, not ["en"])` for
+the complement, and `ghost(text_exact)` for a ghost with no condition. A ghost is an indexed text column that is never stored and never in a document: for
+a document whose body has the source field and which matches the condition (`when.field` equal to
+one of the `in` values, or not, for `not_in`), the source's value is added to the ghost's column, under
+the ghost's own tokenizer. Otherwise the ghost holds nothing for the document. redb keeps the body
+as written, so the text is stored once.
+
+- **A list of values.** `in` is an array, one value or many: Serbian, Slovenian, Bosnian,
+  Montenegrin and Croatian text all feed one `hr_stem_fold` column,
+  `"in": ["hr", "sr", "sl", "bs", "cnr"]`. A scalar is read as a list of one.
+- **The discriminator is a string, integer or boolean field** of the document, and every value in
+  the list has its type. Strings compare exactly (case included). An array-valued discriminator
+  matches `in` when any element is in the list. A document without the discriminator, or with a
+  value of another type, does not match `in`.
+- **`not_in` is the complement of `in`, decided 2026-10-27.** `"when": {"field": "lang",
+  "not_in": [...]}` matches exactly the documents that `in` with the same list does not: an array
+  discriminator none of whose elements is in the list, and a document with no discriminator or one
+  of another type. One rule rather than a second set of edge cases, and it makes a pair of ghosts on
+  one list cover every row with the source exactly once. A condition has `in` or `not_in`, not both.
+  It is the easier form wherever the rest is the open set: "every language without a stemmer" is
+  `not_in` the stemmed ones, and a language that first appears next year is covered from its first
+  write without a schema change.
+- **A source feeds any number of ghosts**, and a document can match several of them; conditions
+  need not be disjoint. Kept in step by hand: a value added to a stemmer's `in` but not to the
+  catch-all's `not_in` is indexed in both columns — searchable, and scored twice in a default-field
+  search, not lost.
+- **A ghost without a condition, decided 2026-10-27.** `when` omitted: every document whose body
+  has the source feeds the ghost. `"text": {"type": "text", "tokenizer": "default"}` and
+  `"text_stem": {"type": "text", "tokenizer": "en_stem", "ghost": {"source": "text"}}` is a
+  single-language index searched by exact form and by stem with the text stored once — the first
+  row of the table above, at the size of the last, and the case most indexes have, since most hold
+  one language. It is also the way to give an unindexed source one column under an analyzer of the
+  operator's choosing, and to try an analyzer beside the column in use before switching to it.
+- **A catch-all is optional.** With an indexed source, languages without a stemmer need no ghost:
+  the source column, with the default tokenizer, is what they would have had. With an unindexed
+  source, a `not_in` ghost is what keeps them searchable (below).
+- **The source is an array of strings the way a text column is:** each element is indexed, with
+  the position gap between elements a text field already has.
+
+**What the schema refuses,** at `PUT /_config` and `PATCH /_schema`, in the way `validate_tokenizers`
+and `validate_default_fields` refuse today:
+
+- a `source` that is not declared, is not `text` or `string`, is itself a ghost (no chains), or is
+  `id` or a shadow field — the put path strips a shadow name from the body before the document is
+  built (`filter_shadow_fields_owned`), so a ghost on one would always be empty;
+- a `when.field` that is not declared, is a ghost, or is not a string, integer or boolean field; a
+  `when` with both `in` and `not_in`, or neither; an empty list in either (an empty `not_in`
+  would mean every document: omit `when` for that); a value of another type than the field;
+- a ghost that is `stored`, `fast` or `id`;
+- a ghost with no condition on an indexed source, under the source's own analysis (tokenizer and
+  record option, compared as `rebuild_changes` compares them): it would build the source's column a
+  second time.
+
+**The source may be unindexed, decided 2026-10-27.** A ghost reads its source from the stored
+body, not from the source's column, and redb keeps every field of the body whatever its `indexed`
+flag says — the put path strips shadow names and nothing else — so the source needs no column of
+its own. Its life is its own, and the ghosts it feeds are untouched by it:
+
+- *Declared unindexed.* No column is built for it; its value is in redb, comes back in every hit,
+  and feeds the ghosts from the first write.
+- *Indexed later* (`PATCH /_schema`, `indexed: true`). `FieldEdit::apply` pins it, clearing
+  `learned`, as any promotion does. A shard that holds documents has no column for it, so it is
+  `pending_reindex` there (`unbuilt_promotions`) like any field declared ahead of the index.
+- *No longer indexed* (`indexed: false`). The builder stops feeding its column (it adds only
+  `indexed` fields); the terms already in it stay until a rebuild and are not reachable, since a
+  clause naming a non-indexed field is dropped with `non_indexed_field_note`. The ghosts go on
+  being fed. `FieldEdit::apply` needs no new check for this.
+- *Removed from the declaration* (a `PUT /_config` that leaves it out). Refused while a ghost names
+  it, the way `validate_default_fields` refuses a listed field that is no longer indexed: "remove
+  the ghost first, or in the same request". `merge_learned` treats a declared field a `PUT` leaves
+  out as removed on purpose, and the next write carrying it would add it back as a learned field —
+  the ghost would read a field the schema says it does not know. `indexed: false` is the way to
+  stop indexing it.
+- *A learned source.* A write cannot break the type rule — a learned text field only widens to
+  text (`TantivyFieldType::widened`) — but the declaration that names it as a source clears its
+  `learned`, as a promotion does, so the source is a declared field from then on.
+
+A query naming an unindexed source has its clause dropped as today, and the note names where the
+text is searched instead: "field `text_exact` is not indexed; its text is searched through
+`text_en`, `text_hr`, …".
+
+**What an unindexed source asks of the operator.** A row whose discriminator matches no ghost is
+not searchable by its text at all. Covering those rows is a catch-all ghost — for an index with a
+ghost per stemmer, a `text_other` ghost under the `default` tokenizer with
+`"not_in": ["en", "de", "fr", "es", "it", "hr", "sr", "sl", "bs", "cnr"]`, the union of the stemmer
+ghosts' lists. A language that shows up later is covered from its first row; one that later gets a
+stemmer is moved by adding it to that ghost's `in` and to this `not_in` in one change, which by the
+rule below applies to new writes. And the exact word forms of a stemmed language are no longer a
+column of their own: only the stemmed one is.
+
+A write whose body names a ghost is refused with `400`, naming the field, rather than dropped:
+the value would be neither stored nor indexed, and nothing would say so. The check goes in
+`validate_document` (`server/src/node/search.rs`), beside `disagreeing_shadow_field`; and
+`evolve_field` (`schema.rs`) leaves a ghost alone, as it leaves a shadow field.
+
+**Where the facts are.**
+
+- *One builder for the write and the replay.* `SchemaFields::document` (`storage/src/schema.rs`) is
+  called from exactly two places, the put path (`store.rs`, before the redb transaction opens) and
+  the WAL replay (`store.rs`, in recovery), so a document indexes on recovery as it did when
+  written. The ghost columns are added there, reading the stored body, and so need nothing the
+  recovery does not have. The put path also strips shadow fields from the body before it is stored
+  (`filter_shadow_fields_owned`): a precedent for the body and the index differing, in the other
+  direction. Two rules in the builder:
+  - *The body loop skips a ghost's name.* A body written before its field became a ghost still
+    carries the value (below); the column is fed from the source alone, or a replay of such a
+    document would index both copies.
+  - *The ghosts are read from the `IndexSchema` the builder is handed,* not cached in
+    `SchemaFields`: an index opened from disk gets its `SchemaFields` from the Tantivy schema alone
+    (`load_fields_from_existing_index`, `store.rs`), which knows nothing of sources or conditions.
+    A walk of the ghost list per document is cheap beside tokenizing the text; cache it only if a
+    bench says otherwise.
+- *The column build already takes any indexed text field.* `create_schema_from_definition`
+  (`store.rs`) skips only `id`, `_seq`, non-indexed and shadow fields; a ghost is `indexed`, not
+  shadow, and builds as a text column with its tokenizer and record option. `SchemaFields`
+  records it in `indexed_fields` and `built_types` like any other.
+- *The schema owns the rest.* `FieldDef` gains the property (`schema.rs`, beside `is_shadow`); the
+  fingerprint (`fingerprint_of_effective`) includes source, field, operator and values — and a
+  marker of its own for a ghost with no condition, so that none hashes like any list — since two nodes must
+  agree on which documents a column holds; `normalize_after_deserialization` leaves it alone;
+  `rebuild_changes` knows it (below); `GET /_config` reports it, `stored` false.
+- *The schema takes a ghost out of every hit, the way it puts a shadow name in.* Every hit is built
+  in `fetch_documents` (`storage/src/search.rs`) — both search paths and the `id:VALUE` lookup — and
+  its one rewrite of the stored body, `reconstruct_shadow_fields_owned`, is where a ghost's name is
+  removed, gated by a `has_ghost_fields()` as the shadow branch is by `has_shadow_fields()`. Before
+  the projection and the array cap, as the shadow rewrite is, so a document written before its field
+  became a ghost (and still holding the value) and one written after answer alike.
+- *A projection naming a ghost says why it is empty.* `unknown_projection_fields`
+  (`server/src/node/search.rs`) counts every schema field as known, so `fields: [text_en]` would
+  return hits without it and no word. It gets the dropped-clause note other projections get, naming
+  the source: "`text_en` is a ghost; its value is in `text_exact`".
+- *A sort on a ghost is refused.* `unsortable_sort_field` lets a non-fast `text` field through and
+  orders the candidates from the stored body afterwards; a ghost has no value there, so every row
+  would sort as missing. It refuses a ghost by name, pointing at the source.
+- A ghost can be a default search field (it is an indexed text column), so `default_fields` can
+  list the language columns and `text_exact`.
+
+**A change to a ghost is valid from the change on.** The rule, decided 2026-10-27: a schema change
+that turns a field into a ghost, or changes the values of a ghost's condition, applies to writes
+from that point; documents already written keep what they were indexed with until they are written
+again. Nothing is backfilled and nothing is refused for being populated, with one exception the
+engine imposes — a built Tantivy index's columns are fixed, so a column that does not exist yet
+cannot be written into. `rebuild_changes` then knows three cases:
+
+1. *An indexed field becomes a ghost* (today's `text_en`, fed from `text_exact` on `lang`), or a
+   ghost becomes a plain field again. The column, its type and its tokenizer stay, so documents
+   written before and after share it and answer the same queries. Old bodies keep the value in
+   redb — the saving applies to documents written after the change, until the old ones are written
+   again — and the hit rewrite above keeps it out of the answer. Accepted; reported as
+   `applies to new writes`, not as a conflict. Today `rebuild_changes` compares type, tokenizer,
+   record option and `fast` only, and would see no change here at all: it has to report this one.
+2. *A ghost's `source` or `when` changes* (`bs` added to `text_hr`). From the change on, new `bs`
+   rows feed the column; old ones do not until rewritten, and a value taken out leaves its old rows
+   in the column. Adding a condition to a ghost that had none, or taking it away, is the same kind
+   of change. Accepted and reported the same way.
+3. *A ghost is added to an index whose shard already holds documents.* That shard has no column for
+   it: `pending_reindex`, not searchable there until rebuilt, as for any field declared ahead of the
+   index. An empty index, or a shard built fresh, gets the column and works from the first write.
+
+A changed tokenizer or type on a ghost stays a conflict refused with `409`, as on any built column:
+a query would be analysed differently from the terms the column holds.
+
+The old copies are disk only. Two ways to take them back: write the documents again, or have the offline `cameodb compact --rewrite` ([F11](#f11--the-disk-a-delete-frees-was-never-returned))
+drop ghost names from the bodies it rewrites. Case 3, and any wish to make cases 1 and 2 hold for
+old rows too, is [D1](#d1--reindex): the condition reads only what redb holds, so rebuilding a shard
+from its documents under the new schema fills the ghosts exactly as the writes would have, and D1
+stops needing the source to be re-ingested.
+
+**Migrating an index that writes its text twice** is then one schema change and a change in the
+writer, no reload. Take an index that writes every row's text to `text_exact` and again to a field
+per language: `text_en`, `text_de`, … become ghosts of `text_exact` on `lang`, `text_hr` with
+`"in": ["hr", "sr", "sl", "bs", "cnr"]` (after [Q2](#q2--the-croatian-analyzers-read-serbian-cyrillic),
+so a writer that transliterated Serbian before writing need not), a `text_other` field that repeated
+`text_exact` under the same `default` tokenizer for the languages without a stemmer leaves
+`default_fields`, and the writer stops sending the language fields from the same moment — a write
+still naming one is refused once it is a ghost.
+
+The two layouts such an index can choose between, both with the text stored once, in its original
+script:
+
+| Layout | Columns | Allocated size, sample |
+|---|---|---|
+| source indexed: `text_exact` searched for exact forms and for the languages without a stemmer, a ghost per stemmer | exact + stemmed | about 860–875 MB (derived; the table above) |
+| source unindexed: a ghost per stemmer, and `text_other` a `not_in` ghost for the rest | one per row | about 705 MB — the columns of the "stemmed language field only" row, measured |
+
+The second builds what the "stemmed language field only" row built, with one difference: there the
+writer stored only the language field, so text it had transliterated was stored transliterated;
+here redb keeps the original script and the analyzer folds it (Q2).
+
+**On a cluster.** The schema is decided once and stored on every node (`PrepareSchema` and
+`ApplySchema`), and no document or wire message changes. A peer on a build that does not know
+`ghost` deserializes the schema without it (`FieldDef` has no `deny_unknown_fields`) and builds a
+plain text column that is never filled. That is not silent: the peer's stored schema then hashes
+differently, and thumbprints are compared at apply and at reconcile (`schema_change.rs`), so the
+likely result is a divergence reconciled again and again rather than one quiet empty column — to
+be confirmed by tracing the reconcile loop. The `PUT` already needs every node connected, but not
+at one version. The lean is a gate at `PrepareSchema`: a proposal with a ghost in it is refused
+while any peer is on a build that does not know the property, rather than documenting "upgrade
+every node first".
+
+**Tests.** Storage: the document builder per condition kind (string, integer, boolean, array
+discriminator, missing discriminator, wrong type, several values, several ghosts on a source,
+overlapping conditions, an array source), each for `in` and for `not_in`, and an `in`/`not_in` pair
+on one list feeding every document exactly once, and a ghost with no condition feeding every
+document with the source and none without it; a ghost document and the same document replayed from the
+WAL give equal Tantivy documents; a body that still carries the ghost's name indexes the source's
+value only; the stored body holds no ghost; the fingerprint moves with the condition;
+`rebuild_changes` for each of the three cases and the `409`; every refusal above. Server:
+`PUT /_config` with ghosts, a write refused for naming one, a search by stem on a ghost and an exact
+search on the source finding the same row, `GET /_config` reporting the property and a saved read
+restoring it (P3); a populated index whose plain field becomes a ghost — old and new rows both
+found by stem, neither hit carrying the field, the old row's redb body unchanged; a condition value
+added on a populated index reaching new rows only; a ghost added to a populated index reported
+`pending_reindex`; `fields: [ghost]` answered with the note, a sort on a ghost refused; an
+unindexed source feeding its ghosts and coming back in hits, then indexed (`pending_reindex` on a
+populated shard), then no longer indexed with its ghosts still fed, and a `PUT` that leaves it out
+refused while a ghost names it; a query on an unindexed source answered with the note naming its
+ghosts; an update
+that changes the discriminator moving the row between ghosts. Cluster: a three-node schema with ghosts, and a
+write through each node. **Measure** the table above on the sample, redb and Tantivy
+separately, with and without ghosts. **Docs:** `docs/API_REFERENCE.md` (the field reference and the
+tokenizer table), `docs/ARCHITECTURE.md` (the write path), the MCP syntax and schema descriptions
+(`crates/mcp/src/syntax.rs`, `guidance.rs`, `server/src/mcp/schema.rs`, `discovery.rs`), and a
+`CHANGELOG.md` entry.
+
+**Not in this item:** deriving a value by transformation (a transliteration, a lower-casing)
+rather than by analysis — the analyzer does that, and Q2 puts the Serbian one there; a
+ghost fed from several sources; a condition on more than one discriminator or on a range.
+
+### Q2 — The Croatian analyzers read Serbian Cyrillic
+
+📋 **Planned.** Filed 2026-10-26. Wanted by Q1: a ghost reads the source text as it was written,
+so a transliteration a writer does before sending the text (one way to make Serbian Cyrillic
+searchable today) has no place to happen.
+
+**Today.** `hr_stem` is a lower-caser and the Croatian stemmer's plain model; `hr_stem_fold` is a
+lower-caser, `AsciiFoldingFilter` and the stemmer's folded model (`storage/src/analysis/mod.rs`,
+`analysis/croatian/`). Serbian, Slovenian, Bosnian and
+Montenegrin text goes to them because the Croatian stemmer serves them well, but Serbian is also
+written in Cyrillic, and Cyrillic words reach the stemmer unchanged: a Latin query for `kamen`
+does not find `камен`, and neither is stemmed. A third of the Serbian and Slovenian texts in
+Q1's sample are Cyrillic.
+
+**The change.** A token filter, placed after the lower-caser in both chains (so before the ASCII fold
+in `hr_stem_fold`), mapping the Serbian Cyrillic alphabet to its Latin letters — the 30 letters, with `љ`, `њ` and `џ` to the
+digraphs `lj`, `nj` and `dž`, and `ђ`, `ћ`, `ч`, `ш`, `ж` to `đ`, `ć`, `č`, `š`, `ž` — so the stemmer, and
+in `hr_stem_fold` the fold, then see what they see for Latin text. `hr_stem` keeps the diacritics the
+mapping produces (`č`, `ć`, `đ`, `š`, `ž`), as it does for Latin text: Cyrillic is another spelling
+of the same language, and the mapping is all that separates the two. Cyrillic letters outside the Serbian
+alphabet (Russian, Bulgarian) pass through unchanged. The mapping is lossless in this direction,
+so the original script stays in the source column, which is why Q1 matters here.
+
+**It goes into `hr_stem` and `hr_stem_fold` themselves, decided 2026-10-26.** No new analyzer name. Today a Cyrillic
+word reaches the stemmer unchanged and is left as it is, so folding it can only add matches, and
+mixed-script text is unlikely in practice. The one effect to document: an index that already holds
+Cyrillic text was built with Cyrillic terms, and a query in Cyrillic is now analyzed to Latin ones,
+so such an index finds nothing in Cyrillic until it is reloaded. `rebuild_changes` compares
+analyzer names, not behaviour, so nothing refuses or reports this; the CHANGELOG entry and the
+tokenizer table say it. (The alternative, filed and not taken: a new name such as
+`hr_stem_cyr` and `hr_stem_fold_cyr`, which leaves every existing index as it is and is moved to by a rebuild.)
+
+**Tests.** The mapping per letter and per digraph; Cyrillic and Latin spellings of one word
+analyzing to the same terms, for a list of Serbian words in both scripts; Latin text analyzing
+exactly as it did before the change (a regression over the existing sample); mixed-script text; the
+existing `hr_stem_fold_matches_queries_written_without_diacritics` test unchanged; all of it for
+both analyzers, and `hr_stem` keeping `č` and `ć` apart where the folded one joins them. **Measure** the
+stemmer's coverage on the Cyrillic texts of the sample, transliterated, against the same text
+transliterated by hand. **Docs:** the tokenizer table in `docs/API_REFERENCE.md`,
+`docs/ARCHITECTURE.md`, and a `CHANGELOG.md` entry.
 
 ---
 

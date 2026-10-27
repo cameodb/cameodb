@@ -3667,15 +3667,15 @@ them defects is that the answer claims to be whole.
 
 ### OB28 — Two range shapes were dropped without a word or failed the search
 
-✅ **Done 2026-10-21.** Found profiling `narodne_novine` for its descriptions, at `3815886`:
+✅ **Done 2026-10-21.** Found profiling a test index of legal acts for its descriptions, at `3815886`:
 
-- **`field:[* TO *]` answered zero.** On `year`, `act_date`, `klasa` and `heading` alike, with no
+- **`field:[* TO *]` answered zero.** On four of its fields alike (`year` and `act_date` among them), with no
   `_discarded_clauses`. Tantivy's parser drops a range open at both ends as useless and reports
   nothing (`compute_logical_ast_lenient`, "there is no point emitting it"), so the search never
   learned a clause was gone: alone the query was emptied and answered 0 as if nothing matched, and
   `a AND year:[* TO *]` ran as `a`. `field:*` was already reported as a presence test.
 - **A range on a json field was a 500.** `cells:["" TO *]` →
-  `no shard could run this query against 'narodne_novine': tantivy error: An invalid argument was
+  `no shard could run this query against '<index>': tantivy error: An invalid argument was
   passed: 'RangeQuery on JSON is only supported for fast fields currently'`. The parser accepts the
   leaf; `RangeQuery::weight` refuses it on a shard, after the point where a clause can be dropped.
   CameoDB builds no json fast column, so every such range failed.
@@ -4284,7 +4284,7 @@ syntax reference (`crates/mcp/src/syntax.rs`) and guidance, `cameodb.example.tom
 
 ### P2 — One declaration of an index's default fields
 
-✅ **Done 2026-10-20.** Found writing descriptions for `narodne_novine`: its `GET /_config` listed
+✅ **Done 2026-10-20.** Found writing descriptions for a test index: its `GET /_config` listed
 the same five fields under `default_fields` and under `searched_by_default`, and a third time as
 each field's `default_search`. Not an artifact of two periods — all three came in one commit,
 `ee5e76e` (M8): the declaration for a read-modify-write, the effective set for a reader, the
@@ -4330,13 +4330,13 @@ first.
 
 ### P3 — A schema read is a schema write
 
-✅ **Done 2026-10-21.** Found keeping a history of `narodne_novine`'s schema: a saved
+✅ **Done 2026-10-21.** Found keeping a history of a test index's schema: a saved
 `GET /_config` could not be sent back. `PUT` refused it outright — `fields` a list where it takes a
 map, `type` and `shadow` where it takes `field_type` and `is_shadow` — and the read was not a
 complete definition either. It never reported `index_record_option`, `learned` or
 `routing_field_name`, all three in the thumbprint. A missing property is filled with its default
 by `normalize_after_deserialization`, so a read rebuilds exactly only where every value is the
-default. `narodne_novine` does (its `raw` fields are `string`); a schema `data load` wrote does not:
+default. That index does (its `raw` fields are `string`); a schema `data load` wrote does not:
 its category columns are `text` + `raw` + `Basic`. Measured on a probe: the index read
 `f3aa477f…`, the schema rebuilt from that read `e1da1e36…`, and the rebuild `PUT` back onto the
 populated index was refused, `country: index record option Basic → WithFreqsAndPositions`. The

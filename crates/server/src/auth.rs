@@ -1355,7 +1355,7 @@ mod tests {
         struct Pasted {
             security: SecurityConfig,
         }
-        let indexes = vec!["narodne_novine".to_string(), "istarske_novine".to_string()];
+        let indexes = vec!["legal_acts".to_string(), "news".to_string()];
         for source in [
             format!("key_hash_file = {}", toml_string(r"C:\keys\sync")),
             format!("key_hash = {}", toml_string("sha256:abc")),

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Build a `PUT /api/{index}/_config` body: the index's live schema with new descriptions.
 
-    python3 schema_body.py --index narodne_novine --descriptions desc.json --out body.json
-    python3 schema_body.py --index narodne_novine --descriptions desc.json --out body.json --apply
+    python3 schema_body.py --index legal_acts --descriptions desc.json --out body.json
+    python3 schema_body.py --index legal_acts --descriptions desc.json --out body.json --apply
 
 `desc.json` is {"description": "...", "fields": {"<field>": "...", ...}}; a field it leaves out keeps
 the description it has, and "" clears one. The body is the `GET /_config` read itself with the

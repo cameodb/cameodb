@@ -7,7 +7,7 @@ spread over a stratify field (a row kind) and a spread field (usually a year) fo
 — examples, lengths, whether a field holds lists. Counts are exact; everything taken from the sample is
 marked as such.
 
-    python3 profile_index.py --index narodne_novine --stratify unit_type --spread year \
+    python3 profile_index.py --index legal_acts --stratify unit_type --spread year \
         --json profile.json > profile.md
 
 Presence is a range from the lowest term of the field's type, because `field:*` and `field:[* TO *]`
