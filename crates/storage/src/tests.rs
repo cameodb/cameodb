@@ -3746,6 +3746,15 @@ mod ghost_field_tests {
                 with(json!({"type": "text", "ghost": {"source": "text"}})),
                 "same column twice",
             ),
+            // A document never carries a ghost, so nothing could be routed by one.
+            (
+                {
+                    let mut routed = ghost(json!({"source": "text"}));
+                    routed["routing_field_name"] = json!("text_en");
+                    routed
+                },
+                "routing field",
+            ),
         ];
         for (body, expected) in cases {
             let reason = refusal(body.clone());

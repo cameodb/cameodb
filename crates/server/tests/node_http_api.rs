@@ -5175,6 +5175,43 @@ async fn a_ghost_field_is_searched_through_and_never_written_or_returned() {
         body.to_string().contains("'text_en' is a ghost of 'text'"),
         "{body}"
     );
+    // The batch paths refuse it the same way, as they report any document they will not take:
+    // by position, beside the documents of the batch that were written.
+    let (status, body) = post_json(
+        &node,
+        "/api/texts/_bulk",
+        json!([
+            {"id": "bulk_named", "doc": {"lang": "en", "text": "x", "text_en": "y"}},
+            {"id": "bulk_plain", "doc": {"lang": "hr", "text": "plain"}},
+        ]),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["items_written"], 1, "{body}");
+    assert!(
+        body["errors"]
+            .to_string()
+            .contains("document 0: field 'text_en' is a ghost"),
+        "{body}"
+    );
+    let (status, body) = post_ndjson(
+        &node,
+        "/api/texts/document/stream",
+        concat!(
+            "{\"id\":\"stream_named\",\"doc\":{\"lang\":\"en\",\"text\":\"x\",\"text_en\":\"y\"}}\n",
+            "{\"id\":\"stream_plain\",\"doc\":{\"lang\":\"hr\",\"text\":\"plain\"}}\n",
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "partial", "{body}");
+    assert_eq!(body["items_written"], 1, "{body}");
+    assert!(
+        body["errors"]
+            .to_string()
+            .contains("line 1: field 'text_en' is a ghost"),
+        "{body}"
+    );
     client.admin_index_commit("texts").await.expect("commit");
 
     let (status, found) =
@@ -5225,6 +5262,17 @@ async fn a_ghost_field_is_searched_through_and_never_written_or_returned() {
     let (status, body) = put_config(&node, "texts", &chained).await;
     assert_eq!(status, 400, "{body}");
     assert!(body.to_string().contains("is a ghost itself"), "{body}");
+
+    // A document never carries a ghost, so routing by one would leave every delete without a
+    // key to find its shard by.
+    let mut routed = ghost_declaration(json!("en"));
+    routed["routing_field_name"] = json!("text_en");
+    let (status, body) = put_config(&node, "routed", &routed).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string().contains("is the index's routing field"),
+        "{body}"
+    );
 }
 
 /// A change to a ghost on a populated index is accepted, applies to documents written from then

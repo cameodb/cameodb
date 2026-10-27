@@ -4434,8 +4434,34 @@ predates it, so the reconcile loop never meets a peer without ghosts. Tests: sto
 `rebuild_changes`) and `tests/ghost_fields_test.rs` (feeding, no condition, stripping, WAL replay,
 an unindexed source, a field made a ghost); server `a_ghost_field_is_searched_through_and_never_written_or_returned`
 and `a_ghost_change_on_a_populated_index_applies_to_new_writes`; the cluster suite's
-`probe ghosts`. The layouts table's ghost rows stay derived here: they are measured by loading the
-data by hand, and a change that measurement calls for is filed as an improvement of its own.
+`probe ghosts`.
+
+**Measured 2026-10-27** on the same sample (1,039 Gutenberg books, 350,798 rows), each layout on its
+own fresh node, allocated size after the merges. The text is stored once in `text_exact`, which is
+indexed as written, and `text_en`, `text_de`, `text_fr`, `text_es`, `text_it` and `text_hr` are ghosts
+of it fed by `lang`:
+
+| Metadata on each chunk row | Without ghosts | With ghosts | redb | Tantivy |
+|---|---|---|---|---|
+| parent key and `lang` | 1,407 MB | **820 MB** (−42%) | 524 MB | 295 MB |
+| plus title and author | 1,447 MB | **859 MB** (−41%) | 558 MB | 299 MB |
+| the full book core | 1,511 MB | **926 MB** (−39%) | 621 MB | 304 MB |
+
+Below the derived 860–875 MB: the Tantivy side shrank as well, because the layout without ghosts
+also needed a `text_other` column for the languages with no stemmer, while with ghosts those are
+searched in `text_exact` itself and indexed once. Hit counts on 35 queries — stemming, phrases, the
+five Snowball languages, Serbian in both scripts, default fields, metadata filters, language
+isolation — equal the layout without ghosts on 33; the other two find Cyrillic headings the old
+layout's client-side transliteration had missed.
+
+**Found in that measurement, fixed 2026-10-27.** A ghost could be named the index's
+`routing_field_name`: no document carries it, so writes fell through to the id and every delete was
+refused for want of a routing key no hit could supply. `validate_ghosts` refuses it. The API
+reference and the changelog said a write naming a ghost is refused with `400`, which holds for
+`PUT /document`; `_bulk` and `document/stream` report it in `errors` and write the rest of the batch,
+as for any document they will not take, now said there and covered by the server test. The
+`describe_index` tool description now says what the `ghost` object is, since the resident
+instructions are at their word budget.
 
 **Today.** Every analyzer an index wants on a text costs a copy of the text in redb. A Tantivy
 column is fed from the document body, by field name (`SchemaFields::document`,
@@ -4451,7 +4477,7 @@ fresh node and measured after the merges, allocated size:
 | `text_exact` only, no stemming | 524 MB | 190 MB | 715 MB |
 | **ghost: the text once, a stemmed column beside the exact one** | **about 524 MB** | **about 330–350 MB** | **about 860–875 MB** |
 
-The last row is derived, not measured: the Tantivy side is the same content as the first row (a
+The last row was derived before the feature was built (the measured sizes are above): the Tantivy side is the same content as the first row (a
 column per analyzer), and the redb side is the second row's. It is 38% below today's layout and 22%
 above having no stemming at all.
 

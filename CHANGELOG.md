@@ -16,7 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cover every document exactly once; without `when` every document with the source feeds it. The
   document store keeps the text once however many columns search it — one stemmed column per
   language beside the text as written, or the text unindexed and searched only through its ghosts.
-  A write naming a ghost is refused with `400`; hits never carry one, a projection naming one says
+  A document naming a ghost is refused — `400` from `PUT /document`, an entry in `errors` from
+  `_bulk` and `document/stream` — and a ghost cannot be the routing field; hits never carry one, a projection naming one says
   where its value is, and a sort on one is refused. Making a populated field a ghost, or changing a
   ghost's condition, applies to documents written from then on and is listed under
   `applies_to_new_writes`; a ghost added beside a built index is listed under

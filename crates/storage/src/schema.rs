@@ -1844,7 +1844,7 @@ impl IndexSchema {
     ///
     /// Refused where it is declared, because a ghost that cannot be fed is not an error anywhere
     /// later: it would build, take writes, and hold nothing. A ghost is a text column that is not
-    /// stored, fast, `id` or a shadow. Its source is a declared text or string field that is not
+    /// stored, fast, `id`, a shadow or the routing field. Its source is a declared text or string field that is not
     /// itself a ghost (no chains), nor `id` or a shadow field, which the stored body never holds.
     /// Its discriminator is a declared text, string, integer or boolean field, not a ghost, `id`
     /// or a shadow; the condition has `in` or `not_in`, not both, a non-empty list, and values of
@@ -1880,6 +1880,15 @@ impl IndexSchema {
                     "ghost field '{name}' is declared {}; a ghost holds no value of its own to \
                      store or sort by — its text is in '{}'",
                     if field.stored { "stored" } else { "fast" },
+                    ghost.source
+                ));
+            }
+            if name == self.get_routing_field() {
+                return Err(format!(
+                    "ghost field '{name}' is the index's routing field; a write routes by the \
+                     value the document carries under it, and a document never carries a ghost, \
+                     so no write could be routed by it and no delete could find its shard. Route \
+                     by '{}' or another stored field",
                     ghost.source
                 ));
             }

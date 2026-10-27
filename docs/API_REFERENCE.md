@@ -722,13 +722,16 @@ is `in` when any element is. A source feeds any number of ghosts, and conditions
 
 A ghost is searched like any text field, can be a default field, and is never stored or returned:
 no hit carries it, a projection naming it says its value is in the source, and a sort on it is
-refused with `400` pointing at the source. A write naming it is refused with `400`. The source may
+refused with `400` pointing at the source. A document naming it is refused, as any document the
+index will not take is: `PUT /document` answers `400`, while `_bulk` and `document/stream` write the
+rest of the batch and name it in `errors` (`document 0: …`, `line 1: …`). The source may
 be unindexed: the text is then stored once and searched only through the ghosts, a query naming
 the source says which ghosts search it, and a document matching no ghost is not searchable by its
 text — the reason for a `not_in` catch-all.
 
-Refused with `400` where declared: a ghost that is not `text`, or is `stored`, `fast`, `id` or a
-shadow; a source that is not a declared `text` or `string` field, is a ghost itself, or is `id` or
+Refused with `400` where declared: a ghost that is not `text`, or is `stored`, `fast`, `id`, a
+shadow or the index's `routing_field_name` — no document carries a ghost, so none could be routed
+by it and no delete could find its shard; a source that is not a declared `text` or `string` field, is a ghost itself, or is `id` or
 a shadow; a `when.field` that is not a declared `text`, `string`, integer or `boolean` field, or is
 a ghost; a condition with both lists, neither, or an empty one, or a value of another type than
 the field; a ghost without a condition on an indexed source under the source's own analysis, which
