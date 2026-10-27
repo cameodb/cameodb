@@ -1504,7 +1504,17 @@ pub struct SchemaReadiness {
     /// overwritten while its caller heard success. Refused before anything is written instead.
     #[serde(default)]
     pub busy: bool,
+    /// The schema properties this node's build knows beyond the ones every build does
+    /// ([`SCHEMA_FEATURES`]). A build that predates one reads a schema without it and builds the
+    /// index as if it were not there, so a change using one is refused while any node lacks it.
+    /// Empty from a build older than the list.
+    #[serde(default)]
+    pub features: Vec<String>,
 }
+
+/// The schema properties this build knows that an older one would silently drop: see
+/// [`SchemaReadiness::features`].
+pub const SCHEMA_FEATURES: &[&str] = &["ghost"];
 
 /// One node's answer to [`ClientOp::ApplySchema`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

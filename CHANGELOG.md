@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Ghost fields: one stored text, a column per analyzer.** A text field declared with
+  `"ghost": {"source": "text", "when": {"field": "lang", "in": ["en"]}}` is a search column filled
+  from `text` for the documents whose `lang` is one of the listed values, analysed by its own
+  tokenizer, and never stored. `not_in` takes the complement, so an `in` and a `not_in` on one list
+  cover every document exactly once; without `when` every document with the source feeds it. The
+  document store keeps the text once however many columns search it — one stemmed column per
+  language beside the text as written, or the text unindexed and searched only through its ghosts.
+  A write naming a ghost is refused with `400`; hits never carry one, a projection naming one says
+  where its value is, and a sort on one is refused. Making a populated field a ghost, or changing a
+  ghost's condition, applies to documents written from then on and is listed under
+  `applies_to_new_writes`; a ghost added beside a built index is listed under
+  `pending_reindex_fields`. `GET /_config` reports the property and a saved read restores it. On a
+  cluster, a schema with ghosts is refused while any node runs a build that does not know them —
+  upgrade every node first.
+
 ### Changed
 
 - **`hr_stem` and `hr_stem_fold` read Serbian Cyrillic.** A word in Serbian Cyrillic is mapped to

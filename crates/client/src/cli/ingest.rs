@@ -535,6 +535,7 @@ pub(crate) fn schema_from_analysis(analysis: &SourceAnalysis) -> Result<JsonValu
             tokenizer: Some("raw".to_string()),
             index_record_option: Some("Basic".to_string()),
             learned: false,
+            ghost: None,
         },
     );
 

@@ -1653,6 +1653,7 @@ impl HybridStore {
                     tokenizer,
                     index_record_option,
                     learned: false,
+                    ghost: None,
                 },
             );
         }
@@ -1849,6 +1850,7 @@ impl HybridStore {
                         tokenizer: Some("raw".to_string()),
                         index_record_option: Some("Basic".to_string()),
                         learned: false,
+                        ghost: None,
                     },
                 );
                 self.store_schema(index, &synced)?;
@@ -3241,16 +3243,16 @@ impl HybridStore {
             kind: PreparedKind,
         }
 
-        let has_shadow_fields = schema.has_shadow_fields();
+        let has_unstored_fields = schema.has_shadow_fields() || schema.has_ghost_fields();
 
         // Step 1: everything that is CPU and not redb, done before the write transaction opens.
         //
-        // Shadow filtering, the stored-body serialisation *and* the Tantivy document build all
-        // read the batch and the schema and touch no table, so none of them needs to be inside
-        // the transaction — and while they were, every document's field traversal held the redb
-        // write lock against every other writer of this store. The transaction below is now the
-        // two `insert`s and the bookkeeping that depends on what they displaced, which is the
-        // only part that genuinely needs to be there.
+        // Shadow and ghost filtering, the stored-body serialisation *and* the Tantivy document
+        // build all read the batch and the schema and touch no table, so none of them needs to be
+        // inside the transaction — and while they were, every document's field traversal held
+        // the redb write lock against every other writer of this store. The transaction below is
+        // now the two `insert`s and the bookkeeping that depends on what they displaced, which is
+        // the only part that genuinely needs to be there.
         //
         // A refused value still aborts the whole batch and writes nothing; it now does so
         // before any table is opened rather than by dropping a transaction that had already
@@ -3259,8 +3261,8 @@ impl HybridStore {
         for (op, seq_id) in ops.into_iter().zip(seq_ids_iter) {
             match op {
                 WalOp::Put { id, json_blob } => {
-                    let filtered_json_blob = if has_shadow_fields {
-                        json_blob.map(|blob| filter_shadow_fields_owned(blob, &schema))
+                    let filtered_json_blob = if has_unstored_fields {
+                        json_blob.map(|blob| filter_unstored_fields_owned(blob, &schema))
                     } else {
                         json_blob
                     };

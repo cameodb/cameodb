@@ -694,6 +694,47 @@ Macedonian — is left as written. The dictionary is Croatian and so ijekavian: 
 meets its ijekavian word (`vreme` → `vrijeme`), but not always (`pesma` stays `pesma`). A text in
 two languages is best split into a field per language, each with its own tokenizer.
 
+**Ghost fields.** A text searched under more than one analyzer — stemmed and as written, or
+stemmed by the language of its row — needs a column per analyzer, and a column is filled from a
+field of the document; without ghosts the document carries the text once per column. A `ghost`
+field is a column filled from another field instead, so the text is stored once:
+
+```json
+"text":    {"type": "text"},
+"lang":    {"type": "string"},
+"text_en": {"type": "text", "tokenizer": "en_stem",
+            "ghost": {"source": "text", "when": {"field": "lang", "in": ["en"]}}},
+"text_hr": {"type": "text", "tokenizer": "hr_stem_fold",
+            "ghost": {"source": "text", "when": {"field": "lang", "in": ["hr", "sr", "bs", "cnr"]}}},
+"text_other": {"type": "text",
+            "ghost": {"source": "text", "when": {"field": "lang", "not_in": ["en", "hr", "sr", "bs", "cnr"]}}}
+```
+
+A document whose `text` is set and whose `lang` is one of the `in` values feeds `text_en` with
+that text, analysed by `en_stem`; any other document leaves it empty. `not_in` is the exact
+complement — a document without `lang`, or with a value of another type, is not `in` any list and
+so is `not_in` every one — which makes an `in` and a `not_in` on one list cover every document with
+the source exactly once, and lets a catch-all reach languages that first appear later. Without
+`when`, every document with the source feeds the ghost: `"text_stem": {"type": "text", "tokenizer":
+"en_stem", "ghost": {"source": "text"}}` beside `text` searches one language both stemmed and as
+written. A value in `in` or `not_in` may be given alone for a list of one. An array discriminator
+is `in` when any element is. A source feeds any number of ghosts, and conditions may overlap.
+
+A ghost is searched like any text field, can be a default field, and is never stored or returned:
+no hit carries it, a projection naming it says its value is in the source, and a sort on it is
+refused with `400` pointing at the source. A write naming it is refused with `400`. The source may
+be unindexed: the text is then stored once and searched only through the ghosts, a query naming
+the source says which ghosts search it, and a document matching no ghost is not searchable by its
+text — the reason for a `not_in` catch-all.
+
+Refused with `400` where declared: a ghost that is not `text`, or is `stored`, `fast`, `id` or a
+shadow; a source that is not a declared `text` or `string` field, is a ghost itself, or is `id` or
+a shadow; a `when.field` that is not a declared `text`, `string`, integer or `boolean` field, or is
+a ghost; a condition with both lists, neither, or an empty one, or a value of another type than
+the field; a ghost without a condition on an indexed source under the source's own analysis, which
+would build the same column twice; and a declaration that leaves out a field a ghost reads. On a
+cluster a schema with ghosts is refused while any node runs a build that does not know them.
+
 **IP addresses.** An `ip` field takes an IPv4 or IPv6 address as a string — `"10.1.2.3"`,
 `"2001:db8::1"`, `"::ffff:10.1.2.3"` — or a list of them. Each is held as IPv6, an IPv4 address in
 its mapped form, so `10.1.2.3` and `::ffff:10.1.2.3` are one value; the document keeps the address as
@@ -741,6 +782,15 @@ are compared as they build: `string` is a `text` field with
 tokenizer `raw` and `index_record_option` `Basic`, so changing one to the other changes no column
 and is accepted on an index holding documents.
 
+A change to where a column's values come from keeps the column and applies from the change on: a
+field made a ghost or a plain field again, or a ghost given another source or condition, is
+accepted on an index holding documents and listed under `applies_to_new_writes`. Documents written
+before keep what they were indexed with until they are written again — a body written before its
+field became a ghost keeps its own copy in the document store, and no hit returns it. A ghost added
+to an index holding documents has no column there until a rebuild, as any field declared ahead of
+the index, and is listed under `pending_reindex_fields`. A ghost's tokenizer or type is a built
+column like any other: changing it on an index holding documents is refused with `409`.
+
 **On a cluster, a schema is decided once and stored on every node.** The node receiving the
 `PUT` asks every node first what the change would ask of it — the version it holds, its documents
 of the index, the built columns the change touches — and decides from all of them: the new
@@ -771,7 +821,9 @@ id — `["Hr", "cmMacAddress"]`. The CLI loader writes it and keys every later l
 ```
 
 `version` is the schema's new version and `nodes` how many nodes stored it — `1` on a standalone
-node. A change refused while the index holds documents answers `409` naming each change and the
+node. On an index holding documents, `applies_to_new_writes` lists the ghost changes that apply to
+documents written from now on, and `pending_reindex_fields` the indexed fields its built index has
+no column for yet; each is present only when it lists something. A change refused while the index holds documents answers `409` naming each change and the
 documents in the way; one that could not reach every node answers `503` and says whether anything
 was stored. `shard_count` in a body is accepted and ignored: a node's shard count is its own
 configuration.
@@ -867,6 +919,7 @@ The per-field keys:
 | `tokenizer` | On an indexed `text` or `string` field: how its values become terms, the default it took when none was declared — `default` for `text`, `raw` for `string` |
 | `index_record_option` | On an indexed `text` or `string` field: what its postings keep — `Basic`, `WithFreqs` or `WithFreqsAndPositions`. `WithFreqsAndPositions` for `text` unless declared otherwise, `Basic` for `string`. A field without positions matches no phrase; the CLI loader writes its category columns as `text` with `raw` and `Basic` |
 | `learned` | Present, and `true`, on a field added by a write rather than declared: not indexed, and its type widens to take each new value rather than refusing it |
+| `ghost` | Present on a ghost field, as declared: the `source` its column is filled from, and the `when` condition, if any, on which documents feed it. Searched, never returned — see [Ghost fields](#createupdate-index-schema) |
 | `default_search` | Whether a term with no field in front of it searches this field. With `default_fields` declared: the declared fields the built index can search. Without: every field it can search as indexed text, string or json, other than `id` and a shadow, by name. Either way the first `max_default_fields` of them. Computed on each read, never stored |
 
 #### Change Field Indexing Flags

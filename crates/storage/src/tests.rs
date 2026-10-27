@@ -3497,3 +3497,342 @@ mod full_merge {
         assert!(store.start_full_merge("absent").expect("absent").is_none());
     }
 }
+
+/// Ghost fields (ROADMAP Q1): which documents a condition selects, what a declaration may say,
+/// and what a change to one asks of a built index.
+#[cfg(test)]
+mod ghost_field_tests {
+    use crate::{GhostCondition, IndexSchema};
+    use serde_json::{Value as JsonValue, json};
+
+    /// A schema as `PUT /_config` takes it, normalized as every node stores it.
+    fn declared(body: JsonValue) -> IndexSchema {
+        let mut schema: IndexSchema = serde_json::from_value(body).expect("declaration");
+        schema.normalize_after_deserialization();
+        schema
+    }
+
+    /// `text` stored once, `lang` beside it, and `text_en` its English column.
+    fn languages(when: JsonValue) -> JsonValue {
+        json!({"fields": {
+            "text": {"type": "text"},
+            "lang": {"type": "string"},
+            "n": {"type": "i64"},
+            "flag": {"type": "boolean"},
+            "text_en": {"type": "text", "tokenizer": "en_stem",
+                        "ghost": {"source": "text", "when": when}},
+        }})
+    }
+
+    fn condition(value: JsonValue) -> GhostCondition {
+        serde_json::from_value(value).expect("condition")
+    }
+
+    fn body(value: JsonValue) -> serde_json::Map<String, JsonValue> {
+        value.as_object().expect("object").clone()
+    }
+
+    #[test]
+    fn in_matches_a_listed_value_of_the_same_type_and_nothing_else() {
+        let strings = condition(json!({"field": "lang", "in": ["en", "hr"]}));
+        assert!(strings.matches(&body(json!({"lang": "en"}))));
+        assert!(strings.matches(&body(json!({"lang": "hr"}))));
+        // Exactly, case included.
+        assert!(!strings.matches(&body(json!({"lang": "EN"}))));
+        assert!(!strings.matches(&body(json!({"lang": "de"}))));
+        // Any element of an array discriminator will do.
+        assert!(strings.matches(&body(json!({"lang": ["de", "hr"]}))));
+        assert!(!strings.matches(&body(json!({"lang": ["de", "fr"]}))));
+        // No discriminator, or one of another type, does not match.
+        assert!(!strings.matches(&body(json!({"text": "x"}))));
+        assert!(!strings.matches(&body(json!({"lang": 1}))));
+
+        let integers = condition(json!({"field": "n", "in": [1, 2]}));
+        assert!(integers.matches(&body(json!({"n": 2}))));
+        assert!(!integers.matches(&body(json!({"n": "2"}))));
+        assert!(!integers.matches(&body(json!({"n": 3}))));
+
+        let booleans = condition(json!({"field": "flag", "in": true}));
+        assert!(booleans.matches(&body(json!({"flag": true}))));
+        assert!(!booleans.matches(&body(json!({"flag": false}))));
+        assert!(!booleans.matches(&body(json!({"flag": "true"}))));
+    }
+
+    /// `not_in` is the exact complement of `in` on the same list, so a pair of ghosts on one list
+    /// feeds every document exactly once.
+    #[test]
+    fn not_in_is_the_complement_of_in() {
+        let list = json!(["en", "hr"]);
+        let listed = condition(json!({"field": "lang", "in": list}));
+        let rest = condition(json!({"field": "lang", "not_in": list}));
+        for document in [
+            json!({"lang": "en"}),
+            json!({"lang": "de"}),
+            json!({"lang": ["de", "en"]}),
+            json!({"lang": ["de", "fr"]}),
+            json!({"lang": []}),
+            json!({"lang": 7}),
+            json!({"lang": null}),
+            json!({}),
+        ] {
+            let document = body(document);
+            assert_ne!(
+                listed.matches(&document),
+                rest.matches(&document),
+                "{document:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scalar_is_a_list_of_one_and_the_shape_reads_back_as_written() {
+        let schema = declared(languages(json!({"field": "lang", "in": "en"})));
+        let ghost = schema.fields["text_en"].ghost.clone().expect("ghost");
+        assert_eq!(
+            ghost.when.as_ref().map(GhostCondition::values),
+            Some(&[json!("en")][..])
+        );
+        assert_eq!(ghost.to_string(), r#"ghost(text, lang, ["en"])"#);
+        // Serialized as a list, and read back to the same schema.
+        let written = serde_json::to_value(&schema).expect("serialize");
+        assert_eq!(
+            written["fields"]["text_en"]["ghost"],
+            json!({"source": "text", "when": {"field": "lang", "in": ["en"]}})
+        );
+        let read: IndexSchema = serde_json::from_value(written).expect("read back");
+        assert_eq!(read.calculate_fingerprint(), schema.calculate_fingerprint());
+
+        let negated = declared(languages(json!({"field": "lang", "not_in": ["en", "hr"]})));
+        assert_eq!(
+            negated.fields["text_en"]
+                .ghost
+                .as_ref()
+                .unwrap()
+                .to_string(),
+            r#"ghost(text, lang, not ["en","hr"])"#
+        );
+
+        // A misspelled key is refused rather than read as a condition with no list.
+        let misspelled = serde_json::from_value::<IndexSchema>(languages(
+            json!({"field": "lang", "not-in": ["en"]}),
+        ));
+        assert!(misspelled.is_err());
+    }
+
+    #[test]
+    fn the_fingerprint_moves_with_the_ghost_and_its_condition() {
+        let plain = declared(json!({"fields": {
+            "text": {"type": "text"},
+            "lang": {"type": "string"},
+            "n": {"type": "i64"},
+            "flag": {"type": "boolean"},
+            "text_en": {"type": "text", "tokenizer": "en_stem"},
+        }}));
+        let thumbprints: Vec<u64> = [
+            plain.clone(),
+            declared(languages(json!({"field": "lang", "in": ["en"]}))),
+            declared(languages(json!({"field": "lang", "in": ["en", "hr"]}))),
+            declared(languages(json!({"field": "lang", "not_in": ["en"]}))),
+            declared(languages(json!({"field": "flag", "in": [true]}))),
+            declared(languages(JsonValue::Null)),
+        ]
+        .iter()
+        .map(IndexSchema::calculate_fingerprint)
+        .collect();
+        let mut distinct = thumbprints.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), thumbprints.len(), "{thumbprints:x?}");
+    }
+
+    #[test]
+    fn naming_a_learned_field_as_source_or_condition_declares_it() {
+        let schema = declared(json!({"fields": {
+            "text": {"type": "text", "indexed": false, "learned": true},
+            "lang": {"type": "text", "indexed": false, "learned": true},
+            "text_en": {"type": "text", "tokenizer": "en_stem",
+                        "ghost": {"source": "text", "when": {"field": "lang", "in": ["en"]}}},
+        }}));
+        assert!(!schema.fields["text"].learned);
+        assert!(!schema.fields["lang"].learned);
+        schema
+            .validate_ghosts()
+            .expect("an unindexed source and condition are valid");
+    }
+
+    fn refusal(body: JsonValue) -> String {
+        declared(body)
+            .validate_ghosts()
+            .expect_err("must be refused")
+    }
+
+    #[test]
+    fn every_ghost_the_index_could_not_feed_is_refused() {
+        let with = |text_en: JsonValue| {
+            json!({"fields": {
+                "text": {"type": "text"},
+                "lang": {"type": "string"},
+                "n": {"type": "i64"},
+                "when": {"type": "date"},
+                "book_id": {"type": "text", "shadow": true},
+                "other": {"type": "text", "tokenizer": "en_stem", "ghost": {"source": "text"}},
+                "text_en": text_en,
+            }})
+        };
+        let ghost = |ghost: JsonValue| {
+            with(json!({"type": "text", "tokenizer": "en_stem", "ghost": ghost}))
+        };
+        let cases = [
+            (
+                ghost(json!({"source": "missing"})),
+                "not a field of this index",
+            ),
+            (ghost(json!({"source": "other"})), "is a ghost itself"),
+            (ghost(json!({"source": "id"})), "document's key"),
+            (ghost(json!({"source": "book_id"})), "document's key"),
+            (ghost(json!({"source": "n"})), "a text or string field"),
+            (
+                ghost(json!({"source": "text", "when": {"field": "missing", "in": ["en"]}})),
+                "not a field of this index",
+            ),
+            (
+                ghost(json!({"source": "text", "when": {"field": "other", "in": ["en"]}})),
+                "is a ghost itself",
+            ),
+            (
+                ghost(json!({"source": "text", "when": {"field": "when", "in": ["en"]}})),
+                "text, string, integer or boolean",
+            ),
+            (
+                ghost(
+                    json!({"source": "text", "when": {"field": "lang", "in": ["en"], "not_in": ["hr"]}}),
+                ),
+                "both",
+            ),
+            (
+                ghost(json!({"source": "text", "when": {"field": "lang"}})),
+                "neither",
+            ),
+            (
+                ghost(json!({"source": "text", "when": {"field": "lang", "in": []}})),
+                "empty 'in'",
+            ),
+            (
+                ghost(json!({"source": "text", "when": {"field": "lang", "not_in": []}})),
+                "empty 'not_in'",
+            ),
+            (
+                ghost(json!({"source": "text", "when": {"field": "lang", "in": [1]}})),
+                "not a value of 'lang'",
+            ),
+            (
+                ghost(json!({"source": "text", "when": {"field": "n", "in": ["1"]}})),
+                "not a value of 'n'",
+            ),
+            (
+                with(json!({"type": "text", "stored": true, "ghost": {"source": "text"}})),
+                "stored",
+            ),
+            (
+                with(json!({"type": "text", "fast": true, "ghost": {"source": "text"}})),
+                "fast",
+            ),
+            (
+                with(json!({"type": "i64", "ghost": {"source": "text"}})),
+                "a ghost is a text column",
+            ),
+            // The source's own column, built a second time.
+            (
+                with(json!({"type": "text", "ghost": {"source": "text"}})),
+                "same column twice",
+            ),
+        ];
+        for (body, expected) in cases {
+            let reason = refusal(body.clone());
+            assert!(
+                reason.contains(expected),
+                "{expected:?} not in {reason:?} for {body}"
+            );
+        }
+
+        // The same analysis is fine under a condition, and with no condition over an unindexed
+        // source, which builds no column of its own.
+        declared(with(json!({"type": "text", "ghost": {"source": "text", "when": {"field": "lang", "not_in": ["en"]}}})))
+            .validate_ghosts()
+            .expect("a condition makes it another column");
+        let mut unindexed = with(json!({"type": "text", "ghost": {"source": "text"}}));
+        unindexed["fields"]["text"]["indexed"] = json!(false);
+        declared(unindexed)
+            .validate_ghosts()
+            .expect("no column to duplicate");
+    }
+
+    fn changes(current: &IndexSchema, next: &IndexSchema) -> Vec<(String, bool, bool)> {
+        current
+            .rebuild_changes(next)
+            .into_iter()
+            .map(|change| (change.what, change.conflicts, change.new_writes))
+            .collect()
+    }
+
+    /// A change to where a column's values come from keeps the column, and applies to documents
+    /// written from then on; a change to the column itself stays a conflict.
+    #[test]
+    fn a_ghost_change_applies_to_new_writes_and_its_column_still_conflicts() {
+        let plain = declared(json!({"fields": {
+            "text": {"type": "text"},
+            "lang": {"type": "string"},
+            "n": {"type": "i64"},
+            "flag": {"type": "boolean"},
+            "text_en": {"type": "text", "tokenizer": "en_stem"},
+        }}));
+        let english = declared(languages(json!({"field": "lang", "in": ["en"]})));
+        let more = declared(languages(json!({"field": "lang", "in": ["en", "hr"]})));
+
+        // 1. A plain field becomes a ghost, and back again.
+        assert_eq!(
+            changes(&plain, &english),
+            vec![(
+                r#"text_en: its own value → ghost(text, lang, ["en"]), for documents written from now on"#
+                    .to_string(),
+                false,
+                true
+            )]
+        );
+        assert_eq!(changes(&english, &plain).len(), 1);
+        assert!(changes(&english, &plain)[0].2);
+
+        // 2. Its condition changes, or is taken away.
+        assert_eq!(
+            changes(&english, &more),
+            vec![(
+                r#"text_en: ghost(text, lang, ["en"]) → ghost(text, lang, ["en","hr"]), for documents written from now on"#
+                    .to_string(),
+                false,
+                true
+            )]
+        );
+        let every = declared(languages(JsonValue::Null));
+        assert!(changes(&english, &every)[0].2);
+
+        // 3. A ghost added beside a built index: a column it does not have yet.
+        let mut without = english.clone();
+        without.fields.remove("text_en");
+        assert_eq!(
+            changes(&without, &english),
+            vec![("text_en: indexed as text".to_string(), false, false)]
+        );
+
+        // A changed tokenizer is a conflict as on any built column.
+        let mut retokenized = english.clone();
+        retokenized.fields.get_mut("text_en").unwrap().tokenizer = Some("default".to_string());
+        assert_eq!(
+            changes(&english, &retokenized),
+            vec![(
+                "text_en: tokenizer en_stem → default".to_string(),
+                true,
+                false
+            )]
+        );
+    }
+}

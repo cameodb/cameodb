@@ -344,6 +344,15 @@ pub const SHADOW_FIELD: &str = "A field marked `shadow` is the name the source d
      fast column, and `_approximate_sort` names the field the hits carry that order under — \
      the shadow name, whichever of the two names you sorted by.";
 
+/// What a ghost field is, for a caller who meets the `ghost` property in a schema.
+pub const GHOST_FIELD: &str = "A field with a `ghost` property is a search column filled from \
+     another field, its `source`, rather than from a value of its own: from every document, or \
+     from those whose `when.field` is (`in`) or is not (`not_in`) one of the listed values — one \
+     stemmed column per language beside a text stored once, for instance. Query it like any text \
+     field; it is analysed by its own tokenizer. It is never stored, so hits do not carry it: \
+     project, sort and pivot on the source, which holds the text. A query naming an unindexed \
+     source says which ghosts search its text instead.";
+
 /// Facts about querying that belong to no single operator.
 pub const RULES: &[&str] = &[
     "A field name containing a dot is written as it is, unescaped: `k8s.node:worker-1`. Escaping \
@@ -352,6 +361,7 @@ pub const RULES: &[&str] = &[
      `shadow`. Fields discovered from a document are added unindexed, and stay that way until a \
      schema update promotes them, so check the `indexed` flag before naming a field.",
     SHADOW_FIELD,
+    GHOST_FIELD,
     "A term with no field in front of it searches the index's default fields, which may be fewer \
      than all of its text fields: an index can declare them, and a node caps how many are \
      searched. Each field's `default_search` flag says whether a bare term reaches it, and a \

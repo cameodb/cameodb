@@ -5114,3 +5114,250 @@ max_array_limit = 500
     .await;
     assert_eq!(status, 400);
 }
+
+/// A text stored once in `text`, searched stemmed through `text_en` where `lang` is `en` and as
+/// written through `text_rest` everywhere else (ROADMAP Q1).
+fn ghost_declaration(english: serde_json::Value) -> serde_json::Value {
+    json!({"fields": {
+        "text": {"type": "text"},
+        "lang": {"type": "string"},
+        "text_en": {"type": "text", "tokenizer": "en_stem",
+                    "ghost": {"source": "text", "when": {"field": "lang", "in": english}}},
+        "text_rest": {"type": "text",
+                      "ghost": {"source": "text", "when": {"field": "lang", "not_in": ["en"]}}},
+    }})
+}
+
+fn config_field<'a>(config: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    config["fields"]
+        .as_array()
+        .and_then(|fields| fields.iter().find(|field| field["name"] == name))
+        .unwrap_or_else(|| panic!("no field {name}: {config}"))
+}
+
+/// Declared, read back and restored; written, searched, projected and sorted on.
+#[tokio::test]
+async fn a_ghost_field_is_searched_through_and_never_written_or_returned() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+
+    let (status, body) = put_config(&node, "texts", &ghost_declaration(json!("en"))).await;
+    assert_eq!(status, 200, "{body}");
+
+    // Reported as declared, and a saved read restores the same schema.
+    let config = get_json(&node, "/api/texts/_config").await;
+    let text_en = config_field(&config, "text_en");
+    assert_eq!(
+        text_en["ghost"],
+        json!({"source": "text", "when": {"field": "lang", "in": ["en"]}}),
+        "{text_en}"
+    );
+    assert_eq!(text_en["stored"], json!(false));
+    let (status, body) = put_config(&node, "texts", &config).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["unchanged"], json!(true), "{body}");
+
+    for (id, lang, text) in [("en", "en", "running dogs"), ("hr", "hr", "running psi")] {
+        let (status, body) =
+            put_document(&node, "texts", id, &json!({"lang": lang, "text": text})).await;
+        assert_eq!(status, 200, "{body}");
+    }
+    // A value under a ghost's name would be neither stored nor indexed: refused, naming it.
+    let (status, body) = put_document(
+        &node,
+        "texts",
+        "named",
+        &json!({"lang": "en", "text": "x", "text_en": "y"}),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string().contains("'text_en' is a ghost of 'text'"),
+        "{body}"
+    );
+    client.admin_index_commit("texts").await.expect("commit");
+
+    let (status, found) =
+        post_json(&node, "/api/texts/search", json!({"query": "text_en:run"})).await;
+    assert_eq!(status, 200, "{found}");
+    assert_eq!(hit_ids(&found), ["en"]);
+    let hit = &found["hits"][0];
+    assert!(
+        hit.get("text_en").is_none() && hit["text"] == "running dogs",
+        "{hit}"
+    );
+    let (_, found) = post_json(
+        &node,
+        "/api/texts/search",
+        json!({"query": "text_rest:running"}),
+    )
+    .await;
+    assert_eq!(hit_ids(&found), ["hr"]);
+
+    // A projection naming a ghost says why it is empty, and points at the source.
+    let (status, found) = post_json(
+        &node,
+        "/api/texts/search",
+        json!({"query": "text_en:run", "fields": ["text_en"]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{found}");
+    assert!(
+        found["_discarded_clauses"]
+            .to_string()
+            .contains("its value is in 'text'"),
+        "{found}"
+    );
+
+    // A sort on a ghost would sort every row as missing: refused, naming the source.
+    let (status, body) = post_json(
+        &node,
+        "/api/texts/search",
+        json!({"query": "text_en:run", "sort": {"field": "text_en", "order": "asc"}}),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.to_string().contains("sort on 'text'"), "{body}");
+
+    // A ghost the index could not feed is refused where it is declared.
+    let mut chained = ghost_declaration(json!("en"));
+    chained["fields"]["text_rest"]["ghost"]["source"] = json!("text_en");
+    let (status, body) = put_config(&node, "texts", &chained).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.to_string().contains("is a ghost itself"), "{body}");
+}
+
+/// A change to a ghost on a populated index is accepted, applies to documents written from then
+/// on, and says so; a ghost added beside built columns waits for a rebuild; an unindexed source
+/// goes on feeding its ghosts.
+#[tokio::test]
+async fn a_ghost_change_on_a_populated_index_applies_to_new_writes() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+    let search = |query: &'static str| {
+        let node = &node;
+        async move {
+            let (status, found) =
+                post_json(node, "/api/langs/search", json!({"query": query})).await;
+            assert_eq!(status, 200, "{found}");
+            let mut ids = hit_ids(&found);
+            ids.sort();
+            (ids, found)
+        }
+    };
+
+    // A plain stemmed field the writer filled with a second copy of the text.
+    let (status, body) = put_config(
+        &node,
+        "langs",
+        &json!({"fields": {
+            "text": {"type": "text"},
+            "lang": {"type": "string"},
+            "text_en": {"type": "text", "tokenizer": "en_stem"},
+        }}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = put_document(
+        &node,
+        "langs",
+        "before",
+        &json!({"lang": "en", "text": "running", "text_en": "running"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    client.admin_index_commit("langs").await.expect("commit");
+
+    // Made a ghost, with a ghost for the rest added beside it.
+    let (status, body) = put_config(&node, "langs", &ghost_declaration(json!(["en"]))).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body["applies_to_new_writes"]
+            .to_string()
+            .contains("text_en: its own value → ghost(text, lang, [\\\"en\\\"])"),
+        "{body}"
+    );
+    assert_eq!(
+        body["pending_reindex_fields"],
+        json!(["text_rest"]),
+        "{body}"
+    );
+
+    let (status, body) = put_document(
+        &node,
+        "langs",
+        "after",
+        &json!({"lang": "en", "text": "runs"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    client.admin_index_commit("langs").await.expect("commit");
+    let (ids, found) = search("text_en:run").await;
+    assert_eq!(ids, ["after", "before"]);
+    for hit in found["hits"].as_array().unwrap() {
+        assert!(hit.get("text_en").is_none(), "{hit}");
+    }
+
+    // A value added to the condition reaches new rows only.
+    let (status, body) = put_document(
+        &node,
+        "langs",
+        "hr-old",
+        &json!({"lang": "hr", "text": "runs"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = put_config(&node, "langs", &ghost_declaration(json!(["en", "hr"]))).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body["applies_to_new_writes"]
+            .to_string()
+            .contains("\\\"hr\\\""),
+        "{body}"
+    );
+    let (status, body) = put_document(
+        &node,
+        "langs",
+        "hr-new",
+        &json!({"lang": "hr", "text": "runs"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    client.admin_index_commit("langs").await.expect("commit");
+    let (ids, _) = search("text_en:run").await;
+    assert_eq!(ids, ["after", "before", "hr-new"]);
+
+    // The source stops being indexed; its ghosts go on being fed, and a query naming it says
+    // where its text is searched.
+    let (status, body) = patch_schema(&node, "langs", &json!({"text": false})).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = put_document(
+        &node,
+        "langs",
+        "late",
+        &json!({"lang": "en", "text": "runner"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    client.admin_index_commit("langs").await.expect("commit");
+    let (ids, _) = search("text_en:runner").await;
+    assert_eq!(ids, ["late"]);
+    let (_, found) = search("text:runner").await;
+    assert!(
+        found["_discarded_clauses"]
+            .to_string()
+            .contains("searched through 'text_en'"),
+        "{found}"
+    );
+
+    // Left out of a declaration while a ghost names it: refused.
+    let mut without = ghost_declaration(json!(["en", "hr"]));
+    without["fields"].as_object_mut().unwrap().remove("text");
+    let (status, body) = put_config(&node, "langs", &without).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string()
+            .contains("remove the ghost in the same request"),
+        "{body}"
+    );
+}

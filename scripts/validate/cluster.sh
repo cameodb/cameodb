@@ -303,6 +303,8 @@ check_cmd "a missing index is a 404 through every node, a new one is found throu
 # never crosses to the node answering the caller whole.
 check_cmd "each hit's arrays are capped through every node, wherever the document lives" \
     probe arrays crossarrays 6 300000
+check_cmd "ghost fields declared through one node are held and fed alike through every node" \
+    probe ghosts crossghosts
 check_cmd "every node writes and deletes right after the cross-node load" probe probe 30
 check_cmd "the ring is still converged after the cross-node load" probe converge 10
 

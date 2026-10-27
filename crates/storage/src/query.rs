@@ -1288,6 +1288,16 @@ pub(crate) fn non_indexed_field_note(field: &str) -> String {
     )
 }
 
+/// Note for an unindexed field whose text ghost fields search instead.
+pub(crate) fn ghost_source_note(field: &str, ghosts: &[&String]) -> String {
+    let named: Vec<String> = ghosts.iter().map(|name| format!("'{name}'")).collect();
+    format!(
+        "field '{field}' is not indexed, so the clause naming it was dropped and this result set \
+         does not match what the query asked for; its text is searched through {}",
+        named.join(", ")
+    )
+}
+
 /// Whether the lenient parse left nothing to run.
 ///
 /// Tantivy trims discarded clauses out of the AST and returns `EmptyQuery` when that removes
@@ -1391,7 +1401,10 @@ pub(crate) fn describe_discarded_all(
     for (field, issue) in from_schema {
         let note = match issue {
             FieldIssue::Unknown => unknown_field_note(&field),
-            FieldIssue::NotIndexed => non_indexed_field_note(&field),
+            FieldIssue::NotIndexed => match schema.ghosts_of(&field).as_slice() {
+                [] => non_indexed_field_note(&field),
+                ghosts => ghost_source_note(&field, ghosts),
+            },
         };
         if !out.contains(&note) {
             out.push(note);

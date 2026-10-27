@@ -712,12 +712,26 @@ pub(super) fn unknown_projection_fields(
              effect; if it was meant as query text, quote it or drop the keyword"
         )
     };
+    // A ghost is a field of the schema, and no hit carries it: its text is its source's.
+    let ghost_note = |field: &str| {
+        let ghost = schema.fields.get(field)?.ghost.as_ref()?;
+        Some(format!(
+            "'return {field}' names a ghost field, which is searched but never returned; its \
+             value is in '{}'",
+            ghost.source
+        ))
+    };
 
     fields
         .unwrap_or_default()
         .iter()
-        .filter(|field| !known(field))
-        .map(|field| note("return", field))
+        .filter_map(|field| {
+            if !known(field) {
+                Some(note("return", field))
+            } else {
+                ghost_note(field)
+            }
+        })
         .collect()
 }
 
@@ -806,7 +820,7 @@ pub(super) fn unusable_document_identity(id: &str, doc: &JsonValue) -> Option<St
 ///
 /// A shadow field is the document key under the source's own name, and nothing holds a second
 /// copy of the value: the write path strips the field out of the stored blob
-/// (`filter_shadow_fields_owned`) and the read path writes the key back under it
+/// (`filter_unstored_fields_owned`) and the read path writes the key back under it
 /// (`reconstruct_shadow_fields_owned`). That round trip returns what was written only while the
 /// two agree, so a document saying otherwise has that value silently and unrecoverably
 /// discarded — it is refused here rather than accepted and destroyed.
@@ -847,6 +861,28 @@ pub(super) fn disagreeing_shadow_field(
             )
         })
     })
+}
+
+/// Why this document cannot be written, if it names a ghost field.
+///
+/// Refused rather than dropped: a ghost's column is filled from its source, and the field is
+/// never stored, so the value would vanish with nothing said. The first ghost in sorted order is
+/// named, so a document naming two names the same one every time.
+pub(super) fn written_ghost_field(doc: &JsonValue, schema: &IndexSchema) -> Option<String> {
+    if !schema.has_ghost_fields() {
+        return None;
+    }
+    let (name, ghost) = doc
+        .as_object()?
+        .keys()
+        .filter_map(|name| Some((name, schema.fields.get(name)?.ghost.as_ref()?)))
+        .min_by_key(|(name, _)| *name)?;
+    Some(format!(
+        "field '{name}' is a ghost of '{source}': its column is filled from '{source}' and it is \
+         never stored, so a value written under it would be neither stored nor indexed. Write the \
+         text to '{source}' instead",
+        source = ghost.source
+    ))
 }
 
 /// The field type a value would be given if the schema had never seen the field.
@@ -1137,6 +1173,15 @@ pub(super) fn unsortable_sort_field(
     let Some(def) = schema.fields.get(field) else {
         return refuse("the index has no column of that name".to_string());
     };
+
+    // A text sort orders the candidates by the stored value, and a ghost has none: every row
+    // would sort as missing.
+    if let Some(ghost) = &def.ghost {
+        return refuse(format!(
+            "a ghost field holds no value of its own to sort by; sort on '{}', its source",
+            ghost.source
+        ));
+    }
 
     if def.is_fast()
         || matches!(
@@ -1533,7 +1578,17 @@ pub(super) fn validate_document(
         };
     }
 
-    // Check 3: every field either fits what the schema declares, or is one the schema has
+    // Check 3: a ghost is filled from its source and never stored, so a value written under its
+    // name would be neither stored nor indexed.
+    if let Some(err) = written_ghost_field(doc, schema_cache) {
+        return SchemaValidationResult {
+            needs_evolution: false,
+            new_fields: Vec::new(),
+            validation_error: Some(err),
+        };
+    }
+
+    // Check 4: every field either fits what the schema declares, or is one the schema has
     // yet to hear about.
     let mut needs_evolution = false;
     let mut new_fields = Vec::new();

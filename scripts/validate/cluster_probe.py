@@ -27,6 +27,10 @@ show the evidence. Nodes come from CLUSTER_NODES, a comma-separated list of base
                                            searches through every node: each hit's array capped
                                            at the default or the asked-for number, with the
                                            original length reported; past the maximum refused
+  ghosts <index>                           a schema with ghost fields declared through one node is
+                                           held alike by every node; a write through each feeds
+                                           the ghosts, found by stem through every node, never
+                                           returned
 """
 import collections
 import json
@@ -476,6 +480,69 @@ def cmd_arrays(index, count, elements):
     return 0 if ok else 1
 
 
+def cmd_ghosts(index):
+    """Ghost fields across the cluster: declared once, held at one thumbprint everywhere, and fed
+    by a write through any node — so a stem search through any node finds every row."""
+    ok = True
+    declaration = {"fields": {
+        "text": {"type": "text"},
+        "lang": {"type": "string"},
+        "text_en": {"type": "text", "tokenizer": "en_stem",
+                    "ghost": {"source": "text", "when": {"field": "lang", "in": ["en"]}}},
+        "text_rest": {"type": "text",
+                      "ghost": {"source": "text", "when": {"field": "lang", "not_in": ["en"]}}},
+    }}
+    status, _, body = call("PUT", f"{NODES[0]}/api/{index}/_config", declaration)
+    stored = body.get("nodes") if isinstance(body, dict) else None
+    if status != 200 or stored != len(NODES):
+        print(f"declaring '{index}': {status}, stored on {stored} nodes   <-- expected 200 on all")
+        return 1
+
+    thumbprints = set()
+    for node in NODES:
+        _, _, config = call("GET", f"{node}/api/{index}/_config")
+        fields = {f.get("name"): f for f in (config or {}).get("fields", [])}
+        thumbprints.add((config or {}).get("thumbprint"))
+        if fields.get("text_en", {}).get("ghost") != declaration["fields"]["text_en"]["ghost"]:
+            print(f"  {node} does not report text_en as declared: {fields.get('text_en')}")
+            ok = False
+    if len(thumbprints) != 1:
+        print(f"  the nodes hold different schemas: {sorted(map(str, thumbprints))}")
+        ok = False
+
+    for k, node in enumerate(NODES):
+        status, _, _ = call("PUT", f"{node}/api/{index}/document",
+                            {"id": f"en{k}", "doc": {"lang": "en", "text": f"running node{k}"}})
+        ok &= status in (200, 201)
+    status, _, _ = call("PUT", f"{NODES[-1]}/api/{index}/document",
+                        {"id": "hr", "doc": {"lang": "hr", "text": "running"}})
+    ok &= status in (200, 201)
+    status, _, body = call("PUT", f"{NODES[0]}/api/{index}/document",
+                           {"id": "named", "doc": {"lang": "en", "text": "x", "text_en": "y"}})
+    if status != 400:
+        print(f"  a write naming a ghost: {status}   <-- expected 400")
+        ok = False
+
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        _, _, body = call("POST", f"{NODES[0]}/api/{index}/search", {"query": "text:running", "limit": 0})
+        if isinstance(body, dict) and body.get("total_hits") == len(NODES) + 1:
+            break
+        time.sleep(1)
+
+    for node in NODES:
+        for query, want in (("text_en:run", len(NODES)), ("text_rest:running", 1)):
+            status, _, body = call("POST", f"{node}/api/{index}/search", {"query": query, "limit": 10})
+            hits = body.get("hits", []) if isinstance(body, dict) else []
+            carried = [h.get("id") for h in hits if "text_en" in h or "text_rest" in h]
+            good = status == 200 and len(hits) == want and not carried
+            ok &= good
+            print(f"  {node} {query}: {status}, {len(hits)} hits" +
+                  ("" if good else f"   <-- expected {want}, none carrying a ghost ({carried})"))
+    print("every node holds and feeds the ghosts alike" if ok else "a node disagrees about the ghosts")
+    return 0 if ok else 1
+
+
 def cmd_stats():
     """The swarm counters each node keeps, as METRIC lines. Always exits 0."""
     for node in NODES:
@@ -699,6 +766,8 @@ def main():
         return cmd_fault(int(args[0]), int(args[1]), int(args[2]), args[3])
     if cmd == "arrays":
         return cmd_arrays(args[0], int(args[1]), int(args[2]))
+    if cmd == "ghosts":
+        return cmd_ghosts(args[0])
     sys.exit(f"unknown subcommand: {cmd}")
 
 

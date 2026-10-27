@@ -277,6 +277,104 @@ pub(crate) fn normalize_description(description: &mut Option<String>) {
     }
 }
 
+/// Where a ghost field's values come from: another field of the stored body, for every document
+/// or for those a condition on a third field selects. See [`FieldDef::ghost`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Ghost {
+    /// The text or string field whose value fills the ghost's column.
+    pub source: String,
+    /// Which documents feed it; every document with the source when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<GhostCondition>,
+}
+
+/// The documents a ghost is fed from: those whose `field` is one of the `in` values, or none of
+/// the `not_in` ones. Exactly one of the two lists, and not empty: see
+/// [`IndexSchema::validate_ghosts`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct GhostCondition {
+    /// The discriminator: a text, string, integer or boolean field of the document.
+    pub field: String,
+    #[serde(
+        default,
+        rename = "in",
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub in_values: Option<Vec<JsonValue>>,
+    #[serde(
+        default,
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub not_in: Option<Vec<JsonValue>>,
+}
+
+/// A list of condition values, or one value read as a list of one.
+fn one_or_many<'de, D>(deserializer: D) -> Result<Option<Vec<JsonValue>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match JsonValue::deserialize(deserializer)? {
+        JsonValue::Null => None,
+        JsonValue::Array(values) => Some(values),
+        value => Some(vec![value]),
+    })
+}
+
+impl GhostCondition {
+    /// The values the condition lists, whichever list it is.
+    pub fn values(&self) -> &[JsonValue] {
+        self.in_values
+            .as_deref()
+            .or(self.not_in.as_deref())
+            .unwrap_or_default()
+    }
+
+    /// Whether `body` is a document this condition selects.
+    ///
+    /// `in` matches a discriminator equal to one of the values — any element of an array
+    /// discriminator will do — and nothing else: no discriminator, or one of another type, does
+    /// not match. `not_in` is the exact complement, so a pair of ghosts on one list feeds every
+    /// document exactly once. Values compare as JSON: strings exactly, case included.
+    pub fn matches(&self, body: &JsonMap<String, JsonValue>) -> bool {
+        let values = self.values();
+        let listed = match body.get(&self.field) {
+            Some(JsonValue::Array(items)) => items.iter().any(|item| values.contains(item)),
+            Some(value) => values.contains(value),
+            None => false,
+        };
+        listed != self.not_in.is_some()
+    }
+}
+
+impl Ghost {
+    /// Whether `body` feeds this ghost: it has the source, and the condition, if any, selects it.
+    pub fn feeds(&self, body: &JsonMap<String, JsonValue>) -> bool {
+        body.contains_key(&self.source) && self.when.as_ref().is_none_or(|when| when.matches(body))
+    }
+}
+
+/// `ghost(text, lang, ["en"])`, `ghost(text, lang, not ["en"])`, or `ghost(text)`: how a change
+/// or a note names a ghost.
+impl std::fmt::Display for Ghost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ghost({}", self.source)?;
+        if let Some(when) = &self.when {
+            let negation = if when.not_in.is_some() { "not " } else { "" };
+            write!(
+                f,
+                ", {}, {negation}{}",
+                when.field,
+                JsonValue::from(when.values().to_vec())
+            )?;
+        }
+        write!(f, ")")
+    }
+}
+
 /// Field definition for schema evolution and validation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FieldDef {
@@ -331,6 +429,16 @@ pub struct FieldDef {
     /// was given. In the fingerprint when set, since it changes which values a write may carry.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub learned: bool,
+    /// A ghost field: an indexed text column filled from another field of the stored body
+    /// rather than from a value of its own, and never stored. One copy of a text in redb then
+    /// feeds as many columns as there are analyzers to search it with — one per language, under
+    /// a condition on a language field, or one beside the source's own.
+    ///
+    /// The column is fed by the document builder ([`SchemaFields::document`]), a write naming
+    /// the field is refused, and the name is taken out of every hit — a body written before the
+    /// field became a ghost still carries a value of its own. Omitted when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ghost: Option<Ghost>,
 }
 
 impl FieldDef {
@@ -354,6 +462,7 @@ impl FieldDef {
             tokenizer: None,           // Will be set when creating from actual Tantivy schema
             index_record_option: None, // Will be set when creating from actual Tantivy schema
             learned: false,
+            ghost: None,
         }
     }
 
@@ -450,7 +559,13 @@ impl FieldDef {
             tokenizer: None,
             index_record_option: None,
             learned: false,
+            ghost: None,
         }
+    }
+
+    /// Whether this field is a [ghost](Self::ghost).
+    pub fn is_ghost(&self) -> bool {
+        self.ghost.is_some()
     }
 
     /// Infer Tantivy field type from JSON value
@@ -1069,6 +1184,11 @@ pub struct SchemaChange {
     /// The built index would act against the schema until rebuilt, rather than merely lack a
     /// column the schema declares.
     pub conflicts: bool,
+    /// The column stays as built and the change applies to documents written from now on: a
+    /// field made a ghost or a plain field again, or a ghost fed from another source or under
+    /// another condition. Documents already written keep what they were indexed with until they
+    /// are written again, so it is accepted on a populated index, and said.
+    pub new_writes: bool,
 }
 
 impl SchemaChange {
@@ -1076,6 +1196,7 @@ impl SchemaChange {
         Self {
             what,
             conflicts: true,
+            new_writes: false,
         }
     }
 
@@ -1083,6 +1204,15 @@ impl SchemaChange {
         Self {
             what,
             conflicts: false,
+            new_writes: false,
+        }
+    }
+
+    fn for_new_writes(what: String) -> Self {
+        Self {
+            what,
+            conflicts: false,
+            new_writes: true,
         }
     }
 }
@@ -1318,6 +1448,23 @@ impl IndexSchema {
                 _ => {}
             }
         }
+        // A field a ghost reads — its source or its discriminator — is declared by being named:
+        // no longer learned, so a write cannot widen it to a type the ghost cannot read, and a
+        // `PUT` that leaves it out removes it rather than letting the next write add it back.
+        let read_by_ghosts: Vec<String> = self
+            .fields
+            .values()
+            .filter_map(|field| field.ghost.as_ref())
+            .flat_map(|ghost| {
+                std::iter::once(ghost.source.clone())
+                    .chain(ghost.when.as_ref().map(|when| when.field.clone()))
+            })
+            .collect();
+        for name in read_by_ghosts {
+            if let Some(field) = self.fields.get_mut(&name) {
+                field.learned = false;
+            }
+        }
         // `_seq` is deliberately not inserted. It used to be forced into every schema so the
         // Tantivy index would carry a column for the checkpoint scan to order on; the commit
         // payload made that scan a fallback, so new indices no longer declare the field. A
@@ -1446,6 +1593,25 @@ impl IndexSchema {
             if field.learned {
                 combined.push(0x4C);
             }
+            // Likewise only when set. Two nodes must agree on which documents a column holds, so
+            // the source, the operator and every value are hashed — and a ghost with no
+            // condition has a marker of its own, so that it hashes like no list.
+            if let Some(ghost) = &field.ghost {
+                combined.push(0x47);
+                push_str(&mut combined, &ghost.source);
+                match &ghost.when {
+                    None => combined.push(0),
+                    Some(when) => {
+                        combined.push(if when.not_in.is_some() { 2 } else { 1 });
+                        push_str(&mut combined, &when.field);
+                        let values = when.values();
+                        combined.extend_from_slice(&(values.len() as u64).to_le_bytes());
+                        for value in values {
+                            push_str(&mut combined, &value.to_string());
+                        }
+                    }
+                }
+            }
         }
 
         // Index-level properties. The routing field earns its place here more than any type
@@ -1485,7 +1651,11 @@ impl IndexSchema {
     /// and silently skipped every decimal written, a re-tokenized field analysed queries one way
     /// and documents another, a new id sat each record beside its old copy. The rest declare a
     /// column the index does not have yet, which the schema listing already reports as not
-    /// searchable or sortable until a rebuild. Empty when the built index serves `next` as it is:
+    /// searchable or sortable until a rebuild. A change to where a column's values come from — a
+    /// [ghost](FieldDef::ghost) made, unmade or re-pointed — keeps the column and applies to
+    /// documents written from then on ([`SchemaChange::new_writes`]), so it needs no rebuild at
+    /// all, and is listed so the caller hears that. Empty when the built index serves `next` as
+    /// it is:
     /// a description, the default search fields, a type renamed over the same column. Both
     /// schemas are compared as they build, not as they are spelled: `tokenizer: None` and
     /// `"default"` on a text field are one declaration, and so are `string` and a `text` field
@@ -1510,6 +1680,7 @@ impl IndexSchema {
         let mut changes = Vec::new();
         let mut conflict = |what: String| changes.push(SchemaChange::conflicting(what));
         let mut pending = Vec::new();
+        let mut new_writes = Vec::new();
         for name in names.into_iter().filter(|n| *n != "id") {
             match (built(&current, name), built(&next, name)) {
                 (None, None) => {}
@@ -1554,6 +1725,21 @@ impl IndexSchema {
                             now.is_fast()
                         ));
                     }
+                    // Where the column's values come from. The column stays, so documents
+                    // written before and after share it and answer the same queries; which
+                    // documents fed it changes from here on.
+                    if was.ghost != now.ghost {
+                        let feed = |ghost: &Option<Ghost>| {
+                            ghost
+                                .as_ref()
+                                .map_or_else(|| "its own value".to_string(), Ghost::to_string)
+                        };
+                        new_writes.push(format!(
+                            "{name}: {} → {}, for documents written from now on",
+                            feed(&was.ghost),
+                            feed(&now.ghost)
+                        ));
+                    }
                 }
             }
         }
@@ -1572,6 +1758,7 @@ impl IndexSchema {
             ));
         }
         changes.extend(pending.into_iter().map(SchemaChange::pending));
+        changes.extend(new_writes.into_iter().map(SchemaChange::for_new_writes));
         changes
     }
 
@@ -1653,6 +1840,146 @@ impl IndexSchema {
         ))
     }
 
+    /// Check every [ghost](FieldDef::ghost) against the fields it reads.
+    ///
+    /// Refused where it is declared, because a ghost that cannot be fed is not an error anywhere
+    /// later: it would build, take writes, and hold nothing. A ghost is a text column that is not
+    /// stored, fast, `id` or a shadow. Its source is a declared text or string field that is not
+    /// itself a ghost (no chains), nor `id` or a shadow field, which the stored body never holds.
+    /// Its discriminator is a declared text, string, integer or boolean field, not a ghost, `id`
+    /// or a shadow; the condition has `in` or `not_in`, not both, a non-empty list, and values of
+    /// the discriminator's type. A ghost with no condition on an indexed source under the
+    /// source's own analysis would build the source's column a second time.
+    ///
+    /// Read against the normalized schema, as the index builder reads it.
+    pub fn validate_ghosts(&self) -> Result<(), String> {
+        let mut ghosts: Vec<(&String, &FieldDef, &Ghost)> = self
+            .fields
+            .iter()
+            .filter_map(|(name, field)| field.ghost.as_ref().map(|ghost| (name, field, ghost)))
+            .collect();
+        // Sorted for the same reason as descriptions: an operator works through one error at a
+        // time, so it has to be the same one each time.
+        ghosts.sort_by_key(|(name, _, _)| *name);
+
+        for (name, field, ghost) in ghosts {
+            if name == "id" || field.is_shadow {
+                return Err(format!(
+                    "field '{name}' cannot be a ghost: the identifier and its shadows are the \
+                     document's key, not a column"
+                ));
+            }
+            if field.field_type != TantivyFieldType::Text {
+                return Err(format!(
+                    "ghost field '{name}' is {}; a ghost is a text column",
+                    field.field_type.to_string()
+                ));
+            }
+            if field.stored || field.is_fast() {
+                return Err(format!(
+                    "ghost field '{name}' is declared {}; a ghost holds no value of its own to \
+                     store or sort by — its text is in '{}'",
+                    if field.stored { "stored" } else { "fast" },
+                    ghost.source
+                ));
+            }
+
+            let reads = |what: &str, read: &str| -> Result<&FieldDef, String> {
+                if read == "id" || self.is_shadow_field(read) {
+                    return Err(format!(
+                        "ghost field '{name}' names '{read}' as its {what}, which is the \
+                         document's key and is not in the stored body"
+                    ));
+                }
+                let Some(def) = self.fields.get(read) else {
+                    return Err(format!(
+                        "ghost field '{name}' names '{read}' as its {what}, which is not a field \
+                         of this index; declare '{read}', or remove the ghost in the same request"
+                    ));
+                };
+                if def.ghost.is_some() {
+                    return Err(format!(
+                        "ghost field '{name}' names '{read}' as its {what}, which is a ghost \
+                         itself and holds no value; name the field it reads instead"
+                    ));
+                }
+                Ok(def)
+            };
+
+            let source = reads("source", &ghost.source)?;
+            if !matches!(
+                source.field_type,
+                TantivyFieldType::Text | TantivyFieldType::String
+            ) {
+                return Err(format!(
+                    "ghost field '{name}' reads '{}', a {} field; a ghost's source is a text or \
+                     string field",
+                    ghost.source,
+                    source.field_type.to_string()
+                ));
+            }
+
+            let Some(when) = &ghost.when else {
+                if source.indexed && text_analysis(source) == text_analysis(field) {
+                    return Err(format!(
+                        "ghost field '{name}' reads every value of '{}' under the analysis \
+                         '{}' already has, so it would build the same column twice; give it \
+                         another tokenizer, or a condition",
+                        ghost.source, ghost.source
+                    ));
+                }
+                continue;
+            };
+
+            let discriminator = reads("condition field", &when.field)?;
+            let (list, operator) = match (&when.in_values, &when.not_in) {
+                (Some(list), None) => (list, "in"),
+                (None, Some(list)) => (list, "not_in"),
+                (Some(_), Some(_)) => {
+                    return Err(format!(
+                        "ghost field '{name}' has both 'in' and 'not_in'; a condition has one"
+                    ));
+                }
+                (None, None) => {
+                    return Err(format!(
+                        "ghost field '{name}' has a condition on '{}' with neither 'in' nor \
+                         'not_in'; give one, or omit 'when' to feed it from every document",
+                        when.field
+                    ));
+                }
+            };
+            if list.is_empty() {
+                return Err(format!(
+                    "ghost field '{name}' has an empty '{operator}' list; name at least one \
+                     value, or omit 'when' to feed it from every document"
+                ));
+            }
+            let fits: fn(&JsonValue) -> bool = match discriminator.field_type {
+                TantivyFieldType::Text | TantivyFieldType::String => JsonValue::is_string,
+                TantivyFieldType::I64 => JsonValue::is_i64,
+                TantivyFieldType::U64 => JsonValue::is_u64,
+                TantivyFieldType::Boolean => JsonValue::is_boolean,
+                _ => {
+                    return Err(format!(
+                        "ghost field '{name}' has a condition on '{}', a {} field; a condition \
+                         field is text, string, integer or boolean",
+                        when.field,
+                        discriminator.field_type.to_string()
+                    ));
+                }
+            };
+            if let Some(value) = list.iter().find(|value| !fits(value)) {
+                return Err(format!(
+                    "ghost field '{name}' lists {value} in '{operator}', which is not a value of \
+                     '{}', a {} field",
+                    when.field,
+                    discriminator.field_type.to_string()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Check operator-supplied descriptions against their limits.
     ///
     /// Rejected rather than truncated: a description cut off mid-sentence still reads as the
@@ -1724,6 +2051,31 @@ impl IndexSchema {
         names
     }
 
+    /// Whether any field is a [ghost](FieldDef::ghost).
+    pub fn has_ghost_fields(&self) -> bool {
+        self.fields.values().any(FieldDef::is_ghost)
+    }
+
+    /// Whether `field_name` is a [ghost](FieldDef::ghost).
+    pub fn is_ghost_field(&self, field_name: &str) -> bool {
+        self.fields.get(field_name).is_some_and(FieldDef::is_ghost)
+    }
+
+    /// The indexed ghosts `source` feeds, sorted: where its text is searched when it is not
+    /// indexed itself.
+    pub fn ghosts_of(&self, source: &str) -> Vec<&String> {
+        let mut names: Vec<&String> = self
+            .fields
+            .iter()
+            .filter(|(_, field)| {
+                field.indexed && field.ghost.as_ref().is_some_and(|g| g.source == source)
+            })
+            .map(|(name, _)| name)
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
     /// Get the routing field name (defaults to "id")
     pub fn get_routing_field(&self) -> &str {
         if self.routing_field_name.is_empty() {
@@ -1759,8 +2111,9 @@ impl IndexSchema {
         }
 
         // CRITICAL: Never evolve shadow fields - they preserve their special status
+        // A ghost is never written, so a value under its name teaches nothing about it.
         if let Some(field_def) = self.fields.get(&name)
-            && field_def.is_shadow
+            && (field_def.is_shadow || field_def.is_ghost())
         {
             return false; // shadow fields should never evolve
         }
@@ -2014,6 +2367,12 @@ pub(crate) fn reconstruct_shadow_fields_owned(
         _ => return json_blob,
     };
 
+    // A ghost is never in a hit. A body written before its field became a ghost still holds a
+    // value of its own, and is answered like one written after.
+    if schema.has_ghost_fields() {
+        obj.retain(|key, _| !schema.is_ghost_field(key));
+    }
+
     // CASE 1: No Shadow Fields -> Strict ID Ordering
     if !schema.has_shadow_fields() {
         // Fast Path: Check if 'id' is already first (O(1) check)
@@ -2056,16 +2415,24 @@ pub(crate) fn reconstruct_shadow_fields_owned(
     JsonValue::Object(out)
 }
 
-/// Optimized: Filter shadow fields in-place using retain.
+/// Optimized: Filter shadow and ghost fields in-place using retain.
+///
+/// A ghost is refused at the door; this keeps it out of redb for a body that arrives by
+/// another route, or was validated against the schema before the field became a ghost.
 ///
 /// This avoids allocating a new map and cloning keys/values.
-pub(crate) fn filter_shadow_fields_owned(
+pub(crate) fn filter_unstored_fields_owned(
     mut json_blob: JsonValue,
     schema: &IndexSchema,
 ) -> JsonValue {
     if let JsonValue::Object(ref mut map) = json_blob {
         // retain is O(n) scan but O(0) allocation
-        map.retain(|key, _| !schema.is_shadow_field(key));
+        map.retain(|key, _| {
+            !schema
+                .fields
+                .get(key)
+                .is_some_and(|field| field.is_shadow || field.is_ghost())
+        });
     }
     json_blob
 }
@@ -2123,6 +2490,12 @@ impl SchemaFields {
     /// and every value of an indexed field the index built a column for, added by the column's
     /// own kind ([`Self::write_type`]). Shadow fields are never indexed.
     ///
+    /// A [ghost](FieldDef::ghost) is fed from its source when the body feeds it, and never from
+    /// a value under its own name — a body written before the field became a ghost still has
+    /// one, and indexing both would make a replay of it differ from a write. The ghosts are read
+    /// from `schema`, not cached here: an index opened from disk gets these fields from the
+    /// Tantivy schema alone, which knows nothing of sources or conditions.
+    ///
     /// One builder for the write and for the WAL replay, so a document indexes on recovery
     /// exactly as it did when it was written. `bad_value` is the one thing they differ in: a
     /// write refuses a value its column cannot take, a replay skips it — the body is durable
@@ -2139,11 +2512,12 @@ impl SchemaFields {
         if let Some(seq_field) = self.seq {
             document.add_u64(seq_field, seq);
         }
-        for (name, value) in body.and_then(JsonValue::as_object).into_iter().flatten() {
+        let body = body.and_then(JsonValue::as_object);
+        for (name, value) in body.into_iter().flatten() {
             let Some(declared) = schema
                 .fields
                 .get(name)
-                .filter(|field| field.indexed && !field.is_shadow)
+                .filter(|field| field.indexed && !field.is_shadow && !field.is_ghost())
             else {
                 continue;
             };
@@ -2155,6 +2529,30 @@ impl SchemaFields {
                 *column,
                 name,
                 &self.write_type(name, &declared.field_type),
+                value,
+                bad_value,
+            )?;
+        }
+        let Some(body) = body else {
+            return Ok(document);
+        };
+        for (name, field) in &schema.fields {
+            let Some(ghost) = field.ghost.as_ref().filter(|_| field.indexed) else {
+                continue;
+            };
+            let (Some(value), Some(column)) =
+                (body.get(&ghost.source), self.indexed_fields.get(name))
+            else {
+                continue;
+            };
+            if !ghost.feeds(body) {
+                continue;
+            }
+            add_json_value_to_doc(
+                &mut document,
+                *column,
+                name,
+                &self.write_type(name, &field.field_type),
                 value,
                 bad_value,
             )?;

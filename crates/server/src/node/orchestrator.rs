@@ -4008,6 +4008,10 @@ impl NodeOrchestrator {
                 if field.learned {
                     entry.insert("learned".to_string(), JsonValue::Bool(true));
                 }
+                // Searched, never returned: where its values come from, as declared.
+                if let Some(ghost) = &field.ghost {
+                    entry.insert("ghost".to_string(), serde_json::json!(ghost));
+                }
                 Some(JsonValue::Object(entry))
             })
             .collect()
@@ -5787,9 +5791,10 @@ impl NodeOrchestrator {
     }
 
     /// A declaration as every node stores it: normalized, with an explicit `id`, and refused
-    /// with a `400` naming the field when it lists a default field it lacks or a tokenizer this
-    /// node cannot build. Each node checks with its own tokenizers, so a node on an older build
-    /// refuses in phase one rather than failing every commit after phase two.
+    /// with a `400` naming the field when it lists a default field it lacks, a tokenizer this
+    /// node cannot build, or a ghost it cannot feed. Each node checks with its own tokenizers, so
+    /// a node on an older build refuses in phase one rather than failing every commit after phase
+    /// two.
     fn checked_declaration(mut schema: IndexSchema) -> Result<IndexSchema, OrchestratorError> {
         schema.normalize_after_deserialization();
         // A declared default-field list names fields of this schema, or it is refused: a typo
@@ -5805,6 +5810,10 @@ impl NodeOrchestrator {
         // refuses it too, for schemas that arrive by other routes.
         schema
             .validate_tokenizers()
+            .map_err(OrchestratorError::Validation)?;
+        // A ghost that cannot be fed would build, take writes and hold nothing.
+        schema
+            .validate_ghosts()
             .map_err(OrchestratorError::Validation)?;
         // Ensure 'id' field is explicitly in the schema for visibility
         if !schema.fields.contains_key("id") {
@@ -5893,6 +5902,10 @@ impl NodeOrchestrator {
             unbuilt,
             quota_exceeded,
             busy,
+            features: super::SCHEMA_FEATURES
+                .iter()
+                .map(|f| f.to_string())
+                .collect(),
         };
         serde_json::to_value(readiness).map_err(|e| OrchestratorError::Io(std::io::Error::other(e)))
     }

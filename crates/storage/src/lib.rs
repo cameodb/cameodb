@@ -53,9 +53,9 @@ pub use merge::MergeStarted;
 pub use projection::{TRUNCATED_ARRAYS_FIELD, apply_field_projection, cap_document_arrays};
 pub use query::{FieldReference, field_references};
 pub use schema::{
-    DropsCounted, FieldDef, IndexSchema, SchemaChange, SchemaFieldUpdate, SchemaFields,
-    SchemaRecord, SchemaState, SchemaVersion, TantivyFieldType, UnknownFieldType, WalOp,
-    byte_value_error, count_drops, date_out_of_range, date_sort_secs, document_key_field,
+    DropsCounted, FieldDef, Ghost, GhostCondition, IndexSchema, SchemaChange, SchemaFieldUpdate,
+    SchemaFields, SchemaRecord, SchemaState, SchemaVersion, TantivyFieldType, UnknownFieldType,
+    WalOp, byte_value_error, count_drops, date_out_of_range, date_sort_secs, document_key_field,
     facet_path_error, is_date_value, parse_date_to_timestamp_secs, select_default_fields,
 };
 pub use search::SearchOptions;

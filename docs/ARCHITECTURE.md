@@ -128,7 +128,11 @@ Writes are durable only if committed to Redb. Tantivy is treated as a "View."
     already going to `TABLE_DATA` in this same transaction, so the log records which document
     changed and leaves the content to the one authoritative copy.
 4.  **Commit Redb.** (Data is safe).
-5.  **Update Tantivy:** Parse JSON, extract indexed fields, add to Inverted Index.
+5.  **Update Tantivy:** Parse JSON, extract indexed fields, add to Inverted Index. A ghost field
+    is filled here from its source field's value, when the document matches its condition, and
+    never from a value of its own: the body in `TABLE_DATA` holds the text once, however many
+    columns analyse it. The one document builder serves the write and the WAL replay, so a
+    replayed document indexes as it did when written.
 
 **Threading Isolation:** All redb and tantivy operations are executed via `tokio::task::spawn_blocking` when called from async actors to maintain runtime performance.
 
@@ -139,6 +143,7 @@ Writes are durable only if committed to Redb. Tantivy is treated as a "View."
     * `routing_key` -> Sharding Key for consistent hashing
     * `text_fields` -> Tantivy Text fields, tokenized by the analyzer the field names (`default`, a Snowball stemmer such as `it_stem` or `it_stem_fold`, or the Croatian `hr_stem` / `hr_stem_fold`, which map Serbian Cyrillic to Latin before folding and stemming); see the Tokenizers table in the API reference
     * `numeric_fields` -> Tantivy FastField for range queries and aggregations
+    * `ghost` fields -> Tantivy Text fields filled from another field of the stored body, for every document or under an `in` / `not_in` condition on a discriminator field; never stored, and taken out of every hit
 
 ### 4.3. Search Result Serialization
 **Design Challenge:** Tantivy documents must be serializable for distributed actor communication.

@@ -198,13 +198,24 @@ pub(crate) async fn change_schema_cluster(
 ) -> Result<JsonValue, OrchestratorError> {
     let reach = reach_whole_cluster(&targets, status.as_ref(), &index)?;
     match run_change(&reach, &index, schema, None).await? {
-        Step::Applied(done) => Ok(serde_json::json!({
-            "acknowledged": true,
-            "index": index,
-            "version": done.version,
-            "nodes": done.nodes,
-            "field_names": done.field_names,
-        })),
+        Step::Applied(done) => {
+            let mut response = serde_json::json!({
+                "acknowledged": true,
+                "index": index,
+                "version": done.version,
+                "nodes": done.nodes,
+                "field_names": done.field_names,
+            });
+            // Declared ahead of a built index holding documents: not searchable until rebuilt.
+            if !done.unbuilt.is_empty() {
+                response["pending_reindex_fields"] = serde_json::json!(done.unbuilt);
+            }
+            // Accepted over documents indexed the old way, which keep it until written again.
+            if !done.new_writes.is_empty() {
+                response["applies_to_new_writes"] = serde_json::json!(done.new_writes);
+            }
+            Ok(response)
+        }
         Step::Unchanged {
             version,
             field_names,
@@ -295,6 +306,9 @@ struct Done {
     field_names: Vec<String>,
     /// Fields marked indexed that a node holding documents has no column for yet.
     unbuilt: Vec<String>,
+    /// Changes that keep a populated column and apply to documents written from now on: see
+    /// [`storage::SchemaChange::new_writes`].
+    new_writes: Vec<String>,
 }
 
 /// One round of a schema change: phase one on every node, the decision, phase two. With `edit`,
@@ -401,6 +415,25 @@ async fn run_change(
         let jitter = BUSY_BACKOFF_MS + (Uuid::new_v4().as_u128() % BUSY_JITTER_MS as u128) as u64;
         tokio::time::sleep(std::time::Duration::from_millis(jitter)).await;
     };
+
+    // A node on a build that does not know ghost fields would read this schema without them and
+    // build a plain column that is never fed — and hash it differently, so the cluster would
+    // reconcile it again and again. Refused until every node knows them.
+    if schema.has_ghost_fields() {
+        let behind: Vec<String> = readiness
+            .iter()
+            .filter(|(_, ready)| !ready.features.iter().any(|feature| feature == "ghost"))
+            .map(|(node, _)| node.name())
+            .collect();
+        if !behind.is_empty() {
+            reach.release(&index, change).await;
+            return Err(OrchestratorError::Validation(format!(
+                "index '{index}' was not changed: it declares ghost fields, and {} run a build \
+                 that does not know them. Upgrade every node first",
+                behind.join(", ")
+            )));
+        }
+    }
 
     // One version for every node: one past the highest any node holds, a dropped index's record
     // included, so the declaration is newer than everything the cluster has seen.
@@ -690,11 +723,22 @@ async fn run_change(
         .collect();
     unbuilt.sort();
     unbuilt.dedup();
+    // Said only where documents are: an empty index has nothing written before the change.
+    let new_writes = match held.as_ref() {
+        Some(held) if documents > 0 => held
+            .rebuild_changes(&schema)
+            .into_iter()
+            .filter(|change| change.new_writes)
+            .map(|change| change.what)
+            .collect(),
+        _ => Vec::new(),
+    };
     Ok(Step::Applied(Done {
         version: schema.version,
         nodes: applied.len(),
         field_names,
         unbuilt,
+        new_writes,
     }))
 }
 
@@ -791,6 +835,12 @@ impl FieldEdit {
         }
         if let Some(list) = &self.default_fields {
             next.default_fields = (!list.is_empty()).then(|| list.clone());
+        }
+        // Indexing a ghost's source can make a ghost with no condition build the source's own
+        // column a second time.
+        if next.has_ghost_fields() && !outcome.applied.is_empty() {
+            next.validate_ghosts()
+                .map_err(OrchestratorError::Validation)?;
         }
         if self.default_fields.is_some() || self.field_updates.values().any(|indexed| !indexed) {
             next.validate_default_fields().map_err(|reason| {

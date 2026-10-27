@@ -257,7 +257,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [P4](docs/ROADMAP-ARCHIVE.md#p4--ip-fields-queried-the-way-addresses-are) | Ip fields queried the way addresses are — CIDR as its range, a bare address searching the ip fields, an open IPv4 range kept among IPv4, `fast` on ip for a sort by address, write refusals naming the value | — | 2026-10-21 | ✅ |
 | [P5](#p5--native-json-fields-paths-typed-values-ranges) | Native json fields — a json field indexes its object beside its text: paths and typed values match, ranges at a path run from the fast column it gets by default, RFC 3339 strings are dates; existing indexes unchanged until rebuilt | — | 2026-10-21 | 📋 |
 | [P6](#p6--a-hit-says-which-array-elements-matched) | A hit says which array elements matched — `_matched_elements` beside `_truncated_arrays`, a per-field matcher from the screened AST applied in the fetch phase before the cap, `matches N` per request; priority not yet decided | — | 2026-10-21 | 📋 |
-| [Q1](#q1--ghost-fields-index-columns-derived-from-another-field-under-a-condition) | Ghost fields — an index column derived from another field's value, for every document or under an `in` / `not_in` condition on a discriminator field, indexed in Tantivy and never stored in redb; one copy of the text in redb instead of one per analyzer — about 38% less disk on a multilingual sample | — | 2026-10-26 | 📋 |
+| [Q1](#q1--ghost-fields-index-columns-derived-from-another-field-under-a-condition) | Ghost fields — an index column derived from another field's value, for every document or under an `in` / `not_in` condition on a discriminator field, indexed in Tantivy and never stored in redb; one copy of the text in redb instead of one per analyzer — about 38% less disk on a multilingual sample | — | 2026-10-26 | ◐ |
 | [Q2](docs/ROADMAP-ARCHIVE.md#q2--the-croatian-analyzers-read-serbian-cyrillic) | The Croatian analyzers read Serbian Cyrillic — a word in Serbian Cyrillic is mapped to Latin inside `hr_stem` and `hr_stem_fold`, per token; a field already holding Cyrillic text is reloaded | — | 2026-10-26 | ✅ |
 
 ---
@@ -2915,9 +2915,31 @@ passage rows, 376 MB of text, in 17 languages; "the sample" below).
 
 ### Q1 — Ghost fields: index columns derived from another field, under a condition
 
-📋 **Planned.** Filed 2026-10-26; revised 2026-10-27 against the code — a change to a ghost applies
-from the change on, ghosts leave hits at the shadow rewrite, and the read and write paths that had
-to know.
+◐ **Implemented 2026-10-27; the measurement remains, to be taken by hand.** Filed 2026-10-26; revised 2026-10-27
+against the code — a change to a ghost applies from the change on, ghosts leave hits at the shadow
+rewrite, and the read and write paths that had to know. Built as written below, with four
+differences decided in the code:
+
+- *A `text` discriminator is accepted* beside `string`, integer and boolean. A language field
+  learned from writes is typed `text`, and the condition compares the stored JSON value exactly
+  whatever the column's analysis, so refusing it would refuse the common case for nothing.
+- *The put path also strips a ghost's name from the body* (`filter_unstored_fields_owned`, which
+  was `filter_shadow_fields_owned`), as a net under the `400`: a write validated against the
+  schema before its field became a ghost stores no copy either.
+- *`PATCH /_schema` may set `indexed: false` on a ghost*: the builder adds only indexed fields, so
+  it is simply no longer fed. A `PATCH` that indexes a source is checked against the
+  no-condition rule.
+- *The `PUT /_config` answer lists `pending_reindex_fields`* for any field a populated built index
+  has no column for, not only a ghost — the `PATCH` answer already did.
+
+The cluster gate is a `features` list on `SchemaReadiness` (`["ghost"]`), empty from a build that
+predates it, so the reconcile loop never meets a peer without ghosts. Tests: storage
+`ghost_field_tests` (conditions, the complement, serde, fingerprint, every refusal,
+`rebuild_changes`) and `tests/ghost_fields_test.rs` (feeding, no condition, stripping, WAL replay,
+an unindexed source, a field made a ghost); server `a_ghost_field_is_searched_through_and_never_written_or_returned`
+and `a_ghost_change_on_a_populated_index_applies_to_new_writes`; the cluster suite's
+`probe ghosts`. **What remains:** the measurement of the layouts table on the sample, which is
+being taken by loading the data by hand rather than by a test.
 
 **Today.** Every analyzer an index wants on a text costs a copy of the text in redb. A Tantivy
 column is fed from the document body, by field name (`SchemaFields::document`,
