@@ -729,13 +729,29 @@ keeping.
 Only digests are stored, so a leaked config file contains nothing that can authenticate. A
 key that is lost is replaced, not recovered.
 
-Roles bundle four capabilities:
+Roles bundle five capabilities:
 
-| Role | `read` | `write` | `index-admin` | `node-admin` |
-|------|:---:|:---:|:---:|:---:|
-| `admin` | ✅ | ✅ | ✅ | ✅ |
-| `writer` | ✅ | ✅ | | |
-| `reader` | ✅ | | | |
+| Role | `read` | `write` | `index-admin` | `node-admin` | `key-manage` |
+|------|:---:|:---:|:---:|:---:|:---:|
+| `admin` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `writer` | ✅ | ✅ | | | |
+| `reader` | ✅ | | | | |
+| `provisioner` | | | | | ✅ |
+
+`provisioner` is for a service that signs tenants up and mints their keys: `key-manage` guards
+the tenant routes and nothing else, so it reads and writes no data and reaches no `/_admin/*`
+route. Mint it like any key (`cameodb keygen --role provisioner --label portal`) and keep it in
+`cameodb.toml` or `keys/`, which the node cannot write. `allowed_tenants` bounds which tenants it
+may manage — exact names or `prefix-*`, as `allowed_indexes` takes indexes — and is refused on a
+key without `key-manage`:
+
+```toml
+[[security.api_keys]]
+key_hash_file = "/etc/cameodb/keys/partner-x-portal"
+role = "provisioner"
+label = "partner-x-portal"
+allowed_tenants = ["partner-x-*"]
+```
 
 `allowed_indexes` applies on top of the role and holds everywhere a key can reach: naming
 another index is refused, and `/_indexes`, the MCP catalog and the MCP resource list return

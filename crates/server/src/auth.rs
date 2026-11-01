@@ -49,6 +49,8 @@ pub enum Capability {
     IndexAdmin,
     /// `/_admin/*` — memory, purge, workers, commit, evict-writer.
     NodeAdmin,
+    /// `/_tenants/*` — create and remove tenants, mint and revoke their keys.
+    KeyManage,
 }
 
 impl Capability {
@@ -59,16 +61,21 @@ impl Capability {
             Capability::Write => "write",
             Capability::IndexAdmin => "index-admin",
             Capability::NodeAdmin => "node-admin",
+            Capability::KeyManage => "key-manage",
         }
     }
 }
 
 /// A named bundle of capabilities.
 ///
-/// Three roles rather than a free-form capability list per key: a key's authority has to be
-/// legible at a glance in a config file and in an audit line, and the three answers below
-/// are the ones deployments actually need. A key that needs something in between gets a
-/// per-index override (Stage C3), not a fourth role.
+/// Named roles rather than a free-form capability list per key: a key's authority has to be
+/// legible at a glance in a config file and in an audit line. A key that needs something
+/// *between* two roles gets a per-index override (Stage C3), not another role.
+///
+/// `provisioner` is the one role that is not a point on that line. It holds `key-manage` and
+/// nothing else — it reads and writes no data — because the service that signs tenants up and
+/// mints their keys is a different authority from any key that uses them, and giving it
+/// `admin` would hand it every index and `/_admin/*` besides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -78,18 +85,21 @@ pub enum Role {
     Writer,
     /// Read only.
     Reader,
+    /// Tenant and key management through `/_tenants/*`, and nothing else.
+    Provisioner,
 }
 
 impl Role {
     /// Every role, most privileged first. Iterated wherever roles are reported, so the
     /// order a summary appears in does not depend on the order keys were configured.
-    pub const ALL: [Role; 3] = [Role::Admin, Role::Writer, Role::Reader];
+    pub const ALL: [Role; 4] = [Role::Admin, Role::Writer, Role::Reader, Role::Provisioner];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Role::Admin => "admin",
             Role::Writer => "writer",
             Role::Reader => "reader",
+            Role::Provisioner => "provisioner",
         }
     }
 
@@ -98,8 +108,9 @@ impl Role {
             "admin" => Ok(Role::Admin),
             "writer" => Ok(Role::Writer),
             "reader" => Ok(Role::Reader),
+            "provisioner" => Ok(Role::Provisioner),
             other => Err(format!(
-                "unknown role '{}' (expected one of: admin, writer, reader)",
+                "unknown role '{}' (expected one of: admin, writer, reader, provisioner)",
                 other
             )),
         }
@@ -113,9 +124,11 @@ impl Role {
                 Capability::Write,
                 Capability::IndexAdmin,
                 Capability::NodeAdmin,
+                Capability::KeyManage,
             ],
             Role::Writer => &[Capability::Read, Capability::Write],
             Role::Reader => &[Capability::Read],
+            Role::Provisioner => &[Capability::KeyManage],
         }
     }
 
@@ -340,11 +353,12 @@ enum IndexPattern {
 }
 
 impl IndexPattern {
-    fn parse(raw: &str) -> Result<Self, String> {
+    /// `field` names the setting in a refusal: `allowed_indexes` or `allowed_tenants`.
+    fn parse(raw: &str, field: &str) -> Result<Self, String> {
         match raw.strip_suffix('*') {
-            Some("") => Err(
-                "'*' alone is not a scope; omit allowed_indexes to allow every index".to_string(),
-            ),
+            Some("") => Err(format!(
+                "'*' alone is not a scope; omit {field} to allow every one"
+            )),
             Some(prefix) if prefix.contains('*') => Err(format!(
                 "'{raw}': `*` is accepted only once, at the end, as a prefix"
             )),
@@ -398,18 +412,23 @@ impl IndexScope {
     /// Parse a configured list. Entries are trimmed and blank ones dropped; a list left empty
     /// is refused, since it reads as "no restriction" and would mean "nothing permitted".
     pub fn parse(list: &[String]) -> Result<Self, String> {
+        Self::parse_field(list, "allowed_indexes")
+    }
+
+    /// The same rules for another list of names: `allowed_tenants` takes exact tenant names
+    /// and `prefix-*` exactly as `allowed_indexes` takes index names.
+    fn parse_field(list: &[String], field: &str) -> Result<Self, String> {
         let patterns = list
             .iter()
             .map(|entry| entry.trim())
             .filter(|entry| !entry.is_empty())
-            .map(IndexPattern::parse)
+            .map(|entry| IndexPattern::parse(entry, field))
             .collect::<Result<Vec<_>, _>>()?;
         if patterns.is_empty() {
-            return Err(
-                "allowed_indexes is empty, which would permit no index at all. Remove \
-                        the field to allow every index, or name the indexes"
-                    .to_string(),
-            );
+            return Err(format!(
+                "{field} is empty, which would permit nothing at all. Remove the field to allow \
+                 every one, or name them"
+            ));
         }
         Ok(Self(patterns))
     }
@@ -637,6 +656,15 @@ pub struct ApiKeyConfig {
     /// default, and what every key on an upgraded node reads as.
     pub tenant: Option<String>,
 
+    /// Tenants a `key-manage` key may manage: exact names, or prefixes ending in `*`
+    /// (`"partner-x-*"`). Omitted means every tenant.
+    ///
+    /// What keeps two provisioning services — or a partner's — on one node from reaching each
+    /// other's tenants. Refused on a key without `key-manage`, where it would read as a
+    /// restriction and be none. Written by an operator only: the tenant API never mints a key
+    /// that carries it.
+    pub allowed_tenants: Option<Vec<String>>,
+
     /// The included file this entry came from, set by the loader; `None` for the main file
     /// and the command-line key. Not part of the file format.
     #[serde(skip)]
@@ -715,6 +743,19 @@ impl SecurityConfig {
                 .map(IndexScope::parse)
                 .transpose()
                 .map_err(|e| anyhow::anyhow!("{origin}: {e}"))?;
+
+            let allowed_tenants = entry
+                .allowed_tenants
+                .as_deref()
+                .map(|list| IndexScope::parse_field(list, "allowed_tenants"))
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("{origin}: {e}"))?;
+            if allowed_tenants.is_some() && !role.has(Capability::KeyManage) {
+                bail!(
+                    "{origin}: allowed_tenants bounds which tenants a key may manage, and role \
+                     '{role}' manages none. Remove it, or give the key role 'provisioner'"
+                );
+            }
 
             // Per-index overrides, validated hard because a mistake here is a silent grant.
             let mut index_overrides = std::collections::HashMap::new();
@@ -832,6 +873,7 @@ impl SecurityConfig {
                 index_overrides,
                 tenant,
                 tenant_scope,
+                allowed_tenants,
             }));
             origins.push(origin);
         }
@@ -1026,6 +1068,9 @@ pub struct KeyEntry {
     /// The scope of that tenant, which bounds this key whatever its own list says; see
     /// [`TenantQuota::allowed_indexes`].
     tenant_scope: Option<IndexScope>,
+    /// Tenants this key may manage; see [`ApiKeyConfig::allowed_tenants`].
+    #[cfg_attr(not(test), expect(dead_code, reason = "read by the R2 tenant routes"))]
+    allowed_tenants: Option<IndexScope>,
 }
 
 impl KeyEntry {
@@ -1091,6 +1136,15 @@ impl KeyEntry {
             .into_iter()
             .flatten()
             .all(|scope| scope.allows(index))
+    }
+
+    /// Whether this key may manage `tenant`. Only meaningful with `key-manage`; the tenant
+    /// routes check the capability first.
+    #[cfg_attr(not(test), expect(dead_code, reason = "read by the R2 tenant routes"))]
+    pub fn allows_tenant(&self, tenant: &str) -> bool {
+        self.allowed_tenants
+            .as_ref()
+            .is_none_or(|scope| scope.allows(tenant))
     }
 
     /// This key's index scope, rendered for a log line.
@@ -1388,11 +1442,13 @@ where
 cameodb keygen — mint an API key
 
 Usage:
-  cameodb keygen --role <admin|writer|reader> [--label <NAME>] [--allowed-indexes <A,B>]
+  cameodb keygen --role <admin|writer|reader|provisioner> [--label <NAME>]
+                 [--allowed-indexes <A,B>]
                  [--key-out <PATH>] [--hash-out <PATH>]
 
 Options:
-  --role <ROLE>             admin (everything), writer (read and write), reader (read only)
+  --role <ROLE>             admin (everything), writer (read and write), reader (read only),
+                            provisioner (tenants and their keys through /_tenants, no data)
   --label <NAME>            Audit identity for logs — a team or service name, not a secret
   --allowed-indexes <A,B>   Restrict this key to these indexes (default: every index)
   --key-out <PATH>          Write the key to PATH (mode 0600) instead of stdout.
@@ -1485,6 +1541,7 @@ is how a working node stops working.";
             index_overrides: std::collections::HashMap::new(),
             tenant: None,
             tenant_scope: None,
+            allowed_tenants: None,
         })],
     };
     if ring.authenticate(key.expose()).is_none() {
@@ -1931,8 +1988,15 @@ mod tests {
         assert!(!Role::Writer.has(Capability::NodeAdmin));
         assert!(Role::Reader.has(Capability::Read));
         assert!(!Role::Reader.has(Capability::Write));
-        // Every role can read; a key that cannot read anything has no use.
-        assert!(Role::ALL.iter().all(|r| r.has(Capability::Read)));
+        // Every role that works with data can read; a data key that cannot read anything has
+        // no use. The provisioner is the exception by design: it manages keys, not data.
+        assert!(
+            Role::ALL
+                .iter()
+                .filter(|r| **r != Role::Provisioner)
+                .all(|r| r.has(Capability::Read))
+        );
+        assert!(!Role::Provisioner.has(Capability::Read));
     }
 
     #[test]
@@ -2525,6 +2589,60 @@ mod tests {
         assert!(ring.entries()[2].allows_index("beta-docs"));
     }
 
+    /// `provisioner` manages tenants and their keys and touches no data; `admin` can do both.
+    #[test]
+    fn a_provisioner_holds_key_manage_and_nothing_else() {
+        assert_eq!(Role::Provisioner.capabilities(), &[Capability::KeyManage]);
+        assert!(Role::Admin.has(Capability::KeyManage));
+        assert!(!Role::Writer.has(Capability::KeyManage));
+        assert_eq!(Role::parse("provisioner"), Ok(Role::Provisioner));
+        assert_eq!(Capability::KeyManage.as_str(), "key-manage");
+    }
+
+    #[test]
+    fn allowed_tenants_bounds_a_key_manage_key_by_name_or_prefix() {
+        let mut key = tenant_key(Role::Provisioner, None, None);
+        key.allowed_tenants = Some(list(&["partner-x-*", "acme"]));
+        let ring = scoped(&[], vec![key, tenant_key(Role::Provisioner, None, None)])
+            .load_keyring()
+            .unwrap();
+        let bounded = &ring.entries()[0];
+        assert!(bounded.allows_tenant("partner-x-acme"));
+        assert!(bounded.allows_tenant("acme"));
+        assert!(!bounded.allows_tenant("beta"));
+        assert!(ring.entries()[1].allows_tenant("beta"));
+    }
+
+    /// On a key that cannot manage tenants the field would read as a restriction and be none;
+    /// empty, it would read as none and mean everything refused.
+    #[test]
+    fn allowed_tenants_is_refused_empty_or_on_a_key_that_manages_none() {
+        let mut writer = tenant_key(Role::Writer, None, None);
+        writer.allowed_tenants = Some(list(&["acme"]));
+        let err = format!(
+            "{:#}",
+            scoped(&[], vec![writer]).load_keyring().unwrap_err()
+        );
+        assert!(err.contains("allowed_tenants"), "{err}");
+        assert!(err.contains("'writer' manages none"), "{err}");
+
+        for bad in [&[][..], &["*"]] {
+            let mut key = tenant_key(Role::Provisioner, None, None);
+            key.allowed_tenants = Some(list(bad));
+            let err = format!("{:#}", scoped(&[], vec![key]).load_keyring().unwrap_err());
+            assert!(err.contains("allowed_tenants"), "{bad:?}: {err}");
+        }
+    }
+
+    /// An override cannot grant a writer `key-manage` on an index any more than `admin`.
+    #[test]
+    fn an_override_to_provisioner_is_a_widening_and_refused() {
+        let mut key = tenant_key(Role::Reader, None, None);
+        key.index_overrides = Some([("docs".to_string(), Role::Provisioner)].into());
+        let err = format!("{:#}", scoped(&[], vec![key]).load_keyring().unwrap_err());
+        assert!(err.contains("key-manage"), "{err}");
+    }
+
     /// Every optional field unset, so a test names only what it is about.
     fn blank_key() -> ApiKeyConfig {
         ApiKeyConfig {
@@ -2535,6 +2653,7 @@ mod tests {
             allowed_indexes: None,
             index_overrides: None,
             tenant: None,
+            allowed_tenants: None,
             source: None,
         }
     }

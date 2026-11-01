@@ -1179,6 +1179,7 @@ mod tests {
             key_hash_file: None,
             index_overrides: None,
             tenant: None,
+            allowed_tenants: None,
             source: None,
         };
         (key, config)
@@ -1653,6 +1654,31 @@ mod tests {
             Some(StatusCode::FORBIDDEN)
         );
         assert!(decide(&ring, "HEAD", "/api/docs/_config", &headers).is_ok());
+    }
+
+    /// A provisioner reaches no data and no node administration: its one capability guards
+    /// routes of its own.
+    #[test]
+    fn a_provisioner_is_refused_on_data_admin_and_mcp() {
+        let (key, config) = key_for(Role::Provisioner, None);
+        let ring = ring(vec![config]);
+        let headers = headers_with(Some(&key));
+        for (method, path) in [
+            ("POST", "/api/docs/search"),
+            ("GET", "/api/docs/_config"),
+            ("PUT", "/api/docs/document"),
+            ("PUT", "/api/docs/_config"),
+            ("GET", "/_indexes"),
+            ("GET", "/_admin/memory"),
+            ("POST", "/_admin/keys/reload"),
+            ("POST", "/mcp"),
+        ] {
+            assert_eq!(
+                status_of(&decide(&ring, method, path, &headers)),
+                Some(StatusCode::FORBIDDEN),
+                "{method} {path}"
+            );
+        }
     }
 
     /// A tenant's scope is enforced at the same chokepoints a key's own list is: named
