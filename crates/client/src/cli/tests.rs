@@ -1509,3 +1509,115 @@ fn every_admin_index_operation_parses_as_a_one_shot_command() {
         assert_eq!(index, "logs");
     }
 }
+
+#[test]
+fn key_and_tenant_commands_parse_as_one_shot_commands() {
+    use clap::Parser;
+    let parse = |args: &[&str]| {
+        let mut argv = vec!["cameodb-client"];
+        argv.extend_from_slice(args);
+        ClientCli::try_parse_from(argv)
+            .unwrap_or_else(|e| panic!("`{}` did not parse: {e}", args.join(" ")))
+            .command
+            .expect("a command")
+    };
+
+    let ClientCommand::Keys {
+        subcommand: KeysCommand::Create(mint),
+    } = parse(&[
+        "keys",
+        "create",
+        "--role",
+        "writer",
+        "--label",
+        "jane@company.com",
+        "--indexes",
+        "docs-*, wiki",
+        "--if-match",
+        "3",
+    ])
+    else {
+        panic!("keys create parsed as something else");
+    };
+    let request = mint.request();
+    assert_eq!(request.role, "writer");
+    assert_eq!(request.label.as_deref(), Some("jane@company.com"));
+    assert_eq!(
+        request.allowed_indexes,
+        Some(vec!["docs-*".to_string(), "wiki".to_string()])
+    );
+    assert_eq!(mint.if_match, Some(3));
+
+    assert!(matches!(
+        parse(&["keys", "revoke", "ab12cd34"]),
+        ClientCommand::Keys {
+            subcommand: KeysCommand::Revoke { .. }
+        }
+    ));
+    assert!(matches!(
+        parse(&[
+            "tenants",
+            "put",
+            "acme",
+            "--max-indexes",
+            "20",
+            "--indexes",
+            "acme-*"
+        ]),
+        ClientCommand::Tenants {
+            subcommand: TenantsCommand::Put {
+                max_indexes: Some(20),
+                ..
+            }
+        }
+    ));
+    assert!(matches!(
+        parse(&["tenants", "create-key", "acme", "--role", "reader"]),
+        ClientCommand::Tenants {
+            subcommand: TenantsCommand::CreateKey { .. }
+        }
+    ));
+    assert!(matches!(
+        parse(&["tenants", "revoke-key", "acme", "ab12cd34"]),
+        ClientCommand::Tenants {
+            subcommand: TenantsCommand::RevokeKey { .. }
+        }
+    ));
+
+    // The node mints writer and reader keys only; the client does not offer more.
+    let mut argv = vec!["cameodb-client", "keys", "create", "--role", "admin"];
+    assert!(ClientCli::try_parse_from(argv.drain(..)).is_err());
+}
+
+/// Without --indexes a key reaches every index; the request says nothing rather than an
+/// empty list, which the node would refuse.
+#[test]
+fn a_mint_without_indexes_sends_no_list() {
+    use clap::Parser;
+    let cli = ClientCli::try_parse_from(["cameodb-client", "keys", "create", "--role", "reader"])
+        .unwrap();
+    let Some(ClientCommand::Keys {
+        subcommand: KeysCommand::Create(mint),
+    }) = cli.command
+    else {
+        panic!("keys create parsed as something else");
+    };
+    let body = serde_json::to_value(mint.request()).unwrap();
+    assert_eq!(body, serde_json::json!({ "role": "reader" }));
+}
+
+#[test]
+fn a_key_file_is_new_and_owner_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jane.key");
+    super::write_new_key_file(&path, "cameo_v1_x").unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "cameo_v1_x\n");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    assert!(super::write_new_key_file(&path, "cameo_v1_y").is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "cameo_v1_x\n");
+}

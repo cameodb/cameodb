@@ -83,6 +83,12 @@ impl Credential {
             .collect()
     }
 
+    /// The key itself, for the one place it is meant to go: shown once to whoever it was
+    /// minted for, or written to the file they will read it from.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
     fn header_value(&self) -> Result<header::HeaderValue> {
         let mut value = header::HeaderValue::from_str(&format!("Bearer {}", self.0))
             .context("API key contains characters that cannot go in a header")?;
@@ -621,6 +627,199 @@ impl CameoClient {
         self.send_json(self.http.get(url), "Admin workers stats")
             .await
     }
+
+    // Keys and tenants managed through the node. Every change takes the revision the caller
+    // last saw as `if_match`: `Some` has a change that lost a race refused `412` rather than
+    // applied over someone else's, readable through [`failure_status`].
+
+    /// The keys the node manages with no tenant: users and agents, each scoped by its own
+    /// `allowed_indexes`.
+    pub async fn list_keys(&self) -> Result<ManagedKeysResponse> {
+        let url = self.base_url.join("_keys")?;
+        self.send_json(self.http.get(url), "Listing keys").await
+    }
+
+    /// Mint a key with no tenant. The response is the only time the key is seen.
+    pub async fn create_key(
+        &self,
+        request: &KeyRequest,
+        if_match: Option<u64>,
+    ) -> Result<MintedKey> {
+        let url = self.base_url.join("_keys")?;
+        let builder = with_if_match(self.http.post(url).json(request), if_match);
+        self.send_json(builder, "Minting a key").await
+    }
+
+    /// Revoke a key with no tenant; it fails from its next request on.
+    pub async fn revoke_key(
+        &self,
+        key_id: &str,
+        if_match: Option<u64>,
+    ) -> Result<ManagedKeysResponse> {
+        let url = self.base_url.join(&format!("_keys/{key_id}"))?;
+        let builder = with_if_match(self.http.delete(url), if_match);
+        self.send_json(builder, "Revoking a key").await
+    }
+
+    /// Every tenant the caller may manage.
+    pub async fn list_tenants(&self) -> Result<TenantsResponse> {
+        let url = self.base_url.join("_tenants")?;
+        self.send_json(self.http.get(url), "Listing tenants").await
+    }
+
+    /// One tenant: its settings, its keys and the indexes it owns.
+    pub async fn get_tenant(&self, tenant: &str) -> Result<TenantResponse> {
+        let url = self.base_url.join(&format!("_tenants/{tenant}"))?;
+        self.send_json(self.http.get(url), "Reading a tenant").await
+    }
+
+    /// Create a tenant, or change its settings; an omitted field keeps its value.
+    pub async fn put_tenant(
+        &self,
+        tenant: &str,
+        request: &TenantRequest,
+        if_match: Option<u64>,
+    ) -> Result<TenantResponse> {
+        let url = self.base_url.join(&format!("_tenants/{tenant}"))?;
+        let builder = with_if_match(self.http.put(url).json(request), if_match);
+        self.send_json(builder, "Setting a tenant").await
+    }
+
+    /// Remove a tenant and its keys. Refused `409` while it owns an index.
+    pub async fn delete_tenant(&self, tenant: &str, if_match: Option<u64>) -> Result<()> {
+        let url = self.base_url.join(&format!("_tenants/{tenant}"))?;
+        let builder = with_if_match(self.http.delete(url), if_match);
+        self.send(builder, "Deleting a tenant").await.map(drop)
+    }
+
+    /// Mint a key in a tenant. The response is the only time the key is seen.
+    pub async fn create_tenant_key(
+        &self,
+        tenant: &str,
+        request: &KeyRequest,
+        if_match: Option<u64>,
+    ) -> Result<MintedKey> {
+        let url = self.base_url.join(&format!("_tenants/{tenant}/keys"))?;
+        let builder = with_if_match(self.http.post(url).json(request), if_match);
+        self.send_json(builder, "Minting a tenant key").await
+    }
+
+    /// Revoke one of a tenant's keys.
+    pub async fn revoke_tenant_key(
+        &self,
+        tenant: &str,
+        key_id: &str,
+        if_match: Option<u64>,
+    ) -> Result<TenantResponse> {
+        let url = self
+            .base_url
+            .join(&format!("_tenants/{tenant}/keys/{key_id}"))?;
+        let builder = with_if_match(self.http.delete(url), if_match);
+        self.send_json(builder, "Revoking a tenant key").await
+    }
+}
+
+fn with_if_match(
+    builder: reqwest::RequestBuilder,
+    if_match: Option<u64>,
+) -> reqwest::RequestBuilder {
+    match if_match {
+        Some(revision) => builder.header(header::IF_MATCH, revision.to_string()),
+        None => builder,
+    }
+}
+
+/// A key as a caller asks for one: `role` is `writer` or `reader`.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct KeyRequest {
+    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Exact index names, or prefixes ending in `*`. Omitted, the key reaches every index.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_indexes: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_overrides: Option<std::collections::BTreeMap<String, String>>,
+}
+
+/// A tenant's settings as a caller writes them; an omitted field keeps its value.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TenantRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_indexes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_indexes: Option<Vec<String>>,
+}
+
+/// A key as a listing describes it: never the key, never its digest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedKey {
+    pub key_id: String,
+    pub label: String,
+    pub role: String,
+    /// The key's scope as the node resolved it: `docs-*`, `all indexes`, `acme-* (tenant)`.
+    pub indexes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedKeysResponse {
+    /// `0` before the first key is minted.
+    pub revision: u64,
+    pub keys: Vec<ManagedKey>,
+}
+
+/// A key just minted. `key` is a [`Credential`], so it is redacted wherever this is debug
+/// printed and scrubbed when dropped.
+#[derive(Debug)]
+pub struct MintedKey {
+    pub key: Credential,
+    pub key_id: String,
+    pub tenant: Option<String>,
+    pub revision: u64,
+}
+
+impl<'de> Deserialize<'de> for MintedKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            key: String,
+            key_id: String,
+            #[serde(default)]
+            tenant: Option<String>,
+            revision: u64,
+        }
+        let mut wire = Wire::deserialize(deserializer)?;
+        let key = Credential::parse(&wire.key).map_err(serde::de::Error::custom);
+        wire.key.zeroize();
+        Ok(Self {
+            key: key?,
+            key_id: wire.key_id,
+            tenant: wire.tenant,
+            revision: wire.revision,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TenantResponse {
+    pub tenant: String,
+    /// Whether the node manages this tenant's file; an unmanaged one is never changed.
+    pub managed: bool,
+    pub revision: Option<u64>,
+    pub max_indexes: usize,
+    pub max_bytes: u64,
+    pub allowed_indexes: Option<Vec<String>>,
+    pub keys: Vec<ManagedKey>,
+    /// The indexes the tenant owns; present when one tenant is read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub indexes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TenantsResponse {
+    pub tenants: Vec<TenantResponse>,
 }
 
 /// Everything but `status` is absent for an unauthenticated caller against a node with
@@ -887,6 +1086,25 @@ pub struct DispatchStatsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A minted key arrives as a Credential: readable on purpose, redacted by accident.
+    #[test]
+    fn a_minted_key_is_a_credential_that_debug_never_prints() {
+        let key = format!("cameo_v1_{}", "A".repeat(43));
+        let minted: MintedKey = serde_json::from_value(serde_json::json!({
+            "key": key, "key_id": "ab12cd34", "revision": 4
+        }))
+        .unwrap();
+        assert_eq!(minted.key.expose(), key);
+        assert_eq!(minted.tenant, None);
+        assert_eq!(minted.revision, 4);
+        assert!(!format!("{minted:?}").contains(&key));
+
+        let malformed = serde_json::from_value::<MintedKey>(serde_json::json!({
+            "key": "not-a-key", "key_id": "x", "revision": 1
+        }));
+        assert!(malformed.is_err());
+    }
 
     /// The node's `/_admin/workers` payload, as the server serializes it today. Pinned here
     /// because the client and the node version independently: renaming a field on the server

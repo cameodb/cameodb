@@ -18,7 +18,10 @@ pub(crate) use profile::*;
 pub(crate) use scan::*;
 pub(crate) use shell::*;
 
-use crate::sdk::{CameoClient, ClientAuth, Credential, IndexInfo, ListIndexesResponse, TlsTrust};
+use crate::sdk::{
+    CameoClient, ClientAuth, Credential, IndexInfo, KeyRequest, ListIndexesResponse, MintedKey,
+    TenantRequest, TlsTrust,
+};
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
 use colored_json;
@@ -569,6 +572,162 @@ pub enum ClientCommand {
         #[command(subcommand)]
         subcommand: AdminCommand,
     },
+
+    /// Keys with no tenant, managed through the node: users and agents, each scoped by its own
+    /// --indexes. Needs a key holding key-manage (role provisioner or admin).
+    Keys {
+        #[command(subcommand)]
+        subcommand: KeysCommand,
+    },
+
+    /// Tenants and their keys, managed through the node. Needs a key holding key-manage.
+    Tenants {
+        #[command(subcommand)]
+        subcommand: TenantsCommand,
+    },
+}
+
+/// What a minted key is: shared by `keys create` and `tenants create-key`.
+#[derive(clap::Args)]
+pub struct MintArgs {
+    /// writer (read and write) or reader (read only); the node mints nothing more
+    #[arg(long, value_enum)]
+    role: MintRole,
+    /// Who the key is for — an email address, an agent's name. Shown in listings and logs
+    #[arg(long)]
+    label: Option<String>,
+    /// Indexes the key may reach: names or prefixes ending in `*`, comma-separated. Omitted,
+    /// it reaches every index — and, beside tenants, every tenant's too
+    #[arg(long = "indexes", value_name = "INDEX[,INDEX...]")]
+    indexes: Option<String>,
+    /// Write the key to this new file (mode 0600) instead of standard output
+    #[arg(long, value_name = "PATH")]
+    key_out: Option<PathBuf>,
+    /// The revision last seen: refused if the file has changed since
+    #[arg(long)]
+    if_match: Option<u64>,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum MintRole {
+    Writer,
+    Reader,
+}
+
+#[derive(Subcommand)]
+pub enum KeysCommand {
+    /// The keys and the file's revision
+    List,
+    /// Mint a key; it is shown once and stored nowhere but as a digest
+    Create(MintArgs),
+    /// Revoke a key by its key_id; it fails from its next request on
+    Revoke {
+        key_id: String,
+        #[arg(long)]
+        if_match: Option<u64>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum TenantsCommand {
+    /// Every tenant this key may manage
+    List,
+    /// One tenant: settings, keys and the indexes it owns
+    Show { tenant: String },
+    /// Create a tenant, or change its settings; an option left out keeps its value
+    Put {
+        tenant: String,
+        /// Most indexes the tenant may own (0 = unlimited)
+        #[arg(long)]
+        max_indexes: Option<usize>,
+        /// Most bytes its indexes may occupy (0 = unlimited)
+        #[arg(long)]
+        max_bytes: Option<u64>,
+        /// The tenant's indexes, names or prefixes ending in `*`, comma-separated; a new
+        /// tenant without it is scoped to `<tenant>-*`
+        #[arg(long = "indexes", value_name = "INDEX[,INDEX...]")]
+        indexes: Option<String>,
+        #[arg(long)]
+        if_match: Option<u64>,
+    },
+    /// Remove a tenant and its keys; refused while it owns an index
+    Delete {
+        tenant: String,
+        #[arg(long)]
+        if_match: Option<u64>,
+    },
+    /// Mint a key in a tenant
+    CreateKey {
+        tenant: String,
+        #[command(flatten)]
+        mint: MintArgs,
+    },
+    /// Revoke one of a tenant's keys
+    RevokeKey {
+        tenant: String,
+        key_id: String,
+        #[arg(long)]
+        if_match: Option<u64>,
+    },
+}
+
+impl MintArgs {
+    fn request(&self) -> KeyRequest {
+        KeyRequest {
+            role: match self.role {
+                MintRole::Writer => "writer",
+                MintRole::Reader => "reader",
+            }
+            .to_string(),
+            label: self.label.clone(),
+            allowed_indexes: self.indexes.as_deref().map(split_ids),
+            index_overrides: None,
+        }
+    }
+}
+
+/// Hand over a key just minted the way `cameodb keygen` does: to a new 0600 file, or alone on
+/// standard output with everything else on standard error, so redirecting stdout captures the
+/// key and nothing else.
+fn deliver_minted(minted: &MintedKey, key_out: Option<&std::path::Path>) -> Result<()> {
+    let about = json!({
+        "key_id": minted.key_id,
+        "tenant": minted.tenant,
+        "revision": minted.revision,
+    });
+    match key_out {
+        Some(path) => {
+            write_new_key_file(path, minted.key.expose())?;
+            eprintln!("Key written to {} (mode 0600)", path.display());
+        }
+        None => {
+            println!("{}", minted.key.expose());
+            eprintln!("The key above is shown once and stored nowhere but as a digest.");
+        }
+    }
+    eprintln!("{}", serde_json::to_string_pretty(&about)?);
+    Ok(())
+}
+
+/// Create `path` holding `key`, readable by its owner alone, refusing to replace a file
+/// already there: overwriting a key file is how a working client stops working.
+fn write_new_key_file(path: &std::path::Path, key: &str) -> Result<()> {
+    use std::io::Write;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).with_context(|| {
+        format!(
+            "cannot create {} (it must not already exist)",
+            path.display()
+        )
+    })?;
+    writeln!(file, "{key}").with_context(|| format!("cannot write {}", path.display()))?;
+    Ok(())
 }
 
 #[derive(Subcommand)]
@@ -933,6 +1092,49 @@ pub async fn run_cli() -> Result<()> {
                 let result = client.admin_worker_stats().await?;
                 print_json(&result)?;
             }
+        },
+        ClientCommand::Keys { subcommand } => match subcommand {
+            KeysCommand::List => print_json(&client.list_keys().await?)?,
+            KeysCommand::Create(mint) => {
+                let minted = client.create_key(&mint.request(), mint.if_match).await?;
+                deliver_minted(&minted, mint.key_out.as_deref())?;
+            }
+            KeysCommand::Revoke { key_id, if_match } => {
+                print_json(&client.revoke_key(&key_id, if_match).await?)?
+            }
+        },
+        ClientCommand::Tenants { subcommand } => match subcommand {
+            TenantsCommand::List => print_json(&client.list_tenants().await?)?,
+            TenantsCommand::Show { tenant } => print_json(&client.get_tenant(&tenant).await?)?,
+            TenantsCommand::Put {
+                tenant,
+                max_indexes,
+                max_bytes,
+                indexes,
+                if_match,
+            } => {
+                let request = TenantRequest {
+                    max_indexes,
+                    max_bytes,
+                    allowed_indexes: indexes.as_deref().map(split_ids),
+                };
+                print_json(&client.put_tenant(&tenant, &request, if_match).await?)?
+            }
+            TenantsCommand::Delete { tenant, if_match } => {
+                client.delete_tenant(&tenant, if_match).await?;
+                eprintln!("Tenant '{tenant}' deleted");
+            }
+            TenantsCommand::CreateKey { tenant, mint } => {
+                let minted = client
+                    .create_tenant_key(&tenant, &mint.request(), mint.if_match)
+                    .await?;
+                deliver_minted(&minted, mint.key_out.as_deref())?;
+            }
+            TenantsCommand::RevokeKey {
+                tenant,
+                key_id,
+                if_match,
+            } => print_json(&client.revoke_tenant_key(&tenant, &key_id, if_match).await?)?,
         },
     }
 

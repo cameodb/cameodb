@@ -266,6 +266,63 @@ allowed_indexes = ["logs"]
 Only digests ever reach the server. A key exists in the clear exactly twice: on the terminal
 that minted it, and wherever its holder stores it.
 
+### Keys provisioned through the node
+
+A service that signs users up — a portal — mints and revokes their keys through the node
+instead of a person editing files. It holds one `provisioner` key, which manages keys and
+reaches no data; the node writes the keys it mints to files under `/etc/cameodb/keys.d`,
+which the packages create writable by the service, and reloads them at once.
+
+```bash
+# Once, as the operator: the provisioner key, kept with the operator's own keys.
+sudo cameodb keygen --role provisioner --label portal \
+  --hash-out /etc/cameodb/keys/portal --key-out /root/portal.key
+```
+
+```toml
+include = ["keys.d/*.toml"]
+
+[security]
+enabled = true
+
+[security.managed_files]
+dir = "keys.d"
+keys = "keys.toml"               # users and agents, each scoped by its own allowed_indexes
+# tenant = "{tenant}.toml"       # companies as tenants, when they are needed
+
+[[security.api_keys]]
+key_hash_file = "/etc/cameodb/keys/portal"
+role = "provisioner"
+label = "portal"
+```
+
+```bash
+# What the portal does, here through the client; it can call the HTTP API directly.
+cameodb client --api-key-file portal.key keys create --role writer \
+  --label jane@company.com --indexes 'docs-*' --key-out jane.key
+cameodb client --api-key-file portal.key keys list
+cameodb client --api-key-file portal.key keys revoke 6eb82d35
+```
+
+| File | Mode | Owner | Why |
+|------|------|-------|-----|
+| `/etc/cameodb/keys.d/` | `750` | cameodb:cameodb | Created by the packages; the node writes managed key files here |
+| `/etc/cameodb/keys.d/*` | `640` | cameodb | Written by the node, a temp file renamed into place; a hand edit lasts until the next change through the API |
+
+The portal's key is the operator's: it lives in `keys/` or `cameodb.toml`, which the node
+cannot write, and the API mints only `writer` and `reader` keys, so a portal can never mint
+itself an admin or another provisioner. Rotate it like any key. `allowed_tenants` on it bounds
+it to some tenants.
+
+**Give every key the portal mints an `allowed_indexes` list.** A key without one reaches every
+index — beside tenants, every tenant's too, since a tenant's scope bounds its own keys and
+reserves nothing from anyone else. Naming a tenant's index in an individual's list is how it is
+shared.
+
+On Windows the MSI creates `C:\ProgramData\CameoDB\keys.d` with the service allowed to
+write it; the same `include` and `[security.managed_files]` lines work unchanged, since paths
+are relative to the config file. A file changed there reloads the keys by itself.
+
 ### Configuring from the environment
 
 For a node whose config comes from a secret manager rather than a file, one key can be
@@ -366,6 +423,9 @@ Worth stating plainly before you rely on it:
   chains the records. Ship it off the node if you need it to survive the node.
 - **An MCP client authenticates with an HTTP header or not at all.** No OAuth flow, no
   per-client credential issuance.
+- **Keys minted through the node live on that node.** In a cluster, `/_keys` and `/_tenants`
+  change the node that received the call; broadcasting them is planned, not built. Provision
+  a single node, or call every node.
 
 ## 🐧 Production Deployment with systemd
 
