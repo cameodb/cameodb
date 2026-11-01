@@ -133,6 +133,7 @@ chmod 700 /var/lib/cameodb
 # As the DEB: key digests readable by the service but owned by root, a log directory the
 # service writes, each created only when missing; the config readable by the service group.
 [ -d /etc/cameodb/keys ] || install -d -o root -g cameodb -m 750 /etc/cameodb/keys
+[ -d /etc/cameodb/keys.d ] || install -d -o cameodb -g cameodb -m 750 /etc/cameodb/keys.d
 [ -d /var/log/cameodb ] || install -d -o cameodb -g cameodb -m 750 /var/log/cameodb
 chown root:cameodb /etc/cameodb/cameodb.toml
 chmod 640 /etc/cameodb/cameodb.toml

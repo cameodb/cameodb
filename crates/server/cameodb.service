@@ -30,6 +30,9 @@ Restart=on-failure
 User=cameodb
 Group=cameodb
 ProtectSystem=full
+# ProtectSystem makes /etc read-only to the node; keys.d is the one folder there it writes,
+# a tenant's key file when its keys are managed through the node. `-`: absent is not an error.
+ReadWritePaths=-/etc/cameodb/keys.d
 PrivateTmp=true
 
 [Install]

@@ -11,6 +11,9 @@
                     (Linux: /var/lib/cameodb and /var/log/cameodb, removed only by purge)
     keys            C:\ProgramData\CameoDB\keys, for key_hash_file: the service reads, only
                     Administrators write (Linux: /etc/cameodb/keys, root:cameodb 0750)
+    keys.d          C:\ProgramData\CameoDB\keys.d, key and tenant files for `include`: the
+                    service writes, for tenants managed through the node (Linux:
+                    /etc/cameodb/keys.d, cameodb:cameodb 0750)
     account         NT SERVICE\CameoDB, a virtual account Windows creates with the service:
                     no password, no user to manage (Linux: the cameodb system user)
     service         CameoDB, automatic start, started on install, restarted on failure
@@ -49,6 +52,7 @@
         <Directory Id="DATADIR" Name="data" />
         <Directory Id="LOGDIR" Name="logs" />
         <Directory Id="KEYDIR" Name="keys" />
+        <Directory Id="KEYDROPDIR" Name="keys.d" />
       </Directory>
     </StandardDirectory>
 
@@ -167,6 +171,17 @@
       <Component Id="KeyDir" Directory="KEYDIR" Guid="D2DEBED2-4DD4-4085-90B5-EBE8A1FE1436" Permanent="yes" Bitness="always64">
         <CreateFolder>
           <PermissionEx Sddl="D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;S-1-5-80-3196691271-1903880709-56935160-284765964-990515363)" />
+        </CreateFolder>
+      </Component>
+
+      <!--
+        Key and tenant files read through `include`: modify for the service, as on data and
+        logs, since the node writes a tenant's file when that tenant is managed through it.
+        The operator's own keys stay in keys\ and cameodb.toml, which it can only read.
+      -->
+      <Component Id="KeyDropDir" Directory="KEYDROPDIR" Guid="0B8CF7B5-7EF4-42BA-A1D1-768C2CD4748A" Permanent="yes" Bitness="always64">
+        <CreateFolder>
+          <PermissionEx Sddl="D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;S-1-5-80-3196691271-1903880709-56935160-284765964-990515363)" />
         </CreateFolder>
       </Component>
 

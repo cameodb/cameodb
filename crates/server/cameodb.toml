@@ -1,3 +1,8 @@
+# Key and tenant files beside this one, one per tenant by convention: each adds
+# [[security.api_keys]] entries and [security.tenants.<name>] tables and nothing else, and a
+# change to one reloads the key ring by itself. Relative to this file's folder.
+# include = ["keys.d/*.toml"]
+
 [node]
 label = "cameodb"
 zone = "default"

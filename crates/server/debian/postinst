@@ -11,6 +11,11 @@ if [ "$1" = "configure" ]; then
     # an operator's own ownership survives an upgrade.
     [ -d /etc/cameodb/keys ] || install -d -o root -g cameodb -m 750 /etc/cameodb/keys
 
+    # Key and tenant files for `include = ["keys.d/*.toml"]`. Owned by the service, which
+    # writes a tenant's file when its keys are managed through the node; the operator's own
+    # keys stay in keys/ and cameodb.toml, which the service cannot write.
+    [ -d /etc/cameodb/keys.d ] || install -d -o cameodb -g cameodb -m 750 /etc/cameodb/keys.d
+
     # For [logging] directory and [security.audit] file, both off in the shipped config. The
     # node writes here as the service user.
     [ -d /var/log/cameodb ] || install -d -o cameodb -g cameodb -m 750 /var/log/cameodb
