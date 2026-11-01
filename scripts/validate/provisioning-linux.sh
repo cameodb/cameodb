@@ -4,8 +4,9 @@
 # provisioning.sh runs a bare binary as the invoking user. This suite installs the package into
 # a Linux container with systemd as PID 1 and checks what only an installed node has: the
 # folders the postinst creates and who owns them, the unit's ProtectSystem sandbox letting the
-# node write `keys.d` (and nothing else under /etc), the watcher picking up a dropped file, the
-# service restarting and the package reinstalling on top of keys it wrote.
+# node write `keys.d` (and nothing else under /etc) — a key minted, its indexes changed in place —
+# the watcher picking up a dropped file, the service restarting and the package reinstalling on
+# top of keys it wrote.
 #
 # Needs Docker and a .deb for the container's architecture:
 #   ./scripts/build/build-packages.sh arm64      # native on Apple Silicon, like the portal
@@ -217,6 +218,16 @@ check_eq "jane is refused outside it" "403" "$(write_doc "$JANE_KEY" wiki 1 x)"
 check_eq "the node cannot write elsewhere under /etc" "denied" \
     "$(dx runuser -u cameodb -- sh -c 'touch /etc/cameodb/probe 2>/dev/null && echo wrote || echo denied' | tr -d '\r')"
 check_eq "the operator's config is unchanged by the node" "root:cameodb 640" "$(mode_owner /etc/cameodb/cameodb.toml)"
+
+section "a key's indexes changed in place"
+if client /root/k/portal.key keys set-indexes "$JANE_ID" --indexes 'docs-*,wiki' > "$WORK/jane.patch" 2>&1; then
+    pass "keys set-indexes rewrites keys.toml under the sandbox"
+else
+    fail "keys set-indexes rewrites keys.toml under the sandbox" "$(tail -3 "$WORK/jane.patch") / $(dx journalctl -u cameodb -n 10 --no-pager 2>&1 | tail -4)"
+fi
+check_eq "the same key now writes wiki"     "200" "$(write_doc "$JANE_KEY" wiki 1 x)"
+check_eq "keys.toml keeps its owner and mode" "cameodb:cameodb 600" "$(mode_owner /etc/cameodb/keys.d/keys.toml)"
+check_eq "no temp file left in keys.d" "keys.toml" "$(dx ls -A /etc/cameodb/keys.d | tr -d '\r' | tr '\n' ' ' | sed 's/ $//')"
 
 section "the watcher"
 HAND_KEY="$(dx cameodb keygen --role reader --label hand@company.com 2> "$WORK/hand.stanza" | tr -d '\r\n')"

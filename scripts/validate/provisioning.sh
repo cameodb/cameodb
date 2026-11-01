@@ -248,6 +248,9 @@ check_eq "ana's tenant key survives"    "200" "$(search "$ANA_KEY" acme-docs)"
 check_eq "eve's key survives"           "200" "$(search "$EVE_KEY" acme-shared)"
 check_eq "the hand-written key survives" "200" "$(search "$HAND_KEY" docs-public)"
 check_eq "jane stays revoked"           "401" "$(search "$JANE_KEY" docs-public)"
+# Minted for docs-public, changed to docs-*: an index it could not reach before is now absent
+# (404), not refused (403).
+check_eq "ann's changed scope survives"  "404" "$(search "$ANN_KEY" docs-later)"
 
 section "no minted key is written down"
 leaked=""
