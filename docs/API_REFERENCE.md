@@ -49,6 +49,7 @@ Both return `{"error": …, "message": …}`. An unknown path answers `401` with
 | `POST` | `/_admin/index/{index}/commit` | `node-admin` |
 | `POST` | `/_admin/index/{index}/merge` | `node-admin` |
 | `POST` | `/_admin/index/{index}/evict-writer` | `node-admin` |
+| `GET` `POST` `DELETE` | `/_keys`, `/_keys/{key_id}` | `key-manage` |
 | `GET` `PUT` `DELETE` | `/_tenants`, `/_tenants/{tenant}` | `key-manage` |
 | `POST` `DELETE` | `/_tenants/{tenant}/keys`, `/_tenants/{tenant}/keys/{key_id}` | `key-manage` |
 | `POST` `GET` `DELETE` | `/mcp` | `read` at the endpoint, then per tool |
@@ -1523,10 +1524,45 @@ and refusals of a valid key are recorded individually; writes, health checks and
 unauthenticated refusals arrive as counted `*_stats` records. Reading this endpoint is itself
 recorded. Field-by-field detail is in [CONFIGURATION.md](CONFIGURATION.md).
 
+#### 🔑 Keys Without Tenants
+
+Mint and revoke keys for users and agents on a running node, each scoped by its own
+`allowed_indexes` — no tenant involved. The keys live in the one file `[security.managed_files]
+keys` names (see the configuration guide), which the node writes, reloads through the same
+loader startup uses, and restores if that loader refuses a change.
+
+Every route needs `key-manage` — the `provisioner` role, or `admin` — held without
+`allowed_tenants`: a key bounded to some tenants manages those tenants only (`403` here).
+
+| Method | Path | |
+|--------|------|---|
+| `GET` | `/_keys` | The file's keys and `revision` |
+| `POST` | `/_keys` | Mint a key: `role` (`writer` or `reader`), `label`, `allowed_indexes`, `index_overrides` |
+| `DELETE` | `/_keys/{key_id}` | Revoke a key, from its next request on |
+
+**Example:**
+```bash
+curl -s -X POST http://localhost:9480/_keys \
+  -H "Authorization: Bearer $PROVISIONER_KEY" -H "Content-Type: application/json" \
+  -H 'If-Match: 0' \
+  -d '{"role": "writer", "label": "jane@company.com", "allowed_indexes": ["docs-*"]}'
+```
+
+**Response** (`201`, with `POST /_tenants/{tenant}/keys` the only responses that carry a key):
+```json
+{"key": "cameo_v1_…", "key_id": "b9b140f4", "revision": 1}
+```
+
+A key without `allowed_indexes` reaches every index, as any key without the list does. The
+file's `revision` starts at `0` before the first key; send it as `If-Match` to have a change
+refused with `412` if the file changed in between. `admin` and `provisioner` keys are refused
+(`403`), an `allowed_indexes` pattern the loader does not take is `400`, a missing key is `404`
+with `"code": "key_not_found"`, and without a `keys` file configured every change answers `409`.
+
 #### 🏢 Tenants and Their Keys
 
 Create tenants, mint and revoke their keys, on a running node. Each managed tenant is one file
-where `[security.tenant_files]` says (see the configuration guide); the node writes it, reloads
+where `[security.managed_files] tenant` says (see the configuration guide); the node writes it, reloads
 the key ring through the same loader startup uses, and undoes a change that loader refuses. A
 tenant written by hand is listed and never changed (`409`).
 
@@ -1575,7 +1611,8 @@ as `If-Match` to have a change refused with `412` if someone changed the tenant 
 - **No escalation.** The API mints `writer` and `reader` keys only (`403` for `admin` or
   `provisioner`), always in the route's tenant. A listing shows each key's `key_id`, `label`,
   `role` and scope, never a digest.
-- **Not configured.** Without `[security.tenant_files]` every change answers `409` saying so.
+- **Not configured.** Without `[security.managed_files] tenant` every change answers `409`
+  saying so.
 - A missing tenant answers `404` with `"code": "tenant_not_found"`, a missing key
   `"code": "key_not_found"`.
 

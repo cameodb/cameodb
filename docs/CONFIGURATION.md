@@ -1357,30 +1357,36 @@ every platform — on Windows, the only reload besides the endpoint. A file that
 logged and the ring in use stays in use. Write a file to a temporary name starting with a dot
 and rename it into place, so the watcher never reads it half-written.
 
-### Tenants managed through the node (`[security.tenant_files]`)
+### Keys managed through the node (`[security.managed_files]`)
 
-With a `provisioner` key and this section, a provisioning service creates tenants and mints
-their keys through `/_tenants` (see the API reference), and the node writes each managed
-tenant's file itself:
+With a `provisioner` key and this section, a provisioning service mints and revokes keys
+through the node — `/_keys` for users and agents with no tenant, `/_tenants` for tenants and
+their keys (see the API reference) — and the node writes the files itself:
 
 ```toml
 include = ["keys.d/*.toml"]
 
-[security.tenant_files]
+[security.managed_files]
 dir = "keys.d"                   # relative to this file's folder
-name = "{tenant}.toml"           # any file name holding {tenant} once: "tenant-{tenant}.toml"
+keys = "keys.toml"               # keys with no tenant, through /_keys
+tenant = "{tenant}.toml"         # one file per tenant, through /_tenants; any name with {tenant}
 ```
 
-Startup refuses a `dir` that does not exist, a `name` without `{tenant}` exactly once or with a
-path separator, wildcard or leading dot, and a layout no `include` pattern reads back — a file
-the node writes and never loads would be a tenant that silently has no keys. Without the
-section, `/_tenants` lists tenants and changes none.
+Name only what you use: `keys` alone is a deployment with no tenants, where each key is scoped
+by its own `allowed_indexes` and nothing else; `tenant` alone manages tenants only. A name left
+out turns its routes off — they answer `409` saying so.
+
+Startup refuses a `dir` that does not exist, a section naming neither file, a `tenant` name
+without `{tenant}` exactly once, a name with a path separator, wildcard or leading dot, and a
+layout no `include` pattern reads back — a file the node writes and never loads would hold keys
+that silently never work.
 
 A managed file carries a `[provisioning]` table — `revision`, `written_by` (the node's id) and
-`written_at` — which is how the node tells its own files from yours. It never rewrites a tenant
-defined anywhere else, nor a file at the path that is not its own. The packages create
-`keys.d` writable by the service; `keys/` and this file stay read-only to it, so the operator's
-own keys — the `provisioner` key among them — are out of the node's reach.
+`written_at` — which is how the node tells its own files from yours. It never rewrites a file it
+did not write, nor a tenant defined anywhere else, and a tenant whose file would be the `keys`
+file is refused. The packages create `keys.d` writable by the service; `keys/` and this file
+stay read-only to it, so the operator's own keys — the `provisioner` key among them — are out of
+the node's reach.
 
 ### Rotation
 

@@ -137,9 +137,12 @@ const ROUTES: &[RouteRule] = &[
     rule("POST",   "/_admin/index/{index}/merge",       Access::Needs(Capability::NodeAdmin)),
     rule("POST",   "/_admin/index/{index}/evict-writer",Access::Needs(Capability::NodeAdmin)),
 
-    // Tenants and their keys. Outside `/_admin`, which the `external` profile unmounts: a
-    // provisioning service manages tenants on exactly the nodes that face the internet. Which
-    // tenants a key may manage is `allowed_tenants`, checked by the handler.
+    // Keys, with no tenant or in one. Outside `/_admin`, which the `external` profile
+    // unmounts: a provisioning service manages keys on exactly the nodes that face the
+    // internet. Which tenants a key may manage is `allowed_tenants`, checked by the handler.
+    rule("GET",    "/_keys",                            Access::Needs(Capability::KeyManage)),
+    rule("POST",   "/_keys",                            Access::Needs(Capability::KeyManage)),
+    rule("DELETE", "/_keys/{key_id}",                   Access::Needs(Capability::KeyManage)),
     rule("GET",    "/_tenants",                         Access::Needs(Capability::KeyManage)),
     rule("GET",    "/_tenants/{tenant}",                Access::Needs(Capability::KeyManage)),
     rule("PUT",    "/_tenants/{tenant}",                Access::Needs(Capability::KeyManage)),
@@ -1669,6 +1672,147 @@ mod tests {
             Some(StatusCode::FORBIDDEN)
         );
         assert!(decide(&ring, "HEAD", "/api/docs/_config", &headers).is_ok());
+    }
+
+    /// The deployment with no tenants at all, configured by files alone: an operator's admin
+    /// key in the main file, users and agents in an included one, each scoped by its own
+    /// list. Every decision the gate makes rests on the key's list and role.
+    #[test]
+    fn without_tenants_an_included_users_file_scopes_each_key_by_its_own_list() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("keys.d")).unwrap();
+        let (admin, jane, agent, auditor) = (
+            ApiKey::generate().unwrap(),
+            ApiKey::generate().unwrap(),
+            ApiKey::generate().unwrap(),
+            ApiKey::generate().unwrap(),
+        );
+        let hash = |key: &ApiKey| key.digest().to_config_value();
+        std::fs::write(
+            dir.path().join("cameodb.toml"),
+            format!(
+                "include = [\"keys.d/*.toml\"]\n[node]\nprofile = \"local\"\n\
+                 [security]\nenabled = true\n\
+                 [[security.api_keys]]\nkey_hash = \"{}\"\nrole = \"admin\"\nlabel = \"ops\"\n",
+                hash(&admin)
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("keys.d/users.toml"),
+            format!(
+                "[[security.api_keys]]\nkey_hash = \"{}\"\nrole = \"writer\"\n\
+                 label = \"jane@company.com\"\nallowed_indexes = [\"docs-*\"]\n\
+                 index_overrides = {{ \"docs-legal\" = \"reader\" }}\n\
+                 [[security.api_keys]]\nkey_hash = \"{}\"\nrole = \"reader\"\n\
+                 label = \"agent:search\"\nallowed_indexes = [\"docs-public\", \"wiki\"]\n\
+                 [[security.api_keys]]\nkey_hash = \"{}\"\nrole = \"reader\"\n\
+                 label = \"auditor@company.com\"\n",
+                hash(&jane),
+                hash(&agent),
+                hash(&auditor)
+            ),
+        )
+        .unwrap();
+        let config = crate::config::CameoDbConfig::load_with_cli(
+            &crate::config::CliOverrides::parse([
+                "--config".to_string(),
+                dir.path()
+                    .join("cameodb.toml")
+                    .to_string_lossy()
+                    .to_string(),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(config.security.tenants.is_empty());
+        let ring = config.security.load_keyring().unwrap();
+        assert!(ring.entries().iter().all(|entry| entry.tenant().is_none()));
+
+        let status = |key: &ApiKey, method: &str, path: &str| {
+            status_of(&decide(&ring, method, path, &headers_with(Some(key))))
+        };
+        // Jane: writes under docs-*, reads only on docs-legal, nothing elsewhere.
+        assert_eq!(status(&jane, "PUT", "/api/docs-2026/document"), None);
+        assert_eq!(status(&jane, "POST", "/api/docs-legal/search"), None);
+        assert_eq!(
+            status(&jane, "PUT", "/api/docs-legal/document"),
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            status(&jane, "POST", "/api/wiki/search"),
+            Some(StatusCode::FORBIDDEN)
+        );
+        // The agent: reads its two indexes, writes nowhere.
+        assert_eq!(status(&agent, "POST", "/api/wiki/search"), None);
+        assert_eq!(
+            status(&agent, "PUT", "/api/wiki/document"),
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            status(&agent, "POST", "/api/docs-private/search"),
+            Some(StatusCode::FORBIDDEN)
+        );
+        // A reader with no list reads everything and changes nothing.
+        assert_eq!(status(&auditor, "POST", "/api/docs-private/search"), None);
+        assert_eq!(
+            status(&auditor, "PUT", "/api/docs-private/document"),
+            Some(StatusCode::FORBIDDEN)
+        );
+        // None of them manages keys or the node; the operator's admin key does both.
+        for key in [&jane, &agent, &auditor] {
+            assert_eq!(status(key, "POST", "/_keys"), Some(StatusCode::FORBIDDEN));
+            assert_eq!(
+                status(key, "GET", "/_admin/memory"),
+                Some(StatusCode::FORBIDDEN)
+            );
+        }
+        assert_eq!(status(&admin, "POST", "/_keys"), None);
+
+        // A listing shows each key what it may reach.
+        let listing = || {
+            serde_json::json!({
+                "indexes": [{"name": "docs-2026"}, {"name": "docs-public"}, {"name": "wiki"},
+                            {"name": "payroll"}],
+                "total_indexes": 4,
+            })
+        };
+        let names = |key: &ApiKey| {
+            let mut value = listing();
+            let authz = Authz::Key(ring.authenticate(key.expose()).unwrap());
+            filter_index_listing(&mut value, &authz);
+            value["indexes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|index| index["name"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&jane), ["docs-2026", "docs-public"]);
+        assert_eq!(names(&agent), ["docs-public", "wiki"]);
+        assert_eq!(names(&auditor).len(), 4);
+    }
+
+    /// `/_keys` is key-manage's, like `/_tenants`; no data role reaches it.
+    #[test]
+    fn the_keys_routes_need_key_manage() {
+        for role in [Role::Admin, Role::Writer, Role::Reader, Role::Provisioner] {
+            let (key, config) = key_for(role, None);
+            let ring = ring(vec![config]);
+            let headers = headers_with(Some(&key));
+            let expected = (!role.has(Capability::KeyManage)).then_some(StatusCode::FORBIDDEN);
+            for (method, path) in [
+                ("GET", "/_keys"),
+                ("POST", "/_keys"),
+                ("DELETE", "/_keys/ab12"),
+            ] {
+                assert_eq!(
+                    status_of(&decide(&ring, method, path, &headers)),
+                    expected,
+                    "{role} {method} {path}"
+                );
+            }
+        }
     }
 
     /// A provisioner reaches no data and no node administration: its one capability guards

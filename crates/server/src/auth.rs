@@ -577,33 +577,46 @@ pub struct SecurityConfig {
     /// belongs to the section that defines keys. Off by default.
     pub audit: crate::audit::AuditConfig,
 
-    /// `[security.tenant_files]` — where the node writes the file of a tenant managed through
-    /// `/_tenants`. Absent, the node manages no tenant's file.
+    /// `[security.managed_files]` — where the node writes the keys it is asked to manage:
+    /// keys with no tenant through `/_keys`, a tenant's file through `/_tenants`. Absent, the
+    /// node writes no key file.
     #[serde(default)]
-    pub tenant_files: Option<TenantFilesConfig>,
+    pub managed_files: Option<ManagedFilesConfig>,
 }
 
-/// `[security.tenant_files]`: the folder and file name of tenant files the node writes.
+/// `[security.managed_files]`: the folder and file names of the key files the node writes.
 ///
 /// Configured rather than inferred from `include`, so the layout is the operator's to choose
 /// and can be read in one place. The loader checks it against `include` at startup: a file
-/// the node writes that no `include` reads back would be a tenant that silently has no keys.
+/// the node writes that no `include` reads back would hold keys that silently never load.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct TenantFilesConfig {
+pub struct ManagedFilesConfig {
     /// The folder, relative to the config file's folder. Resolved to an absolute path by the
     /// loader.
     pub dir: PathBuf,
-    /// The file name, holding `{tenant}` exactly once: `"{tenant}.toml"`,
-    /// `"tenant-{tenant}.toml"`.
-    pub name: String,
+    /// The file of keys with no tenant, managed through `/_keys`: `"keys.toml"`. Absent, those
+    /// routes manage nothing.
+    #[serde(default)]
+    pub keys: Option<String>,
+    /// A tenant's file, holding `{tenant}` exactly once: `"{tenant}.toml"`,
+    /// `"tenant-{tenant}.toml"`. Absent, the tenant routes manage nothing.
+    #[serde(default)]
+    pub tenant: Option<String>,
 }
 
-impl TenantFilesConfig {
-    /// The file a tenant's keys are written to. `tenant` must already have passed
-    /// [`valid_tenant_name`], so it cannot carry a path.
-    pub fn path_for(&self, tenant: &str) -> PathBuf {
-        self.dir.join(self.name.replace("{tenant}", tenant))
+impl ManagedFilesConfig {
+    /// The file of keys with no tenant, if one is configured.
+    pub fn keys_path(&self) -> Option<PathBuf> {
+        self.keys.as_ref().map(|name| self.dir.join(name))
+    }
+
+    /// The file a tenant's keys are written to, if tenant files are configured. `tenant` must
+    /// already have passed [`valid_tenant_name`], so it cannot carry a path.
+    pub fn tenant_path(&self, tenant: &str) -> Option<PathBuf> {
+        self.tenant
+            .as_ref()
+            .map(|name| self.dir.join(name.replace("{tenant}", tenant)))
     }
 }
 
@@ -636,7 +649,7 @@ impl Default for SecurityConfig {
             override_key: None,
             limits: crate::ratelimit::McpLimitsConfig::default(),
             audit: crate::audit::AuditConfig::default(),
-            tenant_files: None,
+            managed_files: None,
         }
     }
 }

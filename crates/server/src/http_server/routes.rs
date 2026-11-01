@@ -41,8 +41,9 @@ use crate::http_server::health::health_handler;
 use crate::http_server::search::{search_handler, search_stream_handler};
 use crate::http_server::shed::{self, ShedLog};
 use crate::http_server::tenants::{
-    create_key_handler, delete_tenant_handler, get_tenant_handler, list_tenants_handler,
-    put_tenant_handler, revoke_key_handler,
+    create_key_handler, create_tenant_key_handler, delete_tenant_handler, get_tenant_handler,
+    list_keys_handler, list_tenants_handler, put_tenant_handler, revoke_key_handler,
+    revoke_tenant_key_handler,
 };
 use crate::http_server::write::{
     bulk_delete_handler, bulk_write_handler, delete_document_handler, write_handler,
@@ -228,6 +229,8 @@ pub fn create_router(state: AppState, config: &RouterConfig<'_>) -> (Router, Mcp
         .route("/_cluster/_indexes", get(list_cluster_indexes_handler))
         // Tenants and their keys: mounted whatever `admin_enabled` says, since a node facing
         // the internet runs with /_admin off and is where tenants are provisioned.
+        .route("/_keys", get(list_keys_handler).post(create_key_handler))
+        .route("/_keys/{key_id}", delete(revoke_key_handler))
         .route("/_tenants", get(list_tenants_handler))
         .route(
             "/_tenants/{tenant}",
@@ -235,10 +238,10 @@ pub fn create_router(state: AppState, config: &RouterConfig<'_>) -> (Router, Mcp
                 .put(put_tenant_handler)
                 .delete(delete_tenant_handler),
         )
-        .route("/_tenants/{tenant}/keys", post(create_key_handler))
+        .route("/_tenants/{tenant}/keys", post(create_tenant_key_handler))
         .route(
             "/_tenants/{tenant}/keys/{key_id}",
-            delete(revoke_key_handler),
+            delete(revoke_tenant_key_handler),
         )
         // Health check
         .route(HEALTH_PATH, get(health_handler))

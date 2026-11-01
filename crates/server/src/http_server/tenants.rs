@@ -1,8 +1,9 @@
-//! `/_tenants` — create tenants, mint and revoke their keys.
+//! `/_keys` and `/_tenants` — mint and revoke keys, with no tenant or in one.
 //!
 //! The handlers decide who may ask; [`crate::tenants::TenantStore`] decides what the files
 //! become. The route table already required `key-manage`; here a caller is held to its
-//! `allowed_tenants`, and a caller bounded by it to index scopes under its tenants' own names.
+//! `allowed_tenants`, and a caller bounded by it to its tenants — never the keys file — and to
+//! index scopes under its tenants' own names.
 
 use axum::{
     Extension, Json,
@@ -107,8 +108,9 @@ pub(super) async fn delete_tenant_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `POST /_tenants/{tenant}/keys` — mint a key. The one response that ever carries one.
-pub(super) async fn create_key_handler(
+/// `POST /_tenants/{tenant}/keys` — mint a key. With `POST /_keys`, the one response that
+/// ever carries one.
+pub(super) async fn create_tenant_key_handler(
     Path(tenant): Path<String>,
     State(state): State<AppState>,
     authz: Option<Extension<Authz>>,
@@ -118,7 +120,7 @@ pub(super) async fn create_key_handler(
     check_tenant(authz.as_deref(), &tenant)?;
     let minted = state
         .tenants
-        .create_key(&tenant, spec, if_match(&headers)?)
+        .create_tenant_key(&tenant, spec, if_match(&headers)?)
         .await
         .map_err(to_app_error)?;
     let audited = format!("key_id={} revision={}", minted.key_id, minted.revision);
@@ -131,7 +133,7 @@ pub(super) async fn create_key_handler(
 }
 
 /// `DELETE /_tenants/{tenant}/keys/{key_id}` — revoke one key, from its next request on.
-pub(super) async fn revoke_key_handler(
+pub(super) async fn revoke_tenant_key_handler(
     Path((tenant, key_id)): Path<(String, String)>,
     State(state): State<AppState>,
     authz: Option<Extension<Authz>>,
@@ -140,7 +142,7 @@ pub(super) async fn revoke_key_handler(
     check_tenant(authz.as_deref(), &tenant)?;
     let view = state
         .tenants
-        .revoke_key(&tenant, &key_id, if_match(&headers)?)
+        .revoke_tenant_key(&tenant, &key_id, if_match(&headers)?)
         .await
         .map_err(to_app_error)?;
     let audited = format!("revision={}", view.revision.unwrap_or_default());
@@ -148,6 +150,69 @@ pub(super) async fn revoke_key_handler(
         Json(serde_json::to_value(view).unwrap_or_default()),
         audited,
     ))
+}
+
+/// `GET /_keys` — the keys the node manages with no tenant.
+pub(super) async fn list_keys_handler(
+    State(state): State<AppState>,
+    authz: Option<Extension<Authz>>,
+) -> Result<Json<JsonValue>, AppError> {
+    check_unbounded(authz.as_deref())?;
+    let view = state.tenants.list_keys().map_err(to_app_error)?;
+    Ok(Json(serde_json::to_value(view).unwrap_or_default()))
+}
+
+/// `POST /_keys` — mint a key with no tenant, scoped by its own `allowed_indexes`.
+pub(super) async fn create_key_handler(
+    State(state): State<AppState>,
+    authz: Option<Extension<Authz>>,
+    headers: HeaderMap,
+    Json(spec): Json<KeySpec>,
+) -> Result<Response, AppError> {
+    check_unbounded(authz.as_deref())?;
+    let minted = state
+        .tenants
+        .create_key(spec, if_match(&headers)?)
+        .await
+        .map_err(to_app_error)?;
+    let audited = format!("key_id={} revision={}", minted.key_id, minted.revision);
+    let mut response = audited_json(
+        Json(serde_json::to_value(&minted).unwrap_or_default()),
+        audited,
+    );
+    *response.status_mut() = StatusCode::CREATED;
+    Ok(response)
+}
+
+/// `DELETE /_keys/{key_id}` — revoke a key with no tenant, from its next request on.
+pub(super) async fn revoke_key_handler(
+    Path(key_id): Path<String>,
+    State(state): State<AppState>,
+    authz: Option<Extension<Authz>>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    check_unbounded(authz.as_deref())?;
+    let view = state
+        .tenants
+        .revoke_key(&key_id, if_match(&headers)?)
+        .await
+        .map_err(to_app_error)?;
+    let audited = format!("revision={}", view.revision);
+    Ok(audited_json(
+        Json(serde_json::to_value(view).unwrap_or_default()),
+        audited,
+    ))
+}
+
+/// A key bounded by `allowed_tenants` manages those tenants and nothing else: a key with no
+/// tenant would reach whatever indexes it names, past every tenant the caller is held to.
+fn check_unbounded(authz: Option<&Authz>) -> Result<(), AppError> {
+    match authz {
+        Some(Authz::Key(entry)) if entry.is_tenant_scoped() => Err(AppError::forbidden(
+            "this key manages only its allowed_tenants; keys with no tenant are outside them",
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// With authentication off there is no caller to bound, as on every other route.
@@ -223,7 +288,7 @@ fn audited_json(body: Json<JsonValue>, audited: String) -> Response {
 fn to_app_error(err: TenantError) -> AppError {
     let message = err.to_string();
     match err {
-        TenantError::NotConfigured
+        TenantError::NotConfigured(_)
         | TenantError::NotManaged { .. }
         | TenantError::ForeignFile(_) => AppError::with_status(StatusCode::CONFLICT, message),
         TenantError::InvalidName(_) | TenantError::Refused(_) => AppError::bad_request(message),
@@ -259,7 +324,7 @@ mod tests {
     #[test]
     fn tenant_errors_map_to_their_statuses_and_codes() {
         let cases = [
-            (TenantError::NotConfigured, StatusCode::CONFLICT),
+            (TenantError::NotConfigured("key"), StatusCode::CONFLICT),
             (
                 TenantError::InvalidName("..".into()),
                 StatusCode::BAD_REQUEST,
@@ -271,7 +336,7 @@ mod tests {
             (TenantError::NotFound("acme".into()), StatusCode::NOT_FOUND),
             (
                 TenantError::RevisionMismatch {
-                    tenant: "acme".into(),
+                    place: "tenant 'acme'".into(),
                     current: 2,
                     expected: 1,
                 },
@@ -291,7 +356,7 @@ mod tests {
         );
         assert_eq!(
             to_app_error(TenantError::KeyNotFound {
-                tenant: "acme".into(),
+                place: "in tenant 'acme'".into(),
                 key_id: "k".into()
             })
             .code,
@@ -325,5 +390,12 @@ mod tests {
             Some(StatusCode::FORBIDDEN)
         );
         assert!(may_manage(None, "acme"));
+
+        // Bounded to some tenants, it manages no key outside them: /_keys is refused.
+        assert_eq!(
+            check_unbounded(Some(&authz)).unwrap_err().status,
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert!(check_unbounded(None).is_ok());
     }
 }
