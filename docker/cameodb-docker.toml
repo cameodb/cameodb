@@ -55,9 +55,16 @@ enabled = false
 # [security]
 # enabled = true
 #
+# # Keys minted through the node by a provisioner key: `include` the folder at the top of this
+# # file and mount a volume writable by the container's user (uid 65532) at /etc/cameodb/keys.d.
+# # include = ["keys.d/*.toml"]
+# # [security.managed_files]
+# # dir = "keys.d"
+# # keys = "keys.toml"
+#
 # [[security.api_keys]]
 # key_hash_file = "/etc/cameodb/keys/ops"
-# role = "admin"                         # admin | writer | reader
+# role = "admin"                         # admin | writer | reader | provisioner
 # label = "ops"
 # # allowed_indexes = ["docs"]           # optional: restrict this key to named indexes
 #

@@ -52,7 +52,7 @@ admin_enabled = true
 
 # Authentication. Off by default; when on, every route except /_cluster/health requires
 # `Authorization: Bearer <key>`. Only digests are stored here, so this file never holds a
-# usable credential — mint keys with `cameodb keygen --role <admin|writer|reader>`, which
+# usable credential — mint keys with `cameodb keygen --role <admin|writer|reader|provisioner>`, which
 # prints the key once and the stanza to paste. Add --hash-out <path> and --key-out <path> to
 # write the digest and the key as 0600 files instead of copying them by hand.
 #

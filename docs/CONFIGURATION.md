@@ -1393,7 +1393,7 @@ it unless they are meant to be shared.
 A managed file carries a `[provisioning]` table — `revision`, `written_by` (the node's id) and
 `written_at` — which is how the node tells its own files from yours. It never rewrites a file it
 did not write, nor a tenant defined anywhere else, and a tenant whose file would be the `keys`
-file is refused. The packages create `keys.d` writable by the service; `keys/` and this file
+file is refused. The files it writes are mode 0600, the service's alone. The packages create `keys.d` writable by the service; `keys/` and this file
 stay read-only to it, so the operator's own keys — the `provisioner` key among them — are out of
 the node's reach.
 

@@ -303,9 +303,10 @@ digests, so a leaked config file contains nothing that can authenticate:
 cameodb keygen --role writer --label team-a --allowed-indexes docs,wiki
 ```
 
-The key is printed once to stdout and the `[[security.api_keys]]` stanza to stderr. Three
-roles bundle four capabilities — `admin` (everything), `writer` (read and write), `reader`
-(read only) — and `allowed_indexes` restricts a key to named indexes for every role.
+The key is printed once to stdout and the `[[security.api_keys]]` stanza to stderr. Four
+roles bundle five capabilities — `admin` (everything), `writer` (read and write), `reader`
+(read only) and `provisioner` (manages keys through the node and reaches no data) — and
+`allowed_indexes` restricts a key to named indexes for every role.
 
 `--key-out` and `--hash-out` write the two files the rest of the design already expects, never
 overwritten: the key `0600`, and the digest `0640` in the group of its directory, so in the
@@ -351,9 +352,35 @@ key that opened it.
 `tools/list` advertises only the tools a caller could actually call, so an agent is never
 offered one that will be refused.
 
+### Keys for many users: `include` and provisioning
+
+A service that signs users up — a portal — does not edit files. It holds one `provisioner` key
+and mints and revokes keys over HTTP, for users and agents (`/_keys`, each key scoped by its own
+`allowed_indexes`) or for companies as tenants (`/_tenants`, with their own index scope and
+quotas). The node writes the keys, as digests, into a folder the config `include`s, and the key
+ring reloads at once, quotas keeping their usage count:
+
+```toml
+include = ["keys.d/*.toml"]            # key and tenant files beside this one
+
+[security.managed_files]
+dir = "keys.d"
+keys = "keys.toml"                     # users and agents with no tenant
+tenant = "{tenant}.toml"               # one file per tenant
+```
+
+```bash
+cameodb client --api-key-file portal.key keys create --role writer \
+  --label jane@company.com --indexes 'docs-*' --key-out jane.key
+```
+
+Files you write by hand are read too, and a change to any of them is picked up without a
+restart or a reload. See [Keys managed through the node](docs/CONFIGURATION.md#keys-managed-through-the-node-securitymanaged_files),
+the [API reference](docs/API_REFERENCE.md) and [Deployment](docs/DEPLOYMENT.md#keys-provisioned-through-the-node).
+On a cluster a change applies on the node that received it.
+
 Not yet: an MCP client presents its key as an HTTP header, so a client that cannot set one
-cannot authenticate. Keys are read at startup — adding or revoking one means add, migrate,
-remove, restart. Every MCP tool today is a read; the capability table denies by default, so
+cannot authenticate. Every MCP tool today is a read; the capability table denies by default, so
 a write tool added later fails closed until it is classified.
 
 ### Security profiles
