@@ -4782,7 +4782,7 @@ quotas swap live through `TenantLimits` with the usage reading kept (`cf876c7`);
 `allowed_indexes` bounds its keys and every scope takes `prefix-*` (`ff3a556`); a `notify`
 watcher on the include folders reloads on change, on every platform (`d816751`); `keys.d` in the
 DEB, RPM and MSI, with `ReadWritePaths` under systemd (`7da20b5`). Validated by
-`scripts/validate/provisioning.sh` on macOS; not yet on Linux (inotify) or the Windows MSI.
+`scripts/validate/provisioning.sh` on macOS and on Linux arm64 (musl binary in a container, inotify watcher); not yet on the Windows MSI.
 
 **Today.** Keys are `[[security.api_keys]]` in the one config file, a digest inline or behind
 `key_hash_file` (`auth.rs`). `KeyReloader::reload` re-reads that file on `POST /_admin/keys/reload`

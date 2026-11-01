@@ -4,6 +4,7 @@
 #   scripts/validate/all.sh                 # everything
 #   scripts/validate/all.sh posture tls     # named suites only
 #   scripts/validate/all.sh cluster         # opt-in: needs Docker, takes several minutes
+#   scripts/validate/all.sh provisioning-linux   # opt-in: a DEB install under systemd in Docker
 #
 # Requires a built binary (cargo build --release, or set CAMEODB_BIN).
 
@@ -14,7 +15,7 @@ source "$SCRIPT_DIR/lib.sh"
 
 ALL_SUITES=(deps unit posture auth provisioning tls remote-sources artifact)
 # Run only when named: they need more than a binary.
-OPT_IN_SUITES=(cluster)
+OPT_IN_SUITES=(cluster provisioning-linux)
 SUITES=("${@:-}")
 [ -z "${SUITES[0]:-}" ] && SUITES=("${ALL_SUITES[@]}")
 

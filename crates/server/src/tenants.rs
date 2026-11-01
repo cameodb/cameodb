@@ -622,8 +622,18 @@ fn write_atomically(path: &Path, content: &str) -> anyhow::Result<()> {
         .and_then(|name| name.to_str())
         .context("a key file has a name")?;
     let temp = dir.join(format!(".{name}.tmp"));
-    let mut file =
-        std::fs::File::create(&temp).with_context(|| format!("cannot write {}", temp.display()))?;
+    // Owner-only, like the key files `keygen` writes: the digests are not secrets, but nothing
+    // outside the service has a reason to read them.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options
+        .open(&temp)
+        .with_context(|| format!("cannot write {}", temp.display()))?;
+    // `mode` above applies only to a file it creates; a temp left by a crashed write keeps its own.
+    #[cfg(unix)]
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     file.write_all(content.as_bytes())?;
     file.sync_all()?;
     drop(file);
@@ -639,6 +649,21 @@ fn write_atomically(path: &Path, content: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_written_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys.toml");
+        // A leftover temp file from a crashed write, with looser permissions.
+        let leftover = dir.path().join(".keys.toml.tmp");
+        std::fs::write(&leftover, "x").unwrap();
+        std::fs::set_permissions(&leftover, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_atomically(&path, "a = 1\n").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
 
     struct Node {
         _dir: tempfile::TempDir,

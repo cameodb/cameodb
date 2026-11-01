@@ -142,7 +142,8 @@ JANE_ID="$(grep -o '"key_id": "[0-9a-f]*"' "$WORK/jane.about" | grep -o '[0-9a-f
 client "$WORK/portal.key" keys create --role reader --label agent:search \
     --indexes 'docs-public' --key-out "$WORK/agent.key" 2>/dev/null
 AGENT_KEY="$(cat "$WORK/agent.key" 2>/dev/null)"
-check_eq "--key-out writes the key owner-only" "600" "$(stat -f '%Lp' "$WORK/agent.key" 2>/dev/null || stat -c '%a' "$WORK/agent.key")"
+# GNU stat first: BSD `stat -f` means "filesystem status" to GNU and prints a paragraph.
+check_eq "--key-out writes the key owner-only" "600" "$(stat -c '%a' "$WORK/agent.key" 2>/dev/null || stat -f '%OLp' "$WORK/agent.key")"
 
 check_eq "jane writes under docs-*"      "200" "$(write_doc "$JANE_KEY" docs-public 1 hello)"
 check_eq "jane is refused outside it"    "403" "$(write_doc "$JANE_KEY" wiki 1 x)"

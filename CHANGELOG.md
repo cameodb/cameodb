@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for companies as tenants. The node writes the keys to files named by
   `[security.managed_files]` (`dir`, `keys`, `tenant`), reloads them at once, and undoes a change
   its own loader refuses; the key itself appears only in the minting response, the file holds
-  its digest. Changes carry a `revision`, checked with `If-Match` (`412`). `allowed_tenants`
+  its digest, in a file only the service can read (0600). Changes carry a `revision`, checked with `If-Match` (`412`). `allowed_tenants`
   bounds a provisioner to some tenants. Outside `/_admin`, so the routes are mounted under the
   `external` profile. On a cluster a change applies on the node that received it.
 - **`include`: key and tenant files beside the config.** `include = ["keys.d/*.toml"]` adds
