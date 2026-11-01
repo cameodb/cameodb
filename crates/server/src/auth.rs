@@ -313,6 +313,29 @@ pub struct TenantQuota {
     pub max_bytes: u64,
 }
 
+/// The `[provisioning]` table of a key file the node wrote for one tenant.
+///
+/// What tells a file the node manages from one an operator wrote: the node rewrites only a
+/// file carrying it. `revision` rises by one with every change to the tenant, and with
+/// `written_by` it is also what a cluster orders two versions of a tenant by.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProvisioningStamp {
+    pub revision: u64,
+    /// The id of the node that made the change.
+    pub written_by: String,
+    /// RFC 3339.
+    pub written_at: String,
+}
+
+/// Where a `[security.tenants.<name>]` table was defined.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TenantSource {
+    pub file: PathBuf,
+    /// Set when the file is one the node wrote; `None` for one an operator wrote.
+    pub provisioning: Option<ProvisioningStamp>,
+}
+
 /// `[security]` — authentication for the HTTP and MCP surface.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -346,6 +369,11 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub tenants: std::collections::HashMap<String, TenantQuota>,
 
+    /// Which file defined each tenant, filled by the loader: the main config file, or the
+    /// included file that added it. Empty for a config with no file behind it.
+    #[serde(skip)]
+    pub tenant_sources: std::collections::HashMap<String, TenantSource>,
+
     /// The single key assembled from `--api-key-hash` and `--api-key-role`.
     ///
     /// Not part of the file format, which is why it is skipped rather than folded into
@@ -378,6 +406,7 @@ impl Default for SecurityConfig {
             implicit_index_creation: true,
             api_keys: Vec::new(),
             tenants: std::collections::HashMap::new(),
+            tenant_sources: std::collections::HashMap::new(),
             override_key: None,
             limits: crate::ratelimit::McpLimitsConfig::default(),
             audit: crate::audit::AuditConfig::default(),
@@ -443,6 +472,11 @@ pub struct ApiKeyConfig {
     /// Omitted means this key belongs to no tenant and spends against no budget — which is the
     /// default, and what every key on an upgraded node reads as.
     pub tenant: Option<String>,
+
+    /// The included file this entry came from, set by the loader; `None` for the main file
+    /// and the command-line key. Not part of the file format.
+    #[serde(skip)]
+    pub source: Option<PathBuf>,
 }
 
 impl SecurityConfig {
@@ -464,17 +498,26 @@ impl SecurityConfig {
     /// Entries are resolved even when `enabled = false`. A broken key file should be found
     /// by whoever writes it, not by whoever later flips the switch.
     pub fn load_keyring(&self) -> Result<KeyRing> {
-        let file_entries = self
-            .api_keys
-            .iter()
-            .enumerate()
-            .map(|(i, entry)| (format!("[[security.api_keys]] entry {}", i + 1), entry));
+        // Numbered within the file each entry came from, so "entry 2" is the second entry
+        // in the file the message names.
+        let mut per_file: std::collections::HashMap<Option<&Path>, usize> =
+            std::collections::HashMap::new();
+        let file_entries = self.api_keys.iter().map(move |entry| {
+            let n = per_file.entry(entry.source.as_deref()).or_default();
+            *n += 1;
+            let origin = match &entry.source {
+                Some(file) => format!("{}: [[security.api_keys]] entry {n}", file.display()),
+                None => format!("[[security.api_keys]] entry {n}"),
+            };
+            (origin, entry)
+        });
         let override_entry = self
             .override_key
             .iter()
             .map(|entry| ("--api-key-hash / CAMEODB_API_KEY_HASH".to_string(), entry));
 
         let mut resolved: Vec<Arc<KeyEntry>> = Vec::new();
+        let mut origins: Vec<String> = Vec::new();
         for (origin, entry) in file_entries.chain(override_entry) {
             // Name the entry the way the operator wrote it: an error that says "label
             // 'team-a'" is actionable, an error that says "index 2" sends them counting.
@@ -572,12 +615,14 @@ impl SecurityConfig {
 
             // Two entries with one digest is a config that cannot mean what it says: the
             // same key would map to two roles, decided by ordering.
-            if let Some(existing) = resolved.iter().find(|k| k.digest == digest) {
+            if let Some(at) = resolved.iter().position(|k| k.digest == digest) {
+                let existing = &resolved[at];
                 bail!(
-                    "{origin}: this key hash is already configured as '{}' (key_id {}). One key \
-                     cannot hold two roles",
+                    "{origin}: this key hash is already configured as '{}' (key_id {}) by {}. \
+                     One key cannot hold two roles",
                     existing.label,
-                    existing.key_id()
+                    existing.key_id(),
+                    origins[at]
                 );
             }
 
@@ -606,6 +651,7 @@ impl SecurityConfig {
                 index_overrides,
                 tenant,
             }));
+            origins.push(origin);
         }
 
         Ok(KeyRing {
@@ -2023,6 +2069,7 @@ mod tests {
             allowed_indexes: None,
             index_overrides: None,
             tenant: None,
+            source: None,
         }
     }
 }

@@ -1179,6 +1179,7 @@ mod tests {
             key_hash_file: None,
             index_overrides: None,
             tenant: None,
+            source: None,
         };
         (key, config)
     }

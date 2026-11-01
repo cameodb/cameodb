@@ -29,6 +29,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 use tracing::{info, warn};
 
+mod include;
 mod overrides;
 
 /// Where [`CameoDbConfig::resolve_config_path`] looks when neither `--config` nor
@@ -86,6 +87,11 @@ pub enum ConfigError {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CameoDbConfig {
+    /// Files of keys and tenants to add to `[security]`, relative to this file's folder: a
+    /// path, or a `*` in the file name (`keys.d/*.toml`). See `config/include.rs`. First, so
+    /// a sample config serializes it above every table, where TOML requires it.
+    pub include: Vec<String>,
+
     /// Node-level configuration (sharding, identity)
     pub node: NodeConfig,
 
@@ -992,8 +998,10 @@ impl CameoDbConfig {
         let content = fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
         info!("📄 Loading configuration from: {}", path.display());
-        Self::parse_config_content(&content, &path.to_string_lossy())
-            .with_context(|| format!("Failed to parse config file: {}", path.display()))
+        let mut config = Self::parse_config_content(&content, &path.to_string_lossy())
+            .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+        config.apply_includes(path)?;
+        Ok(config)
     }
 
     /// Load configuration from a YAML or TOML file.
