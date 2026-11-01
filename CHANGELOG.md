@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from its next request on. The list is required and replaces the old one: a key is never
   widened to every index this way. `client keys set-indexes` and the SDK's `update_key_indexes`
   do the same.
+- **A provisioner grants only its own indexes.** A `provisioner` key with `allowed_indexes`
+  mints and changes keys, and scopes tenants, only within that list (`403` otherwise); a key
+  with no list, which would reach every index, is refused to it. Without the list it grants any
+  index, as before.
 - **`include`: key and tenant files beside the config.** `include = ["keys.d/*.toml"]` adds
   `[[security.api_keys]]` entries and `[security.tenants.<name>]` tables from other files,
   relative to the config file's folder; anything else in them is refused, and a tenant or key

@@ -314,7 +314,9 @@ cameodb client --api-key-file portal.key keys revoke 6eb82d35
 The portal's key is the operator's: it lives in `keys/` or `cameodb.toml`, which the node
 cannot write, and the API mints only `writer` and `reader` keys, so a portal can never mint
 itself an admin or another provisioner. Rotate it like any key. `allowed_tenants` on it bounds
-it to some tenants.
+it to some tenants; `allowed_indexes` on it bounds what it grants — every key it mints or
+changes, and every tenant scope it sets, must lie within that list, so a portal for one product
+cannot hand out keys to another's indexes.
 
 **Give every key the portal mints an `allowed_indexes` list.** A key without one reaches every
 index — beside tenants, every tenant's too, since a tenant's scope bounds its own keys and

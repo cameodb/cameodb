@@ -33,9 +33,12 @@ mkdir -p "$WORK/keys" "$WORK/keys.d" "$WORK/data"
     --hash-out "$WORK/keys/portal" --key-out "$WORK/portal.key" 2>/dev/null
 "$BIN" keygen --role provisioner --label partner \
     --hash-out "$WORK/keys/partner" --key-out "$WORK/partner.key" 2>/dev/null
+"$BIN" keygen --role provisioner --label product \
+    --hash-out "$WORK/keys/product" --key-out "$WORK/product.key" 2>/dev/null
 ADMIN_KEY="$(cat "$WORK/ops.key")"
 PORTAL_KEY="$(cat "$WORK/portal.key")"
 PARTNER_KEY="$(cat "$WORK/partner.key")"
+PRODUCT_KEY="$(cat "$WORK/product.key")"
 
 # A users file written by hand, as a deployment without the API would keep one.
 HAND_KEY="$("$BIN" keygen --role reader --label hand@company.com 2>"$WORK/hand.stanza")"
@@ -88,6 +91,12 @@ key_hash_file = "$WORK/keys/partner"
 role = "provisioner"
 label = "partner"
 allowed_tenants = ["partner-x-*"]
+
+[[security.api_keys]]
+key_hash_file = "$WORK/keys/product"
+role = "provisioner"
+label = "product"
+allowed_indexes = ["docs-*"]
 EOF
 
 start_node() {
@@ -212,6 +221,20 @@ check_eq "an empty list is refused"           "400" "$(code "$PORTAL_KEY" -X PAT
 check_eq "an unknown key is not found"        "404" "$(code "$PORTAL_KEY" -X PATCH "$BASE/_keys/00000000" -H "$json" -d '{"allowed_indexes":["wiki"]}')"
 check_eq "a data key changes no key"          "403" "$(code "$JANE_KEY" -X PATCH "$BASE/_keys/$JANE_ID" -H "$json" -d '{"allowed_indexes":["wiki"]}')"
 check_eq "a partner changes no tenant-less key" "403" "$(code "$PARTNER_KEY" -X PATCH "$BASE/_keys/$JANE_ID" -H "$json" -d '{"allowed_indexes":["wiki"]}')"
+
+section "a provisioner with allowed_indexes grants only within them"
+PRODUCT_MINT="$(body "$PRODUCT_KEY" -X POST "$BASE/_keys" -H "$json" -d '{"role":"reader","label":"ann@company.com","allowed_indexes":["docs-public"]}')"
+ANN_KEY="$(printf '%s' "$PRODUCT_MINT" | field key)"
+ANN_ID="$(printf '%s' "$PRODUCT_MINT" | field key_id)"
+check_eq "a key within docs-* is minted"      "200" "$(search "$ANN_KEY" docs-public)"
+check_eq "a key reaching wiki is refused"     "403" "$(code "$PRODUCT_KEY" -X POST "$BASE/_keys" -H "$json" -d '{"role":"reader","allowed_indexes":["docs-public","wiki"]}')"
+check_eq "a key with no list is refused"      "403" "$(code "$PRODUCT_KEY" -X POST "$BASE/_keys" -H "$json" -d '{"role":"reader"}')"
+check_eq "PATCH within docs-* is taken"       "200" "$(code "$PRODUCT_KEY" -X PATCH "$BASE/_keys/$ANN_ID" -H "$json" -d '{"allowed_indexes":["docs-*"]}')"
+check_eq "PATCH out to wiki is refused"       "403" "$(code "$PRODUCT_KEY" -X PATCH "$BASE/_keys/$ANN_ID" -H "$json" -d '{"allowed_indexes":["wiki"]}')"
+check_eq "a tenant outside docs-* is refused" "403" "$(code "$PRODUCT_KEY" -X PUT "$BASE/_tenants/beta" -H "$json" -d '{}')"
+check_eq "a tenant within docs-* is created"  "200" "$(code "$PRODUCT_KEY" -X PUT "$BASE/_tenants/beta" -H "$json" -d '{"allowed_indexes":["docs-beta-*"]}')"
+check_eq "its key, scoped by the tenant, is minted" "201" "$(code "$PRODUCT_KEY" -X POST "$BASE/_tenants/beta/keys" -H "$json" -d '{"role":"reader"}')"
+check_eq "a key in acme, beyond docs-*, is refused" "403" "$(code "$PRODUCT_KEY" -X POST "$BASE/_tenants/acme/keys" -H "$json" -d '{"role":"reader"}')"
 
 section "revocation"
 client "$WORK/portal.key" keys revoke "$JANE_ID" >/dev/null 2>&1

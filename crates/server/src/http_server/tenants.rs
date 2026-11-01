@@ -3,7 +3,8 @@
 //! The handlers decide who may ask; [`crate::tenants::TenantStore`] decides what the files
 //! become. The route table already required `key-manage`; here a caller is held to its
 //! `allowed_tenants`, and a caller bounded by it to its tenants — never the keys file — and to
-//! index scopes under its tenants' own names.
+//! index scopes under its tenants' own names. A caller with its own `allowed_indexes` grants
+//! no index outside them, to a key or to a tenant.
 
 use axum::{
     Extension, Json,
@@ -67,6 +68,15 @@ pub(super) async fn put_tenant_handler(
              scopes a tenant to indexes named after it"
         )));
     }
+    // A new tenant with no list is scoped to `{tenant}-*`; an update without one keeps its own.
+    let scope = match &spec.allowed_indexes {
+        Some(list) => Some(list.clone()),
+        None if state.tenants.get(&tenant).is_err() => Some(vec![format!("{tenant}-*")]),
+        None => None,
+    };
+    if let Some(scope) = scope {
+        check_grant(authz.as_deref(), Some(&scope))?;
+    }
     let view = state
         .tenants
         .put_tenant(&tenant, spec, if_match(&headers)?)
@@ -118,6 +128,18 @@ pub(super) async fn create_tenant_key_handler(
     Json(spec): Json<KeySpec>,
 ) -> Result<Response, AppError> {
     check_tenant(authz.as_deref(), &tenant)?;
+    // A key with no list of its own reaches what its tenant does.
+    match &spec.allowed_indexes {
+        Some(list) => check_grant(authz.as_deref(), Some(list))?,
+        None => {
+            let tenant_scope = state
+                .tenants
+                .get(&tenant)
+                .map_err(to_app_error)?
+                .allowed_indexes;
+            check_grant(authz.as_deref(), tenant_scope.as_deref())?;
+        }
+    }
     let minted = state
         .tenants
         .create_tenant_key(&tenant, spec, if_match(&headers)?)
@@ -170,6 +192,7 @@ pub(super) async fn create_key_handler(
     Json(spec): Json<KeySpec>,
 ) -> Result<Response, AppError> {
     check_unbounded(authz.as_deref())?;
+    check_grant(authz.as_deref(), spec.allowed_indexes.as_deref())?;
     let minted = state
         .tenants
         .create_key(spec, if_match(&headers)?)
@@ -194,6 +217,7 @@ pub(super) async fn update_key_handler(
     Json(patch): Json<KeyPatch>,
 ) -> Result<Response, AppError> {
     check_unbounded(authz.as_deref())?;
+    check_grant(authz.as_deref(), Some(&patch.allowed_indexes))?;
     let view = state
         .tenants
         .update_key(&key_id, patch, if_match(&headers)?)
@@ -234,6 +258,22 @@ fn check_unbounded(authz: Option<&Authz>) -> Result<(), AppError> {
             "this key manages only its allowed_tenants; keys with no tenant are outside them",
         )),
         _ => Ok(()),
+    }
+}
+
+/// A caller with its own `allowed_indexes` grants only indexes within them: a portal scoped
+/// to its product's indexes cannot hand out keys to every other index on the node.
+fn check_grant(authz: Option<&Authz>, grant: Option<&[String]>) -> Result<(), AppError> {
+    let Some(Authz::Key(entry)) = authz else {
+        return Ok(());
+    };
+    match entry.grant_outside(grant) {
+        Some(outside) => Err(AppError::forbidden(format!(
+            "this key grants only indexes within its own allowed_indexes ({}); {outside} is \
+             outside them",
+            entry.scope_summary()
+        ))),
+        None => Ok(()),
     }
 }
 
@@ -419,5 +459,54 @@ mod tests {
             Some(StatusCode::FORBIDDEN)
         );
         assert!(check_unbounded(None).is_ok());
+    }
+
+    #[test]
+    fn a_caller_grants_only_within_its_own_indexes() {
+        let key = |indexes: Option<Vec<String>>| {
+            let ring = crate::auth::SecurityConfig {
+                enabled: true,
+                api_keys: vec![crate::auth::ApiKeyConfig {
+                    key_hash: Some(
+                        crate::auth::ApiKey::generate()
+                            .unwrap()
+                            .digest()
+                            .to_config_value(),
+                    ),
+                    role: Some(crate::auth::Role::Provisioner),
+                    allowed_indexes: indexes,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+            .load_keyring()
+            .unwrap();
+            Authz::Key(std::sync::Arc::clone(&ring.entries()[0]))
+        };
+        let list = |items: &[&str]| items.iter().map(|i| i.to_string()).collect::<Vec<_>>();
+        let portal = key(Some(list(&["docs-*", "wiki"])));
+        for inside in [&["docs-*"][..], &["docs-2026", "wiki"], &["docs-a-*"]] {
+            assert!(
+                check_grant(Some(&portal), Some(&list(inside))).is_ok(),
+                "{inside:?}"
+            );
+        }
+        for outside in [&["wiki", "audit"][..], &["d*"], &["wiki-*"]] {
+            assert_eq!(
+                check_grant(Some(&portal), Some(&list(outside)))
+                    .unwrap_err()
+                    .status,
+                Some(StatusCode::FORBIDDEN),
+                "{outside:?}"
+            );
+        }
+        // No list is every index, which a scoped caller does not have to give.
+        assert!(check_grant(Some(&portal), None).is_err());
+
+        // Unscoped, or with authentication off, anything goes.
+        let unscoped = key(None);
+        assert!(check_grant(Some(&unscoped), None).is_ok());
+        assert!(check_grant(Some(&unscoped), Some(&list(&["audit"]))).is_ok());
+        assert!(check_grant(None, None).is_ok());
     }
 }

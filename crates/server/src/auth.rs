@@ -1202,6 +1202,25 @@ impl KeyEntry {
             .is_none_or(|scope| scope.allows(tenant))
     }
 
+    /// What of `grant` lies outside this key's own scope, when this key — a provisioner —
+    /// would hand `grant` to another key or a tenant. `None` is no list: every index. A
+    /// key with no scope may grant anything; a list that does not parse is the store's to
+    /// refuse, with its own reason.
+    pub fn grant_outside(&self, grant: Option<&[String]>) -> Option<String> {
+        if !self.is_index_scoped() {
+            return None;
+        }
+        let Some(list) = grant else {
+            return Some("every index".to_string());
+        };
+        let grant = IndexScope::parse(list).ok()?;
+        [&self.allowed_indexes, &self.tenant_scope]
+            .into_iter()
+            .flatten()
+            .find_map(|own| own.first_outside(&grant))
+            .map(|pattern| format!("'{pattern}'"))
+    }
+
     /// True when this key may manage only some tenants.
     pub fn is_tenant_scoped(&self) -> bool {
         self.allowed_tenants.is_some()
