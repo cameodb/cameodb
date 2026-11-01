@@ -532,6 +532,11 @@ pub struct SecurityConfig {
     #[serde(skip)]
     pub tenant_sources: std::collections::HashMap<String, TenantSource>,
 
+    /// The folders `include` reads from, filled by the loader: what the key watcher watches,
+    /// so a file added, changed or removed there reloads the ring.
+    #[serde(skip)]
+    pub include_folders: Vec<PathBuf>,
+
     /// The single key assembled from `--api-key-hash` and `--api-key-role`.
     ///
     /// Not part of the file format, which is why it is skipped rather than folded into
@@ -565,6 +570,7 @@ impl Default for SecurityConfig {
             api_keys: Vec::new(),
             tenants: std::collections::HashMap::new(),
             tenant_sources: std::collections::HashMap::new(),
+            include_folders: Vec::new(),
             override_key: None,
             limits: crate::ratelimit::McpLimitsConfig::default(),
             audit: crate::audit::AuditConfig::default(),
@@ -1186,6 +1192,8 @@ pub struct KeyReloader {
     startup: SecurityConfig,
     /// The tenant quotas, swapped by every reload; the node holds the same handle.
     tenant_limits: TenantLimits,
+    /// The include folders as of the last successful load, for the key watcher.
+    include_folders: arc_swap::ArcSwap<Vec<PathBuf>>,
 }
 
 impl KeyReloader {
@@ -1202,8 +1210,14 @@ impl KeyReloader {
             cli,
             source,
             tenant_limits: TenantLimits::new(security.tenants.clone()),
+            include_folders: arc_swap::ArcSwap::from_pointee(security.include_folders.clone()),
             startup: security,
         })
+    }
+
+    /// The folders the config's `include` reads from, as of the last successful load.
+    pub fn include_folders(&self) -> Arc<Vec<PathBuf>> {
+        self.include_folders.load_full()
     }
 
     /// The tenant quotas this reloader swaps, for the node to enforce.
@@ -1260,6 +1274,8 @@ impl KeyReloader {
         let tenants_changed = *self.tenant_limits.load() != security.tenants;
         let tenant_count = security.tenants.len();
         self.tenant_limits.store(security.tenants);
+        self.include_folders
+            .store(Arc::new(security.include_folders));
 
         let was_enabled = self.ring.load().enabled();
         self.ring.store(Arc::new(ring));
@@ -1322,6 +1338,7 @@ impl KeyReloader {
             source: None,
             startup: SecurityConfig::default(),
             tenant_limits: TenantLimits::default(),
+            include_folders: arc_swap::ArcSwap::from_pointee(Vec::new()),
         })
     }
 

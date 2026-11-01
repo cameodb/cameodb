@@ -76,6 +76,16 @@ impl CameoDbConfig {
                 resolve_pattern(base, pattern)
                     .with_context(|| format!("{}: include '{pattern}'", config_path.display()))?,
             );
+            // The folder, not the file: an editor saves by renaming over the old file, and a
+            // mounted secret is swapped through a symlink, and both are events on the folder.
+            let folder = base
+                .join(pattern)
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| base.to_path_buf());
+            if !self.security.include_folders.contains(&folder) {
+                self.security.include_folders.push(folder);
+            }
         }
 
         let mut seen = std::collections::HashSet::new();

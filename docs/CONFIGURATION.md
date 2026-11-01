@@ -1297,6 +1297,50 @@ If the node runs as its own user, `chown` any `key_hash_file` to it: the file is
 startup. CameoDB warns if a `key_hash_file` is writable by group or others — a digest is not
 secret, but a writable one lets anyone mint themselves a role.
 
+### Key and tenant files (`include`)
+
+Keys and tenants can live in files of their own beside `cameodb.toml` — one per tenant, say —
+named by `include` at the top of the main file:
+
+```toml
+include = ["keys.d/*.toml"]      # relative to this file's folder
+
+[security]
+enabled = true
+```
+
+```toml
+# keys.d/acme.toml
+[security.tenants.acme]
+max_indexes = 20
+allowed_indexes = ["acme-*"]
+
+[[security.api_keys]]
+key_hash = "sha256:…"
+role = "writer"
+label = "ingest@acme.com"
+tenant = "acme"
+```
+
+A path is relative to the folder of the config file, not the working directory, so the same
+line reads `/etc/cameodb/keys.d` under the Linux packages and `C:\ProgramData\CameoDB\keys.d`
+under the MSI. `*` is accepted in the file name only; a wildcard may match nothing (an empty
+folder is fine), never matches a name starting with a dot, and files are read in name order. A
+literal path that does not exist, or a missing folder, refuses the config.
+
+An included file **adds** keys and tenants and can do nothing else: `[[security.api_keys]]`,
+`[security.tenants.<name>]` and the `[provisioning]` table a node-written file carries are
+accepted, and any other setting — a port, the profile, `[security] enabled` — is refused,
+naming the file. So is an unknown field on a key entry, which in the main file is only a
+warning. Nothing overrides anything: a tenant defined in two files, or a key hash in two, is
+refused naming both.
+
+**A change to an included file reloads the key ring by itself.** The node watches the include
+folders and runs the same reload SIGHUP does, a quarter of a second after the last change, on
+every platform — on Windows, the only reload besides the endpoint. A file that does not load is
+logged and the ring in use stays in use. Write a file to a temporary name starting with a dot
+and rename it into place, so the watcher never reads it half-written.
+
 ### Rotation
 
 Keys are read at startup, and re-read on demand: `POST /_admin/keys/reload` (a `node-admin`

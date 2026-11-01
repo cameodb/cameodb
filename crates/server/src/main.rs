@@ -20,6 +20,7 @@ mod compact;
 mod config;
 mod distributed;
 mod http_server;
+mod key_watch;
 mod logging;
 mod mcp;
 mod node;
@@ -813,6 +814,10 @@ async fn run(args: Vec<String>) -> Result<()> {
             }
         });
     }
+
+    // An included key or tenant file changed on disk reloads the ring without a signal — on
+    // every platform, which on Windows is the only reload there is besides the endpoint.
+    key_watch::spawn(Arc::clone(&keyring));
 
     // Extract HTTP configuration
     let http_config = &cameodb_config.network.http;
