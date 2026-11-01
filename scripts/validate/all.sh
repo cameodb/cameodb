@@ -12,7 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
-ALL_SUITES=(deps unit posture auth tls remote-sources artifact)
+ALL_SUITES=(deps unit posture auth provisioning tls remote-sources artifact)
 # Run only when named: they need more than a binary.
 OPT_IN_SUITES=(cluster)
 SUITES=("${@:-}")

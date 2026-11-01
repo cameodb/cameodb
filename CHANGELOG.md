@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Keys minted and revoked through the node.** A `provisioner` key — a new role holding the new
+  `key-manage` capability and nothing else — mints `writer` and `reader` keys over HTTP and
+  revokes them: `POST /_keys`, `GET /_keys`, `DELETE /_keys/{key_id}` for users and agents with
+  no tenant, each scoped by its own `allowed_indexes`, and `/_tenants/{tenant}` and its `keys`
+  for companies as tenants. The node writes the keys to files named by
+  `[security.managed_files]` (`dir`, `keys`, `tenant`), reloads them at once, and undoes a change
+  its own loader refuses; the key itself appears only in the minting response, the file holds
+  its digest. Changes carry a `revision`, checked with `If-Match` (`412`). `allowed_tenants`
+  bounds a provisioner to some tenants. Outside `/_admin`, so the routes are mounted under the
+  `external` profile. On a cluster a change applies on the node that received it.
+- **`include`: key and tenant files beside the config.** `include = ["keys.d/*.toml"]` adds
+  `[[security.api_keys]]` entries and `[security.tenants.<name>]` tables from other files,
+  relative to the config file's folder; anything else in them is refused, and a tenant or key
+  hash defined twice is refused naming both files. A change to an included file reloads the key
+  ring by itself — on Windows, the first reload besides the endpoint. The DEB, RPM and MSI create
+  `keys.d` writable by the service; under systemd, `ReadWritePaths` opens that one folder.
+- **A tenant can scope its keys.** `allowed_indexes` on `[security.tenants.<name>]` bounds every
+  key of that tenant; a key's own list narrows within it. A key list reaching past its tenant,
+  and two tenants' overlapping scopes, are refused at startup. Tenants stay opt-in: a key with no
+  tenant is scoped by its own list as before.
+- **`client keys` and `client tenants`.** The bundled client mints, lists and revokes keys and
+  manages tenants; a minted key goes alone to stdout, or with `--key-out` to a new 0600 file. The
+  SDK has the same calls, the minted key held as a redacted `Credential`.
+- **`allowed_indexes` takes prefixes.** `["logs-*", "audit"]` reaches `logs-2026` and `audit`; an
+  index created later under the prefix needs no new key. A bare `*` is refused.
+
 - **Ghost fields: one stored text, a column per analyzer.** A text field declared with
   `"ghost": {"source": "text", "when": {"field": "lang", "in": ["en"]}}` is a search column filled
   from `text` for the documents whose `lang` is one of the listed values, analysed by its own
@@ -43,6 +69,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finds `Häuser`; `de_stem` already finds `Hauser`. The plain analyzers are unchanged.
 
 ### Changed
+
+- **Tenant quotas reload live.** A changed `[security.tenants.*]` takes effect on SIGHUP,
+  `POST /_admin/keys/reload` or a changed included file, checked against the usage already
+  measured; it was reported as not applied until a restart.
+- **`GET /_indexes` names each index's owning tenant** (`"tenant"`), absent for an unowned one.
+- **A 404 says what is missing.** A missing tenant or key answers `"code": "tenant_not_found"` or
+  `"key_not_found"`; an index still answers `"index_not_found"`.
 
 - **`it_stem` and `it_stem_fold` bring together forms Snowball left apart.** A word of four
   letters or more that the stemmer left whole loses its final vowel as a longer word does, so

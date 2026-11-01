@@ -93,6 +93,14 @@ enabled = false
 # to be created with PUT /api/{index}/_config, which needs index-admin.
 # implicit_index_creation = false
 
+# Keys minted and revoked through the node, by a service holding a role = "provisioner" key:
+# users and agents through /_keys, tenants through /_tenants. The node writes them to these
+# files, which `include` at the top of this file must read back.
+# [security.managed_files]
+# dir = "keys.d"
+# keys = "keys.toml"                    # keys with no tenant; give each one allowed_indexes
+# tenant = "{tenant}.toml"              # one file per tenant, when tenants are used
+
 # This node is reachable off-box — profile = "internal" with a non-loopback bind — so with
 # authentication off every route, including /_admin/*, is open to anyone who can reach the
 # port. The node starts and warns; `cameodb check-config` exits non-zero, so a deploy step
@@ -103,7 +111,7 @@ enabled = false
 
 # [[security.api_keys]]
 # key_hash = "sha256:…"                 # or: key_hash_file = "/etc/cameodb/keys/ops"
-# role = "admin"                        # admin | writer | reader
+# role = "admin"                        # admin | writer | reader | provisioner
 # label = "ops-team"                    # audit identity in logs; not a secret
 #
 # [[security.api_keys]]
