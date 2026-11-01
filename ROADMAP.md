@@ -70,7 +70,7 @@ on one.
 | O — Post-0.3.6 review: the next-iteration base | ◐ Partial | O1 (the `wal_sync=false` durability barrier) and O2 (deadlines on every remote ask) done 2026-10-15. Left: O3, shard-map merges on a per-owner epoch (the prerequisite N15 does not name, and since 2026-10-18 the one [OB27](#ob27--a-replaced-node-never-leaves-the-cluster)'s `forget` needs), and O4, the request budget on the wire. O5 folds Rust-surface items into N16/N17; O6 reconciles the architecture doc |
 | P — Post-0.3.7 features | ◐ Partial | P1, a cap on how many elements of each array a search hit carries — a node default, a node maximum, and `array N` per request — done 2026-10-19. P2, one declaration of an index's default fields — `searched_by_default` dropped, the `--id` reload keeps the list — done 2026-10-20. P3, a schema read is a schema write — `PUT` takes a `GET`, which now reports every property the thumbprint covers — done 2026-10-21. P4, ip fields queried the way addresses are — CIDR, bare addresses, IPv4-bounded ranges, a fast ip sort — done 2026-10-21. Left: P5, native json fields — paths, typed values and ranges, planned; P6, a hit says which array elements matched, planned |
 | Q — Post-0.3.8 features | ✅ Done | Q1, ghost fields — a column filled from another field of the stored body, for every document or under an `in` / `not_in` condition, never stored — done 2026-10-27. Q2, the Croatian analyzers read Serbian Cyrillic — done 2026-10-27 |
-| R — Key and tenant provisioning | 📋 Planned | Single node planned: included key and tenant files reloaded on change, live tenant quotas (R1); a `key-manage` capability and a `/_tenants` API the node writes the files through (R2). R3, every change broadcast to every node, deferred until cluster support is decided |
+| R — Key and tenant provisioning | ◐ Partial | R1 and R2 done 2026-11-01, single node: included key and tenant files reloaded on change, live tenant quotas and scopes; a provisioner minting and revoking keys through `/_keys` (no tenant) and `/_tenants`, with the client, SDK and a live suite. Left: R3, every change broadcast to every node, deferred until cluster support is decided |
 
 ## Reconciliation, 2026-08-26
 
@@ -261,8 +261,8 @@ first written down here, so the chronology stays visible under the cost ordering
 | [P6](#p6--a-hit-says-which-array-elements-matched) | A hit says which array elements matched — `_matched_elements` beside `_truncated_arrays`, a per-field matcher from the screened AST applied in the fetch phase before the cap, `matches N` per request; priority not yet decided | — | 2026-10-21 | 📋 |
 | [Q1](docs/ROADMAP-ARCHIVE.md#q1--ghost-fields-index-columns-derived-from-another-field-under-a-condition) | Ghost fields — an index column derived from another field's value, for every document or under an `in` / `not_in` condition on a discriminator field, indexed in Tantivy and never stored in redb; one copy of the text in redb instead of one per analyzer — about 38% less disk on a multilingual sample | — | 2026-10-26 | ✅ |
 | [Q2](docs/ROADMAP-ARCHIVE.md#q2--the-croatian-analyzers-read-serbian-cyrillic) | The Croatian analyzers read Serbian Cyrillic — a word in Serbian Cyrillic is mapped to Latin inside `hr_stem` and `hr_stem_fold`, per token; a field already holding Cyrillic text is reloaded | — | 2026-10-26 | ✅ |
-| [R1](#r1--included-key-and-tenant-files-reloaded-when-they-change) | Included key and tenant files, reloaded when they change — `include` adds keys and tenants only, a watcher reloads, tenant quotas swap live with usage kept, a tenant scopes its keys' indexes | — | 2026-11-01 | 📋 |
-| [R2](#r2--the-key-manage-capability-and-the-tenant-api) | The `key-manage` capability and the tenant API — a `provisioner` role, `/_tenants` routes outside `/_admin`, the node generates keys and writes the tenant's file | — | 2026-11-01 | 📋 |
+| [R1](docs/ROADMAP-ARCHIVE.md#r1--included-key-and-tenant-files-reloaded-when-they-change) | Included key and tenant files, reloaded when they change — `include` adds keys and tenants only, a watcher reloads, tenant quotas swap live with usage kept, a tenant scopes its keys' indexes | — | 2026-11-01 | ✅ |
+| [R2](docs/ROADMAP-ARCHIVE.md#r2--the-key-manage-capability-and-the-tenant-api) | The `key-manage` capability and the tenant API — a `provisioner` role, `/_keys` for keys with no tenant and `/_tenants` outside `/_admin`, the node generating keys and writing their files; client, SDK and a live suite | — | 2026-11-01 | ✅ |
 | [R3](#r3--changes-reach-every-node) | Changes reach every node — whole tenant file and revision broadcast, catch-up on reconnect, the response names nodes that did not apply it — deferred until cluster support for provisioning is decided | — | 2026-11-01 | 💭 |
 
 ---
@@ -2909,14 +2909,14 @@ with matches, a projected-away field reporting nothing, the coordinator's re-cap
 
 ---
 
-## R. Key and tenant provisioning 📋 Planned
+## R. Key and tenant provisioning ◐ Partial
 
 Opened 2026-11-01. A provisioning service — a portal that signs up companies, their users and their
 agents — creates tenants and keys on a running node and revokes them, without editing
 `cameodb.toml` and without a restart. Scoped against the code at `192d157`.
 
-R1 and R2 are everything a single node needs, and are the plan. R3, the same for a cluster, is
-deferred until cluster support for provisioning is decided.
+R1 and R2 — everything a single node needs — are done and archived. R3, the same for a cluster,
+is deferred until cluster support for provisioning is decided.
 
 **Decided** (2026-11-01):
 
@@ -2967,146 +2967,8 @@ alongside and included: ClickHouse's `users.xml`/`users.d` with `CREATE USER` wr
 Redis's `aclfile` with `ACL SETUSER` and `ACL SAVE`; Elasticsearch's file realm beside API keys in a
 system index.
 
-### R1 — Included key and tenant files, reloaded when they change
-
-📋 **Planned.** ~3 days. Prerequisite of R2.
-
-**Today.** Keys are `[[security.api_keys]]` in the one config file, a digest inline or behind
-`key_hash_file` (`auth.rs`). `KeyReloader::reload` re-reads that file on `POST /_admin/keys/reload`
-or SIGHUP and swaps the ring. A changed `[security.tenants]` is reported as not applied until a
-restart: `TenantQuotas` (`node/quota.rs`) holds its limits in a plain `HashMap` built once in
-`orchestrator.rs`. Windows has no SIGHUP, so a reload there is HTTP-only.
-
-**Design.**
-
-- *Config.* `include = ["keys.d/*.toml"]`, relative to the config file's folder — so
-  `/etc/cameodb/keys.d` under the Linux packages and `C:\ProgramData\CameoDB\keys.d` under the MSI,
-  with no per-OS default. Globs; files read in sorted order; dotfiles and `*.tmp` skipped, so a file
-  being written is never read half-done.
-- *Merge.* Add, never override. Keys append; a tenant table is added. A digest or tenant name
-  defined twice — across files, or between a file and `cameodb.toml` — is refused, naming both
-  files. Any other key in an included file is refused, naming it — except R2's `[provisioning]`
-  table, which R1 parses and keeps with the tenant so the format is fixed before the API writes it.
-- *Strictness.* As today: a bad file is refused at startup, and on reload the previous ring stays in
-  effect. The admin-lockout check on reload is unchanged.
-- *Reload on change.* A watcher (`notify`) on every included file and folder, debounced, runs the
-  same reload SIGHUP does. Event-driven, and it gives Windows a reload without HTTP.
-- *Tenant index scope.* `allowed_indexes` on `[security.tenants.<t>]`, and on keys, takes exact names
-  or a prefix ending in `*` (`"acme-*"`); a bare `*` is refused — omit the field instead. A tenant
-  key's scope is the tenant's intersected with its own, applied wherever `allows_index` is today, so
-  listings, MCP and implicit index creation follow it. Refused at load: a key list or an
-  `index_overrides` entry reaching outside its tenant's scope, and two tenants' scopes that overlap
-  (one pattern's literal part a prefix of the other's). A tenant without the field keeps today's
-  behaviour, and a key with no `tenant` is scoped by its own `allowed_indexes` alone — tenants are
-  opt-in, and no existing deployment changes.
-- *Live tenant quotas.* `TenantQuotas::limits` behind an `ArcSwap`, swapped by the reload; `usage`
-  and its refresh are untouched, so what a tenant has used survives the swap. `security.tenants`
-  leaves the not-applied list.
-- *Packaging.* The DEB/RPM postinst creates `/etc/cameodb/keys.d`, `cameodb:cameodb` `0750`: the node
-  writes it (R2). The MSI adds `keys.d` under `DATAROOT`, `Permanent`, with the service SID given
-  modify where `keys` gives it read. `keys/` and `cameodb.toml` stay read-only to the service — the
-  operator's own keys keep the protection the `.wxs` comment describes; the provisioned ones do not,
-  and `docs/DEPLOYMENT.md` says so.
-
-**Tests.** Scope: an `acme-*` tenant's key reaches `acme-docs`, is `403` on `beta-docs`, lists only
-`acme-*`, and mints `acme-new` but not `other`; a key narrowed to `acme-wiki` reaches only that;
-a key list outside the tenant's, an override outside it, overlapping tenant scopes and a bare `*` are
-each refused at load; a tenant without the field behaves as today. Merge: append, a duplicate digest across two files, a duplicate tenant, a stray setting,
-a relative path against the config's folder. Reload: a file added, changed and removed, each seen by
-the watcher; a bad file leaves the ring as it was. Quotas: a lowered `max_indexes` refuses the next
-create; the usage reading survives the swap.
-
-### R2 — The `key-manage` capability and the tenant API
-
-📋 **Planned.** ~3 days. Needs R1.
-
-**Design.**
-
-- *Capability.* `Capability::KeyManage`, held by a fourth role, `provisioner`, which holds nothing
-  else — no read, no write, no `/_admin/*`. A deliberate exception to the "no fourth role" comment on
-  `Role`: this is a different authority, not one between two existing ones. `admin` holds it too.
-- *Routes.* Outside `/_admin`, which the `external` profile turns off and which a public node is:
-
-  | Route | Does |
-  |---|---|
-  | `PUT /_tenants/{t}` | Create the tenant, or set its quota (`max_indexes`, `max_bytes`) |
-  | `GET /_tenants`, `GET /_tenants/{t}` | The tenants; one tenant's quota, usage and keys |
-  | `DELETE /_tenants/{t}` | Remove the tenant and every key it has; refused with `409` while it owns an index |
-  | `POST /_tenants/{t}/keys` | `{role, label, allowed_indexes?, index_overrides?}` → the key once, its `key_id` |
-  | `DELETE /_tenants/{t}/keys/{key_id}` | Revoke one key |
-
-  A listing carries `key_id`, `label`, `role` and scope — never a digest, never a key.
-- *Tenant scope through the API.* `PUT /_tenants/{t}` takes `allowed_indexes`; omitted, it is
-  `["{t}-*"]`, so every API-made tenant is scoped from its first key. A provisioner bounded by
-  `allowed_tenants` may set only patterns beginning `{t}-`, so a partner's tenants cannot reach past
-  their own names. A key's `allowed_indexes` in `POST /_tenants/{t}/keys` must fall inside the
-  tenant's scope (`400` otherwise); omitted, the key has the tenant's whole scope.
-- *No escalation.* A key the API makes is at most `writer` and always has its tenant. `admin` and
-  `provisioner` keys are written by an operator, in `cameodb.toml` or `keys/`.
-- *Where.* `[security.managed_files]`: `dir`, relative to the config file's folder; `keys`, the
-  file name of keys with no tenant (`"keys.toml"`); and `tenant`, a file name holding `{tenant}`
-  exactly once (`"{tenant}.toml"`, `"tenant-{tenant}.toml"`) — no path separator, no leading dot.
-  Refused at startup: a missing `dir`, neither name given, a malformed name, and a file no
-  `include` pattern reads back, since a file the node writes and never reads is a
-  tenant that silently has no keys. Without the section the tenant routes answer that tenant
-  management is not configured. A tenant name the API accepts is letters, digits, `.`, `_` and
-  `-`, starting with a letter or digit, so a name never becomes a path; hand-written tenants
-  keep the names they have.
-- *Writes.* The node owns the file `name` gives for a tenant it manages. Each change is
-  read–change–write under one lock, written to a temp file starting with a dot in `dir`, fsynced,
-  renamed; then the ring and the quotas are swapped directly, without waiting for the watcher. A
-  file already at that path that is not the node's — no `[provisioning]`, or another tenant's —
-  is never overwritten: `409`.
-- *Ready for the cluster.* Everything R3 needs is written from the start, so R3 adds behaviour,
-  not a format change. An API-written file opens with a `[provisioning]` table — `revision`
-  (raised by one on every change to the tenant), `written_by` (the node id that made the change,
-  R3's tie-break) and `written_at` (RFC 3339) — the one table besides keys and tenants an included
-  file accepts. A file without it is hand-written: loaded, never rewritten by the API, which refuses
-  to manage a tenant defined there with `409`. Every tenant response carries `revision`, and a
-  change may send `If-Match: <revision>`, refused with `412` when the tenant has moved on — on one
-  node that catches a provisioning service racing itself; in R3 it is the same check across nodes.
-- *Who holds `provisioner`.* The operator, never the API: a `provisioner` key is minted with
-  `cameodb keygen --role provisioner --label <service>` when the node is installed, its digest put
-  in `cameodb.toml` or `keys/` — the operator-owned, service-read-only places — and the key handed
-  to the provisioning service's secret store. It is that service's one credential to the node. It
-  reads and writes no data: a tenant's data is reached with that tenant's keys, which the service
-  mints and gives to the tenant's users and agents. The API caps what it mints at `writer`, so a
-  provisioner cannot mint another provisioner or an admin. Rotation is any key's: mint a second,
-  move the service over, remove the first. A deployment with no provisioning service needs no such
-  key — `admin` holds `key-manage`, so an operator drives the same routes with an admin key.
-- *`allowed_tenants`.* A field on `[[security.api_keys]]`: exact names, or a prefix ending in `*`
-  (`"partner-x-*"`) — a provisioning service creates tenants as companies sign up, and an exact list
-  would need an operator edit for each. Omitted means every tenant. Honoured on every tenant route:
-  `PUT` of a tenant outside it is `403`, and `GET /_tenants` lists only what it allows, as
-  `/_indexes` lists only what `allowed_indexes` allows. An empty list is refused at load, as an
-  empty `allowed_indexes` is, and so is the field on a key that does not hold `key-manage`, where it
-  would read as a restriction and be none. Operator-written only: the API never mints a key that
-  carries it.
-- *In a cluster, until R3.* A change applies on the node that received it and on no other; the
-  API reference says so, and the response names that node.
-- *Audit.* Each change is an audit event: who (the provisioner's `key_id`), which tenant, which
-  `key_id`, never the key.
-
-**Tests.** A provisioner can reach the tenant routes and nothing else; a writer and a reader cannot
-reach them. An attempt to create an `admin` key is refused. A created key authenticates at once,
-and fails at once after its revoke. Two concurrent creates for one tenant both land. A tenant with
-an index refuses deletion. A stale `If-Match` is `412` and changes nothing; every change raises
-`revision` by one and records `written_by`. A tenant defined in a hand-written file is `409`.
-`keygen --role provisioner` mints a key that reaches the tenant routes and no data.
-A tenant made without `allowed_indexes` is scoped `{t}-*`; a bounded provisioner setting
-`["beta-*"]` on `partner-x-acme` is `403`; a key list outside the tenant scope is `400`.
-`allowed_tenants`: a provisioner bound to `partner-x-*` creates `partner-x-acme`, is `403` on
-`acme`, and lists only its own; an empty list and the field on a `writer` are refused at load. A key appears in no response but the one that created it, and in no log.
-
-**Keys without tenants (`/_keys`).** `POST /_keys` mints a `writer` or `reader` key with its own
-`allowed_indexes` and no tenant into the `keys` file; `GET /_keys` lists that file's keys;
-`DELETE /_keys/{key_id}` revokes one. `key-manage` without `allowed_tenants` — a provisioner bound
-to some tenants manages those tenants only. A tenant whose file would be the `keys` file is
-refused. **Tests:** with no `[security.tenants]` anywhere — keys in included files scoped by
-their own exact and prefix lists, listings filtered, a changed file reloaded, no quota measured or
-enforced; through `/_keys`, a minted key authenticates and is scoped by its list, survives a
-restart from the file, fails after revoke, a stale `If-Match` is `412`, a pattern the loader
-refuses is `400` and undone, an `admin` key is `403`, and a bounded provisioner is `403`.
+- ✅ [**R1 — Included key and tenant files, reloaded when they change**](docs/ROADMAP-ARCHIVE.md#r1--included-key-and-tenant-files-reloaded-when-they-change)
+- ✅ [**R2 — The `key-manage` capability and the tenant API**](docs/ROADMAP-ARCHIVE.md#r2--the-key-manage-capability-and-the-tenant-api)
 
 ### R3 — Changes reach every node
 
@@ -3137,9 +2999,8 @@ another, it fails on all three. A node stopped during a create catches up on res
 asked. A response names a node that did not answer. Two nodes sending the same tenant at the same
 revision settle by node id.
 
-**Docs, R1–R2.** `docs/CONFIGURATION.md` (`include`), `docs/API_REFERENCE.md` (the tenant routes),
-`docs/DEPLOYMENT.md` (the folders, their owners, what a provisioner can and cannot do),
-`cameodb.example.toml`, the Windows `cameodb.toml`, and a `CHANGELOG.md` entry.
+**Docs.** The single-node limit in `docs/API_REFERENCE.md` and `docs/DEPLOYMENT.md` replaced by
+what a cluster does; a `CHANGELOG.md` entry.
 
 ---
 
