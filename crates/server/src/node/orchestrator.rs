@@ -6508,6 +6508,11 @@ pub(super) async fn list_indexes(
                         JsonValue::String(description.clone()),
                     );
                 }
+                // The owner stamped at creation, so a listing answers "what does this tenant
+                // hold" — which removing a tenant asks first. Absent for an unowned index.
+                if let Some(tenant) = &schema.tenant {
+                    json_obj.insert("tenant".to_string(), JsonValue::String(tenant.clone()));
+                }
                 let (searched, truncated) =
                     NodeOrchestrator::searched_by_default(&schema, &searchable, max_default_fields);
                 NodeOrchestrator::insert_default_search(&mut json_obj, &schema, truncated);

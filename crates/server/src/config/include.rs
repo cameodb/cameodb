@@ -25,6 +25,11 @@ use serde::Deserialize;
 use super::CameoDbConfig;
 use crate::auth::{ApiKeyConfig, ProvisioningStamp, TenantQuota, TenantSource};
 
+/// Tenant names a `[security.tenant_files]` name is tried with: an `include` pattern has to read
+/// back the file of every one of them, so a pattern that happens to match one name and not
+/// another is caught at startup rather than on the tenant it misses.
+const SAMPLE_TENANTS: &[&str] = &["t", "0", "acme", "a.b_c-d"];
+
 /// One included file, exactly as written.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -62,14 +67,16 @@ impl CameoDbConfig {
                 },
             );
         }
-        if self.include.is_empty() {
-            return Ok(());
-        }
-
         let base = config_path
             .parent()
             .filter(|dir| !dir.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
+        self.resolve_tenant_files(base)
+            .with_context(|| format!("{}: [security.tenant_files]", config_path.display()))?;
+        if self.include.is_empty() {
+            return Ok(());
+        }
+
         let mut files = Vec::new();
         for pattern in &self.include {
             files.extend(
@@ -96,6 +103,56 @@ impl CameoDbConfig {
                 self.merge_included(&file)?;
             }
         }
+        Ok(())
+    }
+
+    /// Check `[security.tenant_files]` and resolve its folder to an absolute path.
+    ///
+    /// Refused: a name without `{tenant}` exactly once, one that could name a path or a hidden
+    /// file, a folder that does not exist, and a layout no `include` pattern reads back.
+    fn resolve_tenant_files(&mut self, base: &Path) -> Result<()> {
+        let Some(files) = &mut self.security.tenant_files else {
+            return Ok(());
+        };
+        let name = files.name.as_str();
+        if name.matches("{tenant}").count() != 1 {
+            bail!("name '{name}' must hold {{tenant}} exactly once");
+        }
+        let rest = name.replace("{tenant}", "");
+        if rest.contains(['/', '\\', '{', '}', '*']) || name.starts_with('.') {
+            bail!(
+                "name '{name}' must be a plain file name: no path separator, no other braces or \
+                 wildcard, and no leading dot, which would hide the file from include"
+            );
+        }
+
+        let dir = base.join(&files.dir);
+        let dir = dir
+            .canonicalize()
+            .with_context(|| format!("dir {} does not exist", dir.display()))?;
+        if !dir.is_dir() {
+            bail!("dir {} is not a folder", dir.display());
+        }
+
+        for tenant in SAMPLE_TENANTS {
+            let file_name = name.replace("{tenant}", tenant);
+            let read_back = self.include.iter().any(|pattern| {
+                let path = base.join(pattern);
+                let folder = path.parent().and_then(|folder| folder.canonicalize().ok());
+                let file_pattern = path.file_name().and_then(|name| name.to_str());
+                folder.as_deref() == Some(dir.as_path())
+                    && file_pattern.is_some_and(|pattern| wildcard_matches(pattern, &file_name))
+            });
+            if !read_back {
+                bail!(
+                    "no include pattern reads back {}, so a tenant the node writes there would \
+                     have no keys. Add an include such as \"{}/*.toml\"",
+                    dir.join(&file_name).display(),
+                    files.dir.display()
+                );
+            }
+        }
+        files.dir = dir;
         Ok(())
     }
 
@@ -470,6 +527,83 @@ mod tests {
             );
             let err = format!("{:#}", load(&main_path).unwrap_err());
             assert!(err.contains("[provisioning]"), "{err}");
+        }
+    }
+
+    #[test]
+    fn tenant_files_resolve_their_folder_and_must_be_read_back() {
+        let section = |dir: &str, name: &str| {
+            format!("[security.tenant_files]\ndir = \"{dir}\"\nname = \"{name}\"\n")
+        };
+        let (dir, main_path) = folder(
+            &format!(
+                "include = [\"keys.d/*.toml\"]\n{}",
+                section("keys.d", "tenant-{tenant}.toml")
+            ),
+            &[(".keep", String::new()), ("keys.d/.keep", String::new())],
+        );
+        let config = load(&main_path).unwrap();
+        let files = config.security.tenant_files.unwrap();
+        assert_eq!(files.dir, dir.path().join("keys.d").canonicalize().unwrap());
+        assert_eq!(files.path_for("acme"), files.dir.join("tenant-acme.toml"));
+
+        for (include, dir, name, says) in [
+            (
+                "keys.d/*.toml",
+                "absent.d",
+                "{tenant}.toml",
+                "does not exist",
+            ),
+            ("keys.d/*.toml", "keys.d", "tenant.toml", "exactly once"),
+            (
+                "keys.d/*.toml",
+                "keys.d",
+                "{tenant}{tenant}.toml",
+                "exactly once",
+            ),
+            (
+                "keys.d/*.toml",
+                "keys.d",
+                "../{tenant}.toml",
+                "plain file name",
+            ),
+            (
+                "keys.d/*.toml",
+                "keys.d",
+                ".{tenant}.toml",
+                "plain file name",
+            ),
+            // Written as .json, read as .toml: never loaded.
+            (
+                "keys.d/*.toml",
+                "keys.d",
+                "{tenant}.json",
+                "no include pattern",
+            ),
+            // Matches some tenants' files and not others'.
+            (
+                "keys.d/a*.toml",
+                "keys.d",
+                "{tenant}.toml",
+                "no include pattern",
+            ),
+            (
+                "other.d/*.toml",
+                "keys.d",
+                "{tenant}.toml",
+                "no include pattern",
+            ),
+        ] {
+            let (_dir, main_path) = folder(
+                &format!("include = [\"{include}\"]\n{}", section(dir, name)),
+                &[
+                    ("keys.d/.keep", String::new()),
+                    ("other.d/.keep", String::new()),
+                ],
+            );
+            let err = format!("{:#}", load(&main_path).unwrap_err());
+            assert!(err.contains("[security.tenant_files]"), "{name}: {err}");
+            assert!(err.contains(says), "{include} {dir} {name}: {err}");
         }
     }
 

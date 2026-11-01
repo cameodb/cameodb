@@ -49,12 +49,14 @@ Both return `{"error": …, "message": …}`. An unknown path answers `401` with
 | `POST` | `/_admin/index/{index}/commit` | `node-admin` |
 | `POST` | `/_admin/index/{index}/merge` | `node-admin` |
 | `POST` | `/_admin/index/{index}/evict-writer` | `node-admin` |
+| `GET` `PUT` `DELETE` | `/_tenants`, `/_tenants/{tenant}` | `key-manage` |
+| `POST` `DELETE` | `/_tenants/{tenant}/keys`, `/_tenants/{tenant}/keys/{key_id}` | `key-manage` |
 | `POST` `GET` `DELETE` | `/mcp` | `read` at the endpoint, then per tool |
 | `GET` `POST` | `/mcp/sse` | `read` at the endpoint, then per tool |
 | `POST` | `/mcp/messages` | `read` at the endpoint, then per tool |
 
-Roles bundle these: `admin` holds all four, `writer` holds `read` and `write`, `reader` holds
-`read`. Where a path contains `{index}`, a key restricted with `allowed_indexes` is refused
+Roles bundle these: `admin` holds all five, `writer` holds `read` and `write`, `reader` holds
+`read`, and `provisioner` holds `key-manage` alone. Where a path contains `{index}`, a key restricted with `allowed_indexes` is refused
 unless that index is in its list.
 
 A `write` call on an index that does not exist creates it — the documents are sampled into a
@@ -1090,6 +1092,7 @@ curl -s http://localhost:9480/_indexes
       "memory_bytes": 47316480,
       "shard_count": 4,
       "warm_shards": 4,
+      "tenant": "acme",
       "field_count": 3,
       "fields": [
         {"name": "id", "type": "text", "indexed": true, "stored": true, "fast": false, "shadow": false, "searchable": true},
@@ -1107,6 +1110,8 @@ curl -s http://localhost:9480/_indexes
 ```
 
 The listing describes each index in full, so learning a field's type costs no extra request.
+`tenant` names the owning tenant, stamped when the index was created; it is absent for an index
+nobody owns.
 Field entries are exactly those of `GET /api/{index}/_config`.
 
 Sizes are **bytes**, not megabytes: `GET /_cluster/_indexes` sums them across nodes, and summing
@@ -1517,6 +1522,62 @@ a non-zero value means the window shown is incomplete. Reads, MCP tool calls, ad
 and refusals of a valid key are recorded individually; writes, health checks and
 unauthenticated refusals arrive as counted `*_stats` records. Reading this endpoint is itself
 recorded. Field-by-field detail is in [CONFIGURATION.md](CONFIGURATION.md).
+
+#### 🏢 Tenants and Their Keys
+
+Create tenants, mint and revoke their keys, on a running node. Each managed tenant is one file
+where `[security.tenant_files]` says (see the configuration guide); the node writes it, reloads
+the key ring through the same loader startup uses, and undoes a change that loader refuses. A
+tenant written by hand is listed and never changed (`409`).
+
+Every route needs `key-manage` — the `provisioner` role, or `admin`. A key with
+`allowed_tenants` reaches only those tenants (`403` otherwise), sees only them in a listing, and
+may scope a tenant only to indexes named after it (`{tenant}-…`). These routes are not under
+`/_admin`, so they are mounted under every profile, `external` included.
+
+**Until clustering of tenants is built, a change applies on the node that received it.**
+
+| Method | Path | |
+|--------|------|---|
+| `GET` | `/_tenants` | Every tenant the caller may manage |
+| `PUT` | `/_tenants/{tenant}` | Create, or change `max_indexes`, `max_bytes`, `allowed_indexes` |
+| `GET` | `/_tenants/{tenant}` | Settings, keys and the indexes it owns |
+| `DELETE` | `/_tenants/{tenant}` | The tenant and its keys; `409` while it owns an index |
+| `POST` | `/_tenants/{tenant}/keys` | Mint a key: `role` (`writer` or `reader`), `label`, `allowed_indexes`, `index_overrides` |
+| `DELETE` | `/_tenants/{tenant}/keys/{key_id}` | Revoke a key, from its next request on |
+
+**Example:**
+```bash
+curl -s -X PUT http://localhost:9480/_tenants/acme \
+  -H "Authorization: Bearer $PROVISIONER_KEY" -H "Content-Type: application/json" \
+  -d '{"max_indexes": 20}'
+
+curl -s -X POST http://localhost:9480/_tenants/acme/keys \
+  -H "Authorization: Bearer $PROVISIONER_KEY" -H "Content-Type: application/json" \
+  -H 'If-Match: 1' \
+  -d '{"role": "writer", "label": "jane@acme.com"}'
+```
+
+**Response** (`201`, the only response that ever carries a key):
+```json
+{"key": "cameo_v1_…", "key_id": "ca432e14", "tenant": "acme", "revision": 2}
+```
+
+A tenant's response carries its `revision`, which rises by one with every change. Send it back
+as `If-Match` to have a change refused with `412` if someone changed the tenant in between.
+
+- **Names.** A tenant the node creates is letters, digits, `.`, `_` and `-`, starting with a
+  letter or digit, at most 64 characters (`400` otherwise) — it becomes a file name.
+- **Defaults.** A new tenant without `allowed_indexes` is scoped to `["{tenant}-*"]`. On a
+  change, an omitted field keeps its value. A key without `allowed_indexes` has its tenant's
+  whole scope; one reaching past it is refused `400`, as is anything else the loader refuses —
+  a scope overlapping another tenant's, for one.
+- **No escalation.** The API mints `writer` and `reader` keys only (`403` for `admin` or
+  `provisioner`), always in the route's tenant. A listing shows each key's `key_id`, `label`,
+  `role` and scope, never a digest.
+- **Not configured.** Without `[security.tenant_files]` every change answers `409` saying so.
+- A missing tenant answers `404` with `"code": "tenant_not_found"`, a missing key
+  `"code": "key_not_found"`.
 
 #### Key Ring Reload
 Re-resolve `[[security.api_keys]]` — and any `key_hash_file` they name — from the

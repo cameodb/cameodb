@@ -35,6 +35,9 @@ pub struct AppError {
     /// was lost and in health's `connected_nodes` and `ping_failures`, and one `ERROR` per
     /// request for it is the per-refusal logging OB15 measured costing half the goodput.
     pub quiet: bool,
+    /// The `code` a 404 body carries, when the missing thing is not an index. `None` is
+    /// [`INDEX_NOT_FOUND`], what every 404 meant before anything else could be missing.
+    pub code: Option<&'static str>,
 }
 
 impl AppError {
@@ -46,6 +49,7 @@ impl AppError {
             retry_after_secs: None,
             shed: false,
             quiet: false,
+            code: None,
         }
     }
 
@@ -61,6 +65,28 @@ impl AppError {
             retry_after_secs: None,
             shed: false,
             quiet: false,
+            code: None,
+        }
+    }
+
+    /// Any status with an explicit, client-safe message, for an answer none of the named
+    /// constructors covers — a `409` conflict, a `412` failed precondition.
+    pub fn with_status(status: StatusCode, msg: impl Into<String>) -> Self {
+        Self {
+            error: anyhow::anyhow!("{}", msg.into()),
+            status: Some(status),
+            retry_after_secs: None,
+            shed: false,
+            quiet: false,
+            code: None,
+        }
+    }
+
+    /// A 404 for something that is not an index, carrying its own `code`.
+    pub fn not_found(code: &'static str, msg: impl Into<String>) -> Self {
+        Self {
+            code: Some(code),
+            ..Self::with_status(StatusCode::NOT_FOUND, msg)
         }
     }
 
@@ -72,6 +98,7 @@ impl AppError {
             retry_after_secs: None,
             shed: false,
             quiet: false,
+            code: None,
         }
     }
 
@@ -85,6 +112,7 @@ impl AppError {
             retry_after_secs: None,
             shed: false,
             quiet: false,
+            code: None,
         }
     }
 
@@ -106,6 +134,7 @@ impl AppError {
             retry_after_secs: Some(retry_after_secs),
             shed: false,
             quiet: false,
+            code: None,
         }
     }
 
@@ -149,6 +178,7 @@ impl AppError {
                 retry_after_secs: None,
                 shed: false,
                 quiet: false,
+                code: None,
             };
         }
 
@@ -223,7 +253,8 @@ impl IntoResponse for AppError {
         let body = if status.is_server_error() {
             serde_json::json!({ "error": message })
         } else if status == StatusCode::NOT_FOUND {
-            serde_json::json!({ "error": message, "details": error_msg, "code": INDEX_NOT_FOUND })
+            let code = self.code.unwrap_or(INDEX_NOT_FOUND);
+            serde_json::json!({ "error": message, "details": error_msg, "code": code })
         } else {
             serde_json::json!({ "error": message, "details": error_msg })
         };
@@ -260,6 +291,7 @@ where
             retry_after_secs: None,
             shed: false,
             quiet: false,
+            code: None,
         }
     }
 }

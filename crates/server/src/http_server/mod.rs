@@ -12,6 +12,7 @@ mod health;
 mod routes;
 mod search;
 mod shed;
+mod tenants;
 mod write;
 
 use crate::ratelimit::Caller;

@@ -82,6 +82,9 @@ pub struct AppState {
     /// SIGHUP both land on its `reload`, which swaps the ring underneath every
     /// in-flight reader.
     pub keyring: Arc<crate::auth::KeyReloader>,
+    /// Tenants and their keys, managed through `/_tenants`: the files `[security.tenant_files]`
+    /// names, rewritten under one lock and reloaded into `keyring`.
+    pub tenants: Arc<crate::tenants::TenantStore>,
     /// This node's writer-thread liveness. The health endpoint reads it with one atomic load so
     /// a shard whose writer thread has died stops the node reporting green.
     pub writer_liveness: Arc<WriterLiveness>,

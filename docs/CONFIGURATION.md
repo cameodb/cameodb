@@ -1357,6 +1357,31 @@ every platform — on Windows, the only reload besides the endpoint. A file that
 logged and the ring in use stays in use. Write a file to a temporary name starting with a dot
 and rename it into place, so the watcher never reads it half-written.
 
+### Tenants managed through the node (`[security.tenant_files]`)
+
+With a `provisioner` key and this section, a provisioning service creates tenants and mints
+their keys through `/_tenants` (see the API reference), and the node writes each managed
+tenant's file itself:
+
+```toml
+include = ["keys.d/*.toml"]
+
+[security.tenant_files]
+dir = "keys.d"                   # relative to this file's folder
+name = "{tenant}.toml"           # any file name holding {tenant} once: "tenant-{tenant}.toml"
+```
+
+Startup refuses a `dir` that does not exist, a `name` without `{tenant}` exactly once or with a
+path separator, wildcard or leading dot, and a layout no `include` pattern reads back — a file
+the node writes and never loads would be a tenant that silently has no keys. Without the
+section, `/_tenants` lists tenants and changes none.
+
+A managed file carries a `[provisioning]` table — `revision`, `written_by` (the node's id) and
+`written_at` — which is how the node tells its own files from yours. It never rewrites a tenant
+defined anywhere else, nor a file at the path that is not its own. The packages create
+`keys.d` writable by the service; `keys/` and this file stay read-only to it, so the operator's
+own keys — the `provisioner` key among them — are out of the node's reach.
+
 ### Rotation
 
 Keys are read at startup, and re-read on demand: `POST /_admin/keys/reload` (a `node-admin`

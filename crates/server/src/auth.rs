@@ -576,6 +576,49 @@ pub struct SecurityConfig {
     /// Here for the same reason as `limits`: the record it writes is *about a key*, so it
     /// belongs to the section that defines keys. Off by default.
     pub audit: crate::audit::AuditConfig,
+
+    /// `[security.tenant_files]` — where the node writes the file of a tenant managed through
+    /// `/_tenants`. Absent, the node manages no tenant's file.
+    #[serde(default)]
+    pub tenant_files: Option<TenantFilesConfig>,
+}
+
+/// `[security.tenant_files]`: the folder and file name of tenant files the node writes.
+///
+/// Configured rather than inferred from `include`, so the layout is the operator's to choose
+/// and can be read in one place. The loader checks it against `include` at startup: a file
+/// the node writes that no `include` reads back would be a tenant that silently has no keys.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TenantFilesConfig {
+    /// The folder, relative to the config file's folder. Resolved to an absolute path by the
+    /// loader.
+    pub dir: PathBuf,
+    /// The file name, holding `{tenant}` exactly once: `"{tenant}.toml"`,
+    /// `"tenant-{tenant}.toml"`.
+    pub name: String,
+}
+
+impl TenantFilesConfig {
+    /// The file a tenant's keys are written to. `tenant` must already have passed
+    /// [`valid_tenant_name`], so it cannot carry a path.
+    pub fn path_for(&self, tenant: &str) -> PathBuf {
+        self.dir.join(self.name.replace("{tenant}", tenant))
+    }
+}
+
+/// Whether `name` may be a tenant the node creates: letters, digits, `.`, `_` and `-`,
+/// starting with a letter or digit, at most 64 characters.
+///
+/// A tenant name becomes a file name, so it may never carry a separator, a `..` or a leading
+/// dot that hides the file from the loader. Tenants written by hand keep whatever names they
+/// already have; this applies to the ones the node is asked to create.
+pub fn valid_tenant_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    name.len() <= 64
+        && chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && !name.contains("..")
 }
 
 impl Default for SecurityConfig {
@@ -593,6 +636,7 @@ impl Default for SecurityConfig {
             override_key: None,
             limits: crate::ratelimit::McpLimitsConfig::default(),
             audit: crate::audit::AuditConfig::default(),
+            tenant_files: None,
         }
     }
 }
@@ -1069,7 +1113,6 @@ pub struct KeyEntry {
     /// [`TenantQuota::allowed_indexes`].
     tenant_scope: Option<IndexScope>,
     /// Tenants this key may manage; see [`ApiKeyConfig::allowed_tenants`].
-    #[cfg_attr(not(test), expect(dead_code, reason = "read by the R2 tenant routes"))]
     allowed_tenants: Option<IndexScope>,
 }
 
@@ -1140,11 +1183,15 @@ impl KeyEntry {
 
     /// Whether this key may manage `tenant`. Only meaningful with `key-manage`; the tenant
     /// routes check the capability first.
-    #[cfg_attr(not(test), expect(dead_code, reason = "read by the R2 tenant routes"))]
     pub fn allows_tenant(&self, tenant: &str) -> bool {
         self.allowed_tenants
             .as_ref()
             .is_none_or(|scope| scope.allows(tenant))
+    }
+
+    /// True when this key may manage only some tenants.
+    pub fn is_tenant_scoped(&self) -> bool {
+        self.allowed_tenants.is_some()
     }
 
     /// This key's index scope, rendered for a log line.
@@ -1248,6 +1295,9 @@ pub struct KeyReloader {
     tenant_limits: TenantLimits,
     /// The include folders as of the last successful load, for the key watcher.
     include_folders: arc_swap::ArcSwap<Vec<PathBuf>>,
+    /// `[security]` as of the last successful load: the tenant files layout and where each
+    /// tenant was defined, which the tenant store decides by.
+    loaded: arc_swap::ArcSwap<SecurityConfig>,
 }
 
 impl KeyReloader {
@@ -1265,8 +1315,14 @@ impl KeyReloader {
             source,
             tenant_limits: TenantLimits::new(security.tenants.clone()),
             include_folders: arc_swap::ArcSwap::from_pointee(security.include_folders.clone()),
+            loaded: arc_swap::ArcSwap::from_pointee(security.clone()),
             startup: security,
         })
+    }
+
+    /// `[security]` as of the last successful load.
+    pub fn security(&self) -> Arc<SecurityConfig> {
+        self.loaded.load_full()
     }
 
     /// The folders the config's `include` reads from, as of the last successful load.
@@ -1325,6 +1381,7 @@ impl KeyReloader {
 
         // The quotas before the ring, so a key of a new tenant is never accepted before the
         // tenant's ceiling is in force.
+        self.loaded.store(Arc::new(security.clone()));
         let tenants_changed = *self.tenant_limits.load() != security.tenants;
         let tenant_count = security.tenants.len();
         self.tenant_limits.store(security.tenants);
@@ -1393,6 +1450,7 @@ impl KeyReloader {
             startup: SecurityConfig::default(),
             tenant_limits: TenantLimits::default(),
             include_folders: arc_swap::ArcSwap::from_pointee(Vec::new()),
+            loaded: arc_swap::ArcSwap::from_pointee(SecurityConfig::default()),
         })
     }
 

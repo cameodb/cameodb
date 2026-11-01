@@ -137,6 +137,16 @@ const ROUTES: &[RouteRule] = &[
     rule("POST",   "/_admin/index/{index}/merge",       Access::Needs(Capability::NodeAdmin)),
     rule("POST",   "/_admin/index/{index}/evict-writer",Access::Needs(Capability::NodeAdmin)),
 
+    // Tenants and their keys. Outside `/_admin`, which the `external` profile unmounts: a
+    // provisioning service manages tenants on exactly the nodes that face the internet. Which
+    // tenants a key may manage is `allowed_tenants`, checked by the handler.
+    rule("GET",    "/_tenants",                         Access::Needs(Capability::KeyManage)),
+    rule("GET",    "/_tenants/{tenant}",                Access::Needs(Capability::KeyManage)),
+    rule("PUT",    "/_tenants/{tenant}",                Access::Needs(Capability::KeyManage)),
+    rule("DELETE", "/_tenants/{tenant}",                Access::Needs(Capability::KeyManage)),
+    rule("POST",   "/_tenants/{tenant}/keys",           Access::Needs(Capability::KeyManage)),
+    rule("DELETE", "/_tenants/{tenant}/keys/{key_id}",  Access::Needs(Capability::KeyManage)),
+
     // MCP. Streamable HTTP uses one path for all three verbs; the GET (SSE stream) and
     // DELETE (end session) are gated too, not only the POST that carries the payload.
     rule("POST",   "/mcp",                              Access::Mcp),
@@ -188,6 +198,7 @@ pub fn classify<'a>(method: &str, path: &'a str) -> Option<Classified<'a>> {
 }
 
 /// `Some(index)` when `path` matches `pattern`; the inner `Option` is the `{index}` segment.
+/// Any other `{…}` segment matches one non-empty path segment and is not an index.
 fn match_pattern<'a>(pattern: &str, path: &'a str) -> Option<Option<&'a str>> {
     let mut pattern_segments = pattern.split('/');
     let mut path_segments = path.split('/');
@@ -202,6 +213,10 @@ fn match_pattern<'a>(pattern: &str, path: &'a str) -> Option<Option<&'a str>> {
                         return None;
                     }
                     index = Some(actual);
+                } else if expected.starts_with('{') {
+                    if actual.is_empty() {
+                        return None;
+                    }
                 } else if expected != actual {
                     return None;
                 }

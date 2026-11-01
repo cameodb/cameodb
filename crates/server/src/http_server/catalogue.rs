@@ -160,6 +160,7 @@ pub(super) async fn create_config_handler(
             retry_after_secs: None,
             shed: false,
             quiet: false,
+            code: None,
         });
     }
     Ok(Json(result))
@@ -293,6 +294,7 @@ pub(super) async fn update_schema_handler(
             retry_after_secs: None,
             shed: false,
             quiet: false,
+            code: None,
         });
     }
 

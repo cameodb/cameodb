@@ -32,6 +32,7 @@ mod remote_peer_pool;
 mod service;
 mod state;
 mod swarm;
+mod tenants;
 
 use cluster_coordinator::{
     ClusterCoordinator, DiscoverPeers, GetStatus, InitSwarm, ShutdownSwarm, SubscribeTopology,
@@ -745,6 +746,10 @@ async fn run(args: Vec<String>) -> Result<()> {
         max_response_bytes: cameodb_config.effective_max_response_bytes(),
         audit: Arc::clone(&audit_sink),
         keyring: Arc::clone(&keyring),
+        tenants: Arc::new(tenants::TenantStore::new(
+            Arc::clone(&keyring),
+            node_id.to_string(),
+        )),
         writer_liveness,
         read_pool_health,
         queue_load,
