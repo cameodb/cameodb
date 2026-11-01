@@ -2953,6 +2953,13 @@ deferred until cluster support for provisioning is decided.
     and revokes keys with no tenant in the one `keys` file, by the same store, lock, rollback and
     `If-Match` as a tenant's file; a key's scope is its own list, as with no tenants today.
     Tenants are added on top later and change nothing for these keys.
+13. **Tenants and individuals share a node, kept apart by the provisioning service**
+    (2026-11-01). A tenant's scope bounds its own keys and reserves nothing from keys with no
+    tenant: an individual whose list names a tenant's index has it shared, one with no list
+    reaches everything, and a tenant may be scoped over names an individual uses. The service
+    lists a company's indexes in its tenant and gives every individual a list without them;
+    the node enforces no separation between the two, and tests pin that so a change is a
+    decision.
 
 How other databases split the same thing — operator-owned files plus a part the server writes,
 alongside and included: ClickHouse's `users.xml`/`users.d` with `CREATE USER` written to

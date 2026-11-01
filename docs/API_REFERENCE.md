@@ -1553,7 +1553,9 @@ curl -s -X POST http://localhost:9480/_keys \
 {"key": "cameo_v1_…", "key_id": "b9b140f4", "revision": 1}
 ```
 
-A key without `allowed_indexes` reaches every index, as any key without the list does. The
+A key without `allowed_indexes` reaches every index, as any key without the list does —
+tenants' indexes included: a tenant's scope bounds its own keys and reserves nothing from keys
+with no tenant, so naming a tenant's index here is how it is shared. The
 file's `revision` starts at `0` before the first key; send it as `If-Match` to have a change
 refused with `412` if the file changed in between. `admin` and `provisioner` keys are refused
 (`403`), an `allowed_indexes` pattern the loader does not take is `400`, a missing key is `404`

@@ -1381,6 +1381,15 @@ without `{tenant}` exactly once, a name with a path separator, wildcard or leadi
 layout no `include` pattern reads back — a file the node writes and never loads would hold keys
 that silently never work.
 
+**Tenants and individuals on one node.** With both names set, companies are tenants and
+individuals are keys with no tenant, side by side: their files, revisions and listings are
+separate, and changing one never touches the other. A tenant's `allowed_indexes` bounds its own
+keys and **reserves nothing** from anyone else — an individual key with no list, or one naming a
+tenant's index, reaches it. That is how an index is shared (name it in the individual's list),
+and it is why keeping companies and individuals apart is the provisioning service's job: list a
+company's indexes in its tenant, give every individual a list, and leave tenant indexes out of
+it unless they are meant to be shared.
+
 A managed file carries a `[provisioning]` table — `revision`, `written_by` (the node's id) and
 `written_at` — which is how the node tells its own files from yours. It never rewrites a file it
 did not write, nor a tenant defined anywhere else, and a tenant whose file would be the `keys`

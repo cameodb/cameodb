@@ -936,6 +936,186 @@ mod tests {
         assert!(matches!(err, TenantError::ForeignFile(_)), "{err}");
     }
 
+    fn scoped_tenant(indexes: &[&str]) -> TenantSpec {
+        TenantSpec {
+            allowed_indexes: Some(indexes.iter().map(|i| i.to_string()).collect()),
+            ..Default::default()
+        }
+    }
+
+    /// One node serving a company as a tenant and individuals with no tenant. The company's
+    /// indexes are listed in its tenant; an individual reaches one of them only when the
+    /// portal shares it by naming it in that individual's list.
+    #[tokio::test]
+    async fn a_company_tenant_and_individuals_share_a_node() {
+        let node = node("{tenant}.toml", "");
+        node.store
+            .put_tenant("acme", scoped_tenant(&["acme-docs", "acme-shared"]), None)
+            .await
+            .unwrap();
+        let acme_staff = node
+            .store
+            .create_tenant_key("acme", user("ana@acme.com", Role::Writer, None), None)
+            .await
+            .unwrap();
+        let ivan = node
+            .store
+            .create_key(user("ivan@mail.com", Role::Writer, Some(&["ivan-*"])), None)
+            .await
+            .unwrap();
+        let eve = node
+            .store
+            .create_key(
+                user(
+                    "eve@mail.com",
+                    Role::Reader,
+                    Some(&["eve-notes", "acme-shared"]),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let ring = node.keys.current();
+        let ana = ring.authenticate(&acme_staff.key).unwrap();
+        assert_eq!(ana.tenant(), Some("acme"));
+        assert!(ana.allows_index("acme-docs") && ana.allows_index("acme-shared"));
+        assert!(!ana.allows_index("ivan-notes") && !ana.allows_index("eve-notes"));
+
+        let ivan = ring.authenticate(&ivan.key).unwrap();
+        assert_eq!(ivan.tenant(), None);
+        assert!(ivan.allows_index("ivan-notes"));
+        assert!(!ivan.allows_index("acme-docs") && !ivan.allows_index("eve-notes"));
+
+        // Shared: Eve reads the one acme index the portal gave her, and no other.
+        let eve = ring.authenticate(&eve.key).unwrap();
+        assert!(eve.allows_index("acme-shared") && eve.allows_index("eve-notes"));
+        assert!(!eve.allows_index("acme-docs"));
+
+        // Each listing holds its own: the tenant its staff, the keys file its individuals.
+        let tenant = node.store.get("acme").unwrap();
+        assert_eq!(tenant.keys.len(), 1);
+        assert_eq!(tenant.keys[0].label, "ana@acme.com");
+        let individuals = node.store.list_keys().unwrap();
+        let labels: Vec<&str> = individuals.keys.iter().map(|k| k.label.as_str()).collect();
+        assert_eq!(labels, ["ivan@mail.com", "eve@mail.com"]);
+
+        // Two files, two revisions, two quotas' worth of state: only acme has a ceiling entry.
+        assert_eq!((tenant.revision, individuals.revision), (Some(2), 2));
+        assert_eq!(node.keys.tenant_limits().load().len(), 1);
+    }
+
+    /// Changing one side leaves the other alone, in the ring and on disk.
+    #[tokio::test]
+    async fn tenant_and_individual_changes_do_not_touch_each_other() {
+        let node = node("{tenant}.toml", "");
+        node.store
+            .put_tenant("acme", scoped_tenant(&["acme-*"]), None)
+            .await
+            .unwrap();
+        let ana = node
+            .store
+            .create_tenant_key("acme", user("ana@acme.com", Role::Writer, None), None)
+            .await
+            .unwrap();
+        let ivan = node
+            .store
+            .create_key(user("ivan@mail.com", Role::Writer, Some(&["ivan-*"])), None)
+            .await
+            .unwrap();
+        let tenant_file = node.root.join("keys.d/acme.toml");
+        let acme_before = std::fs::read_to_string(&tenant_file).unwrap();
+
+        node.store.revoke_key(&ivan.key_id, None).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&tenant_file).unwrap(), acme_before);
+        assert!(node.keys.current().authenticate(&ana.key).is_some());
+
+        let eve = node
+            .store
+            .create_key(user("eve@mail.com", Role::Reader, Some(&["eve-*"])), None)
+            .await
+            .unwrap();
+        let keys_before = std::fs::read_to_string(node.root.join("keys.d/keys.toml")).unwrap();
+        node.store
+            .revoke_tenant_key("acme", &ana.key_id, None)
+            .await
+            .unwrap();
+        node.store
+            .put_tenant(
+                "acme",
+                TenantSpec {
+                    max_indexes: Some(4),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(node.root.join("keys.d/keys.toml")).unwrap(),
+            keys_before
+        );
+        assert!(node.keys.current().authenticate(&eve.key).is_some());
+        assert!(node.keys.current().authenticate(&ana.key).is_none());
+
+        // And a node started on the same files later has exactly this.
+        let restarted = reloader(&node.root);
+        assert!(restarted.current().authenticate(&eve.key).is_some());
+        assert!(restarted.current().authenticate(&ana.key).is_none());
+        assert_eq!(restarted.tenant_limits().load()["acme"].max_indexes, 4);
+    }
+
+    /// What the node leaves to the portal, pinned so a change to it is a decision: a tenant's
+    /// scope bounds the tenant's keys and reserves nothing from anyone else. An individual with
+    /// no list reaches a tenant's indexes, one listing them is a share, and a tenant may be
+    /// scoped over names an individual uses. Keeping them apart is the portal's to do.
+    #[tokio::test]
+    async fn tenant_scopes_bound_tenant_keys_and_reserve_nothing_from_individuals() {
+        let node = node("{tenant}.toml", "");
+        node.store
+            .put_tenant("acme", scoped_tenant(&["acme-*"]), None)
+            .await
+            .unwrap();
+        let unlisted = node
+            .store
+            .create_key(user("ops-bot", Role::Reader, None), None)
+            .await
+            .unwrap();
+        let sharing = node
+            .store
+            .create_key(user("eve@mail.com", Role::Reader, Some(&["acme-*"])), None)
+            .await
+            .unwrap();
+        let ring = node.keys.current();
+        assert!(
+            ring.authenticate(&unlisted.key)
+                .unwrap()
+                .allows_index("acme-docs")
+        );
+        assert!(
+            ring.authenticate(&sharing.key)
+                .unwrap()
+                .allows_index("acme-docs")
+        );
+
+        node.store
+            .put_tenant("beta", scoped_tenant(&["eve-*"]), None)
+            .await
+            .unwrap();
+        let beta = node
+            .store
+            .create_tenant_key("beta", user("bo@beta.com", Role::Reader, None), None)
+            .await
+            .unwrap();
+        assert!(
+            node.keys
+                .current()
+                .authenticate(&beta.key)
+                .unwrap()
+                .allows_index("eve-notes")
+        );
+    }
+
     fn writer() -> KeySpec {
         KeySpec {
             role: Role::Writer,
