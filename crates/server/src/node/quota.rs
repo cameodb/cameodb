@@ -307,6 +307,7 @@ mod tests {
                         TenantQuota {
                             max_indexes,
                             max_bytes,
+                            ..Default::default()
                         },
                     )
                 })
@@ -340,6 +341,7 @@ mod tests {
                 TenantQuota {
                     max_indexes: 5,
                     max_bytes: 100,
+                    ..Default::default()
                 },
             )]
             .into_iter()
@@ -357,6 +359,7 @@ mod tests {
                     TenantQuota {
                         max_indexes: 3,
                         max_bytes: 40,
+                        ..Default::default()
                     },
                 ),
                 (
@@ -364,6 +367,7 @@ mod tests {
                     TenantQuota {
                         max_indexes: 1,
                         max_bytes: 0,
+                        ..Default::default()
                     },
                 ),
             ]
@@ -433,6 +437,7 @@ mod tests {
                     TenantQuota {
                         max_indexes: 0,
                         max_bytes: 10,
+                        ..Default::default()
                     },
                 )]
                 .into_iter()

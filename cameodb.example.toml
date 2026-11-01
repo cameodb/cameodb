@@ -126,6 +126,7 @@ enabled = false
 # [security.tenants.team-a]
 # max_indexes = 20
 # max_bytes = 53687091200               # 50 GiB
+# allowed_indexes = ["team-a-*"]        # bounds every team-a key; a key's own list narrows within
 
 # What one caller may spend per minute. Both meters off by default.
 #

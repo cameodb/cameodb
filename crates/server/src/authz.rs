@@ -1655,6 +1655,47 @@ mod tests {
         assert!(decide(&ring, "HEAD", "/api/docs/_config", &headers).is_ok());
     }
 
+    /// A tenant's scope is enforced at the same chokepoints a key's own list is: named
+    /// access to another tenant's index is refused, and a listing hides it.
+    #[test]
+    fn a_tenant_scope_is_enforced_on_requests_and_listings() {
+        let (key, mut config) = key_for(Role::Writer, None);
+        config.tenant = Some("acme".to_string());
+        let ring = SecurityConfig {
+            enabled: true,
+            api_keys: vec![config],
+            tenants: [(
+                "acme".to_string(),
+                crate::auth::TenantQuota {
+                    allowed_indexes: Some(vec!["acme-*".to_string()]),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        }
+        .load_keyring()
+        .unwrap();
+        let headers = headers_with(Some(&key));
+        assert!(decide(&ring, "PUT", "/api/acme-docs/document", &headers).is_ok());
+        assert_eq!(
+            status_of(&decide(&ring, "PUT", "/api/beta-docs/document", &headers)),
+            Some(StatusCode::FORBIDDEN)
+        );
+
+        let mut listing = serde_json::json!({
+            "indexes": [{"name": "acme-docs"}, {"name": "beta-docs"}],
+            "total_indexes": 2,
+        });
+        let authz = Authz::Key(ring.authenticate(key.expose()).unwrap());
+        filter_index_listing(&mut listing, &authz);
+        assert_eq!(
+            listing["indexes"],
+            serde_json::json!([{"name": "acme-docs"}])
+        );
+        assert_eq!(listing["total_indexes"], 1);
+    }
+
     /// An [`Authz`] holding a key scoped to `indexes`.
     fn scoped_as(indexes: Option<Vec<&str>>) -> Authz {
         let (key, config) = key_for(Role::Reader, indexes);

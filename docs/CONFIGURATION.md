@@ -739,7 +739,10 @@ Roles bundle four capabilities:
 
 `allowed_indexes` applies on top of the role and holds everywhere a key can reach: naming
 another index is refused, and `/_indexes`, the MCP catalog and the MCP resource list return
-only the indexes that key may see.
+only the indexes that key may see. An entry is an exact index name or a prefix ending in `*` —
+`["logs-*", "audit"]` reaches `logs-2026` and `audit`, and an index created later under the
+prefix needs no new key. A bare `*` is refused (omit the field to allow every index), and so is a
+`*` anywhere but the end.
 
 **`index_overrides` reduces a key on one index.** The case it exists for is a `writer` that
 must be read-only on a single sensitive index while keeping write everywhere else — one key
@@ -784,9 +787,12 @@ you only discover on the day you turn authentication on. These all refuse to sta
 - a hash that is not `sha256:<64 hex>`
 - two entries with the same hash — one key cannot hold two roles
 - `allowed_indexes = []`, which reads as "no restriction" but means "no index at all"
+- `allowed_indexes` holding a bare `*`, or a `*` that is not at the end
 - an `index_overrides` entry that grants more than the key's own role
 - an `index_overrides` entry naming an index outside `allowed_indexes`
 - a blank `tenant`
+- a key's `allowed_indexes` or `index_overrides` reaching past its tenant's `allowed_indexes`
+- two tenants whose `allowed_indexes` overlap
 
 ### Tenant quotas (`[security.tenants]`)
 
@@ -808,6 +814,28 @@ max_bytes = 53687091200          # 50 GiB across all of them (0 = unlimited)
 Both ceilings default to `0`, unlimited, and a tenant with no `[security.tenants]` entry has no
 ceiling at all — so an upgrade, or a key given a tenant before anyone has decided its limits,
 changes nothing. Several keys may name one tenant; they share its quota.
+
+**A tenant can scope its keys' indexes.** Without it, a tenant only meters: a key with a tenant
+and no `allowed_indexes` of its own reaches every index on the node, other tenants' included.
+`allowed_indexes` on the tenant bounds every key that names it, and a key's own list narrows
+within that:
+
+```toml
+[security.tenants.acme]
+allowed_indexes = ["acme-*"]     # every acme key, whatever else it says
+
+[[security.api_keys]]
+key_hash_file = "/etc/cameodb/keys/jane"
+role = "reader"
+tenant = "acme"
+allowed_indexes = ["acme-wiki"]  # narrower still; ["beta-docs"] would be refused at startup
+```
+
+A key's list or `index_overrides` reaching past its tenant's scope is refused rather than
+silently cut down, and two tenants whose scopes overlap — `acme-*` and `acme-eu-*`, or two lists
+naming one index — are refused, since an index both match is one both tenants' keys can reach.
+A tenant without `allowed_indexes`, and a key with no `tenant`, behave as they always have: the
+key's own list is its whole scope.
 
 **Ownership is decided once, when the index is created,** and stamped on its schema. The stamp
 comes from the key, never the request body: a write or `PUT /_config` naming someone else's

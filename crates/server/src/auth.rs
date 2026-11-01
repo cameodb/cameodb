@@ -311,6 +311,139 @@ pub struct TenantQuota {
     /// path, which is the cost `commit_index` had removed from it earlier in this cycle.
     #[serde(default)]
     pub max_bytes: u64,
+
+    /// The indexes every key of this tenant is bounded to: exact names, or prefixes ending in
+    /// `*` (`"acme-*"`). A key's own `allowed_indexes` narrows within it. Omitted, the tenant
+    /// bounds nothing and its keys are scoped by their own lists alone, as before tenants had
+    /// a scope.
+    ///
+    /// Not a quota, but it lives in the same `[security.tenants.<name>]` table: it is the
+    /// other half of what a tenant is, and moves with a reload the same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_indexes: Option<Vec<String>>,
+}
+
+/// An index scope: exact index names, and prefixes written with a trailing `*`.
+///
+/// One type for a key's `allowed_indexes` and a tenant's, so both follow one matching rule. A
+/// bare `*` is refused — omitting the field already means every index, and a second spelling of
+/// "no restriction" would read as a restriction. A `*` anywhere but the end is refused too:
+/// index names are routing keys, not file names, and a prefix is the one shape a tenant's
+/// namespace needs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexScope(Vec<IndexPattern>);
+
+#[derive(Debug, Clone, PartialEq)]
+enum IndexPattern {
+    Exact(String),
+    Prefix(String),
+}
+
+impl IndexPattern {
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw.strip_suffix('*') {
+            Some("") => Err(
+                "'*' alone is not a scope; omit allowed_indexes to allow every index".to_string(),
+            ),
+            Some(prefix) if prefix.contains('*') => Err(format!(
+                "'{raw}': `*` is accepted only once, at the end, as a prefix"
+            )),
+            Some(prefix) => Ok(Self::Prefix(prefix.to_string())),
+            None if raw.contains('*') => Err(format!(
+                "'{raw}': `*` is accepted only at the end, as a prefix"
+            )),
+            None => Ok(Self::Exact(raw.to_string())),
+        }
+    }
+
+    fn matches(&self, index: &str) -> bool {
+        match self {
+            Self::Exact(name) => name == index,
+            Self::Prefix(prefix) => index.starts_with(prefix.as_str()),
+        }
+    }
+
+    /// Whether every index `other` matches, this matches too.
+    fn covers(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Exact(a), Self::Exact(b)) => a == b,
+            (Self::Exact(_), Self::Prefix(_)) => false,
+            (Self::Prefix(a), Self::Exact(b) | Self::Prefix(b)) => b.starts_with(a.as_str()),
+        }
+    }
+
+    /// Whether some index name matches both.
+    fn overlaps(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Exact(a), Self::Exact(b)) => a == b,
+            (Self::Exact(name), prefix @ Self::Prefix(_))
+            | (prefix @ Self::Prefix(_), Self::Exact(name)) => prefix.matches(name),
+            (Self::Prefix(a), Self::Prefix(b)) => {
+                a.starts_with(b.as_str()) || b.starts_with(a.as_str())
+            }
+        }
+    }
+}
+
+impl fmt::Display for IndexPattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Exact(name) => f.write_str(name),
+            Self::Prefix(prefix) => write!(f, "{prefix}*"),
+        }
+    }
+}
+
+impl IndexScope {
+    /// Parse a configured list. Entries are trimmed and blank ones dropped; a list left empty
+    /// is refused, since it reads as "no restriction" and would mean "nothing permitted".
+    pub fn parse(list: &[String]) -> Result<Self, String> {
+        let patterns = list
+            .iter()
+            .map(|entry| entry.trim())
+            .filter(|entry| !entry.is_empty())
+            .map(IndexPattern::parse)
+            .collect::<Result<Vec<_>, _>>()?;
+        if patterns.is_empty() {
+            return Err(
+                "allowed_indexes is empty, which would permit no index at all. Remove \
+                        the field to allow every index, or name the indexes"
+                    .to_string(),
+            );
+        }
+        Ok(Self(patterns))
+    }
+
+    pub fn allows(&self, index: &str) -> bool {
+        self.0.iter().any(|pattern| pattern.matches(index))
+    }
+
+    /// The first of `inner`'s patterns this scope does not wholly contain.
+    fn first_outside(&self, inner: &Self) -> Option<String> {
+        inner
+            .0
+            .iter()
+            .find(|pattern| !self.0.iter().any(|own| own.covers(pattern)))
+            .map(ToString::to_string)
+    }
+
+    /// A pair of patterns, one from each scope, that some index name would match both of.
+    fn overlap_with(&self, other: &Self) -> Option<(String, String)> {
+        self.0.iter().find_map(|a| {
+            other
+                .0
+                .iter()
+                .find(|b| a.overlaps(b))
+                .map(|b| (a.to_string(), b.to_string()))
+        })
+    }
+}
+
+impl fmt::Display for IndexScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let rendered: Vec<String> = self.0.iter().map(ToString::to_string).collect();
+        f.write_str(&rendered.join(", "))
+    }
 }
 
 /// The tenant quotas in force, shared between the key reloader, which swaps them, and the
@@ -541,6 +674,8 @@ impl SecurityConfig {
             .iter()
             .map(|entry| ("--api-key-hash / CAMEODB_API_KEY_HASH".to_string(), entry));
 
+        let tenant_scopes = self.tenant_scopes()?;
+
         let mut resolved: Vec<Arc<KeyEntry>> = Vec::new();
         let mut origins: Vec<String> = Vec::new();
         for (origin, entry) in file_entries.chain(override_entry) {
@@ -568,25 +703,12 @@ impl SecurityConfig {
                 anyhow::anyhow!("{origin}: needs a role (admin, writer, or reader)")
             })?;
 
-            let allowed_indexes = match &entry.allowed_indexes {
-                None => None,
-                Some(indexes) => {
-                    let cleaned: Vec<String> = indexes
-                        .iter()
-                        .map(|index| index.trim().to_string())
-                        .filter(|index| !index.is_empty())
-                        .collect();
-                    if cleaned.is_empty() {
-                        // An empty allow-list reads as "no restriction" and means "nothing
-                        // permitted". Refuse rather than pick one of those meanings.
-                        bail!(
-                            "{origin}: allowed_indexes is empty, which would permit no index at \
-                             all. Remove the field to allow every index, or name the indexes"
-                        );
-                    }
-                    Some(cleaned)
-                }
-            };
+            let allowed_indexes = entry
+                .allowed_indexes
+                .as_deref()
+                .map(IndexScope::parse)
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("{origin}: {e}"))?;
 
             // Per-index overrides, validated hard because a mistake here is a silent grant.
             let mut index_overrides = std::collections::HashMap::new();
@@ -619,9 +741,10 @@ impl SecurityConfig {
                 }
 
                 // An override for an index the key cannot reach at all is dead config. It
-                // reads as protection and provides none, which is worse than absent.
+                // reads as protection and provides none, which is worse than absent. The
+                // tenant's scope is checked below, once the tenant is known.
                 if let Some(allowed) = &allowed_indexes
-                    && !allowed.iter().any(|permitted| permitted == index)
+                    && !allowed.allows(index)
                 {
                     bail!(
                         "{origin}: index_overrides names '{index}', which is not in \
@@ -668,6 +791,33 @@ impl SecurityConfig {
                 Some(tenant) => Some(tenant.to_string()),
             };
 
+            // A key narrows within its tenant's scope and never reaches past it. Refused
+            // rather than intersected silently: a key list naming an index the tenant cannot
+            // reach is a mistake about what the key is for.
+            let tenant_scope = tenant
+                .as_deref()
+                .and_then(|tenant| tenant_scopes.get(tenant))
+                .cloned();
+            if let (Some(scope), Some(tenant)) = (&tenant_scope, tenant.as_deref()) {
+                if let Some(outside) = allowed_indexes
+                    .as_ref()
+                    .and_then(|own| scope.first_outside(own))
+                {
+                    bail!(
+                        "{origin}: allowed_indexes names '{outside}', outside tenant '{tenant}''s \
+                         scope ({scope}). A key narrows within its tenant's indexes, never past \
+                         them"
+                    );
+                }
+                if let Some(index) = index_overrides.keys().find(|index| !scope.allows(index)) {
+                    bail!(
+                        "{origin}: index_overrides names '{index}', outside tenant '{tenant}''s \
+                         scope ({scope}). The key cannot reach that index at all, so the \
+                         override protects nothing"
+                    );
+                }
+            }
+
             resolved.push(Arc::new(KeyEntry {
                 digest,
                 role,
@@ -675,6 +825,7 @@ impl SecurityConfig {
                 allowed_indexes,
                 index_overrides,
                 tenant,
+                tenant_scope,
             }));
             origins.push(origin);
         }
@@ -683,6 +834,44 @@ impl SecurityConfig {
             enabled: self.enabled,
             entries: resolved,
         })
+    }
+
+    /// Each tenant's index scope, refusing a malformed one and two that overlap.
+    ///
+    /// Overlap is refused because the scope is what keeps one tenant's keys off another's
+    /// indexes: an index name both scopes match is an index both tenants' keys can reach.
+    fn tenant_scopes(&self) -> Result<std::collections::HashMap<String, IndexScope>> {
+        let origin = |tenant: &str| match self.tenant_sources.get(tenant) {
+            Some(source) => format!("{}: [security.tenants.{tenant}]", source.file.display()),
+            None => format!("[security.tenants.{tenant}]"),
+        };
+
+        let mut names: Vec<&String> = self.tenants.keys().collect();
+        names.sort();
+        let mut scopes: Vec<(&str, IndexScope)> = Vec::new();
+        for tenant in names {
+            let Some(list) = &self.tenants[tenant].allowed_indexes else {
+                continue;
+            };
+            let scope =
+                IndexScope::parse(list).map_err(|e| anyhow::anyhow!("{}: {e}", origin(tenant)))?;
+            for (other, other_scope) in &scopes {
+                if let Some((mine, theirs)) = scope.overlap_with(other_scope) {
+                    bail!(
+                        "{}: allowed_indexes '{mine}' overlaps tenant '{other}''s '{theirs}' \
+                         ({}). Two tenants' keys would reach the same indexes; give each \
+                         tenant a scope of its own",
+                        origin(tenant),
+                        origin(other)
+                    );
+                }
+            }
+            scopes.push((tenant.as_str(), scope));
+        }
+        Ok(scopes
+            .into_iter()
+            .map(|(tenant, scope)| (tenant.to_string(), scope))
+            .collect())
     }
 }
 
@@ -821,12 +1010,16 @@ pub struct KeyEntry {
     digest: KeyDigest,
     role: Role,
     label: String,
-    allowed_indexes: Option<Vec<String>>,
+    /// The key's own scope; see [`ApiKeyConfig::allowed_indexes`].
+    allowed_indexes: Option<IndexScope>,
     /// Per-index role subtraction; see [`ApiKeyConfig::index_overrides`]. Empty for the
     /// overwhelming majority of keys, so the lookup below is skipped entirely for them.
     index_overrides: std::collections::HashMap<String, Role>,
     /// The tenant whose quota this key spends; see [`ApiKeyConfig::tenant`].
     tenant: Option<String>,
+    /// The scope of that tenant, which bounds this key whatever its own list says; see
+    /// [`TenantQuota::allowed_indexes`].
+    tenant_scope: Option<IndexScope>,
 }
 
 impl KeyEntry {
@@ -876,9 +1069,9 @@ impl KeyEntry {
             .unwrap_or(self.role)
     }
 
-    /// True when this key is restricted to a named set of indexes.
+    /// True when this key is restricted to a set of indexes, by its own list or its tenant's.
     pub fn is_index_scoped(&self) -> bool {
-        self.allowed_indexes.is_some()
+        self.allowed_indexes.is_some() || self.tenant_scope.is_some()
     }
 
     /// Whether this key may touch `index`.
@@ -888,17 +1081,19 @@ impl KeyEntry {
     /// refused rather than allowed, which is the direction to fail in. Decoding here instead
     /// would mean comparing against a different string than the router hands the handler.
     pub fn allows_index(&self, index: &str) -> bool {
-        match &self.allowed_indexes {
-            None => true,
-            Some(allowed) => allowed.iter().any(|permitted| permitted == index),
-        }
+        [&self.allowed_indexes, &self.tenant_scope]
+            .into_iter()
+            .flatten()
+            .all(|scope| scope.allows(index))
     }
 
     /// This key's index scope, rendered for a log line.
     pub fn scope_summary(&self) -> String {
-        match &self.allowed_indexes {
-            None => "all indexes".to_string(),
-            Some(indexes) => indexes.join(", "),
+        match (&self.allowed_indexes, &self.tenant_scope) {
+            (None, None) => "all indexes".to_string(),
+            (Some(own), None) => own.to_string(),
+            (None, Some(tenant)) => format!("{tenant} (tenant)"),
+            (Some(own), Some(tenant)) => format!("{own} (within tenant {tenant})"),
         }
     }
 }
@@ -1260,12 +1455,19 @@ is how a working node stops working.";
             digest: digest.clone(),
             role,
             label: label.clone().unwrap_or_else(|| "keygen".to_string()),
-            allowed_indexes: allowed_indexes.clone(),
+            // Parsed as the loader will parse it, so a pattern the config would refuse is
+            // refused here, before a key is printed for a stanza that cannot load.
+            allowed_indexes: allowed_indexes
+                .as_deref()
+                .map(IndexScope::parse)
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("--allowed-indexes: {e}"))?,
             // `keygen` mints a key, it does not configure one. Overrides and tenancy are
             // written by hand into the stanza afterwards, so the round-trip check below proves
             // the key, not a policy it does not yet carry.
             index_overrides: std::collections::HashMap::new(),
             tenant: None,
+            tenant_scope: None,
         })],
     };
     if ring.authenticate(key.expose()).is_none() {
@@ -2149,6 +2351,161 @@ mod tests {
         assert!(report.enabled);
         assert!(keys.current().enabled());
         assert!(keys.current().authenticate(key_a.expose()).is_some());
+    }
+
+    fn list(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    /// A key of `role`, in `tenant` if given, with its own `allowed_indexes` if given.
+    fn tenant_key(role: Role, tenant: Option<&str>, indexes: Option<&[&str]>) -> ApiKeyConfig {
+        ApiKeyConfig {
+            key_hash: Some(ApiKey::generate().unwrap().digest().to_config_value()),
+            role: Some(role),
+            tenant: tenant.map(str::to_string),
+            allowed_indexes: indexes.map(list),
+            ..blank_key()
+        }
+    }
+
+    /// `[security]` with `tenants` as `(name, allowed_indexes)` and the given keys.
+    fn scoped(tenants: &[(&str, Option<&[&str]>)], keys: Vec<ApiKeyConfig>) -> SecurityConfig {
+        SecurityConfig {
+            enabled: true,
+            api_keys: keys,
+            tenants: tenants
+                .iter()
+                .map(|(name, indexes)| {
+                    (
+                        name.to_string(),
+                        TenantQuota {
+                            allowed_indexes: indexes.map(list),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_index_scope_takes_exact_names_and_trailing_prefixes_only() {
+        let scope = IndexScope::parse(&list(&["logs-*", "audit"])).unwrap();
+        assert!(scope.allows("logs-2026"));
+        assert!(scope.allows("logs-"));
+        assert!(scope.allows("audit"));
+        assert!(!scope.allows("audit-2026"));
+        assert!(!scope.allows("log"));
+        assert_eq!(scope.to_string(), "logs-*, audit");
+
+        for bad in [&["*"][..], &["lo*gs"], &["logs-**"], &["  ", ""]] {
+            assert!(IndexScope::parse(&list(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    /// The case tenants exist for: a key minted with no list of its own reaches its tenant's
+    /// indexes and nobody else's.
+    #[test]
+    fn a_tenant_scope_bounds_a_key_with_no_list_of_its_own() {
+        let ring = scoped(
+            &[("acme", Some(&["acme-*"]))],
+            vec![tenant_key(Role::Writer, Some("acme"), None)],
+        )
+        .load_keyring()
+        .unwrap();
+        let key = &ring.entries()[0];
+        assert!(key.allows_index("acme-docs"));
+        assert!(!key.allows_index("beta-docs"));
+        assert!(key.is_index_scoped());
+        assert_eq!(key.scope_summary(), "acme-* (tenant)");
+    }
+
+    #[test]
+    fn a_key_narrows_within_its_tenant_scope() {
+        let ring = scoped(
+            &[("acme", Some(&["acme-*"]))],
+            vec![
+                tenant_key(Role::Reader, Some("acme"), Some(&["acme-wiki"])),
+                tenant_key(Role::Reader, Some("acme"), Some(&["acme-eu-*"])),
+            ],
+        )
+        .load_keyring()
+        .unwrap();
+        assert!(ring.entries()[0].allows_index("acme-wiki"));
+        assert!(!ring.entries()[0].allows_index("acme-docs"));
+        assert!(ring.entries()[1].allows_index("acme-eu-docs"));
+        assert!(!ring.entries()[1].allows_index("acme-us-docs"));
+        assert_eq!(
+            ring.entries()[0].scope_summary(),
+            "acme-wiki (within tenant acme-*)"
+        );
+    }
+
+    #[test]
+    fn a_key_list_or_override_past_its_tenant_scope_is_refused() {
+        for indexes in [&["beta-docs"][..], &["acme-docs", "beta-docs"], &["a*"]] {
+            let err = scoped(
+                &[("acme", Some(&["acme-*"]))],
+                vec![tenant_key(Role::Reader, Some("acme"), Some(indexes))],
+            )
+            .load_keyring()
+            .unwrap_err();
+            let err = format!("{err:#}");
+            assert!(err.contains("outside tenant 'acme'"), "{indexes:?}: {err}");
+        }
+
+        let mut key = tenant_key(Role::Writer, Some("acme"), None);
+        key.index_overrides = Some([("beta-audit".to_string(), Role::Reader)].into());
+        let err = scoped(&[("acme", Some(&["acme-*"]))], vec![key])
+            .load_keyring()
+            .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("index_overrides names 'beta-audit'"), "{err}");
+    }
+
+    #[test]
+    fn overlapping_tenant_scopes_are_refused() {
+        for (a, b) in [
+            (&["acme-*"][..], &["acme-eu-*"][..]),
+            (&["acme-*"], &["acme-x"]),
+            (&["shared"], &["beta-*", "shared"]),
+        ] {
+            let err = scoped(&[("acme", Some(a)), ("beta", Some(b))], vec![])
+                .load_keyring()
+                .unwrap_err();
+            let err = format!("{err:#}");
+            assert!(err.contains("overlaps tenant"), "{a:?} {b:?}: {err}");
+        }
+        assert!(
+            scoped(
+                &[("acme", Some(&["acme-*"])), ("beta", Some(&["beta-*"]))],
+                vec![]
+            )
+            .load_keyring()
+            .is_ok()
+        );
+    }
+
+    /// Tenants are opt-in: no tenant, or a tenant with no scope, is today's behaviour — the
+    /// key's own list and nothing else, now with prefixes.
+    #[test]
+    fn without_a_tenant_scope_a_key_is_scoped_by_its_own_list_alone() {
+        let ring = scoped(
+            &[("acme", None)],
+            vec![
+                tenant_key(Role::Reader, None, Some(&["logs-*"])),
+                tenant_key(Role::Reader, Some("acme"), None),
+                tenant_key(Role::Reader, Some("acme"), Some(&["beta-docs"])),
+            ],
+        )
+        .load_keyring()
+        .unwrap();
+        assert!(ring.entries()[0].allows_index("logs-2026"));
+        assert!(!ring.entries()[0].allows_index("audit"));
+        assert!(ring.entries()[1].allows_index("anything"));
+        assert!(!ring.entries()[1].is_index_scoped());
+        assert!(ring.entries()[2].allows_index("beta-docs"));
     }
 
     /// Every optional field unset, so a test names only what it is about.
