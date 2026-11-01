@@ -1290,10 +1290,12 @@ holding `node-admin`, which would make `/_admin/*` unreachable until a restart. 
 already past the gate finishes on the entry it authenticated as; a revoked key fails its
 next request.
 
-What moves with a reload is `enabled` and the key list, plus the `--api-key-hash` override,
-which is re-applied rather than read from the file. `tenants`, `limits`, `audit` and
-`implicit_index_creation` do not — they are bound at startup, and the reload response names
-them under `not_applied` when the file changed them.
+What moves with a reload is `enabled`, the key list and the tenant quotas
+(`[security.tenants.*]`), plus the `--api-key-hash` override, which is re-applied rather than
+read from the file. A changed quota applies to the next mint and write, against the usage
+already measured — the reading is kept, not reset. `limits`, `audit` and
+`implicit_index_creation` do not move — they are bound at startup, and the reload response
+names them under `not_applied` when the file changed them.
 
 ### TLS certificate renewal
 

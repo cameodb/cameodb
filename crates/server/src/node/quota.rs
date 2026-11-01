@@ -28,7 +28,7 @@ use arc_swap::ArcSwapOption;
 use futures::future::join_all;
 use storage::HybridStore;
 
-use crate::auth::TenantQuota;
+use crate::auth::TenantLimits;
 
 /// How old a usage reading may be before a write asks for a new one.
 ///
@@ -58,7 +58,8 @@ struct UsageReading {
 /// reading taken by one serves the other.
 #[derive(Debug)]
 pub(crate) struct TenantQuotas {
-    limits: HashMap<String, TenantQuota>,
+    /// Swapped by a key reload; `usage` is not, so what a tenant has used survives the swap.
+    limits: TenantLimits,
     usage: Arc<ArcSwapOption<UsageReading>>,
     /// Set while a refresh is running, so a burst of writes past the TTL starts one, not many.
     refreshing: Arc<AtomicBool>,
@@ -66,11 +67,11 @@ pub(crate) struct TenantQuotas {
 }
 
 impl TenantQuotas {
-    pub(crate) fn new(limits: HashMap<String, TenantQuota>) -> Self {
+    pub(crate) fn new(limits: TenantLimits) -> Self {
         Self::with_ttl(limits, USAGE_TTL)
     }
 
-    pub(super) fn with_ttl(limits: HashMap<String, TenantQuota>, ttl: Duration) -> Self {
+    pub(super) fn with_ttl(limits: TenantLimits, ttl: Duration) -> Self {
         Self {
             limits,
             usage: Arc::new(ArcSwapOption::empty()),
@@ -82,6 +83,7 @@ impl TenantQuotas {
     /// The index ceiling for `tenant`, if one is set.
     pub(super) fn max_indexes(&self, tenant: &str) -> Option<usize> {
         self.limits
+            .load()
             .get(tenant)
             .map(|quota| quota.max_indexes)
             .filter(|&max| max > 0)
@@ -89,6 +91,7 @@ impl TenantQuotas {
 
     fn max_bytes(&self, tenant: &str) -> Option<u64> {
         self.limits
+            .load()
             .get(tenant)
             .map(|quota| quota.max_bytes)
             .filter(|&max| max > 0)
@@ -292,9 +295,10 @@ async fn measure_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::TenantQuota;
 
     fn quotas(entries: &[(&str, usize, u64)]) -> TenantQuotas {
-        TenantQuotas::new(
+        TenantQuotas::new(TenantLimits::new(
             entries
                 .iter()
                 .map(|&(tenant, max_indexes, max_bytes)| {
@@ -307,7 +311,7 @@ mod tests {
                     )
                 })
                 .collect(),
-        )
+        ))
     }
 
     fn with_reading(quotas: &TenantQuotas, bytes: &[(&str, u64)]) {
@@ -324,6 +328,52 @@ mod tests {
         assert_eq!(quotas.max_indexes("acme"), None);
         assert!(quotas.check_mint("acme", 10_000).is_ok());
         assert!(quotas.check_write(Some("acme"), &HashMap::new()).is_ok());
+    }
+
+    /// A reload swaps the limits under a running node: the next check uses the new ceiling,
+    /// and the usage already measured is what it is checked against.
+    #[test]
+    fn swapped_limits_apply_at_once_and_keep_the_usage_reading() {
+        let limits = TenantLimits::new(
+            [(
+                "acme".to_string(),
+                TenantQuota {
+                    max_indexes: 5,
+                    max_bytes: 100,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let quotas = TenantQuotas::new(limits.clone());
+        with_reading(&quotas, &[("acme", 50)]);
+        assert!(quotas.check_mint("acme", 3).is_ok());
+        assert!(quotas.check_write(Some("acme"), &HashMap::new()).is_ok());
+
+        limits.store(
+            [
+                (
+                    "acme".to_string(),
+                    TenantQuota {
+                        max_indexes: 3,
+                        max_bytes: 40,
+                    },
+                ),
+                (
+                    "beta".to_string(),
+                    TenantQuota {
+                        max_indexes: 1,
+                        max_bytes: 0,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert!(quotas.check_mint("acme", 3).is_err());
+        // 50 bytes were measured before the swap; the new 40-byte ceiling refuses them.
+        assert!(quotas.check_write(Some("acme"), &HashMap::new()).is_err());
+        assert!(quotas.check_mint("beta", 1).is_err());
     }
 
     /// `0` is unlimited for each ceiling independently, so setting one leaves the other off.
@@ -377,15 +427,17 @@ mod tests {
     #[tokio::test]
     async fn a_stale_reading_still_decides_and_is_replaced() {
         let quotas = TenantQuotas::with_ttl(
-            [(
-                "acme".to_string(),
-                TenantQuota {
-                    max_indexes: 0,
-                    max_bytes: 10,
-                },
-            )]
-            .into_iter()
-            .collect(),
+            TenantLimits::new(
+                [(
+                    "acme".to_string(),
+                    TenantQuota {
+                        max_indexes: 0,
+                        max_bytes: 10,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            ),
             Duration::ZERO,
         );
         with_reading(&quotas, &[("acme", 10)]);

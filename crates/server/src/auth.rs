@@ -313,6 +313,31 @@ pub struct TenantQuota {
     pub max_bytes: u64,
 }
 
+/// The tenant quotas in force, shared between the key reloader, which swaps them, and the
+/// node, which enforces them.
+///
+/// Only the limits live here. What each tenant has used is the node's
+/// [`crate::node::TenantQuotas`] reading, and stays where it is when the limits are swapped, so a
+/// reload that changes a ceiling is checked against the usage already measured rather than
+/// against a node that forgot it.
+#[derive(Debug, Clone, Default)]
+pub struct TenantLimits(Arc<arc_swap::ArcSwap<std::collections::HashMap<String, TenantQuota>>>);
+
+impl TenantLimits {
+    pub fn new(limits: std::collections::HashMap<String, TenantQuota>) -> Self {
+        Self(Arc::new(arc_swap::ArcSwap::from_pointee(limits)))
+    }
+
+    /// The limits as they stand: a consistent snapshot, cheap to take.
+    pub fn load(&self) -> Arc<std::collections::HashMap<String, TenantQuota>> {
+        self.0.load_full()
+    }
+
+    pub(crate) fn store(&self, limits: std::collections::HashMap<String, TenantQuota>) {
+        self.0.store(Arc::new(limits));
+    }
+}
+
 /// The `[provisioning]` table of a key file the node wrote for one tenant.
 ///
 /// What tells a file the node manages from one an operator wrote: the node rewrites only a
@@ -961,9 +986,11 @@ pub struct KeyReloader {
     /// list is never re-walked.
     source: Option<PathBuf>,
     /// The `[security]` section as it stood at startup, so a reload can report the fields it
-    /// cannot move — `tenants`, `limits`, `audit` and `implicit_index_creation` are bound
-    /// into the node, the rate limiter and the audit sink before any request is served.
+    /// cannot move — `limits`, `audit` and `implicit_index_creation` are bound into the
+    /// node, the rate limiter and the audit sink before any request is served.
     startup: SecurityConfig,
+    /// The tenant quotas, swapped by every reload; the node holds the same handle.
+    tenant_limits: TenantLimits,
 }
 
 impl KeyReloader {
@@ -979,8 +1006,14 @@ impl KeyReloader {
             ring: arc_swap::ArcSwap::from_pointee(ring),
             cli,
             source,
+            tenant_limits: TenantLimits::new(security.tenants.clone()),
             startup: security,
         })
+    }
+
+    /// The tenant quotas this reloader swaps, for the node to enforce.
+    pub fn tenant_limits(&self) -> TenantLimits {
+        self.tenant_limits.clone()
     }
 
     /// The ring to decide a request against: a consistent snapshot, cheap to take.
@@ -1020,15 +1053,18 @@ impl KeyReloader {
         if security.implicit_index_creation != self.startup.implicit_index_creation {
             not_applied.push("security.implicit_index_creation");
         }
-        if security.tenants != self.startup.tenants {
-            not_applied.push("security.tenants");
-        }
         if security.limits != self.startup.limits {
             not_applied.push("security.limits");
         }
         if security.audit != self.startup.audit {
             not_applied.push("security.audit");
         }
+
+        // The quotas before the ring, so a key of a new tenant is never accepted before the
+        // tenant's ceiling is in force.
+        let tenants_changed = *self.tenant_limits.load() != security.tenants;
+        let tenant_count = security.tenants.len();
+        self.tenant_limits.store(security.tenants);
 
         let was_enabled = self.ring.load().enabled();
         self.ring.store(Arc::new(ring));
@@ -1044,6 +1080,9 @@ impl KeyReloader {
                 indexes = %entry.scope_summary(),
                 "🔑 API key loaded by reload"
             );
+        }
+        if tenants_changed {
+            info!(tenants = tenant_count, "Tenant quotas loaded by reload");
         }
         if ring.enabled() != was_enabled {
             warn!(
@@ -1087,6 +1126,7 @@ impl KeyReloader {
             cli: crate::config::CliOverrides::default(),
             source: None,
             startup: SecurityConfig::default(),
+            tenant_limits: TenantLimits::default(),
         })
     }
 
@@ -2041,6 +2081,58 @@ mod tests {
         assert_eq!(report.not_applied, vec!["security.limits"]);
         // ...and the key material itself still moved.
         assert!(keys.current().authenticate(key_a.expose()).is_some());
+    }
+
+    /// Tenant quotas move with the keys, through the handle the node holds, and a tenant added
+    /// in an included file arrives with its ceiling.
+    #[test]
+    fn a_reload_swaps_tenant_quotas_in_the_handle_the_node_holds() {
+        let key_a = ApiKey::generate().unwrap();
+        let mut toml = security_toml(true, &[(&key_a, "admin")]);
+        toml.push_str("\n[security.tenants.acme]\nmax_indexes = 2\n");
+        let (dir, cli) = config_file(&format!("include = [\"keys.d/*.toml\"]\n{toml}"));
+        std::fs::create_dir(dir.path().join("keys.d")).unwrap();
+        let keys = reloader_for(&cli);
+        let limits = keys.tenant_limits();
+        assert_eq!(limits.load()["acme"].max_indexes, 2);
+
+        rewrite_config(
+            &dir,
+            &format!(
+                "include = [\"keys.d/*.toml\"]\n{}",
+                toml.replace("max_indexes = 2", "max_indexes = 7")
+            ),
+        );
+        std::fs::write(
+            dir.path().join("keys.d/beta.toml"),
+            "[security.tenants.beta]\nmax_bytes = 1000\n",
+        )
+        .unwrap();
+
+        let report = keys.reload().unwrap();
+        assert!(report.not_applied.is_empty(), "{:?}", report.not_applied);
+        assert_eq!(limits.load()["acme"].max_indexes, 7);
+        assert_eq!(limits.load()["beta"].max_bytes, 1000);
+    }
+
+    /// A refused reload leaves the quotas as they were, as it leaves the ring.
+    #[test]
+    fn a_refused_reload_leaves_tenant_quotas_alone() {
+        let key_a = ApiKey::generate().unwrap();
+        let mut toml = security_toml(true, &[(&key_a, "admin")]);
+        toml.push_str("\n[security.tenants.acme]\nmax_indexes = 2\n");
+        let (dir, cli) = config_file(&toml);
+        let keys = reloader_for(&cli);
+
+        rewrite_config(
+            &dir,
+            &format!(
+                "{}[[security.api_keys]]\nrole = \"reader\"\n",
+                toml.replace("= 2", "= 9")
+            ),
+        );
+        assert!(keys.reload().is_err());
+        assert_eq!(keys.tenant_limits().load()["acme"].max_indexes, 2);
     }
 
     /// `enabled` lives inside the ring, so flipping it is part of what a reload can do —

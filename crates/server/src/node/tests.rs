@@ -459,7 +459,7 @@ fn bare_engine() -> OrchestratorEngine {
         shards: ArcSwap::from_pointee(HashMap::new()),
         routing_ring: Arc::new(ArcSwap::from_pointee(ConsistentRing::new())),
         schema_cache: Arc::new(SchemaCache::new()),
-        quotas: Arc::new(TenantQuotas::new(HashMap::new())),
+        quotas: Arc::new(TenantQuotas::new(crate::auth::TenantLimits::default())),
         coordinator: None,
         identity: NodeIdentity::new(),
         default_search_limit: 10,

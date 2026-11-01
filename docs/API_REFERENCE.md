@@ -1552,8 +1552,9 @@ curl -s -X POST -H "Authorization: Bearer $ADMIN_KEY" \
 ```
 
 `not_applied` names `[security]` fields the file changed that a running node cannot adopt —
-`tenants`, `limits`, `audit` and `implicit_index_creation` are bound at startup and take
-effect on restart. `enabled` and the key list are the ones that move; an
+`limits`, `audit` and `implicit_index_creation` are bound at startup and take effect on
+restart. `enabled`, the key list and the tenant quotas are the ones that move — a changed
+ceiling is checked against the usage already measured; an
 `--api-key-hash`/`CAMEODB_API_KEY_HASH` override survives the reload, since it never came
 from the file.
 
