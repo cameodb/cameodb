@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its digest, in a file only the service can read (0600). Changes carry a `revision`, checked with `If-Match` (`412`). `allowed_tenants`
   bounds a provisioner to some tenants. Outside `/_admin`, so the routes are mounted under the
   `external` profile. On a cluster a change applies on the node that received it.
+- **A key's indexes change in place.** `PATCH /_keys/{key_id}` with `{"allowed_indexes": [...]}`
+  rewrites the scope of a key with no tenant; its holder keeps the key, and the new scope holds
+  from its next request on. The list is required and replaces the old one: a key is never
+  widened to every index this way. `client keys set-indexes` and the SDK's `update_key_indexes`
+  do the same.
 - **`include`: key and tenant files beside the config.** `include = ["keys.d/*.toml"]` adds
   `[[security.api_keys]]` entries and `[security.tenants.<name>]` tables from other files,
   relative to the config file's folder; anything else in them is refused, and a tenant or key

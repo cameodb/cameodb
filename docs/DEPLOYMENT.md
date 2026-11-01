@@ -301,6 +301,8 @@ label = "portal"
 cameodb client --api-key-file portal.key keys create --role writer \
   --label jane@company.com --indexes 'docs-*' --key-out jane.key
 cameodb client --api-key-file portal.key keys list
+# A subscription change: the same key, new indexes (PATCH /_keys/{key_id}).
+cameodb client --api-key-file portal.key keys set-indexes 6eb82d35 --indexes 'docs-*,reports-*'
 cameodb client --api-key-file portal.key keys revoke 6eb82d35
 ```
 

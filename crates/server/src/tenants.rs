@@ -72,6 +72,14 @@ pub struct TenantSpec {
     pub allowed_indexes: Option<Vec<String>>,
 }
 
+/// A change to a key the node holds: its index scope, rewritten in place, so the holder keeps
+/// the key it has. Required, and never `null`: widening a key to every index is a new key.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyPatch {
+    pub allowed_indexes: Vec<String>,
+}
+
 /// A key as a caller asks for one. The tenant, if any, is the route's; the key itself is the
 /// node's to generate.
 #[derive(Debug, Clone, Deserialize)]
@@ -195,6 +203,38 @@ impl TenantStore {
         if_match: Option<u64>,
     ) -> Result<MintedKey, TenantError> {
         self.mint(Slot::Keys, spec, if_match).await
+    }
+
+    /// Rewrite the `allowed_indexes` of a key the keys file holds. The key, its id, role and
+    /// label stay; the new scope holds from its next request on.
+    pub async fn update_key(
+        &self,
+        key_id: &str,
+        patch: KeyPatch,
+        if_match: Option<u64>,
+    ) -> Result<KeysView, TenantError> {
+        // As on mint: the pattern's own fault, before anything is written.
+        crate::auth::IndexScope::parse(&patch.allowed_indexes).map_err(TenantError::Refused)?;
+        let _guard = self.lock.lock().await;
+        let (path, file) = self.open(Slot::Keys)?;
+        let not_found = || TenantError::KeyNotFound {
+            place: "in the keys file".to_string(),
+            key_id: key_id.to_string(),
+        };
+        let mut file = file.ok_or_else(not_found)?;
+        check_revision(Slot::Keys, Some(&file), if_match)?;
+        let entry = file
+            .security
+            .api_keys
+            .iter_mut()
+            .find(|entry| has_key_id(entry, key_id))
+            .ok_or_else(not_found)?;
+        entry.allowed_indexes = Some(patch.allowed_indexes);
+        let revision = self.commit(&path, Slot::Keys, file)?;
+        let (_, file) = self.open(Slot::Keys)?;
+        let mut view = self.keys_view(file.as_ref());
+        view.revision = revision;
+        Ok(view)
     }
 
     /// Revoke a key the keys file holds.
@@ -574,13 +614,9 @@ fn key_view(entry: &crate::auth::KeyEntry) -> KeyView {
 /// Drop the key with `key_id` from `file`, or say it was not there.
 fn remove_key(file: &mut ManagedFile, key_id: &str, place: &str) -> Result<(), TenantError> {
     let before = file.security.api_keys.len();
-    file.security.api_keys.retain(|entry| {
-        entry
-            .key_hash
-            .as_deref()
-            .and_then(|hash| KeyDigest::parse(hash).ok())
-            .is_none_or(|digest| digest.key_id() != key_id)
-    });
+    file.security
+        .api_keys
+        .retain(|entry| !has_key_id(entry, key_id));
     if file.security.api_keys.len() == before {
         return Err(TenantError::KeyNotFound {
             place: place.to_string(),
@@ -588,6 +624,14 @@ fn remove_key(file: &mut ManagedFile, key_id: &str, place: &str) -> Result<(), T
         });
     }
     Ok(())
+}
+
+fn has_key_id(entry: &ApiKeyConfig, key_id: &str) -> bool {
+    entry
+        .key_hash
+        .as_deref()
+        .and_then(|hash| KeyDigest::parse(hash).ok())
+        .is_some_and(|digest| digest.key_id() == key_id)
 }
 
 fn check_revision(
@@ -875,6 +919,86 @@ mod tests {
 
         let err = node.store.revoke_key(&jane.key_id, None).await.unwrap_err();
         assert!(matches!(err, TenantError::KeyNotFound { .. }), "{err}");
+    }
+
+    /// A subscription change: the holder keeps the key it has, and the new scope holds from
+    /// its next request on.
+    #[tokio::test]
+    async fn without_tenants_a_keys_indexes_change_in_place() {
+        let node = keys_only_node();
+        let jane = node
+            .store
+            .create_key(
+                user("jane@company.com", Role::Writer, Some(&["docs-*"])),
+                None,
+            )
+            .await
+            .unwrap();
+        let bob = node
+            .store
+            .create_key(user("bob@company.com", Role::Reader, Some(&["wiki"])), None)
+            .await
+            .unwrap();
+        let patch = |list: &[&str]| KeyPatch {
+            allowed_indexes: list.iter().map(|i| i.to_string()).collect(),
+        };
+
+        let view = node
+            .store
+            .update_key(&jane.key_id, patch(&["wiki", "reports-*"]), Some(2))
+            .await
+            .unwrap();
+        assert_eq!(view.revision, 3);
+        assert_eq!(view.keys[0].key_id, jane.key_id);
+        assert_eq!(view.keys[0].indexes, "wiki, reports-*");
+        let entry = node.keys.current().authenticate(&jane.key).unwrap();
+        assert_eq!(
+            (entry.role(), entry.label()),
+            (Role::Writer, "jane@company.com")
+        );
+        assert!(entry.allows_index("reports-2026"));
+        assert!(!entry.allows_index("docs-2026"));
+        let bob_entry = node.keys.current().authenticate(&bob.key).unwrap();
+        assert!(bob_entry.allows_index("wiki") && !bob_entry.allows_index("reports-1"));
+
+        // Refused, the file is as it was: a list the loader would not take, an empty one, a
+        // stale revision, a key the file does not hold.
+        let before = std::fs::read_to_string(node.root.join("keys.d/keys.toml")).unwrap();
+        for (list, if_match) in [
+            (&["*"][..], None),
+            (&[][..], None),
+            (&["docs"][..], Some(2)),
+        ] {
+            let err = node
+                .store
+                .update_key(&jane.key_id, patch(list), if_match)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    TenantError::Refused(_) | TenantError::RevisionMismatch { current: 3, .. }
+                ),
+                "{err}"
+            );
+        }
+        let err = node
+            .store
+            .update_key("nope", patch(&["docs"]), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TenantError::KeyNotFound { .. }), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(node.root.join("keys.d/keys.toml")).unwrap(),
+            before
+        );
+        assert!(
+            node.keys
+                .current()
+                .authenticate(&jane.key)
+                .unwrap()
+                .allows_index("wiki")
+        );
     }
 
     #[tokio::test]

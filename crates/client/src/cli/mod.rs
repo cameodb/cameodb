@@ -620,6 +620,16 @@ pub enum KeysCommand {
     List,
     /// Mint a key; it is shown once and stored nowhere but as a digest
     Create(MintArgs),
+    /// Change a key's indexes in place; its holder keeps the key it has
+    SetIndexes {
+        key_id: String,
+        /// Indexes the key may reach from now on: names or prefixes ending in `*`,
+        /// comma-separated. They replace the key's list
+        #[arg(long = "indexes", value_name = "INDEX[,INDEX...]")]
+        indexes: String,
+        #[arg(long)]
+        if_match: Option<u64>,
+    },
     /// Revoke a key by its key_id; it fails from its next request on
     Revoke {
         key_id: String,
@@ -1099,6 +1109,15 @@ pub async fn run_cli() -> Result<()> {
                 let minted = client.create_key(&mint.request(), mint.if_match).await?;
                 deliver_minted(&minted, mint.key_out.as_deref())?;
             }
+            KeysCommand::SetIndexes {
+                key_id,
+                indexes,
+                if_match,
+            } => print_json(
+                &client
+                    .update_key_indexes(&key_id, &split_ids(&indexes), if_match)
+                    .await?,
+            )?,
             KeysCommand::Revoke { key_id, if_match } => {
                 print_json(&client.revoke_key(&key_id, if_match).await?)?
             }

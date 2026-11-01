@@ -18,7 +18,7 @@ use crate::cluster_coordinator::OperationType;
 use crate::http_server::error::AppError;
 use crate::node::ClientOp;
 use crate::state::AppState;
-use crate::tenants::{KeySpec, TenantError, TenantSpec, TenantView};
+use crate::tenants::{KeyPatch, KeySpec, TenantError, TenantSpec, TenantView};
 
 /// `GET /_tenants` — every tenant the caller may manage, managed by the node or not.
 pub(super) async fn list_tenants_handler(
@@ -182,6 +182,28 @@ pub(super) async fn create_key_handler(
     );
     *response.status_mut() = StatusCode::CREATED;
     Ok(response)
+}
+
+/// `PATCH /_keys/{key_id}` — rewrite a key's `allowed_indexes` in place: a subscription change
+/// reaches the key its holder already has, from its next request on.
+pub(super) async fn update_key_handler(
+    Path(key_id): Path<String>,
+    State(state): State<AppState>,
+    authz: Option<Extension<Authz>>,
+    headers: HeaderMap,
+    Json(patch): Json<KeyPatch>,
+) -> Result<Response, AppError> {
+    check_unbounded(authz.as_deref())?;
+    let view = state
+        .tenants
+        .update_key(&key_id, patch, if_match(&headers)?)
+        .await
+        .map_err(to_app_error)?;
+    let audited = format!("key_id={key_id} revision={}", view.revision);
+    Ok(audited_json(
+        Json(serde_json::to_value(view).unwrap_or_default()),
+        audited,
+    ))
 }
 
 /// `DELETE /_keys/{key_id}` — revoke a key with no tenant, from its next request on.

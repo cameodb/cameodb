@@ -1548,6 +1548,29 @@ fn key_and_tenant_commands_parse_as_one_shot_commands() {
     );
     assert_eq!(mint.if_match, Some(3));
 
+    let ClientCommand::Keys {
+        subcommand:
+            KeysCommand::SetIndexes {
+                key_id,
+                indexes,
+                if_match,
+            },
+    } = parse(&[
+        "keys",
+        "set-indexes",
+        "ab12cd34",
+        "--indexes",
+        "wiki, reports-*",
+        "--if-match",
+        "4",
+    ])
+    else {
+        panic!("keys set-indexes parsed as something else");
+    };
+    assert_eq!(key_id, "ab12cd34");
+    assert_eq!(split_ids(&indexes), ["wiki", "reports-*"]);
+    assert_eq!(if_match, Some(4));
+
     assert!(matches!(
         parse(&["keys", "revoke", "ab12cd34"]),
         ClientCommand::Keys {

@@ -202,6 +202,17 @@ check_eq "partner mints no tenant-less keys"  "403" "$(code "$PARTNER_KEY" -X PO
 check_eq "partner lists only its own" "['partner-x-co']" \
     "$(body "$PARTNER_KEY" "$BASE/_tenants" | python3 -I -c 'import json,sys; print([t["tenant"] for t in json.load(sys.stdin)["tenants"]])')"
 
+section "a subscription change keeps the key"
+check_eq "PATCH narrows jane to wiki"         "200" "$(code "$PORTAL_KEY" -X PATCH "$BASE/_keys/$JANE_ID" -H "$json" -d '{"allowed_indexes":["wiki"]}')"
+check_eq "the same key is refused on docs-*"  "403" "$(search "$JANE_KEY" docs-public)"
+client "$WORK/portal.key" keys set-indexes "$JANE_ID" --indexes 'docs-*' >/dev/null 2>&1
+check_eq "set-indexes gives docs-* back"      "200" "$(search "$JANE_KEY" docs-public)"
+check_eq "a stale If-Match is refused"        "412" "$(code "$PORTAL_KEY" -X PATCH "$BASE/_keys/$JANE_ID" -H "$json" -H 'If-Match: 1' -d '{"allowed_indexes":["wiki"]}')"
+check_eq "an empty list is refused"           "400" "$(code "$PORTAL_KEY" -X PATCH "$BASE/_keys/$JANE_ID" -H "$json" -d '{"allowed_indexes":[]}')"
+check_eq "an unknown key is not found"        "404" "$(code "$PORTAL_KEY" -X PATCH "$BASE/_keys/00000000" -H "$json" -d '{"allowed_indexes":["wiki"]}')"
+check_eq "a data key changes no key"          "403" "$(code "$JANE_KEY" -X PATCH "$BASE/_keys/$JANE_ID" -H "$json" -d '{"allowed_indexes":["wiki"]}')"
+check_eq "a partner changes no tenant-less key" "403" "$(code "$PARTNER_KEY" -X PATCH "$BASE/_keys/$JANE_ID" -H "$json" -d '{"allowed_indexes":["wiki"]}')"
+
 section "revocation"
 client "$WORK/portal.key" keys revoke "$JANE_ID" >/dev/null 2>&1
 check_eq "a revoked key is refused at once" "401" "$(search "$JANE_KEY" docs-public)"

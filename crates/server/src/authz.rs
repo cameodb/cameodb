@@ -142,6 +142,7 @@ const ROUTES: &[RouteRule] = &[
     // internet. Which tenants a key may manage is `allowed_tenants`, checked by the handler.
     rule("GET",    "/_keys",                            Access::Needs(Capability::KeyManage)),
     rule("POST",   "/_keys",                            Access::Needs(Capability::KeyManage)),
+    rule("PATCH",  "/_keys/{key_id}",                   Access::Needs(Capability::KeyManage)),
     rule("DELETE", "/_keys/{key_id}",                   Access::Needs(Capability::KeyManage)),
     rule("GET",    "/_tenants",                         Access::Needs(Capability::KeyManage)),
     rule("GET",    "/_tenants/{tenant}",                Access::Needs(Capability::KeyManage)),
@@ -1804,6 +1805,7 @@ mod tests {
             for (method, path) in [
                 ("GET", "/_keys"),
                 ("POST", "/_keys"),
+                ("PATCH", "/_keys/ab12"),
                 ("DELETE", "/_keys/ab12"),
             ] {
                 assert_eq!(

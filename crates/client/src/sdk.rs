@@ -650,6 +650,20 @@ impl CameoClient {
         self.send_json(builder, "Minting a key").await
     }
 
+    /// Rewrite the `allowed_indexes` of a key with no tenant. The holder keeps the key it has;
+    /// the new scope holds from its next request on.
+    pub async fn update_key_indexes(
+        &self,
+        key_id: &str,
+        allowed_indexes: &[String],
+        if_match: Option<u64>,
+    ) -> Result<ManagedKeysResponse> {
+        let url = self.base_url.join(&format!("_keys/{key_id}"))?;
+        let body = serde_json::json!({ "allowed_indexes": allowed_indexes });
+        let builder = with_if_match(self.http.patch(url).json(&body), if_match);
+        self.send_json(builder, "Changing a key's indexes").await
+    }
+
     /// Revoke a key with no tenant; it fails from its next request on.
     pub async fn revoke_key(
         &self,
