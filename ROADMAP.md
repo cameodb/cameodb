@@ -2945,8 +2945,14 @@ deferred until cluster support for provisioning is decided.
     narrows within it. A key with no tenant is scoped by its own `allowed_indexes` alone, as
     today: a deployment that does not use tenants configures and operates exactly as before.
 11. **Where the node writes is configured, not inferred** (2026-11-01):
-    `[security.tenant_files] dir` and `name`, any file name holding `{tenant}` once. Absent, the
-    tenant routes manage nothing; present, it must be read back by an `include` pattern.
+    `[security.managed_files]` — `dir`, `keys` (the file of keys with no tenant) and `tenant`
+    (any file name holding `{tenant}` once). Each name absent turns its routes off; present, it
+    must be read back by an `include` pattern.
+12. **Keys without tenants come first** (2026-11-01). The provisioning service's first version
+    uses no tenants: users and agents, their keys and `allowed_indexes`. `/_keys` mints, lists
+    and revokes keys with no tenant in the one `keys` file, by the same store, lock, rollback and
+    `If-Match` as a tenant's file; a key's scope is its own list, as with no tenants today.
+    Tenants are added on top later and change nothing for these keys.
 
 How other databases split the same thing — operator-owned files plus a part the server writes,
 alongside and included: ClickHouse's `users.xml`/`users.d` with `CREATE USER` written to
@@ -3030,10 +3036,11 @@ create; the usage reading survives the swap.
   tenant's scope (`400` otherwise); omitted, the key has the tenant's whole scope.
 - *No escalation.* A key the API makes is at most `writer` and always has its tenant. `admin` and
   `provisioner` keys are written by an operator, in `cameodb.toml` or `keys/`.
-- *Where.* `[security.tenant_files]`: `dir`, relative to the config file's folder, and `name`, a
-  file name holding `{tenant}` exactly once (`"{tenant}.toml"`, `"tenant-{tenant}.toml"`) — no
-  path separator, no leading dot. Refused at startup: a missing `dir`, a malformed `name`, and a
-  `dir`/`name` no `include` pattern matches, since a file the node writes and never reads is a
+- *Where.* `[security.managed_files]`: `dir`, relative to the config file's folder; `keys`, the
+  file name of keys with no tenant (`"keys.toml"`); and `tenant`, a file name holding `{tenant}`
+  exactly once (`"{tenant}.toml"`, `"tenant-{tenant}.toml"`) — no path separator, no leading dot.
+  Refused at startup: a missing `dir`, neither name given, a malformed name, and a file no
+  `include` pattern reads back, since a file the node writes and never reads is a
   tenant that silently has no keys. Without the section the tenant routes answer that tenant
   management is not configured. A tenant name the API accepts is letters, digits, `.`, `_` and
   `-`, starting with a letter or digit, so a name never becomes a path; hand-written tenants
@@ -3083,6 +3090,16 @@ A tenant made without `allowed_indexes` is scoped `{t}-*`; a bounded provisioner
 `["beta-*"]` on `partner-x-acme` is `403`; a key list outside the tenant scope is `400`.
 `allowed_tenants`: a provisioner bound to `partner-x-*` creates `partner-x-acme`, is `403` on
 `acme`, and lists only its own; an empty list and the field on a `writer` are refused at load. A key appears in no response but the one that created it, and in no log.
+
+**Keys without tenants (`/_keys`).** `POST /_keys` mints a `writer` or `reader` key with its own
+`allowed_indexes` and no tenant into the `keys` file; `GET /_keys` lists that file's keys;
+`DELETE /_keys/{key_id}` revokes one. `key-manage` without `allowed_tenants` — a provisioner bound
+to some tenants manages those tenants only. A tenant whose file would be the `keys` file is
+refused. **Tests:** with no `[security.tenants]` anywhere — keys in included files scoped by
+their own exact and prefix lists, listings filtered, a changed file reloaded, no quota measured or
+enforced; through `/_keys`, a minted key authenticates and is scoped by its list, survives a
+restart from the file, fails after revoke, a stale `If-Match` is `412`, a pattern the loader
+refuses is `400` and undone, an `admin` key is `403`, and a bounded provisioner is `403`.
 
 ### R3 — Changes reach every node
 
