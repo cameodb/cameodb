@@ -2944,6 +2944,9 @@ deferred until cluster support for provisioning is decided.
     `[security.tenants.<t>] allowed_indexes` bounds every key of the tenant; a key's own list
     narrows within it. A key with no tenant is scoped by its own `allowed_indexes` alone, as
     today: a deployment that does not use tenants configures and operates exactly as before.
+11. **Where the node writes is configured, not inferred** (2026-11-01):
+    `[security.tenant_files] dir` and `name`, any file name holding `{tenant}` once. Absent, the
+    tenant routes manage nothing; present, it must be read back by an `include` pattern.
 
 How other databases split the same thing — operator-owned files plus a part the server writes,
 alongside and included: ClickHouse's `users.xml`/`users.d` with `CREATE USER` written to
@@ -3027,9 +3030,19 @@ create; the usage reading survives the swap.
   tenant's scope (`400` otherwise); omitted, the key has the tenant's whole scope.
 - *No escalation.* A key the API makes is at most `writer` and always has its tenant. `admin` and
   `provisioner` keys are written by an operator, in `cameodb.toml` or `keys/`.
-- *Writes.* The node owns `keys.d/{t}.toml` for a tenant it manages. Each change is read–change–write
-  under one lock, written to a temp file in the same folder, fsynced, renamed; then the ring and the
-  quotas are swapped directly, without waiting for the watcher.
+- *Where.* `[security.tenant_files]`: `dir`, relative to the config file's folder, and `name`, a
+  file name holding `{tenant}` exactly once (`"{tenant}.toml"`, `"tenant-{tenant}.toml"`) — no
+  path separator, no leading dot. Refused at startup: a missing `dir`, a malformed `name`, and a
+  `dir`/`name` no `include` pattern matches, since a file the node writes and never reads is a
+  tenant that silently has no keys. Without the section the tenant routes answer that tenant
+  management is not configured. A tenant name the API accepts is letters, digits, `.`, `_` and
+  `-`, starting with a letter or digit, so a name never becomes a path; hand-written tenants
+  keep the names they have.
+- *Writes.* The node owns the file `name` gives for a tenant it manages. Each change is
+  read–change–write under one lock, written to a temp file starting with a dot in `dir`, fsynced,
+  renamed; then the ring and the quotas are swapped directly, without waiting for the watcher. A
+  file already at that path that is not the node's — no `[provisioning]`, or another tenant's —
+  is never overwritten: `409`.
 - *Ready for the cluster.* Everything R3 needs is written from the start, so R3 adds behaviour,
   not a format change. An API-written file opens with a `[provisioning]` table — `revision`
   (raised by one on every change to the tenant), `written_by` (the node id that made the change,
