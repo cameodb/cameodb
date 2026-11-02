@@ -1823,6 +1823,7 @@ impl MicroshardActor {
                         deadline,
                         fields: fields.as_deref(),
                         array_limit,
+                        match_query: None,
                     },
                 )
             })
@@ -1916,6 +1917,7 @@ impl MicroshardActor {
         let ids = request.ids;
         let fields = request.fields;
         let array_limit = request.array_limit;
+        let match_query = request.match_query;
 
         let deadline = self
             .read_budget
@@ -1928,6 +1930,7 @@ impl MicroshardActor {
                     &ids,
                     fields.as_deref(),
                     array_limit,
+                    match_query.as_deref(),
                     deadline.as_ref(),
                 )
             })

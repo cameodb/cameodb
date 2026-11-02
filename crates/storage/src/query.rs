@@ -713,6 +713,7 @@ pub(crate) fn prepare_query_parser(
         held,
         json_fields,
         ip_fields,
+        default_fields: selected,
     })
 }
 
@@ -730,6 +731,8 @@ pub(crate) struct PreparedQuery {
     json_fields: HashSet<String>,
     /// The ip fields, by name — see [`screen_clauses`].
     ip_fields: Vec<String>,
+    /// The fields a clause naming none searches, as the parser was given them.
+    pub(crate) default_fields: Vec<String>,
 }
 
 impl PreparedQuery {
@@ -743,7 +746,8 @@ impl PreparedQuery {
         Vec<tantivy::query::QueryParserError>,
         Vec<String>,
     ) {
-        let (ast, grammar_errors) = tantivy::query_grammar::parse_query_lenient(&self.text);
+        let mut notes = Vec::new();
+        let (ast, grammar_errors) = self.screened(&mut notes);
         let mut errors: Vec<tantivy::query::QueryParserError> = grammar_errors
             .into_iter()
             .map(|error| {
@@ -753,15 +757,32 @@ impl PreparedQuery {
                 ))
             })
             .collect();
-        let mut notes = Vec::new();
+        let (query, mut built_errors) = self.parser.build_query_from_user_input_ast_lenient(ast);
+        errors.append(&mut built_errors);
+        (query, errors, notes)
+    }
+
+    /// The query as the parser builds it: the grammar's tree, held ranges put back and every
+    /// leaf screened. What [`parse`](Self::parse) hands the parser, and what the fetch phase reads
+    /// to find which elements of an array a hit matched — see [`crate::matched`].
+    pub(crate) fn screened_ast(&self) -> tantivy::query_grammar::UserInputAst {
+        self.screened(&mut Vec::new()).0
+    }
+
+    fn screened(
+        &self,
+        notes: &mut Vec<String>,
+    ) -> (
+        tantivy::query_grammar::UserInputAst,
+        Vec<tantivy::query_grammar::LenientError>,
+    ) {
+        let (ast, grammar_errors) = tantivy::query_grammar::parse_query_lenient(&self.text);
         let screen = ScreenFields {
             json: &self.json_fields,
             ip: &self.ip_fields,
         };
-        let ast = screen_clauses(restore_ranges(ast, &self.held), &screen, &mut notes);
-        let (query, mut built_errors) = self.parser.build_query_from_user_input_ast_lenient(ast);
-        errors.append(&mut built_errors);
-        (query, errors, notes)
+        let ast = screen_clauses(restore_ranges(ast, &self.held), &screen, notes);
+        (ast, grammar_errors)
     }
 
     /// The normalized query as it reads, held ranges written back.

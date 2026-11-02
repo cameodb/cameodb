@@ -10,6 +10,8 @@
 //! The array cap sits beside it for the same reason: the shard is where a field of a few
 //! hundred thousand elements can be shortened before it costs the wire anything.
 
+use std::collections::HashMap;
+
 use serde_json::Value as JsonValue;
 
 /// Apply field projection to a JSON document, keeping only specified fields.
@@ -50,6 +52,15 @@ pub fn apply_field_projection(doc: JsonValue, fields: &[String]) -> JsonValue {
 /// asked for — the node projects the merged page again, and the account has to survive it.
 pub const TRUNCATED_ARRAYS_FIELD: &str = "_truncated_arrays";
 
+/// The key a hit names the elements its cut arrays lead with under: for each array, the stored
+/// positions of the elements the query matched, in the order they now lead. See
+/// [`cap_document_arrays_leading`].
+pub const MATCHED_ELEMENTS_FIELD: &str = "_matched_elements";
+
+/// How many matched positions an array cut to nothing reports — `array 0`, the sizes without
+/// the payload. With elements, the cap itself bounds them.
+pub const MATCHED_POSITIONS_WITHOUT_ELEMENTS: usize = 100;
+
 /// Keep at most `max` elements of every array in a document, and say which were cut.
 ///
 /// A search bounds how many hits it returns; this bounds how large one hit can be. A single
@@ -66,26 +77,93 @@ pub const TRUNCATED_ARRAYS_FIELD: &str = "_truncated_arrays";
 /// Idempotent, which is what lets the node apply it again after a merge: an array already at
 /// most `max` is left alone, and an entry already in the account is kept rather than replaced
 /// — it holds the length the array had before the first cut, which a second pass cannot see.
+/// Every `_`-prefixed key is metadata and left whole.
 pub fn cap_document_arrays(doc: &mut JsonValue, max: usize) {
+    cap_document_arrays_leading(doc, max, &HashMap::new());
+}
+
+/// [`cap_document_arrays`], with the arrays in `leading` led by the elements at those positions.
+///
+/// A top-level array longer than `max` that has positions in `leading` keeps the elements at
+/// them first, in the order given, then fills the cap from the rest in stored order; no element
+/// appears twice. Its positions are recorded under [`MATCHED_ELEMENTS_FIELD`]. An array that is
+/// not cut keeps its stored order — it is whole, so nothing it holds is missing.
+pub fn cap_document_arrays_leading(
+    doc: &mut JsonValue,
+    max: usize,
+    leading: &HashMap<String, Vec<usize>>,
+) {
     let JsonValue::Object(map) = doc else {
         return;
     };
     let mut truncated: Vec<(String, usize)> = Vec::new();
+    let mut matched: Vec<(String, Vec<usize>)> = Vec::new();
     for (key, value) in map.iter_mut() {
-        if key == TRUNCATED_ARRAYS_FIELD {
+        if key.starts_with('_') {
             continue;
+        }
+        if let (JsonValue::Array(items), Some(positions)) = (&mut *value, leading.get(key))
+            && items.len() > max
+            && !positions.is_empty()
+        {
+            truncated.push((key.clone(), items.len()));
+            *items = lead_with(std::mem::take(items), positions, max);
+            // The positions that lead; all of them for an array cut to nothing, where they are
+            // the whole answer.
+            let shown = if max == 0 {
+                positions.len()
+            } else {
+                positions.len().min(max)
+            };
+            matched.push((key.clone(), positions[..shown].to_vec()));
         }
         cap_value(value, max, key, &mut truncated);
     }
-    if truncated.is_empty() {
+    record(
+        map,
+        TRUNCATED_ARRAYS_FIELD,
+        truncated.into_iter().map(|(p, n)| (p, JsonValue::from(n))),
+    );
+    record(
+        map,
+        MATCHED_ELEMENTS_FIELD,
+        matched.into_iter().map(|(p, at)| (p, JsonValue::from(at))),
+    );
+}
+
+/// `items` cut to `max`: the elements at `positions` first, in that order, then the rest in
+/// stored order.
+fn lead_with(items: Vec<JsonValue>, positions: &[usize], max: usize) -> Vec<JsonValue> {
+    let mut slots: Vec<Option<JsonValue>> = items.into_iter().map(Some).collect();
+    let mut kept = Vec::with_capacity(max);
+    for &position in positions {
+        if kept.len() == max {
+            return kept;
+        }
+        if let Some(item) = slots.get_mut(position).and_then(Option::take) {
+            kept.push(item);
+        }
+    }
+    kept.extend(slots.into_iter().flatten().take(max - kept.len()));
+    kept
+}
+
+/// Add `entries` to the account under `key`, keeping an entry a first pass already made.
+fn record(
+    map: &mut serde_json::Map<String, JsonValue>,
+    key: &str,
+    entries: impl Iterator<Item = (String, JsonValue)>,
+) {
+    let mut entries = entries.peekable();
+    if entries.peek().is_none() {
         return;
     }
     let account = map
-        .entry(TRUNCATED_ARRAYS_FIELD)
+        .entry(key)
         .or_insert_with(|| JsonValue::Object(serde_json::Map::new()));
     if let JsonValue::Object(account) = account {
-        for (path, length) in truncated {
-            account.entry(path).or_insert(JsonValue::from(length));
+        for (path, value) in entries {
+            account.entry(path).or_insert(value);
         }
     }
 }
@@ -212,5 +290,46 @@ mod tests {
         cap_document_arrays(&mut doc, 0);
         cap_document_arrays(&mut doc, 0);
         assert_eq!(doc[TRUNCATED_ARRAYS_FIELD], json!({"a": 2, "b": 2, "c": 2}));
+    }
+
+    fn leading(entries: &[(&str, &[usize])]) -> HashMap<String, Vec<usize>> {
+        entries
+            .iter()
+            .map(|(key, positions)| (key.to_string(), positions.to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn a_cut_array_leads_with_its_positions_and_fills_in_stored_order() {
+        let mut doc = json!({"ips": ["a", "b", "c", "d", "e", "f"]});
+        cap_document_arrays_leading(&mut doc, 4, &leading(&[("ips", &[4, 1])]));
+        assert_eq!(doc["ips"], json!(["e", "b", "a", "c"]), "no element twice");
+        assert_eq!(doc[MATCHED_ELEMENTS_FIELD], json!({"ips": [4, 1]}));
+        assert_eq!(doc[TRUNCATED_ARRAYS_FIELD], json!({"ips": 6}));
+    }
+
+    #[test]
+    fn an_uncut_array_keeps_its_order_whatever_matched() {
+        let mut doc = json!({"ips": ["a", "b", "c"]});
+        cap_document_arrays_leading(&mut doc, 3, &leading(&[("ips", &[2])]));
+        assert_eq!(doc, json!({"ips": ["a", "b", "c"]}));
+    }
+
+    /// The node caps again after the merge: the leading elements are already the head, and the
+    /// positions — an array themselves — are metadata, never cut.
+    #[test]
+    fn a_second_pass_keeps_the_order_and_the_positions() {
+        let mut doc = json!({"ips": ["a", "b", "c", "d", "e", "f"]});
+        cap_document_arrays_leading(&mut doc, 2, &leading(&[("ips", &[3, 4, 5])]));
+        let once = doc.clone();
+        assert_eq!(doc["ips"], json!(["d", "e"]));
+        cap_document_arrays(&mut doc, 2);
+        assert_eq!(doc, once);
+        cap_document_arrays(&mut doc, 0);
+        assert_eq!(
+            doc[MATCHED_ELEMENTS_FIELD],
+            json!({"ips": [3, 4]}),
+            "the ones that lead"
+        );
     }
 }

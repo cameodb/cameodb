@@ -2975,6 +2975,117 @@ async fn a_narrowed_search_is_reported_and_not_refused() {
     );
 }
 
+/// Both search tools lead a cut array with the elements the query matched, by default, and take
+/// `matches` — the argument or the inline clause — to keep the stored head (ROADMAP P6).
+#[tokio::test]
+async fn both_search_tools_lead_a_cut_array_with_its_matches() {
+    let node = TestNode::start_with(
+        r#"
+[search]
+default_array_limit = 2
+"#,
+    )
+    .await;
+    for index in ["alpha", "beta"] {
+        // The addresses indexed, so a clause can match them.
+        let status = http()
+            .put(format!("{}/api/{index}/_config", node.url))
+            .json(&json!({"fields": {
+                "title": {"field_type": "text", "indexed": true},
+                "string_ipv4": {"field_type": "ip", "indexed": true},
+            }}))
+            .send()
+            .await
+            .expect("create config")
+            .status();
+        assert!(status.is_success(), "creating '{index}' failed: {status}");
+        let addresses: Vec<String> = (0..500)
+            .map(|n| format!("10.1.{}.{}", n / 256, n % 256))
+            .collect();
+        let status = http()
+            .put(format!("{}/api/{index}/document", node.url))
+            .json(&json!({
+                "id": format!("{index}-1"),
+                "doc": {"title": "quarterly record", "string_ipv4": addresses},
+            }))
+            .send()
+            .await
+            .expect("write")
+            .status();
+        assert!(status.is_success(), "seeding {index} failed: {status}");
+        node.await_searchable(index, 1).await;
+    }
+
+    let listing = node
+        .rpc(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+        .await;
+    for tool in listing["result"]["tools"].as_array().expect("tools") {
+        let name = tool["name"].as_str().unwrap_or("?");
+        if name.starts_with("search") {
+            assert_eq!(
+                tool["inputSchema"]["properties"]["matches"]["type"],
+                json!("boolean"),
+                "{name}"
+            );
+        }
+    }
+
+    // 10.1.1.44 is element 300.
+    let query = "string_ipv4:10.1.1.44";
+    let (is_error, result) = node
+        .call_tool("search_index", json!({"index": "alpha", "query": query}))
+        .await;
+    assert!(!is_error, "{result}");
+    let hit = &result["hits"][0];
+    assert_eq!(
+        hit["string_ipv4"],
+        json!(["10.1.1.44", "10.1.0.0"]),
+        "{hit}"
+    );
+    assert_eq!(hit["_matched_elements"], json!({"string_ipv4": [300]}));
+
+    let (_, result) = node
+        .call_tool(
+            "search_across_indexes",
+            json!({"indexes": ["alpha", "beta"], "query": query}),
+        )
+        .await;
+    for hit in result["hits"].as_array().expect("hits") {
+        assert_eq!(hit["string_ipv4"][0], json!("10.1.1.44"), "{hit}");
+        assert_eq!(
+            hit["_matched_elements"],
+            json!({"string_ipv4": [300]}),
+            "{hit}"
+        );
+    }
+
+    for (tool, arguments) in [
+        (
+            "search_index",
+            json!({"index": "alpha", "query": query, "matches": false}),
+        ),
+        (
+            "search_index",
+            json!({"index": "alpha", "query": format!("{query} matches off")}),
+        ),
+        (
+            "search_across_indexes",
+            json!({"indexes": ["alpha", "beta"], "query": query, "matches": false}),
+        ),
+    ] {
+        let (is_error, result) = node.call_tool(tool, arguments.clone()).await;
+        assert!(!is_error, "{tool}: {result}");
+        for hit in result["hits"].as_array().expect("hits") {
+            assert_eq!(
+                hit["string_ipv4"],
+                json!(["10.1.0.0", "10.1.0.1"]),
+                "{tool} {arguments}: {hit}"
+            );
+            assert!(hit.get("_matched_elements").is_none(), "{tool}: {hit}");
+        }
+    }
+}
+
 /// Both search tools cap each hit's arrays: the node's default when the call names none, the
 /// `array` argument or the inline clause when it does, and a refusal past the configured
 /// maximum — advertised as the schema's `maximum` and enforced at the same number.

@@ -36,6 +36,9 @@ pub struct SearchPayload {
     /// Most elements kept of each array in a hit. Absent is the node's
     /// `[search] default_array_limit`; past `[security.limits] max_array_limit` is refused.
     pub array: Option<usize>,
+    /// Whether an array `array` cuts leads with the elements the query matched. Absent is the
+    /// node's `[search] match_elements_first`.
+    pub matches: Option<bool>,
 }
 
 /// Handler for standard search operations
@@ -68,6 +71,7 @@ pub(super) async fn search_handler(
     let array_limit = state
         .checked_array_limit(payload.array.or(inline.array))
         .map_err(AppError::bad_request)?;
+    let match_elements = state.match_elements(payload.matches.or(inline.matches));
 
     // The ceiling is enforced here, not only on the MCP tools. `max_search_limit` is the node's
     // bound on how much one search may fetch, and the HTTP surface can ask for exactly the same
@@ -105,6 +109,7 @@ pub(super) async fn search_handler(
         fields: final_fields,
         sort: final_sort,
         array_limit: Some(array_limit),
+        match_elements,
     };
 
     let result = state
@@ -163,6 +168,7 @@ pub(super) async fn search_stream_handler(
     let array_limit = state
         .checked_array_limit(payload.array.or(inline.array))
         .map_err(AppError::bad_request)?;
+    let match_elements = state.match_elements(payload.matches.or(inline.matches));
 
     if let Some(offset) = payload.offset.or(inline.offset).filter(|off| *off > 0) {
         return Err(AppError::bad_request(format!(
@@ -195,6 +201,7 @@ pub(super) async fn search_stream_handler(
         fields: final_fields,
         sort: final_sort,
         array_limit: Some(array_limit),
+        match_elements,
     };
 
     // The search runs here, so a refusal answers with its own status; only the answer streams.

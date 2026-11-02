@@ -290,3 +290,6 @@ default_search_limit = 10
 # Elements kept of each array in a hit when a search names no `array`; a hit that lost elements
 # carries `_truncated_arrays`. At most security.limits.max_array_limit.
 default_array_limit = 1000
+# A cut array leads with the elements the query matched, named in `_matched_elements`; an array
+# that is not cut keeps its order. A request turns it off with `matches false`.
+match_elements_first = true

@@ -65,6 +65,9 @@ pub struct AppState {
     /// Resolved at the surface, as `limit` is, so every layer below carries the number that
     /// runs rather than an absence each would have to fill in the same way.
     pub default_array_limit: usize,
+    /// Whether a cut array leads with the elements the query matched when a search does not
+    /// say, from `[search] match_elements_first`. Resolved at the surface, as `array` is.
+    pub match_elements_first: bool,
     /// Largest `array` a search may ask for, from `[security.limits] max_array_limit`.
     ///
     /// Enforced on HTTP and MCP alike, and advertised as the `maximum` of each MCP search
@@ -118,5 +121,11 @@ impl AppState {
     /// the argument it advertised.
     pub(crate) fn checked_array_limit(&self, array: Option<usize>) -> Result<usize, String> {
         cameodb_mcp::checked_array_limit(array, self.default_array_limit, self.max_array_limit)
+    }
+
+    /// Whether this search's cut arrays lead with their matching elements: what the request said
+    /// — the argument, else the inline `matches` clause — else this node's default.
+    pub(crate) fn match_elements(&self, matches: Option<bool>) -> bool {
+        matches.unwrap_or(self.match_elements_first)
     }
 }

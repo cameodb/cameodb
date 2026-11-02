@@ -4268,7 +4268,7 @@ to document: because an inline `return` list runs to the next keyword, a field l
 - *Showing the element that matched.* `string_ipv4:1.2.3.4` can match an element far past the
   first N, so the hit shows none of what made it a hit. Keeping matching elements alongside the
   head needs per-element term matching, which is closer to highlighting than to projection.
-  Filed with its design as [P6](../ROADMAP.md#p6--a-hits-matching-elements-come-first).
+  Filed with its design as [P6](#p6--a-hits-matching-elements-come-first).
 - *Paging inside an array* (`array_offset`). A caller who needs all 300k elements is doing an
   export, not a search.
 - *A per-field cap* (`{"string_ipv4": 50, "*": 1000}`). One number first; a map can be added
@@ -4402,6 +4402,121 @@ non-address notes, a numeric sort with a missing value last), an HTTP test (sort
 the refusal for a plain field, CIDR and a bare address, each write refusal by value), and the two
 no-column tests narrowed to the four types that still have none. Docs: the API reference's
 column-type list and an *IP addresses* section; the MCP ip type hint.
+
+### P6 — A hit's matching elements come first
+
+✅ **Done 2026-11-02.** Built as decided below, with three departures:
+
+- *Top-level fields only.* "Arrays of scalars, at any object path" (decision 5) became the arrays
+  in a document's own fields: a schema field is top-level, and an array inside a json value is
+  matched by no clause (P5). Arrays of objects keep their head.
+- *No substring prefilter.* The `memchr::memmem` prefilter is unsound under folding and stemming
+  analyzers — `Häuser` folds to `hauser`, which is no substring of the element — so it was
+  dropped. In its place the term, range and set tests read tokens as they stream, without
+  collecting them, and a phrase is collected only for an element holding its first word.
+  Measured on a release build, one hit holding 300,000 elements, none matching: an ip array
+  adds 4 ms to an 18 ms search, a text array 22 ms.
+- *Positions shown are the ones that lead.* `_matched_elements` lists at most the cap; with
+  `array 0`, up to `MATCHED_POSITIONS_WITHOUT_ELEMENTS` (100).
+
+Where it is: `storage/src/matched.rs` — `ElementMatcher`, built once per fetch batch from
+`PreparedQuery::screened_ast` (the tree `parse` now builds from) and the default fields the
+parser was given; `cap_document_arrays_leading` and `lead_with` in `storage/src/projection.rs`,
+the cap skipping every `_` key; `fetch_documents` takes `match_query`, finds positions on the
+whole record before the projection — a ghost's condition may read a field the projection drops —
+and only for top-level arrays the cap cuts and the caller sees. On the node, `ArrayCut` carries
+the cap and the switch from the op to `FetchDocsRequest::match_query`; `ClientOp::Search` carries
+`match_elements`, both `serde(default)` for older peers. Surfaces: `[search]
+match_elements_first` (on), `--match-elements-first`, the body's `matches`, inline `matches
+on|off`, the MCP tools' `matches`.
+
+Tests: `matched_elements_test.rs` (each leaf kind, NOT excluded, default fields, a ghost fed and
+not fed, projection, `array 0`, the match limit, a match at 250,000 of 300,000), unit tests for
+the cap and the phrase check, the inline clause, an HTTP test on both routes, an MCP test on both
+tools. Not run: a two-node search through `cluster.sh`; a single node already sends every fetch
+to its shards as a `FetchDocsRequest`.
+
+Filed 2026-10-21; redesigned and given priority 2026-11-02. Picks up the second out-of-scope note
+of [P1](#p1--a-hits-arrays-are-capped-the-way-its-hits-are).
+
+**Today.** The P1 cap keeps the first N elements of each array in stored order. A clause such as
+`domains:"bad.example.com"` matches an element anywhere in the array, often far past N, so the
+hit shows none of what made it a hit. An array stored sorted returns its alphabetical head, so the
+matching element is reliably absent. The search index sees the whole array; the caller cannot see
+which element matched without fetching the array whole, which past `max_array_limit` it cannot.
+
+**Decided** (2026-11-02):
+
+1. **An array that is cut puts its matching elements first.** The elements a query's positive
+   clauses match lead, in stored order, up to N; the rest of the cap is filled from the elements
+   that did not match, in stored order. No element appears twice.
+2. **Only an array that is cut is reordered.** One of N elements or fewer is already whole and
+   keeps its stored order, so a response in which nothing is cut is byte-identical to today's.
+3. **The hit names what was moved.** `"_matched_elements": {"domains": [812345, 17, 2]}` — the
+   stored positions of the leading elements, in the order they lead, keyed by the path
+   `_truncated_arrays` uses. With `array 0` the elements are left out and the positions still
+   reported: the compact answer to "which ones matched".
+4. **On by default, off per request.** `[search] match_elements_first = true`; `"matches": false`
+   in the body, `matches off` inline, `matches` on the MCP tools. No count of its own: the array
+   cap already bounds the matches.
+5. **Arrays of scalars, at any object path, first.** An array of objects, and an array inside one,
+   keeps today's head: matching one means deciding which nested value counts. A follow-up.
+
+**Where the facts are** (checked at `888cb27`).
+
+- *The fetch phase has no query.* `search_keys` parses and walks; `fetch_documents`
+  (`storage/src/search.rs`) builds every hit — redb read, shadow and ghost reconstruction,
+  projection, cap — and on a cluster runs on the owning shard from a `FetchDocsRequest` that
+  carries only ids, `fields` and `array_limit` (`server/src/node/mod.rs`). The approximate-sort
+  path in `search_keys` also calls it, uncapped, and passes no matcher.
+- *The built tantivy query is not enough.* `BooleanQuery::query_terms` visits `MustNot` clauses,
+  `RangeQuery` keeps its bounds private, and `PhraseQuery` has no slop getter.
+- *The screened AST is, but is not kept.* `PreparedQuery::parse` (`storage/src/query.rs`) builds
+  it — `screen_clauses(restore_ranges(ast))` — and hands it straight to the query builder. Before
+  it exists, `AND NOT` is rewritten to `-x` / `(* -x)`, shadow names to `id`, dates and facets
+  normalized, and a prefix past `min_prefix_length` to a term range; a bare term has no field and
+  means the selected default fields, capped by `max_default_fields`.
+- *Elements are separate in the index.* tantivy leaves a position gap between a field's values,
+  so a term or exact phrase hit always has one element that caused it.
+- *Ghost fields.* A ghost column (Q1) is indexed text fed from `Ghost.source` under its `when`
+  condition and never stored. A bare term can match only through a ghost's analyzer, and the source
+  may be unindexed. The matcher maps a ghost leaf to its source: the source's elements, tokenized
+  by the ghost's analyzer, for a document the condition admits, reported under the source's path.
+- *The coordinator caps again after the merge* (`cap_hit_arrays`, `server/src/node/search.rs`).
+  Keeping the first N keeps the matches, but `cap_document_arrays` (`storage/src/projection.rs`)
+  skips only `_truncated_arrays`, and would cut `_matched_elements`.
+
+**The approach.**
+
+1. *Storage — the matcher.* `PreparedQuery` keeps the screened AST and the default fields it
+   resolved. A matcher per field, built once per fetch batch from positive leaves only (a `MustNot`
+   subtree is skipped): text and string tokenized by the field's analyzer
+   (`index.tokenizer_for_field`) — a term, an exact phrase as contiguous tokens, a phrase with
+   slop, a prefix range on a token; numeric, date and ip by typed equality, range and set, CIDR as
+   its range; `*` and presence give no element evidence. Ghost leaves resolved to their source.
+2. *Storage — the cap.* In `fetch_documents`, after the projection: for every array longer than N
+   whose field the query names, the matching positions, scanning in stored order and stopping at N;
+   a case-folded substring prefilter (`memchr::memmem`) rules out most elements before tokenizing.
+   The cap then takes those first and fills from the rest, and records `_matched_elements`.
+   `cap_document_arrays` skips every `_`-prefixed key.
+3. *The wire.* `#[serde(default)] match_query: Option<String>` on `FetchDocsRequest` and
+   `SearchOptions`; the owning shard re-parses it once per batch. A peer on an older build ignores
+   it and returns the stored head: clean degradation, documented.
+4. *The surface.* The node default, the body field, the inline keyword and the MCP parameter, as
+   `array` is plumbed.
+
+**Limits to document.** A phrase with slop can, rarely, match across two adjacent elements; that
+hit has no single element to move. Matching is the query's positive clauses per field, not a
+re-evaluation of the whole query: for `A AND B` over two fields each moves its own elements.
+
+**Tests.** Storage: the matcher per leaf kind, `NOT` excluded, default-field and ghost expansion,
+the prefilter agreeing with the tokenizer, the reorder (matches first, filled in stored order, no
+duplicates, an uncut array untouched), the cap leaving `_` keys alone. Server: the body field,
+inline keyword and MCP parameter, a 300k-element array matching at position 250,000, `array 0`
+with positions, a projected-away field moving nothing, the coordinator's re-cap keeping the order
+and the positions, and a two-node search answered by the owning shard. **Docs:**
+`docs/API_REFERENCE.md` (P1's "first N in stored order" restated), `docs/CONFIGURATION.md`, the
+MCP syntax reference (`crates/mcp/src/syntax.rs`), `cameodb.example.toml`, `CHANGELOG.md`.
 
 ## Q. Post-0.3.8 features ✅ Done
 

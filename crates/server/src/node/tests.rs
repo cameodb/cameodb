@@ -583,6 +583,7 @@ fn a_search_without_an_array_limit_reads_as_whole_arrays_and_one_with_it_keeps_i
         old,
         ClientOp::Search {
             array_limit: None,
+            match_elements: false,
             ..
         }
     ));
@@ -595,6 +596,7 @@ fn a_search_without_an_array_limit_reads_as_whole_arrays_and_one_with_it_keeps_i
         fields: None,
         sort: None,
         array_limit: Some(7),
+        match_elements: true,
     };
     let widened = super::router::widen_broadcast_op(
         op,
@@ -610,6 +612,7 @@ fn a_search_without_an_array_limit_reads_as_whole_arrays_and_one_with_it_keeps_i
                 limit: Some(30),
                 offset: None,
                 array_limit: Some(7),
+                match_elements: true,
                 ..
             }
         ),
@@ -2797,6 +2800,7 @@ fn a_fan_out_reads_the_page_off_the_operation() {
         fields: None,
         sort: None,
         array_limit: None,
+        match_elements: false,
     };
 
     assert_eq!(
@@ -4050,6 +4054,7 @@ fn only_what_a_worker_can_serve_leaves_the_mailbox() {
             fields: None,
             sort: None,
             array_limit: None,
+            match_elements: false,
         },
         // Asks the peers when the schema is not held here; see
         // `a_config_this_node_does_not_hold_is_asked_of_its_peers`.

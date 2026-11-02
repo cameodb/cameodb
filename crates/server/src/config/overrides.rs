@@ -141,6 +141,11 @@ pub(crate) const OVERRIDES: &[Override] = &[
         apply: |c, v| { c.search.default_array_limit = v.parse()?; Ok(()) },
     },
     Override {
+        flag: "--match-elements-first", env: "CAMEODB_MATCH_ELEMENTS_FIRST", kind: FlagKind::Switch,
+        placeholder: "", help: "A cut array leads with the elements the query matched (=false to keep its head)",
+        apply: |c, v| { c.search.match_elements_first = parse_bool(v); Ok(()) },
+    },
+    Override {
         flag: "--supervisor-timeout-secs", env: "CAMEODB_SUPERVISOR_TIMEOUT_SECS", kind: FlagKind::Value,
         placeholder: "<SECS>", help: "Shard supervisor timeout",
         apply: |c, v| { c.search.supervisor_timeout_secs = v.parse()?; Ok(()) },

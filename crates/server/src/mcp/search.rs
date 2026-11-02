@@ -245,6 +245,7 @@ pub(super) fn search_index(
             bounds.offset.or(inline.offset),
         )?;
         let array_limit = effective_array_limit(&state, bounds.array.or(inline.array))?;
+        let match_elements = state.match_elements(bounds.matches.or(inline.matches));
         let final_fields = index.fields.or(inline.fields);
         // The argument wins over an inline `sort` clause, as `limit` and `fields` do: a caller
         // that passed a structured sort chose it deliberately, where the clause may be part of
@@ -262,6 +263,7 @@ pub(super) fn search_index(
                     fields: final_fields,
                     sort: final_sort,
                     array_limit: Some(array_limit),
+                    match_elements,
                 },
                 None,
                 OperationType::Read,
@@ -339,6 +341,7 @@ pub(super) fn search_across_indexes(
         // One cap for every index, as one window is: the argument, else the inline clause, else
         // this node's default.
         let array_limit = effective_array_limit(&state, bounds.array.or(inline.array))?;
+        let match_elements = state.match_elements(bounds.matches.or(inline.matches));
         let requested_limit = window.limit;
         let requested_offset = window.offset;
 
@@ -397,6 +400,7 @@ pub(super) fn search_across_indexes(
                                 fields: final_fields,
                                 sort: storage_sort,
                                 array_limit: Some(array_limit),
+                                match_elements,
                             },
                             None,
                             OperationType::Read,

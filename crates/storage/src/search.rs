@@ -8,6 +8,7 @@
 //! and what it removed from that was one B-tree descent — the body is copied out either way.
 //! What it cost was a generation protocol whose only purpose was to stop it serving a body a
 //! write had superseded. `get_by_key` reads redb and is right by construction.
+use crate::matched::ElementMatcher;
 use crate::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -39,6 +40,42 @@ pub struct SearchOptions<'a> {
     /// Most elements kept of each array in a hit, applied after the projection — see
     /// [`cap_document_arrays`]. `None` returns every array whole.
     pub array_limit: Option<usize>,
+    /// The query whose matching elements a cut array leads with — see
+    /// [`fetch_documents`](HybridStore::fetch_documents). `None` cuts every array to its head.
+    pub match_query: Option<&'a str>,
+}
+
+/// For each array of `doc` the cap will cut and `matcher` tests, the positions it matched.
+///
+/// Only top-level arrays the caller will see: one projected away is never scanned.
+fn matched_positions(
+    matcher: &mut ElementMatcher,
+    doc: &JsonValue,
+    fields: Option<&[String]>,
+    max: usize,
+) -> HashMap<String, Vec<usize>> {
+    let mut leading = HashMap::new();
+    let Some(body) = doc.as_object() else {
+        return leading;
+    };
+    let limit = if max == 0 {
+        MATCHED_POSITIONS_WITHOUT_ELEMENTS
+    } else {
+        max
+    };
+    for (key, value) in body {
+        let Some(items) = value.as_array().filter(|items| items.len() > max) else {
+            continue;
+        };
+        if !matcher.tests(key) || fields.is_some_and(|wanted| !wanted.contains(key)) {
+            continue;
+        }
+        let positions = matcher.positions(body, key, items, limit);
+        if !positions.is_empty() {
+            leading.insert(key.clone(), positions);
+        }
+    }
+    leading
 }
 
 /// Wrap the parsed query so the segment walks it drives sample the deadline from inside.
@@ -491,6 +528,7 @@ impl HybridStore {
             &ids,
             opts.fields,
             opts.array_limit,
+            opts.match_query,
             opts.deadline.as_ref(),
         )?;
         let fetched_count = fetch.docs.len();
@@ -1234,6 +1272,8 @@ impl HybridStore {
                 &candidate_ids,
                 Some(&projected),
                 None,
+                // Uncapped, so nothing is cut and nothing to lead with.
+                None,
                 opts.deadline.as_ref(),
             )?;
             timings.fetch_ms += fetch.fetch_ms;
@@ -1307,12 +1347,18 @@ impl HybridStore {
     /// the answer preserves it, so assembling the page is a lookup rather than another
     /// sort. An id with no stored document is skipped — it was deleted between the
     /// phases, and a missing row is what the lookup map already tolerated.
+    ///
+    /// With `match_query`, an array the cap cuts leads with the elements that query matched,
+    /// and the hit names their positions — see [`cap_document_arrays_leading`]. The query is
+    /// the one the key phase ran, parsed again here once for the batch: on a cluster this runs
+    /// on the owning shard, which is handed only the query text.
     pub fn fetch_documents(
         &self,
         index: &str,
         ids: &[String],
         fields: Option<&[String]>,
         array_limit: Option<usize>,
+        match_query: Option<&str>,
         deadline: Option<&SearchDeadline>,
     ) -> Result<FetchOutcome, StoreError> {
         if let Some(deadline) = deadline {
@@ -1344,6 +1390,12 @@ impl HybridStore {
                 .unwrap_or_else(|| Arc::new(IndexSchema::default()))
         };
 
+        // Only an array the cap cuts is reordered, so without a cap there is nothing to match.
+        let mut matcher = match (array_limit, match_query) {
+            (Some(_), Some(query)) => self.element_matcher(index, &schema, query)?,
+            _ => None,
+        };
+
         let mut docs = Vec::with_capacity(ids.len());
         for doc_id in ids {
             let Some(doc_bytes) = doc_map.get(doc_id) else {
@@ -1361,6 +1413,12 @@ impl HybridStore {
                 serde_json::json!({ "id": doc_id })
             };
 
+            // Read from the whole record, before the projection: a ghost's condition can name a
+            // field the caller did not ask for.
+            let leading = match (&mut matcher, array_limit) {
+                (Some(matcher), Some(max)) => matched_positions(matcher, &doc, fields, max),
+                _ => HashMap::new(),
+            };
             // The projection is the last thing before the answer leaves: shadow
             // reconstruction — and anything else reading the full document — works on
             // the whole record.
@@ -1369,7 +1427,7 @@ impl HybridStore {
             }
             // After the projection, so only the arrays the caller will see are walked.
             if let Some(max) = array_limit {
-                cap_document_arrays(&mut doc, max);
+                cap_document_arrays_leading(&mut doc, max, &leading);
             }
             docs.push((doc_id.clone(), doc));
         }
@@ -1379,6 +1437,29 @@ impl HybridStore {
             fetch_ms,
             build_ms: build_start.elapsed().as_millis() as u64,
         })
+    }
+
+    /// The matcher for `query` on this shard's copy of `index`, or `None` when nothing in it
+    /// can name an element — or the index has no reader yet, so no document to match.
+    fn element_matcher(
+        &self,
+        index: &str,
+        schema: &IndexSchema,
+        query: &str,
+    ) -> Result<Option<ElementMatcher>, StoreError> {
+        let Some((reader, fields)) = self.get_reader(index)? else {
+            return Ok(None);
+        };
+        let searcher = reader.searcher();
+        let tantivy_index = searcher.index();
+        let prepared =
+            prepare_query_parser(tantivy_index, &fields, schema, query, &self.config.query)?;
+        Ok(ElementMatcher::new(
+            &prepared,
+            tantivy_index,
+            schema,
+            &fields,
+        ))
     }
 
     /// Get adaptive sample count based on table size.

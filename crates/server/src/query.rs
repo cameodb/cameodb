@@ -1,5 +1,5 @@
-//! The inline modifiers a query may carry after its text: `return`, `limit`, `offset`, `sort`
-//! and `array`.
+//! The inline modifiers a query may carry after its text: `return`, `limit`, `offset`, `sort`,
+//! `array` and `matches`.
 //!
 //! Shared by every surface — an HTTP search, an MCP tool call and the bundled client all accept
 //! the same query string, so they have to agree on where the query ends and the modifiers begin.
@@ -10,7 +10,7 @@
 use storage::{SortOrder, SortSpec};
 
 /// The keywords that open an inline modifier clause.
-const MODIFIER_KEYWORDS: [&str; 5] = ["return", "limit", "offset", "sort", "array"];
+const MODIFIER_KEYWORDS: [&str; 6] = ["return", "limit", "offset", "sort", "array", "matches"];
 
 /// Whether a token has the shape of a field name, which rules out quoted text, groups and a
 /// `field:value` clause.
@@ -83,6 +83,8 @@ pub(crate) struct QueryModifiers {
     pub sort: Option<SortSpec>,
     /// Most elements kept of each array in a hit.
     pub array: Option<usize>,
+    /// Whether a cut array leads with the elements the query matched.
+    pub matches: Option<bool>,
 }
 
 /// Parse `tokens` as an unbroken run of modifier clauses, in any order and at most one of each.
@@ -109,6 +111,16 @@ fn parse_modifier_run(tokens: &[&str]) -> Option<QueryModifiers> {
                 run.array = Some(tokens.get(idx + 1)?.parse().ok()?);
                 idx += 2;
             }
+            // `on`/`off` or `true`/`false`; anything else leaves the run, and the words stay
+            // query text, as `limit many` does.
+            "matches" if run.matches.is_none() => {
+                run.matches = Some(match *tokens.get(idx + 1)? {
+                    "on" | "true" => true,
+                    "off" | "false" => false,
+                    _ => return None,
+                });
+                idx += 2;
+            }
             "sort" if run.sort.is_none() => {
                 run.sort = Some(parse_sort_spec(tokens.get(idx + 1)?)?);
                 idx += 2;
@@ -129,8 +141,8 @@ fn parse_modifier_run(tokens: &[&str]) -> Option<QueryModifiers> {
     Some(run)
 }
 
-/// Split a query from its trailing inline modifiers — `return`, `limit`, `offset`, `sort` and
-/// `array`.
+/// Split a query from its trailing inline modifiers — `return`, `limit`, `offset`, `sort`,
+/// `array` and `matches`.
 ///
 /// A keyword counts only where it opens a run of clauses that reaches the end of the query and
 /// leaves at least one token in front of it. Everything else is query text, so a keyword used as a
@@ -722,5 +734,33 @@ mod tests {
         let m = parse_query_keywords("title:rust array 5 array 6");
         assert_eq!(m.array, Some(6));
         assert_eq!(m.query, "title:rust array 5");
+    }
+
+    #[test]
+    fn a_matches_clause_takes_on_or_off() {
+        for (query, expected) in [
+            ("ips:10.0.0.1 matches off", false),
+            ("ips:10.0.0.1 matches false", false),
+            ("ips:10.0.0.1 array 5 matches on", true),
+            ("ips:10.0.0.1 matches true array 5", true),
+        ] {
+            let m = parse_query_keywords(query);
+            assert_eq!(m.query, "ips:10.0.0.1", "{query}");
+            assert_eq!(m.matches, Some(expected), "{query}");
+        }
+    }
+
+    /// Any other word after it, or none, leaves the words in the query.
+    #[test]
+    fn matches_as_a_word_stays_in_the_query() {
+        for query in [
+            "title matches",
+            "what matches here",
+            "title:x matches maybe",
+        ] {
+            let m = parse_query_keywords(query);
+            assert_eq!(m.query, query, "{query}");
+            assert_eq!(m.matches, None, "{query}");
+        }
     }
 }

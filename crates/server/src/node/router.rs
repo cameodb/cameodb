@@ -130,6 +130,7 @@ pub(super) fn widen_broadcast_op(op: ClientOp, window: SearchWindow) -> ClientOp
             fields,
             sort,
             array_limit,
+            match_elements,
             ..
         } => ClientOp::Search {
             index,
@@ -139,6 +140,7 @@ pub(super) fn widen_broadcast_op(op: ClientOp, window: SearchWindow) -> ClientOp
             fields,
             sort,
             array_limit,
+            match_elements,
         },
         other => other,
     }

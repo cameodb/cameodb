@@ -2781,6 +2781,7 @@ impl OrchestratorEngine {
                 fields,
                 sort,
                 array_limit,
+                match_elements,
             } => WorkerOutcome::Done(
                 self.engine_search(
                     &index,
@@ -2791,7 +2792,10 @@ impl OrchestratorEngine {
                     },
                     fields.as_deref(),
                     sort.as_ref(),
-                    array_limit,
+                    ArrayCut {
+                        limit: array_limit,
+                        lead_with_matches: match_elements,
+                    },
                 )
                 .await,
             ),
@@ -3123,7 +3127,7 @@ impl OrchestratorEngine {
         window: SearchWindow,
         fields: Option<&[String]>,
         sort: Option<&SortSpec>,
-        array_limit: Option<usize>,
+        arrays: ArrayCut,
     ) -> Result<JsonValue, OrchestratorError> {
         let shards = self.shards.load();
         if shards.is_empty() {
@@ -3143,7 +3147,7 @@ impl OrchestratorEngine {
             schema: &schema,
             max_concurrent_shard_searches: self.max_concurrent_shard_searches,
         }
-        .gather(index, query, window, fields, sort, array_limit)
+        .gather(index, query, window, fields, sort, arrays)
         .await
     }
 }
@@ -5030,6 +5034,7 @@ impl NodeOrchestrator {
                 fields,
                 sort,
                 array_limit,
+                match_elements,
             } => {
                 self.orch_search(
                     &index,
@@ -5040,7 +5045,10 @@ impl NodeOrchestrator {
                     },
                     fields.as_deref(),
                     sort.as_ref(),
-                    array_limit,
+                    ArrayCut {
+                        limit: array_limit,
+                        lead_with_matches: match_elements,
+                    },
                 )
                 .await
             }
@@ -5746,7 +5754,7 @@ impl NodeOrchestrator {
         window: SearchWindow,
         fields: Option<&[String]>,
         sort: Option<&SortSpec>,
-        array_limit: Option<usize>,
+        arrays: ArrayCut,
     ) -> Result<JsonValue, OrchestratorError> {
         if self.shards.is_empty() {
             return Ok(
@@ -5765,7 +5773,7 @@ impl NodeOrchestrator {
             schema: &schema,
             max_concurrent_shard_searches: self.max_concurrent_shard_searches,
         }
-        .gather(index, query, window, fields, sort, array_limit)
+        .gather(index, query, window, fields, sort, arrays)
         .await
     }
 

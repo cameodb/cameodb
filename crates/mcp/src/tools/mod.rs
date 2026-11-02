@@ -158,6 +158,7 @@ where
                         limit: args.limit,
                         offset: args.offset,
                         array: args.array,
+                        matches: args.matches,
                     },
                 )
                 .await
@@ -186,6 +187,7 @@ where
                         limit: args.limit,
                         offset: args.offset,
                         array: args.array,
+                        matches: args.matches,
                     },
                 )
                 .await

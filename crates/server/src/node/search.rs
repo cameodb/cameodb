@@ -209,8 +209,9 @@ impl ScatterCtx<'_> {
     /// Ask every shard for the whole window from the front — any of them may hold all of it —
     /// then merge the pages under the requested order and answer the caller's slice.
     ///
-    /// `array_limit` rides the fetch phase to the shards that own the page, so an array is
-    /// shortened where the document is built rather than after it has crossed to this node.
+    /// `arrays` rides the fetch phase to the shards that own the page, so an array is
+    /// shortened where the document is built rather than after it has crossed to this node —
+    /// and led by its matching elements there, where the whole array still is.
     pub(super) async fn gather(
         &self,
         index: &str,
@@ -218,7 +219,7 @@ impl ScatterCtx<'_> {
         window: SearchWindow,
         fields: Option<&[String]>,
         sort: Option<&SortSpec>,
-        array_limit: Option<usize>,
+        arrays: ArrayCut,
     ) -> Result<JsonValue, OrchestratorError> {
         let start = std::time::Instant::now();
         let schema = self.schema;
@@ -379,7 +380,8 @@ impl ScatterCtx<'_> {
                     index: index.to_string(),
                     ids,
                     fields: fields.map(|list| list.to_vec()),
-                    array_limit,
+                    array_limit: arrays.limit,
+                    match_query: arrays.lead_with_matches.then(|| query.to_string()),
                 };
                 let shard = self.shards[&shard_id].clone();
                 async move { (shard_id, shard.handle_fetch_docs(req).await) }
@@ -1400,6 +1402,17 @@ pub(super) fn compare_hits_primary(
             .partial_cmp(&hit_score(a))
             .unwrap_or(std::cmp::Ordering::Equal),
     }
+}
+
+/// How a hit's arrays are cut: at most `limit` elements each — `None` keeps them whole — led by
+/// the elements the query matched when `lead_with_matches` is set (ROADMAP P6).
+///
+/// One value from the op to the shard's fetch, where the whole document still is: the cap and
+/// what leads the cut are one decision, made once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ArrayCut {
+    pub(crate) limit: Option<usize>,
+    pub(crate) lead_with_matches: bool,
 }
 
 /// The slice of an ordered result a caller asked for.

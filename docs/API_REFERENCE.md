@@ -151,7 +151,7 @@ curl -s -X POST http://localhost:9480/api/books/search \
 >
 > The JSON payload always wins over inline `return` clauses. Metadata keys (those starting with `_`, e.g. `_score`, `_id`, `shard_id`) are preserved automatically.
 >
-> A field list needs a comma between names, and the clause must sit in one run of `return`/`limit`/`offset`/`sort`/`array` at the end of the query with query text in front of it. Anywhere else the keyword is searched for as a word, so `find tax return forms` is four terms. A `return` naming a field the index does not have is reported in `_discarded_clauses`.
+> A field list needs a comma between names, and the clause must sit in one run of `return`/`limit`/`offset`/`sort`/`array`/`matches` at the end of the query with query text in front of it. Anywhere else the keyword is searched for as a word, so `find tax return forms` is four terms. A `return` naming a field the index does not have is reported in `_discarded_clauses`.
 
 > **Array elements (`array`):** each array in a hit keeps at most `array` elements — the first
 > ones, in stored order, at any depth, including arrays inside objects and arrays of objects. One
@@ -172,6 +172,33 @@ curl -s -X POST http://localhost:9480/api/books/search \
 > absent when nothing was cut, and `"array": 0` returns every array empty with its length — the
 > sizes without the payload. The cap runs on the shard that holds the document, after the field
 > projection, so a projected-away array is neither sent nor reported.
+
+> **Matching elements first (`matches`):** a clause matches an element anywhere in an array, often
+> far past what the cap keeps, so a cut array leads with the elements the query matched: those
+> first, in stored order, then the rest of the cap from the others in stored order, none twice. The
+> hit names the stored positions of the elements that lead, by the same paths
+> `_truncated_arrays` uses:
+>
+> ```json
+> {"id": "r1", "string_ipv4": ["10.0.7.42", "10.0.0.0"], "_truncated_arrays": {"string_ipv4": 2000}, "_matched_elements": {"string_ipv4": [1834]}}
+> ```
+>
+> - **Only an array that is cut is reordered.** An array of `array` elements or fewer is whole and
+>   keeps its stored order, so a response with nothing cut is the same with or without it.
+> - **On by default**, from the node's `[search] match_elements_first`. `"matches": false` in the
+>   payload, or `matches off` inline, keeps every array's head; the payload wins.
+> - **`"array": 0`** returns the arrays empty and still names the matched positions, up to 100
+>   per array — which elements matched, without the payload.
+> - **What counts as a match:** the query's positive clauses, each on its own field — a term, a
+>   phrase with its slop, a prefix, a range or `IN` set, a CIDR block, a bare term on the default
+>   fields — matched by the field's own analyzer, so a match is what the index would match. A
+>   `NOT` clause is never evidence. For `a:x AND b:y` each array leads with its own matches. A
+>   clause on a ghost field leads its source's array, for a document the ghost is fed from.
+> - **Not matched:** a clause on a json, bytes or facet field, a regex, `*`, and an array of
+>   objects or an array inside one, which keep their head. A phrase with slop can, rarely, match
+>   across two adjacent elements; that match has no single element to lead with.
+> - **On a cluster** the shard that holds the document does this. A node on an older build
+>   ignores it and sends the head.
 
 > **Paging (`offset`):** `limit` is the page size and `offset` is where the page starts, so page N
 > is `offset = N * limit`. Supply it in the payload — `"offset": 20` — or inline, as

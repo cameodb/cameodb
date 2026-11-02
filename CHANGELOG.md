@@ -77,6 +77,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   like nouns once folded). `de_stem_fold` reads `ae`, `oe` and `ue` as umlauts, so `Haeuser`
   finds `Häuser`; `de_stem` already finds `Hauser`. The plain analyzers are unchanged.
 
+- **A cut array leads with the elements the query matched.** A clause matches an element
+  anywhere in an array, often far past what the `array` cap keeps, so a hit used to show none of
+  what made it one. An array the cap cuts now keeps its matching elements first, in stored order,
+  fills the rest of the cap from the others, and the hit names their stored positions:
+  `"_matched_elements": {"string_ipv4": [1834]}`. A match is the query's positive clauses on
+  that field, read by the field's own analyzer — terms, phrases, prefixes, ranges, sets, CIDR
+  blocks, bare terms on the default fields; a clause on a ghost field leads its source's array. An
+  array that is not cut keeps its order, so a response with nothing cut is unchanged. On by
+  default (`[search] match_elements_first`); `"matches": false`, an inline `matches off` or the
+  MCP tools' `matches` keeps every array's head. With `array 0`, the positions alone. On a
+  cluster a node on an older build sends the head.
+
 ### Changed
 
 - **Tenant quotas reload live.** A changed `[security.tenants.*]` takes effect on SIGHUP,

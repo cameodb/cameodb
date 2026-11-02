@@ -5115,6 +5115,72 @@ max_array_limit = 500
     assert_eq!(status, 400);
 }
 
+/// A cut array leads with the elements the query matched, by default (ROADMAP P6): those first,
+/// then the rest of the cap in stored order, with `_matched_elements` naming their positions. The
+/// body's `matches` or the inline clause turns it off; an array that is not cut is untouched; the
+/// streaming route does the same.
+#[tokio::test]
+async fn a_cut_array_leads_with_the_elements_the_query_matched() {
+    let node = TestNode::start("default_array_limit = 3\n").await;
+    let client = node.client();
+    let addresses: Vec<String> = (0..2_000)
+        .map(|n| format!("10.0.{}.{}", n / 256, n % 256))
+        .collect();
+    client
+        .write_document(
+            "intel",
+            "r1",
+            &json!({"title": "report", "string_ipv4": addresses, "tags": ["a", "b"]}),
+            None,
+        )
+        .await
+        .expect("write");
+    client.admin_index_commit("intel").await.expect("commit");
+
+    let query = "string_ipv4:10.0.7.42 OR tags:b";
+    let (status, found) = post_json(&node, "/api/intel/search", json!({ "query": query })).await;
+    assert_eq!(status, 200, "{found}");
+    let hit = &found["hits"][0];
+    assert_eq!(
+        hit["string_ipv4"],
+        json!(["10.0.7.42", "10.0.0.0", "10.0.0.1"]),
+        "{hit}"
+    );
+    assert_eq!(hit["_matched_elements"], json!({"string_ipv4": [1834]}));
+    assert_eq!(hit["_truncated_arrays"], json!({"string_ipv4": 2000}));
+    assert_eq!(hit["tags"], json!(["a", "b"]), "an array that is not cut");
+
+    for body in [
+        json!({"query": query, "matches": false}),
+        json!({"query": format!("{query} matches off")}),
+    ] {
+        let (status, found) = post_json(&node, "/api/intel/search", body.clone()).await;
+        assert_eq!(status, 200, "{found}");
+        let hit = &found["hits"][0];
+        assert_eq!(
+            hit["string_ipv4"],
+            json!(["10.0.0.0", "10.0.0.1", "10.0.0.2"]),
+            "{body}: {hit}"
+        );
+        assert!(hit.get("_matched_elements").is_none(), "{body}: {hit}");
+    }
+
+    with_tls_provider();
+    let streamed = reqwest::Client::new()
+        .post(format!("{}/api/intel/search/stream", node.url))
+        .json(&json!({ "query": query }))
+        .send()
+        .await
+        .expect("request")
+        .text()
+        .await
+        .expect("body");
+    let hit: serde_json::Value =
+        serde_json::from_str(streamed.lines().next().expect("a hit line")).expect("json");
+    assert_eq!(hit["string_ipv4"][0], json!("10.0.7.42"), "{hit}");
+    assert_eq!(hit["_matched_elements"], json!({"string_ipv4": [1834]}));
+}
+
 /// A text stored once in `text`, searched stemmed through `text_en` where `lang` is `en` and as
 /// written through `text_rest` everywhere else (ROADMAP Q1).
 fn ghost_declaration(english: serde_json::Value) -> serde_json::Value {

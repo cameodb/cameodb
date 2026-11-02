@@ -1162,6 +1162,10 @@ pub struct FetchDocsRequest {
     /// Most elements kept of each array in a document; `None` keeps them whole.
     #[serde(default)]
     pub array_limit: Option<usize>,
+    /// The query whose matching elements an array the cap cuts leads with; `None` keeps each
+    /// array's head. A shard on a build that predates the field ignores it and sends the head.
+    #[serde(default)]
+    pub match_query: Option<String>,
 }
 
 /// What a shard's fetch phase answered: the documents it holds, in request order.
@@ -1202,6 +1206,11 @@ pub enum ClientOp {
         /// defaulted rather than required.
         #[serde(default)]
         array_limit: Option<usize>,
+        /// Whether an array the cap cuts leads with the elements the query matched, already
+        /// resolved against the node's default by the surface that built the op. `false` from a
+        /// peer on a build that predates the field: every array's head, as before.
+        #[serde(default)]
+        match_elements: bool,
     },
     /// The search an earlier build sent for a streamed request: the first `limit` hits, no
     /// offset. Never built here — the stream route builds a `Search` — and kept on the wire only
@@ -1451,6 +1460,7 @@ impl ClientOp {
                 fields,
                 sort,
                 array_limit: None,
+                match_elements: false,
             },
             other => other,
         }

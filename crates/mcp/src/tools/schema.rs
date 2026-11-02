@@ -126,6 +126,9 @@ pub(crate) struct SearchIndexArgs {
     /// Most elements kept of each array in a hit.
     #[serde(default)]
     pub(crate) array: Option<usize>,
+    /// Whether an array the cap cuts leads with the elements the query matched.
+    #[serde(default)]
+    pub(crate) matches: Option<bool>,
     /// The same structured sort the federated tool takes per index.
     ///
     /// One index is the common case, so this is where a sort is most often wanted; the
@@ -148,6 +151,9 @@ pub(crate) struct SearchAcrossIndexesArgs {
     /// Most elements kept of each array in a hit, the same for every index searched.
     #[serde(default)]
     pub(crate) array: Option<usize>,
+    /// Whether an array the cap cuts leads with the elements the query matched.
+    #[serde(default)]
+    pub(crate) matches: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -220,6 +226,14 @@ fn array_schema(max_array_limit: usize) -> JsonValue {
     })
 }
 
+/// The `matches` property both search schemas carry.
+fn matches_schema() -> JsonValue {
+    json!({
+        "type": "boolean",
+        "description": "Whether an array that `array` cuts leads with the elements the query matched: those first, in stored order, then the rest of the cap from the others. The hit then carries `_matched_elements`, naming each such array by its path with the stored positions of the elements that lead it — with `array` 0, the positions alone. An array that is not cut keeps its stored order. If omitted, the node's configured default applies, which is on unless an operator changed it."
+    })
+}
+
 pub(crate) fn search_index_input_schema(limits: ToolLimits) -> JsonValue {
     let ToolLimits {
         max_search_limit,
@@ -235,7 +249,7 @@ pub(crate) fn search_index_input_schema(limits: ToolLimits) -> JsonValue {
             },
             "query": {
                 "type": "string",
-                "description": "Search query string. Supports field:value, phrases, AND/OR/NOT, ranges, and inline 'return'/'limit'/'offset'/'sort'/'array' modifiers. Use 'limit 0' for count-only queries. Inline sort: 'sort field:asc' or 'sort field:desc'; inline paging: 'limit 10 offset 20'. An argument wins over the same modifier written inline."
+                "description": "Search query string. Supports field:value, phrases, AND/OR/NOT, ranges, and inline 'return'/'limit'/'offset'/'sort'/'array'/'matches' modifiers. Use 'limit 0' for count-only queries. Inline sort: 'sort field:asc' or 'sort field:desc'; inline paging: 'limit 10 offset 20'. An argument wins over the same modifier written inline."
             },
             "limit": {
                 "type": "integer",
@@ -258,6 +272,7 @@ pub(crate) fn search_index_input_schema(limits: ToolLimits) -> JsonValue {
                 "description": "Field names to include in results (field projection). Fields are returned in the exact order specified. Metadata fields (like '_score') are always included automatically."
             },
             "array": array_schema(max_array_limit),
+            "matches": matches_schema(),
             "sort": sort_schema()
         },
         "required": ["index", "query"],
@@ -326,7 +341,8 @@ pub(crate) fn search_across_indexes_input_schema(limits: ToolLimits) -> JsonValu
                     "How many hits to skip before the first one returned, applied once after merging across every index — so page N of a federated search is page N of the combined order, not of each index separately. With `limit` as the page size, page N is `offset = N * limit`. Each index is asked for offset + limit hits, so `offset + limit` must not exceed {max_search_limit}. Defaults to 0."
                 )
             },
-            "array": array_schema(max_array_limit)
+            "array": array_schema(max_array_limit),
+            "matches": matches_schema()
         },
         "required": ["indexes", "query"],
         "additionalProperties": false

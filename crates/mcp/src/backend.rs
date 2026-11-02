@@ -98,8 +98,8 @@ impl<'de> Deserialize<'de> for McpIndexSearchRequest {
     }
 }
 
-/// How much of an answer a search call asked for: how many hits, from where, and how many
-/// elements of each array in them.
+/// How much of an answer a search call asked for: how many hits, from where, how many elements
+/// of each array in them, and whether a cut array leads with the elements the query matched.
 ///
 /// One value rather than three arguments because all three are `Option<usize>` and sit side by
 /// side — `limit` and `offset` mean opposite things, and `array` is a third number of the same
@@ -110,6 +110,7 @@ pub struct McpSearchBounds {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     pub array: Option<usize>,
+    pub matches: Option<bool>,
 }
 
 /// Why an operation failed, classified by whose problem it is.

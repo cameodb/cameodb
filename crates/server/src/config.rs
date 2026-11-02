@@ -748,6 +748,17 @@ pub struct SearchConfig {
     #[serde(default = "default_array_limit")]
     pub default_array_limit: usize,
 
+    /// Whether an array a hit's cap cuts leads with the elements the query matched, when the
+    /// request does not say (default: true).
+    ///
+    /// The cap keeps an array's first elements, and a clause matches an element anywhere in it —
+    /// so a cut hit showed none of what made it a hit. On, the matching elements come first, in
+    /// stored order, the rest of the cap is filled from the others, and `_matched_elements` names
+    /// their stored positions. An array that is not cut keeps its order, so a response with
+    /// nothing cut is the same either way. A request turns it off with `matches false`.
+    #[serde(default = "default_match_elements_first")]
+    pub match_elements_first: bool,
+
     /// Seconds of write inactivity on an index before it is committed anyway (default: 3).
     ///
     /// The idle commit. While writes keep arriving, `commit_interval_ms` bounds how long one
@@ -1684,6 +1695,7 @@ impl Default for SearchConfig {
             enable_early_termination: default_enable_early_termination(),
             default_search_limit: default_search_limit(),
             default_array_limit: default_array_limit(),
+            match_elements_first: default_match_elements_first(),
             supervisor_timeout_secs: default_supervisor_timeout_secs(),
             commit_interval_ms: default_commit_interval_ms(),
             stream_batch_size: default_stream_batch_size(),
@@ -1895,6 +1907,7 @@ config_defaults! {
         .max(2);
     default_search_limit -> usize = 10;
     default_array_limit -> usize = cameodb_mcp::DEFAULT_ARRAY_LIMIT;
+    default_match_elements_first -> bool = true;
     default_indexer_num_threads -> usize = 1;
     default_merge_num_threads -> usize = 2;
     default_supervisor_timeout_secs -> u64 = 3;

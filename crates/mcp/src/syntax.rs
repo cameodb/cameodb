@@ -438,6 +438,14 @@ pub const INLINE_MODIFIERS: &[(&str, &str, &str)] = &[
          Without it the node's default applies, and N is bounded by a maximum the way `limit` is.",
         "string_ipv4:10.0.0.1 array 50",
     ),
+    (
+        "matches off",
+        "Keep each cut array's head. By default an array that `array` cuts leads with the \
+         elements the query matched, in stored order, then the rest of the cap, and the hit names \
+         their stored positions in `_matched_elements`; an array that is not cut keeps its order. \
+         `matches on` asks for it where the node's default is off.",
+        "string_ipv4:10.0.0.1 array 5 matches off",
+    ),
 ];
 
 /// How the inline modifiers are told apart from query text.
@@ -445,8 +453,8 @@ pub const MODIFIER_RULES: &[&str] = &[
     "A modifier counts only where it opens an unbroken run of clauses reaching the end of the \
      query, with query text left in front of it. Anything else is searched for, so `find tax \
      return forms` is four terms and `* limit 10` is how to ask for a bare limit.",
-    "A field list needs a comma between names, a limit or an array needs a number, and a sort \
-     order must be exactly `asc` or `desc`. A clause that does not parse stays in the query rather than being \
+    "A field list needs a comma between names, a limit or an array needs a number, `matches` \
+     needs `on` or `off`, and a sort order must be exactly `asc` or `desc`. A clause that does not parse stays in the query rather than being \
      applied in part.",
     "A modifier naming a field the index does not have is reported as a dropped clause, since a \
      projection would otherwise return documents with no fields.",

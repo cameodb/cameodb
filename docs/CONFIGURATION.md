@@ -303,6 +303,11 @@ default_search_limit = 10
 # Bounded by [security.limits] max_array_limit.
 default_array_limit = 1000
 
+# Whether a cut array leads with the elements the query matched (default: true): those first,
+# then the rest of the cap in stored order, their stored positions in `_matched_elements`. An
+# array that is not cut keeps its order. A request turns it off with `matches false`.
+match_elements_first = true
+
 # Longest a write waits to become searchable while writes to its index keep arriving, in
 # milliseconds (default: 2000). A commit is what makes writes visible to search and it is the
 # expensive half of a write, so this is also what a bulk load's commit cost is amortized over.
@@ -1491,6 +1496,7 @@ clear, only digests. That variable is read by the **client**.
 - `CAMEODB_MEMORY_PRESSURE_THRESHOLD_PERCENT`: Memory pressure threshold
 - `CAMEODB_DEFAULT_SEARCH_LIMIT`: Default search result limit
 - `CAMEODB_DEFAULT_ARRAY_LIMIT`: Elements kept of each array in a hit when a search names no `array`
+- `CAMEODB_MATCH_ELEMENTS_FIRST`: Whether a cut array leads with the elements the query matched (`false` keeps its head)
 
 ## Multi-Disk Setup
 

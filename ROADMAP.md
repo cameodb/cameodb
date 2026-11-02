@@ -67,7 +67,7 @@ on one.
 | M — The 0.3.5 goal set: multi-tenant exposure | ✅ Done, released in 0.3.5 on 2026-09-28 | M0 closed; M1, M2, M3, M4, M5 and M7 done — the blocker is cleared, the surface is metered, and tenants are bounded and isolated per index. No feature build remains; M8 closed with the prefix floor and default-field cap, the clause cap deferred. M6 done: the open-loop arms show goodput degrading rather than collapsing on the bulk, single-write and read lanes, after fixing the two defects its arms found — [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) and [OB15](docs/ROADMAP-ARCHIVE.md#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput), and its confirmation run on 2026-09-27 found OB22 costs a single node nothing measurable |
 | N — Pre-0.3.6 whole-code review | ◐ Partial | N1–N10 and N10a done 2026-10-07/08, in 0.3.6: a `HEAD` authorization gap, batched writes that never learn a field, a peer's 400 answered as 503, node identity replaced silently, query rewrites by substring, three client errors, the first shard's memory budget, streaming broadcast, a storage shutdown race, flattened storage errors, a search of a missing index answering 200. Left, planned and not release blockers: N11–N17 — one way to reach a peer, dead surface, `run_change`, typed boundaries, single owners, the orchestrator split |
 | O — Post-0.3.6 review: the next-iteration base | ◐ Partial | O1 (the `wal_sync=false` durability barrier) and O2 (deadlines on every remote ask) done 2026-10-15. Left: O3, shard-map merges on a per-owner epoch (the prerequisite N15 does not name, and since 2026-10-18 the one [OB27](#ob27--a-replaced-node-never-leaves-the-cluster)'s `forget` needs), and O4, the request budget on the wire. O5 folds Rust-surface items into N16/N17; O6 reconciles the architecture doc |
-| P — Post-0.3.7 features | ◐ Partial | P1, a cap on how many elements of each array a search hit carries — a node default, a node maximum, and `array N` per request — done 2026-10-19. P2, one declaration of an index's default fields — `searched_by_default` dropped, the `--id` reload keeps the list — done 2026-10-20. P3, a schema read is a schema write — `PUT` takes a `GET`, which now reports every property the thumbprint covers — done 2026-10-21. P4, ip fields queried the way addresses are — CIDR, bare addresses, IPv4-bounded ranges, a fast ip sort — done 2026-10-21. Left: P5, native json fields — paths, typed values and ranges, planned; P6, a hit's matching elements come first, planned next |
+| P — Post-0.3.7 features | ◐ Partial | P1, a cap on how many elements of each array a search hit carries — a node default, a node maximum, and `array N` per request — done 2026-10-19. P2, one declaration of an index's default fields — `searched_by_default` dropped, the `--id` reload keeps the list — done 2026-10-20. P3, a schema read is a schema write — `PUT` takes a `GET`, which now reports every property the thumbprint covers — done 2026-10-21. P4, ip fields queried the way addresses are — CIDR, bare addresses, IPv4-bounded ranges, a fast ip sort — done 2026-10-21. P6, a cut array leads with the elements the query matched — `_matched_elements`, on by default — done 2026-11-02. Left: P5, native json fields — paths, typed values and ranges, planned |
 | Q — Post-0.3.8 features | ✅ Done, unreleased (0.3.9) | Q1, ghost fields — a column filled from another field of the stored body, for every document or under an `in` / `not_in` condition, never stored — done 2026-10-27. Q2, the Croatian analyzers read Serbian Cyrillic — done 2026-10-27. The `pt_stem`, `it_stem` and `es`/`fr`/`pt`/`de` `_stem_fold` analyzers of the same days are in the changelog, not filed here |
 | R — Key and tenant provisioning | ◐ Partial, R1 and R2 unreleased (0.3.9) | R1 and R2 done 2026-11-01, single node: included key and tenant files reloaded on change, live tenant quotas and scopes, `allowed_indexes` prefixes; a provisioner minting and revoking keys through `/_keys` (no tenant) and `/_tenants`, changing a key's indexes in place with `PATCH /_keys/{key_id}`, and granting only within its own `allowed_indexes`; client, SDK and a live suite, validated on Linux under systemd and across a restart. Left: R3, every change broadcast to every node, deferred until cluster support is decided — until then a change applies on the node that received it |
 
@@ -278,7 +278,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [P3](docs/ROADMAP-ARCHIVE.md#p3--a-schema-read-is-a-schema-write) | A schema read is a schema write — `PUT /_config` takes a `GET /_config` as it is, and the read reports the record option, `learned` and the routing field it lacked, so a saved read restores its index and the thumbprint proves it | — | 2026-10-21 | ✅ |
 | [P4](docs/ROADMAP-ARCHIVE.md#p4--ip-fields-queried-the-way-addresses-are) | Ip fields queried the way addresses are — CIDR as its range, a bare address searching the ip fields, an open IPv4 range kept among IPv4, `fast` on ip for a sort by address, write refusals naming the value | — | 2026-10-21 | ✅ |
 | [P5](#p5--native-json-fields-paths-typed-values-ranges) | Native json fields — a json field indexes its object beside its text: paths and typed values match, ranges at a path run from the fast column it gets by default, RFC 3339 strings are dates; existing indexes unchanged until rebuilt | — | 2026-10-21 | 📋 |
-| [P6](#p6--a-hits-matching-elements-come-first) | A hit's matching elements come first — an array that is cut leads with the elements the query matched, filled from the rest in stored order; `_matched_elements` names their positions; on by default, off per request; next after the 0.3.9 cut | — | 2026-10-21 | 📋 |
+| [P6](docs/ROADMAP-ARCHIVE.md#p6--a-hits-matching-elements-come-first) | A hit's matching elements come first — an array the cap cuts leads with the elements the query matched, filled from the rest in stored order, `_matched_elements` naming their positions; on by default, `matches off` per request | — | 2026-10-21 | ✅ |
 | [Q1](docs/ROADMAP-ARCHIVE.md#q1--ghost-fields-index-columns-derived-from-another-field-under-a-condition) | Ghost fields — an index column derived from another field's value, for every document or under an `in` / `not_in` condition on a discriminator field, indexed in Tantivy and never stored in redb; one copy of the text in redb instead of one per analyzer — about 38% less disk on a multilingual sample | — | 2026-10-26 | ✅ |
 | [Q2](docs/ROADMAP-ARCHIVE.md#q2--the-croatian-analyzers-read-serbian-cyrillic) | The Croatian analyzers read Serbian Cyrillic — a word in Serbian Cyrillic is mapped to Latin inside `hr_stem` and `hr_stem_fold`, per token; a field already holding Cyrillic text is reloaded | — | 2026-10-26 | ✅ |
 | [R1](docs/ROADMAP-ARCHIVE.md#r1--included-key-and-tenant-files-reloaded-when-they-change) | Included key and tenant files, reloaded when they change — `include` adds keys and tenants only, a watcher reloads, tenant quotas swap live with usage kept, a tenant scopes its keys' indexes | — | 2026-11-01 | ✅ |
@@ -2773,6 +2773,7 @@ not a promise they will not move.
 - ✅ [**P2 — One declaration of an index's default fields**](docs/ROADMAP-ARCHIVE.md#p2--one-declaration-of-an-indexs-default-fields)
 - ✅ [**P3 — A schema read is a schema write**](docs/ROADMAP-ARCHIVE.md#p3--a-schema-read-is-a-schema-write)
 - ✅ [**P4 — Ip fields queried the way addresses are**](docs/ROADMAP-ARCHIVE.md#p4--ip-fields-queried-the-way-addresses-are)
+- ✅ [**P6 — A hit's matching elements come first**](docs/ROADMAP-ARCHIVE.md#p6--a-hits-matching-elements-come-first)
 
 ### P5 — Native json fields: paths, typed values, ranges
 
@@ -2840,90 +2841,6 @@ differs, so a cluster is upgraded before such a schema is applied.
 **Tests.** A path, a typed value, a date, and ranges at a path on a fast field; the bag of words
 unchanged; a `paths: false` field unchanged, notes included; arrays of objects; the thumbprint and
 `GET /_config` round trip with the new properties; the profiler's path report.
-
-### P6 — A hit's matching elements come first
-
-📋 **Planned, next.** Filed 2026-10-21; redesigned and given priority 2026-11-02. Picks up the
-second out-of-scope note of [P1](docs/ROADMAP-ARCHIVE.md#p1--a-hits-arrays-are-capped-the-way-its-hits-are).
-
-**Today.** The P1 cap keeps the first N elements of each array in stored order. A clause such as
-`domains:"bad.example.com"` matches an element anywhere in the array, often far past N, so the
-hit shows none of what made it a hit. An array stored sorted returns its alphabetical head, so the
-matching element is reliably absent. The search index sees the whole array; the caller cannot see
-which element matched without fetching the array whole, which past `max_array_limit` it cannot.
-
-**Decided** (2026-11-02):
-
-1. **An array that is cut puts its matching elements first.** The elements a query's positive
-   clauses match lead, in stored order, up to N; the rest of the cap is filled from the elements
-   that did not match, in stored order. No element appears twice.
-2. **Only an array that is cut is reordered.** One of N elements or fewer is already whole and
-   keeps its stored order, so a response in which nothing is cut is byte-identical to today's.
-3. **The hit names what was moved.** `"_matched_elements": {"domains": [812345, 17, 2]}` — the
-   stored positions of the leading elements, in the order they lead, keyed by the path
-   `_truncated_arrays` uses. With `array 0` the elements are left out and the positions still
-   reported: the compact answer to "which ones matched".
-4. **On by default, off per request.** `[search] match_elements_first = true`; `"matches": false`
-   in the body, `matches off` inline, `matches` on the MCP tools. No count of its own: the array
-   cap already bounds the matches.
-5. **Arrays of scalars, at any object path, first.** An array of objects, and an array inside one,
-   keeps today's head: matching one means deciding which nested value counts. A follow-up.
-
-**Where the facts are** (checked at `888cb27`).
-
-- *The fetch phase has no query.* `search_keys` parses and walks; `fetch_documents`
-  (`storage/src/search.rs`) builds every hit — redb read, shadow and ghost reconstruction,
-  projection, cap — and on a cluster runs on the owning shard from a `FetchDocsRequest` that
-  carries only ids, `fields` and `array_limit` (`server/src/node/mod.rs`). The approximate-sort
-  path in `search_keys` also calls it, uncapped, and passes no matcher.
-- *The built tantivy query is not enough.* `BooleanQuery::query_terms` visits `MustNot` clauses,
-  `RangeQuery` keeps its bounds private, and `PhraseQuery` has no slop getter.
-- *The screened AST is, but is not kept.* `PreparedQuery::parse` (`storage/src/query.rs`) builds
-  it — `screen_clauses(restore_ranges(ast))` — and hands it straight to the query builder. Before
-  it exists, `AND NOT` is rewritten to `-x` / `(* -x)`, shadow names to `id`, dates and facets
-  normalized, and a prefix past `min_prefix_length` to a term range; a bare term has no field and
-  means the selected default fields, capped by `max_default_fields`.
-- *Elements are separate in the index.* tantivy leaves a position gap between a field's values,
-  so a term or exact phrase hit always has one element that caused it.
-- *Ghost fields.* A ghost column (Q1) is indexed text fed from `Ghost.source` under its `when`
-  condition and never stored. A bare term can match only through a ghost's analyzer, and the source
-  may be unindexed. The matcher maps a ghost leaf to its source: the source's elements, tokenized
-  by the ghost's analyzer, for a document the condition admits, reported under the source's path.
-- *The coordinator caps again after the merge* (`cap_hit_arrays`, `server/src/node/search.rs`).
-  Keeping the first N keeps the matches, but `cap_document_arrays` (`storage/src/projection.rs`)
-  skips only `_truncated_arrays`, and would cut `_matched_elements`.
-
-**The approach.**
-
-1. *Storage — the matcher.* `PreparedQuery` keeps the screened AST and the default fields it
-   resolved. A matcher per field, built once per fetch batch from positive leaves only (a `MustNot`
-   subtree is skipped): text and string tokenized by the field's analyzer
-   (`index.tokenizer_for_field`) — a term, an exact phrase as contiguous tokens, a phrase with
-   slop, a prefix range on a token; numeric, date and ip by typed equality, range and set, CIDR as
-   its range; `*` and presence give no element evidence. Ghost leaves resolved to their source.
-2. *Storage — the cap.* In `fetch_documents`, after the projection: for every array longer than N
-   whose field the query names, the matching positions, scanning in stored order and stopping at N;
-   a case-folded substring prefilter (`memchr::memmem`) rules out most elements before tokenizing.
-   The cap then takes those first and fills from the rest, and records `_matched_elements`.
-   `cap_document_arrays` skips every `_`-prefixed key.
-3. *The wire.* `#[serde(default)] match_query: Option<String>` on `FetchDocsRequest` and
-   `SearchOptions`; the owning shard re-parses it once per batch. A peer on an older build ignores
-   it and returns the stored head: clean degradation, documented.
-4. *The surface.* The node default, the body field, the inline keyword and the MCP parameter, as
-   `array` is plumbed.
-
-**Limits to document.** A phrase with slop can, rarely, match across two adjacent elements; that
-hit has no single element to move. Matching is the query's positive clauses per field, not a
-re-evaluation of the whole query: for `A AND B` over two fields each moves its own elements.
-
-**Tests.** Storage: the matcher per leaf kind, `NOT` excluded, default-field and ghost expansion,
-the prefilter agreeing with the tokenizer, the reorder (matches first, filled in stored order, no
-duplicates, an uncut array untouched), the cap leaving `_` keys alone. Server: the body field,
-inline keyword and MCP parameter, a 300k-element array matching at position 250,000, `array 0`
-with positions, a projected-away field moving nothing, the coordinator's re-cap keeping the order
-and the positions, and a two-node search answered by the owning shard. **Docs:**
-`docs/API_REFERENCE.md` (P1's "first N in stored order" restated), `docs/CONFIGURATION.md`, the
-MCP syntax reference (`crates/mcp/src/syntax.rs`), `cameodb.example.toml`, `CHANGELOG.md`.
 
 ---
 
