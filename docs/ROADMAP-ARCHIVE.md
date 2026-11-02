@@ -4268,7 +4268,7 @@ to document: because an inline `return` list runs to the next keyword, a field l
 - *Showing the element that matched.* `string_ipv4:1.2.3.4` can match an element far past the
   first N, so the hit shows none of what made it a hit. Keeping matching elements alongside the
   head needs per-element term matching, which is closer to highlighting than to projection.
-  Filed with its design as [P6](../ROADMAP.md#p6--a-hit-says-which-array-elements-matched).
+  Filed with its design as [P6](../ROADMAP.md#p6--a-hits-matching-elements-come-first).
 - *Paging inside an array* (`array_offset`). A caller who needs all 300k elements is doing an
   export, not a search.
 - *A per-field cap* (`{"string_ipv4": 50, "*": 1000}`). One number first; a map can be added
@@ -4836,8 +4836,12 @@ create; the usage reading survives the swap.
 with rollback and `If-Match` (`2f2637c`); `/_keys` for keys with no tenant, which the
 provisioning service's first version uses (`921060d`); tenants and individuals on one node,
 separation left to the service (`e93c9d5`); `client keys` and `client tenants` and the SDK calls
-(`c8ab89c`); the live suite, 41 checks (`f7b968a`). On a cluster a change applies on the node
-that received it until R3.
+(`c8ab89c`); the live suite, 41 checks (`f7b968a`). Added 2026-11-01 after the first cut:
+`PATCH /_keys/{key_id}` changes a no-tenant key's `allowed_indexes` in place, the list required
+and replacing the old one (`143f1b6`), and a `provisioner` key with its own `allowed_indexes`
+grants, and scopes tenants, only within that list — `403` otherwise, and a key with no list is
+refused to it (`af746bc`); both validated on Linux and across a restart (`55fd6a7`). On a cluster
+a change applies on the node that received it until R3.
 
 **Design.**
 
