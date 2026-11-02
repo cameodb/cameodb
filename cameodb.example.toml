@@ -293,3 +293,6 @@ default_array_limit = 1000
 # A cut array leads with the elements the query matched, named in `_matched_elements`; an array
 # that is not cut keeps its order. A request turns it off with `matches false`.
 match_elements_first = true
+# Most documents a delete by query (POST /api/{index}/delete) removes without "confirm": true;
+# past it the request is refused with the count and nothing is deleted.
+delete_max_docs = 100000

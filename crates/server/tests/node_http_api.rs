@@ -5115,6 +5115,144 @@ max_array_limit = 500
     assert_eq!(status, 400);
 }
 
+/// Delete by query (ROADMAP S1): a dry run counts, a match past `max_docs` is refused with the
+/// count until confirmed, the delete removes exactly the matches, and a query a delete cannot run
+/// is refused before anything is deleted.
+#[tokio::test]
+async fn a_delete_by_query_counts_refuses_past_the_limit_and_deletes_on_confirm() {
+    let node = TestNode::start("delete_max_docs = 5\n").await;
+    with_tls_provider();
+    let status = reqwest::Client::new()
+        .put(format!("{}/api/events/_config", node.url))
+        .json(&json!({"fields": {
+            "status": {"field_type": "string", "indexed": true},
+            "company": {"field_type": "text", "indexed": true},
+            "port": {"field_type": "u64", "indexed": true},
+        }}))
+        .send()
+        .await
+        .expect("config")
+        .status();
+    assert!(status.is_success(), "{status}");
+    let client = node.client();
+    let docs: Vec<serde_json::Value> = (0..20)
+        .map(|n| {
+            json!({"id": format!("e{n:02}"), "doc": {
+                "status": if n < 8 { "expired" } else { "live" },
+                "company": if n == 0 { "Acme Corp" } else { "ACME CORP" },
+                "port": n,
+            }})
+        })
+        .collect();
+    client.bulk_index("events", &docs).await.expect("bulk");
+    client.admin_index_commit("events").await.expect("commit");
+
+    let count = |found: &serde_json::Value| found["matched"].as_u64().unwrap_or(u64::MAX);
+
+    // A dry run counts at any size and deletes nothing.
+    let (status, found) = post_json(
+        &node,
+        "/api/events/delete",
+        json!({"query": "status:expired", "dry_run": true}),
+    )
+    .await;
+    assert_eq!(status, 200, "{found}");
+    assert_eq!(count(&found), 8);
+    assert_eq!(found["deleted"], json!(0));
+
+    // Past the node's limit of 5: refused with the count, nothing deleted.
+    let (status, refused) = post_json(
+        &node,
+        "/api/events/delete",
+        json!({"query": "status:expired"}),
+    )
+    .await;
+    assert_eq!(status, 409, "{refused}");
+    assert_eq!(refused["code"], json!("delete_limit_exceeded"));
+    assert_eq!(count(&refused), 8);
+    assert_eq!(refused["max_docs"], json!(5));
+    assert_eq!(refused["deleted"], json!(0));
+
+    // The SDK answers the refusal rather than raising it: the count is what the caller decides on.
+    let answer = client
+        .delete_by_query("events", "status:expired", &Default::default())
+        .await
+        .expect("a refusal past the limit is an answer");
+    assert_eq!(answer["code"], json!("delete_limit_exceeded"));
+    assert_eq!(answer["matched"], json!(8));
+
+    // Confirmed: deleted, and with refresh gone from search at once.
+    let (status, done) = post_json(
+        &node,
+        "/api/events/delete",
+        json!({"query": "status:expired", "confirm": true, "refresh": true}),
+    )
+    .await;
+    assert_eq!(status, 200, "{done}");
+    assert_eq!(done["deleted"], json!(8));
+    let (_, left) = post_json(
+        &node,
+        "/api/events/search",
+        json!({"query": "status:expired", "limit": 0}),
+    )
+    .await;
+    assert_eq!(left["total_hits"], json!(0), "{left}");
+    let (_, left) = post_json(
+        &node,
+        "/api/events/search",
+        json!({"query": "status:live", "limit": 0}),
+    )
+    .await;
+    assert_eq!(
+        left["total_hits"],
+        json!(12),
+        "the rest is untouched: {left}"
+    );
+
+    // A request max_docs under the node's: within it, deleted without confirm. A text clause is
+    // checked against the stored value; e00 was deleted above, so every candidate is inexact.
+    let (status, done) = post_json(
+        &node,
+        "/api/events/delete",
+        json!({"query": "port:[8 TO 9]", "max_docs": 2, "refresh": true}),
+    )
+    .await;
+    assert_eq!(
+        (status.as_u16(), done["deleted"].clone()),
+        (200, json!(2)),
+        "{done}"
+    );
+    let (_, done) = post_json(
+        &node,
+        "/api/events/delete",
+        json!({"query": "company:\"Acme Corp\"", "dry_run": true}),
+    )
+    .await;
+    assert_eq!(count(&done), 0, "{done}");
+    assert_eq!(done["skipped_inexact"], json!(10), "{done}");
+
+    // What a delete cannot run is refused, naming why.
+    for (query, says) in [
+        ("live", "names no field"),
+        ("*", "every document"),
+        ("status:li*", "prefix"),
+        ("company:acme", "quoted phrase"),
+        ("nosuch:1", "not a field"),
+    ] {
+        let (status, refused) =
+            post_json(&node, "/api/events/delete", json!({"query": query})).await;
+        assert_eq!(status, 400, "{query}: {refused}");
+        let text = refused["details"].as_str().unwrap_or_default();
+        assert!(text.contains(says), "{query}: {refused}");
+    }
+    let (status, refused) = post_json(&node, "/api/events/delete", json!({"query": " "})).await;
+    assert_eq!(status, 400, "{refused}");
+    let (status, refused) =
+        post_json(&node, "/api/nosuch/delete", json!({"query": "status:x"})).await;
+    assert_eq!(status, 404, "{refused}");
+    assert_eq!(refused["code"], json!("index_not_found"));
+}
+
 /// A cut array leads with the elements the query matched, by default (ROADMAP P6): those first,
 /// then the rest of the cap in stored order, with `_matched_elements` naming their positions. The
 /// body's `matches` or the inline clause turns it off; an array that is not cut is untouched; the

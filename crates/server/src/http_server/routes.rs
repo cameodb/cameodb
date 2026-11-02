@@ -46,8 +46,8 @@ use crate::http_server::tenants::{
     revoke_tenant_key_handler, update_key_handler,
 };
 use crate::http_server::write::{
-    bulk_delete_handler, bulk_write_handler, delete_document_handler, write_handler,
-    write_stream_handler,
+    bulk_delete_handler, bulk_write_handler, delete_by_query_handler, delete_document_handler,
+    write_handler, write_stream_handler,
 };
 use crate::node::{OpClass, REQUEST_STARTED_AT};
 use crate::state::AppState;
@@ -219,6 +219,7 @@ pub fn create_router(state: AppState, config: &RouterConfig<'_>) -> (Router, Mcp
         .route("/api/{index}/document/stream", post(write_stream_handler))
         .route("/api/{index}/_bulk", post(bulk_write_handler))
         .route("/api/{index}/_bulk/delete", post(bulk_delete_handler))
+        .route("/api/{index}/delete", post(delete_by_query_handler))
         .route("/api/{index}/_config", put(create_config_handler))
         .route("/api/{index}/_config", get(get_config_handler))
         // Schema maintenance

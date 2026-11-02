@@ -5,6 +5,7 @@
 //! subsystem with invariants of its own rather than a step of dispatch: admission and load
 //! accounting in [`super::admission`], and the routing-key ladder in [`super::routing`].
 
+use super::delete_query::delete_by_query_on_shards;
 use super::*;
 
 use futures::future::join_all;
@@ -1772,6 +1773,8 @@ pub(crate) fn worker_eligible(op: &ClientOp) -> bool {
             // already uses.
             | ClientOp::BulkWrite { .. }
             | ClientOp::BulkDelete { .. }
+            // Each shard finds and deletes its own matches; nothing needs the actor's `&mut`.
+            | ClientOp::DeleteByQuery { .. }
             // A metadata read with no actor state behind it. On the mailbox it queued behind
             // whatever write was there; the pool answers it from an ArcSwap.
             | ClientOp::GetIdentity
@@ -2845,6 +2848,25 @@ impl OrchestratorEngine {
                 docs,
                 forwarded,
             } => WorkerOutcome::Done(self.engine_bulk_delete(&index, docs, forwarded).await),
+            ClientOp::DeleteByQuery {
+                index,
+                query,
+                mode,
+                refresh,
+            } => WorkerOutcome::Done(match self.load_schema(&index).await {
+                Ok(schema) => {
+                    delete_by_query_on_shards(
+                        &self.shards.load_full(),
+                        &schema,
+                        &index,
+                        &query,
+                        mode,
+                        refresh,
+                    )
+                    .await
+                }
+                Err(err) => Err(err),
+            }),
             // Served here rather than on the actor so that "who is this node" cannot queue
             // behind a bulk write holding the mailbox for its whole duration (ROADMAP CH12).
             // It reads an identity that never changes and a shard count from an ArcSwap, so
@@ -5110,6 +5132,22 @@ impl NodeOrchestrator {
                 docs,
                 forwarded,
             } => return self.orch_bulk_delete(&index, docs, forwarded).await.into(),
+            // Off the mailbox: a delete of many documents waits on every shard's writer.
+            ClientOp::DeleteByQuery {
+                index,
+                query,
+                mode,
+                refresh,
+            } => {
+                let schema = match self.load_schema(&index).await {
+                    Ok(schema) => schema,
+                    Err(err) => return Answer::Now(Err(err)),
+                };
+                let shards = self.owned_bulk_view().shards;
+                return Answer::Later(Box::pin(async move {
+                    delete_by_query_on_shards(&shards, &schema, &index, &query, mode, refresh).await
+                }));
+            }
             ClientOp::PrepareSchema {
                 index,
                 schema,

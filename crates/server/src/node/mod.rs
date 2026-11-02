@@ -75,6 +75,7 @@ pub use storage::SortSpec;
 use storage::{IndexSchema, StoreError, TantivyFieldType, WalOp};
 
 mod admission;
+mod delete_query;
 mod orchestrator;
 mod quota;
 mod router;
@@ -99,6 +100,7 @@ pub(in crate::node) use shard::*;
 // deliberate act of widening a boundary; nothing else in `node/` is reachable as
 // `crate::node::*` unless it is declared in this file.
 pub(crate) use admission::{OpClass, QueueLoad, WorkerPoolReport};
+pub(crate) use delete_query::{DeleteMode, DeleteTally};
 pub(crate) use orchestrator::{NodeOrchestrator, lookup_peer_orchestrator};
 pub(crate) use quota::TenantQuotas;
 pub(crate) use router::{RouterActor, ShardAffineConfig, StreamingSearchConfig};
@@ -1305,6 +1307,16 @@ pub enum ClientOp {
     /// one redb transaction. A document that cannot be routed is reported as an error against
     /// that id rather than failing the batch, since a batch may span tenants and one unroutable
     /// id says nothing about the rest.
+    /// One phase of a delete by query, run on this node's shards only — the node that received
+    /// the request fans it out and sums the answers (`RouterActor::delete_by_query`). A peer on a
+    /// build without it cannot decode it, and is reported as a node that did not answer.
+    DeleteByQuery {
+        index: String,
+        query: String,
+        mode: DeleteMode,
+        /// Commit each shard that deleted something, so search reflects the delete at once.
+        refresh: bool,
+    },
     BulkDelete {
         index: String,
         docs: Vec<DeletePayload>,

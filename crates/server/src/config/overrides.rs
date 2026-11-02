@@ -146,6 +146,11 @@ pub(crate) const OVERRIDES: &[Override] = &[
         apply: |c, v| { c.search.match_elements_first = parse_bool(v); Ok(()) },
     },
     Override {
+        flag: "--delete-max-docs", env: "CAMEODB_DELETE_MAX_DOCS", kind: FlagKind::Value,
+        placeholder: "<N>", help: "Documents a delete by query removes without confirm",
+        apply: |c, v| { c.search.delete_max_docs = v.parse()?; Ok(()) },
+    },
+    Override {
         flag: "--supervisor-timeout-secs", env: "CAMEODB_SUPERVISOR_TIMEOUT_SECS", kind: FlagKind::Value,
         placeholder: "<SECS>", help: "Shard supervisor timeout",
         apply: |c, v| { c.search.supervisor_timeout_secs = v.parse()?; Ok(()) },

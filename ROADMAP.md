@@ -70,7 +70,7 @@ on one.
 | P — Post-0.3.7 features | ◐ Partial | P1, a cap on how many elements of each array a search hit carries — a node default, a node maximum, and `array N` per request — done 2026-10-19. P2, one declaration of an index's default fields — `searched_by_default` dropped, the `--id` reload keeps the list — done 2026-10-20. P3, a schema read is a schema write — `PUT` takes a `GET`, which now reports every property the thumbprint covers — done 2026-10-21. P4, ip fields queried the way addresses are — CIDR, bare addresses, IPv4-bounded ranges, a fast ip sort — done 2026-10-21. P6, a cut array leads with the elements the query matched — `_matched_elements`, on by default — done 2026-11-02. Left: P5, native json fields — paths, typed values and ranges, planned |
 | Q — Post-0.3.8 features | ✅ Done, unreleased (0.3.9) | Q1, ghost fields — a column filled from another field of the stored body, for every document or under an `in` / `not_in` condition, never stored — done 2026-10-27. Q2, the Croatian analyzers read Serbian Cyrillic — done 2026-10-27. The `pt_stem`, `it_stem` and `es`/`fr`/`pt`/`de` `_stem_fold` analyzers of the same days are in the changelog, not filed here |
 | R — Key and tenant provisioning | ◐ Partial, R1 and R2 unreleased (0.3.9) | R1 and R2 done 2026-11-01, single node: included key and tenant files reloaded on change, live tenant quotas and scopes, `allowed_indexes` prefixes; a provisioner minting and revoking keys through `/_keys` (no tenant) and `/_tenants`, changing a key's indexes in place with `PATCH /_keys/{key_id}`, and granting only within its own `allowed_indexes`; client, SDK and a live suite, validated on Linux under systemd and across a restart. Left: R3, every change broadcast to every node, deferred until cluster support is decided — until then a change applies on the node that received it |
-| S — Delete by query | 📋 Planned | S1: `POST /api/{index}/delete`, exact clauses on string, text, numeric, date, ip, boolean and id fields; refused past `max_docs` unless confirmed |
+| S — Delete by query | ✅ Done | S1, `POST /api/{index}/delete` — exact clauses, refused past `max_docs` unless confirmed — done 2026-11-02 |
 
 ## Reconciliation, 2026-08-26
 
@@ -285,7 +285,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [R1](docs/ROADMAP-ARCHIVE.md#r1--included-key-and-tenant-files-reloaded-when-they-change) | Included key and tenant files, reloaded when they change — `include` adds keys and tenants only, a watcher reloads, tenant quotas swap live with usage kept, a tenant scopes its keys' indexes | — | 2026-11-01 | ✅ |
 | [R2](docs/ROADMAP-ARCHIVE.md#r2--the-key-manage-capability-and-the-tenant-api) | The `key-manage` capability and the tenant API — a `provisioner` role, `/_keys` for keys with no tenant and `/_tenants` outside `/_admin`, the node generating keys and writing their files; client, SDK and a live suite | — | 2026-11-01 | ✅ |
 | [R3](#r3--changes-reach-every-node) | Changes reach every node — whole tenant file and revision broadcast, catch-up on reconnect, the response names nodes that did not apply it — deferred until cluster support for provisioning is decided | — | 2026-11-01 | 💭 |
-| [S1](#s1--delete-the-documents-a-query-matches) | Delete by query — every shard deletes the matches it holds; exact clauses only (`text` checked against the stored value); over `max_docs` refused with the count, `confirm` to proceed; no version check | — | 2026-11-02 | 📋 |
+| [S1](docs/ROADMAP-ARCHIVE.md#s1--delete-the-documents-a-query-matches) | Delete by query — `POST /api/{index}/delete`: every shard deletes the matches it holds; exact clauses only (`text` checked against the stored value); over `max_docs` refused with the count, `confirm` to proceed | — | 2026-11-02 | ✅ |
 
 ---
 
@@ -2947,109 +2947,6 @@ what a cluster does; a `CHANGELOG.md` entry.
 
 ---
 
-## S. Delete by query 📋 Planned
-
-Opened 2026-11-02. Phase 17 delivered deletion by id, single and bulk, and filed `_delete_by_query`
-as a phase of its own: a search-then-delete loop, a decision about consistency while documents keep
-arriving, and the read-cache fix underneath it (I1, done). Scoped against the code at `38f75f0`.
-
-### S1 — Delete the documents a query matches
-
-📋 **Planned.** ~3–4 days.
-
-**Today.** A delete names an id. `DELETE /api/{index}/document` routes it like a write;
-`POST /api/{index}/_bulk/delete` groups ids by shard on the node that received it and forwards
-each share. Either way the shard's writer removes the redb row and issues `delete_term` in the
-transaction that appends the WAL entry (`handle_batch_delete`, `apply_batch`). On an index whose
-routing field is not `id`, a caller without the routing key is refused: a keyless delete is
-never fanned out. Removing every document that matches a condition means a search, a page at a
-time, then the ids.
-
-**Decided** (2026-11-02):
-
-1. **A shard deletes what it holds.** The query runs on every shard of every node, and each shard
-   deletes the matching ids it found — so no routing key is needed, whatever the routing field.
-2. **Exact matching only.** Allowed clauses, combined with `AND`, `OR` and `-`/`NOT`, with at least
-   one positive clause:
-
-   | Type | Clauses | Matches |
-   |---|---|---|
-   | `string` | `f:value`, `f: IN [a b]`, `f:[a TO b]` | the whole value, case-sensitive |
-   | `text` | `f:"exact value"`, quoted | the whole stored value, case-sensitive — see 3 |
-   | `i64`, `u64`, `f64` | value, `IN`, range | numerically |
-   | `date` | value, range | to the second, as indexed |
-   | `ip` | address, CIDR, `IN`, range | as addresses |
-   | `boolean` | `true` / `false` | exactly |
-   | `id`, a shadow field | value, `IN` | the document key |
-
-   Refused: `json`, `bytes` and `facet` fields, ghost columns, bare terms on the default fields,
-   prefixes, wildcards, `*`, regexes, fuzzy, a phrase with slop — and **any query of which a clause
-   was dropped**: a search runs what is left, but a dropped clause under `AND` widens a delete.
-3. **`text` is exact against the stored value.** The phrase finds candidates through the index;
-   the shard reads each candidate and deletes it only when the field's value, or one element of an
-   array, equals the quoted text exactly. Analysis lowercases and stems, so the index alone cannot
-   tell `"Acme Corp"` from `"acme corps"`. Candidates that fail are counted as `skipped_inexact`.
-4. **Over `max_docs` is refused, with the count; `confirm` deletes anyway.** The operator decides,
-   having seen the number — `confirm` rather than `force`, which reads as overriding a fault:
-   ```json
-   POST /api/intel/delete {"query": "status:expired"}
-   409 {"error": "the query matches 240512 documents, above max_docs 100000; nothing was deleted",
-        "code": "delete_limit_exceeded", "matched": 240512, "max_docs": 100000}
-
-   POST /api/intel/delete {"query": "status:expired", "confirm": true}
-   200 {"deleted": 240512, "matched": 240512, "skipped_inexact": 0,
-        "nodes": {"contacted": 3, "failed": []}, "took_ms": 8412}
-   ```
-   The limit is `"max_docs"` on the request, else a new `[search] delete_max_docs`, **100000** by
-   default — sized to what a node deletes comfortably in one request, not to a search page.
-   Neither existing search setting fits: `default_search_limit` (10) is a page size, and
-   `[security.limits] max_search_limit` (10000) is a hard ceiling no request may pass, where this
-   is a threshold an operator may confirm past. `confirm` skips only this check: the clause rules,
-   scopes and `write_documents_per_minute` still apply. `"dry_run": true` returns the count per
-   node and deletes nothing, at any size.
-5. **What matched at the last commit, no version check.** Each shard queries its last committed
-   searcher: a document written since is not deleted, and one updated since is deleted by id all
-   the same. Documented. `"refresh": true` commits at the end, so search reflects the deletion at
-   once; otherwise within the commit interval.
-6. **`POST /api/{index}/delete`, beside `search`.** A data operation takes a plain word, as
-   `search` and `document` do; the underscore marks meta and batch routes (`_bulk`, `_config`,
-   `_schema`). The query a caller searched with is the query it deletes with, so the two read as a
-   pair, and deletion by id stays where it is (`DELETE …/document?id=`, `_bulk/delete`). Rejected:
-   `_delete_by_query` (long), `search/delete` (a write nested under a read route), `_delete` (reads
-   as batch, and beside `_bulk/delete`), and `DELETE` with a body, which proxies drop — Phase 17's
-   reason for `_bulk/delete` being a `POST`.
-7. **Not atomic across nodes.** The response sums what each node deleted and names the nodes and
-   shards that failed; a partial result says so.
-
-**The approach.**
-
-- *Storage.* `HybridStore::delete_by_query(index, query, opts)`: `prepare_query_parser`, the type
-  screen of decision 2 walked over `PreparedQuery::screened_ast` (the field resolution
-  `matched.rs` does), refused on any discarded clause; every match collected (`DocSetCollector`, not
-  `TopDocs`) and its id resolved from the fast `id` column, else the stored one, as `search_keys`
-  does; for `text` clauses, the stored-value check; then the ids, in chunks (10,000 per redb
-  transaction), under the request's deadline. A counting mode for `dry_run` and the `max_docs`
-  check runs first and deletes nothing.
-- *Node.* `ClientOp::DeleteByQuery`, run where it is received, as a bulk op is: the count phase on
-  every node (this one and each broadcast peer), the limit decided once on the sum, then the delete
-  phase; per-node results merged.
-- *Surface.* `POST /api/{index}/delete` `{query, max_docs, confirm, dry_run, refresh}`,
-  capability `write`, its authz row, tenant and key index scopes as any write. Each deleted
-  document charged to `write_documents_per_minute`; one audit record with the query text. SDK
-  `delete_by_query`, CLI `delete <index> --query '…' [--dry-run] [--confirm] [--max-docs N]`. No MCP
-  tool: that surface does not write.
-
-**Tests.** Storage: each allowed type and clause; each refusal, a dropped clause included; `text`
-exactness (case, a stemmed near-miss skipped, an array element); `dry_run`; the limit and `confirm`;
-a match spanning several chunks; ids from a fast `id` column and from a stored one. Server: the
-route, its refusals and authz row, scopes, the 409 and `confirm`, `refresh`. Cluster: matches on all
-three nodes deleted through one, a frozen node reported as failed.
-
-**Docs.** `docs/API_REFERENCE.md` (the route, the type table, what it promises),
-`docs/CONFIGURATION.md`, the client README, `CHANGELOG.md`.
-
----
-
 ## Delivered work, in the archive
 
 Delivered work is in [docs/ROADMAP-ARCHIVE.md](docs/ROADMAP-ARCHIVE.md), kept in full. Where an item of a group still open
@@ -3058,6 +2955,7 @@ was delivered, its stub stands above in its place; these groups were delivered w
 - ✅ [**L. Post-0.3.4 review — preparing the next cycle**](docs/ROADMAP-ARCHIVE.md#l-post-034-review--preparing-the-next-cycle--done) — L1–L20
 - ✅ [**M. The 0.3.5 goal set — multi-tenant exposure**](docs/ROADMAP-ARCHIVE.md#m-the-035-goal-set--multi-tenant-exposure--done) — M0–M8
 - ✅ [**Q. Post-0.3.8 features**](docs/ROADMAP-ARCHIVE.md#q-post-038-features--done) — Q1–Q2
+- ✅ [**S. Delete by query**](docs/ROADMAP-ARCHIVE.md#s-delete-by-query--done) — S1
 
 The archive also holds the original write-up of every delivered phase, the measurements, and the settled decisions:
 what the affinity flags cost, what the audit trail costs, the non-goals recorded so they are not re-litigated, and the

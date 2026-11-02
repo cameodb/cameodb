@@ -82,7 +82,7 @@ fn matched_positions(
 ///
 /// Identity when there is no deadline: the wrapper exists to stop work, and a search with
 /// no budget to spend has nothing to stop.
-fn with_deadline(
+pub(crate) fn with_deadline(
     parsed_query: Box<dyn tantivy::query::Query>,
     deadline: Option<&SearchDeadline>,
 ) -> Box<dyn tantivy::query::Query> {
@@ -95,7 +95,7 @@ fn with_deadline(
 /// A search error under a tripped deadline is the deadline's error, whatever it rode out
 /// on. The walk reports through tantivy's error channel, which has no deadline variant,
 /// so the flag — not the message text — is what decides.
-fn deadline_or<T>(
+pub(crate) fn deadline_or<T>(
     result: tantivy::Result<T>,
     deadline: Option<&SearchDeadline>,
 ) -> Result<T, StoreError> {

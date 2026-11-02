@@ -5,7 +5,7 @@ use axum::{
     body::Body,
     extract::{Path, Query, State},
     http::{HeaderValue, StatusCode, header},
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use bytes::BytesMut;
 use futures::StreamExt;
@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 use crate::cluster_coordinator::OperationType;
 use crate::http_server::error::AppError;
 use crate::http_server::{caller_of, tenant_of};
-use crate::node::{ClientOp, DeletePayload, DocPayload};
+use crate::node::{ClientOp, DeleteMode, DeletePayload, DeleteTally, DocPayload};
 use crate::ratelimit::{Caller, Verdict};
 use crate::state::AppState;
 
@@ -719,4 +719,108 @@ pub(super) async fn flush_write_batch(
         // No key: a bulk op runs where it was received — see `route_and_handle_inner`.
         .route_and_handle(client_op, None, OperationType::Write)
         .await
+}
+
+/// Body of `POST /api/{index}/delete`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteByQueryPayload {
+    /// The documents to delete: exact clauses only — see the API reference.
+    pub query: String,
+    /// Most documents deleted without `confirm`; absent is `[search] delete_max_docs`.
+    pub max_docs: Option<usize>,
+    /// Delete even past `max_docs`: the operator has seen the count and decided.
+    #[serde(default)]
+    pub confirm: bool,
+    /// Count what would be deleted, and delete nothing.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Commit at the end, so search reflects the delete at once.
+    #[serde(default)]
+    pub refresh: bool,
+}
+
+/// Handler for deleting the documents a query matches (ROADMAP S1).
+///
+/// Two phases across the cluster: every node counts its matches, the limit is decided once on
+/// the sum, then every node deletes. Past `max_docs` without `confirm` the answer is `409` with
+/// the count, and nothing is deleted. Charged to the write allowance per document, as a bulk
+/// delete is.
+pub(super) async fn delete_by_query_handler(
+    Path(index): Path<String>,
+    State(state): State<AppState>,
+    caller: Option<Extension<Caller>>,
+    Json(payload): Json<DeleteByQueryPayload>,
+) -> Result<Response, AppError> {
+    let start = std::time::Instant::now();
+    let DeleteByQueryPayload {
+        query,
+        max_docs,
+        confirm,
+        dry_run,
+        refresh,
+    } = payload;
+    if query.trim().is_empty() {
+        return Err(AppError::bad_request(
+            "'query' is required: name the documents to delete",
+        ));
+    }
+    let max_docs = max_docs.unwrap_or(state.delete_max_docs);
+    info!(index = %index, dry_run, confirm, "Delete by query request");
+
+    let audited_query = state.audit.records_query_text().then(|| query.clone());
+    let respond = |tally: DeleteTally, status: StatusCode, extra: JsonValue| {
+        let mut body = serde_json::json!({
+            "matched": tally.matched,
+            "deleted": tally.deleted,
+            "skipped_inexact": tally.skipped_inexact,
+            "max_docs": max_docs,
+            "dry_run": dry_run,
+            "shards": {"total": tally.shards, "failed": tally.shards_failed},
+            "nodes": {"contacted": tally.nodes_contacted, "failed": tally.nodes_failed},
+            "took_ms": start.elapsed().as_millis() as u64,
+        });
+        if !tally.errors.is_empty() {
+            body["errors"] = serde_json::json!(tally.errors);
+        }
+        if let (JsonValue::Object(body), JsonValue::Object(extra)) = (&mut body, extra) {
+            body.extend(extra);
+        }
+        let mut response = (status, Json(body)).into_response();
+        if let Some(query) = audited_query.clone() {
+            response
+                .extensions_mut()
+                .insert(crate::authz::AuditedQuery(query));
+        }
+        response
+    };
+
+    let counted = state
+        .router
+        .delete_by_query(&index, &query, DeleteMode::Count, false)
+        .await
+        .map_err(AppError::from_route)?;
+    if dry_run || counted.matched == 0 {
+        return Ok(respond(counted, StatusCode::OK, JsonValue::Null));
+    }
+    if counted.matched > max_docs && !confirm {
+        let error = format!(
+            "the query matches {} documents, above max_docs {max_docs}; nothing was deleted. \
+             Send the request again with \"confirm\": true to delete them",
+            counted.matched
+        );
+        return Ok(respond(
+            counted,
+            StatusCode::CONFLICT,
+            serde_json::json!({"error": error, "code": "delete_limit_exceeded"}),
+        ));
+    }
+
+    check_write_rate(&state, &caller_of(caller), counted.matched)?;
+    let deleted = state
+        .router
+        .delete_by_query(&index, &query, DeleteMode::Delete, refresh)
+        .await
+        .map_err(AppError::from_route)?;
+    Ok(respond(deleted, StatusCode::OK, JsonValue::Null))
 }

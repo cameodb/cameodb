@@ -743,6 +743,7 @@ async fn run(args: Vec<String>) -> Result<()> {
         max_federated_indexes: cameodb_config.security.limits.max_federated_indexes,
         default_array_limit: cameodb_config.search.default_array_limit,
         match_elements_first: cameodb_config.search.match_elements_first,
+        delete_max_docs: cameodb_config.search.delete_max_docs,
         max_array_limit: cameodb_config.security.limits.max_array_limit,
         max_response_bytes: cameodb_config.effective_max_response_bytes(),
         audit: Arc::clone(&audit_sink),

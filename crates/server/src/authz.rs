@@ -115,6 +115,7 @@ const ROUTES: &[RouteRule] = &[
     rule("POST",   "/api/{index}/document/stream",      Access::Needs(Capability::Write)),
     rule("POST",   "/api/{index}/_bulk",                Access::Needs(Capability::Write)),
     rule("POST",   "/api/{index}/_bulk/delete",         Access::Needs(Capability::Write)),
+    rule("POST",   "/api/{index}/delete",               Access::Needs(Capability::Write)),
 
     // Index administration
     rule("PUT",    "/api/{index}/_config",              Access::Needs(Capability::IndexAdmin)),

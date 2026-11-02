@@ -38,6 +38,7 @@ Both return `{"error": …, "message": …}`. An unknown path answers `401` with
 | `POST` | `/api/{index}/document/stream` | `write` |
 | `POST` | `/api/{index}/_bulk` | `write` |
 | `POST` | `/api/{index}/_bulk/delete` | `write` |
+| `POST` | `/api/{index}/delete` | `write` |
 | `PUT` | `/api/{index}/_config` | `index-admin` |
 | `PATCH` | `/api/{index}/_schema` | `index-admin` |
 | `DELETE` | `/api/{index}` | `index-admin` |
@@ -632,7 +633,88 @@ curl -s -X POST http://localhost:9480/api/orders/search \
 curl -s -X DELETE "http://localhost:9480/api/orders/document?id=order_77&routing_key=acme"
 ```
 
-Deleting *by query* is not available; the ids have to be named.
+#### Delete by Query
+Remove the documents a query matches, on every shard of every node.
+
+```bash
+POST /api/{index}/delete
+```
+
+| Field | Meaning |
+|---|---|
+| `query` | The documents to delete. Exact clauses only — see below |
+| `max_docs` | Most documents deleted without `confirm`; absent is the node's `[search] delete_max_docs` (100000) |
+| `confirm` | Delete even past `max_docs` — the operator has seen the count and decided |
+| `dry_run` | Count what would be deleted, and delete nothing, at any size |
+| `refresh` | Commit at the end, so search reflects the delete at once |
+
+The same query that searched for the documents deletes them: search first, then send it here.
+
+```bash
+curl -s -X POST http://localhost:9480/api/events/delete \
+  -H "Content-Type: application/json" -d '{"query": "status:expired"}'
+```
+
+A match past `max_docs` is refused with the count, and nothing is deleted:
+
+```json
+409 {"error": "the query matches 240512 documents, above max_docs 100000; nothing was deleted. …",
+     "code": "delete_limit_exceeded", "matched": 240512, "deleted": 0, "max_docs": 100000, …}
+```
+
+The same request with `"confirm": true` deletes them:
+
+```json
+{
+  "matched": 240512,
+  "deleted": 240512,
+  "skipped_inexact": 0,
+  "max_docs": 100000,
+  "dry_run": false,
+  "shards": {"total": 12, "failed": 0},
+  "nodes": {"contacted": 3, "failed": []},
+  "took_ms": 8412
+}
+```
+
+**Exact clauses only.** A search answers a near miss with a lower score; a delete would remove it.
+So a delete matches values, not analyzed terms:
+
+| Field type | Clauses | Matches |
+|---|---|---|
+| `string` | `f:value`, `f: IN [a b]`, `f:[a TO b]` | the whole value, case-sensitive |
+| `text` | `f:"Acme Corp"`, quoted, joined to the rest with `AND` | the whole stored value, case-sensitive — or one element of an array |
+| `i64`, `u64`, `f64` | value, `IN`, range | numerically |
+| `date` | value, range | to the second, as indexed |
+| `ip` | address, CIDR block, `IN`, range | as addresses |
+| `boolean` | `true` / `false` | exactly |
+| `id`, a shadow field | value, `IN` | the document key |
+
+Clauses combine with `AND`, `OR` and `-`/`NOT`, with at least one that is not negated. A `text`
+clause finds its candidates through the index, which lowercases (and, with a stemming analyzer,
+stems), and each is then compared with its stored value: `company:"Acme Corp"` does not delete
+`ACME CORP`. Candidates turned away are counted in `skipped_inexact`.
+
+**Refused with `400`, before anything is deleted:** a term naming no field, `*`, a prefix or
+wildcard, a regex, a phrase with slop, a range or `IN` set on a `text` field, a `text` clause under
+`OR` or `NOT`, a ghost field, a `json`, `bytes` or `facet` field, and **any query a clause of which
+was dropped** — a search runs what is left and reports the rest, but under `AND` what is left
+matches more. The error names the clause and why.
+
+**What it promises:**
+
+- **What matched at each shard's last commit.** A document written since is not deleted; one
+  updated since is deleted all the same. There is no version check.
+- **Two phases across the cluster.** Every node counts its matches; the limit is decided once, on
+  the sum; then every node deletes. Neither is atomic across nodes. `nodes.failed` names a node
+  that did not answer in time, and its documents are *not confirmed* deleted: a node that was
+  slow, not down, still deletes once the request reaches it. Send a `dry_run` of the same query
+  to see what is left.
+- **Charged like a bulk delete:** each deleted document against
+  [`write_documents_per_minute`](CONFIGURATION.md#rate-limiting-tool-calls-search-and-writes-securitylimits),
+  when that is on. `confirm` skips only the `max_docs` check.
+- **Visibility** as for any delete — see above — or at once with `"refresh": true`. The disk is
+  returned when a merge rewrites the segments (`POST /_admin/index/{index}/merge`).
 
 ### ⚙️ Index Management
 

@@ -19,8 +19,8 @@ pub(crate) use scan::*;
 pub(crate) use shell::*;
 
 use crate::sdk::{
-    CameoClient, ClientAuth, Credential, IndexInfo, KeyRequest, ListIndexesResponse, MintedKey,
-    TenantRequest, TlsTrust,
+    CameoClient, ClientAuth, Credential, DeleteByQueryOptions, IndexInfo, KeyRequest,
+    ListIndexesResponse, MintedKey, TenantRequest, TlsTrust,
 };
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -564,6 +564,24 @@ pub enum ClientCommand {
         /// Also delete stored schema/config. Only meaningful when deleting the index.
         #[arg(long, default_value_t = false)]
         delete_schema: bool,
+        /// Delete the documents this query matches rather than the index. Exact clauses only:
+        /// field:value on string, numeric, date, ip, boolean and id fields, a quoted phrase equal
+        /// to the whole value on a text field.
+        #[arg(long, value_name = "QUERY")]
+        query: Option<String>,
+        /// With --query: count what would be deleted, and delete nothing
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// With --query: delete even past the limit, having seen the count
+        #[arg(long, default_value_t = false)]
+        confirm: bool,
+        /// With --query: most documents deleted without --confirm (default: the node's
+        /// [search] delete_max_docs)
+        #[arg(long, value_name = "N")]
+        max_docs: Option<usize>,
+        /// With --query: commit at the end, so search reflects the delete at once
+        #[arg(long, default_value_t = false)]
+        refresh: bool,
     },
 
     /// Admin operations
@@ -878,6 +896,27 @@ fn collect_delete_ids(ids: &[String], ids_file: Option<&str>) -> Result<Option<V
     Ok((!named.is_empty()).then_some(named))
 }
 
+/// Delete what `query` matches and print the answer; a refusal past the limit is printed with
+/// its count and fails the command, so a script stops there.
+pub(crate) async fn delete_by_query(
+    client: &CameoClient,
+    index: &str,
+    query: &str,
+    options: &DeleteByQueryOptions,
+) -> Result<()> {
+    let answer = client.delete_by_query(index, query, options).await?;
+    print_json(&answer)?;
+    if answer["code"] == "delete_limit_exceeded" {
+        return Err(anyhow!(
+            "nothing was deleted: the query matches {} documents, above the limit of {}; run it \
+             again with --confirm to delete them",
+            answer["matched"],
+            answer["max_docs"]
+        ));
+    }
+    Ok(())
+}
+
 /// Delete one document or many, choosing the endpoint that fits.
 ///
 /// One id goes to the single-document route so the answer names the shard that served it; more
@@ -1052,7 +1091,32 @@ pub async fn run_cli() -> Result<()> {
             ids_file,
             routing_key,
             delete_schema,
+            query,
+            dry_run,
+            confirm,
+            max_docs,
+            refresh,
         } => {
+            if let Some(query) = query {
+                if !ids.is_empty() || ids_file.is_some() || delete_schema {
+                    return Err(anyhow!(
+                        "--query deletes what it matches; it does not combine with --id, \
+                         --ids-file or --delete-schema"
+                    ));
+                }
+                let options = DeleteByQueryOptions {
+                    max_docs,
+                    confirm,
+                    dry_run,
+                    refresh,
+                };
+                return delete_by_query(&client, &index, &query, &options).await;
+            }
+            if dry_run || confirm || refresh || max_docs.is_some() {
+                return Err(anyhow!(
+                    "--dry-run, --confirm, --max-docs and --refresh go with --query"
+                ));
+            }
             let named = collect_delete_ids(&ids, ids_file.as_deref())?;
             match named {
                 Some(named) => {

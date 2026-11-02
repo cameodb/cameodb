@@ -570,10 +570,20 @@ impl IndexCompleter {
     }
 
     pub(crate) fn delete_flag_suggestions(&self, prefix: &str, tokens: &[&str]) -> Vec<Pair> {
-        ["--id", "--ids-file", "--routing-key", "--delete-schema"]
-            .into_iter()
-            .filter_map(|flag| self.flag_suggestion(flag, flag, prefix, tokens))
-            .collect()
+        [
+            "--id",
+            "--ids-file",
+            "--routing-key",
+            "--delete-schema",
+            "--query",
+            "--dry-run",
+            "--confirm",
+            "--max-docs",
+            "--refresh",
+        ]
+        .into_iter()
+        .filter_map(|flag| self.flag_suggestion(flag, flag, prefix, tokens))
+        .collect()
     }
 
     pub(crate) fn force_flag_suggestions(&self, prefix: &str, tokens: &[&str]) -> Vec<Pair> {
@@ -1201,6 +1211,8 @@ mod usage {
     pub(super) const DELETE_INDEX: &str = "delete <index> [--delete-schema]";
     pub(super) const DELETE_DOCS: &str =
         "delete <index> (--id <ID[,ID...]> | --ids-file <path>) [--routing-key <KEY>]";
+    pub(super) const DELETE_QUERY: &str =
+        "delete <index> --query <query...> [--dry-run] [--confirm] [--max-docs <n>] [--refresh]";
     pub(super) const ADMIN: &str = "admin <memory|index|workers> ...";
     pub(super) const ADMIN_MEMORY: &str = "admin memory <stats|purge>";
     pub(super) const ADMIN_MEMORY_STATS: &str = "admin memory stats";
@@ -1228,6 +1240,7 @@ const INTERACTIVE_USAGE: &[&str] = &[
     usage::DATA_LOAD,
     usage::DELETE_INDEX,
     usage::DELETE_DOCS,
+    usage::DELETE_QUERY,
     usage::ADMIN_MEMORY_STATS,
     usage::ADMIN_MEMORY_PURGE,
     usage::ADMIN_INDEX_COMMIT,
@@ -1537,7 +1550,12 @@ pub(crate) async fn dispatch_interactive_command(
         }
         "delete" => {
             let index = parts.next().ok_or_else(|| {
-                anyhow!("Usage: {} | {}", usage::DELETE_INDEX, usage::DELETE_DOCS)
+                anyhow!(
+                    "Usage: {} | {} | {}",
+                    usage::DELETE_INDEX,
+                    usage::DELETE_DOCS,
+                    usage::DELETE_QUERY
+                )
             })?;
 
             // Flags, in one pass: --id, --ids-file and --routing-key take values, the rest are
@@ -1550,10 +1568,31 @@ pub(crate) async fn dispatch_interactive_command(
             let mut ids_file: Option<String> = None;
             let mut routing_key: Option<String> = None;
             let mut delete_schema = false;
-            let mut cursor = rest.iter();
+            let mut query_words: Vec<&str> = Vec::new();
+            let mut query_options = DeleteByQueryOptions::default();
+            let mut cursor = rest.iter().peekable();
             while let Some(token) = cursor.next() {
                 match *token {
                     "--delete-schema" => delete_schema = true,
+                    // The query is every word up to the next flag: it has spaces in it, and the
+                    // line is split on them.
+                    "--query" => {
+                        while let Some(word) = cursor.next_if(|word| !word.starts_with("--")) {
+                            query_words.push(word);
+                        }
+                    }
+                    "--dry-run" => query_options.dry_run = true,
+                    "--confirm" => query_options.confirm = true,
+                    "--refresh" => query_options.refresh = true,
+                    "--max-docs" => {
+                        let value = cursor
+                            .next()
+                            .ok_or_else(|| anyhow!("--max-docs needs a number"))?;
+                        query_options.max_docs =
+                            Some(value.parse().map_err(|_| {
+                                anyhow!("--max-docs needs a number, not '{value}'")
+                            })?);
+                    }
                     "--id" => {
                         let value = cursor
                             .next()
@@ -1574,6 +1613,22 @@ pub(crate) async fn dispatch_interactive_command(
                     }
                     other => return Err(anyhow!("Unknown option '{}' for delete", other)),
                 }
+            }
+
+            if !query_words.is_empty() {
+                if !raw_ids.is_empty() || ids_file.is_some() || delete_schema {
+                    return Err(anyhow!(
+                        "--query deletes what it matches; it does not combine with --id, \
+                         --ids-file or --delete-schema"
+                    ));
+                }
+                let query = query_words.join(" ");
+                return delete_by_query(session.client(), index, &query, &query_options).await;
+            }
+            if query_options != DeleteByQueryOptions::default() {
+                return Err(anyhow!(
+                    "--dry-run, --confirm, --max-docs and --refresh go with --query"
+                ));
             }
 
             // Naming documents deletes those; naming none at all still means the index, which is

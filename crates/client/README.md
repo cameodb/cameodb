@@ -72,6 +72,7 @@ cameodb client data load myindex https://external.com/data.csv --insecure-source
 | `schema load <index> <file> [--delimiter ...] [--id COL[,COL...]]` | Detect schema from CSV/TSV/JSON/JSONL/NDJSON, or read a schema file, and apply it to an index (supports compression & HTTP(S)) |
 | `data load <index> <file> [--delimiter ...] [--batch-size N] [--parallel N] [--id COL[,COL...]] [--recreate]` | Ingest CSV/TSV/JSON/JSONL/NDJSON data in batches, up to N at once (supports compression & HTTP(S)) |
 | `delete <index> --id <ID[,ID…]> [--routing-key K]` | Delete documents by id (comma-separated, or `--ids-file <PATH>` for one id per line) |
+| `delete <index> --query '<query>' [--dry-run] [--confirm] [--max-docs N] [--refresh]` | Delete the documents a query matches: exact clauses only (`status:expired`, `port:[1 TO 1024]`, `company:"Acme Corp"`). Past the limit it prints the count, deletes nothing and exits non-zero; `--confirm` deletes them |
 | `delete <index> [--delete-schema]` | Delete an index; prompts `Delete index "<name>"? [yes/NO]:` and only proceeds on `yes` |
 | `admin memory stats` / `admin memory purge [--force]` | Read memory statistics / trigger a jemalloc purge |
 | `admin index <name> commit` / `evict-writer` | Force a commit across the index's shards / evict its writers from cache |

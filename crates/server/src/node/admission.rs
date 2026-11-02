@@ -66,6 +66,7 @@ impl OpClass {
             ClientOp::Search { .. } => OpClass::Read,
             ClientOp::Write { .. } | ClientOp::Delete { .. } => OpClass::Write,
             ClientOp::BulkWrite { .. } | ClientOp::BulkDelete { .. } => OpClass::Bulk,
+            ClientOp::DeleteByQuery { .. } => OpClass::Bulk,
             _ => OpClass::Any,
         }
     }

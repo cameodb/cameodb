@@ -858,7 +858,7 @@ impl RouterActor {
     ///
     /// `op` arrives already widened by [`widen_broadcast_op`]; the window it was widened
     /// from is reported back on [`BroadcastFanout::window`] so the merge can page with it.
-    async fn broadcast_fanout<F, Fut>(
+    pub(super) async fn broadcast_fanout<F, Fut>(
         &self,
         op: ClientOp,
         window: SearchWindow,

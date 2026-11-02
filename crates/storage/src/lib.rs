@@ -34,6 +34,7 @@ use thiserror::Error;
 
 mod analysis;
 mod deadline;
+mod delete_query;
 mod matched;
 mod merge;
 mod projection;
@@ -50,6 +51,7 @@ mod tests;
 // (O4). Now widening it is an edit here: an item a caller outside the crate needs goes in the
 // list, on purpose, and everything else stays the crate's own business.
 pub use deadline::{DeadlineQuery, SearchDeadline};
+pub use delete_query::DeleteMatches;
 pub use merge::MergeStarted;
 pub use projection::{
     MATCHED_ELEMENTS_FIELD, MATCHED_POSITIONS_WITHOUT_ELEMENTS, TRUNCATED_ARRAYS_FIELD,

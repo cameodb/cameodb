@@ -308,6 +308,11 @@ default_array_limit = 1000
 # array that is not cut keeps its order. A request turns it off with `matches false`.
 match_elements_first = true
 
+# Most documents a delete by query removes without `confirm` (default: 100000). A match past it
+# is refused with the count and nothing is deleted; the same request with "confirm": true
+# deletes them. A request's own `max_docs` takes its place for that request.
+delete_max_docs = 100000
+
 # Longest a write waits to become searchable while writes to its index keep arriving, in
 # milliseconds (default: 2000). A commit is what makes writes visible to search and it is the
 # expensive half of a write, so this is also what a bulk load's commit cost is amortized over.
@@ -1498,6 +1503,7 @@ clear, only digests. That variable is read by the **client**.
 - `CAMEODB_DEFAULT_SEARCH_LIMIT`: Default search result limit
 - `CAMEODB_DEFAULT_ARRAY_LIMIT`: Elements kept of each array in a hit when a search names no `array`
 - `CAMEODB_MATCH_ELEMENTS_FIRST`: Whether a cut array leads with the elements the query matched (`false` keeps its head)
+- `CAMEODB_DELETE_MAX_DOCS`: Most documents a delete by query removes without `confirm`
 
 ## Multi-Disk Setup
 

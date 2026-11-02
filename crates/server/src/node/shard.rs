@@ -2182,6 +2182,53 @@ impl MicroshardActor {
         Ok(sequences.len())
     }
 
+    /// One phase of a delete by query on this shard (ROADMAP S1).
+    ///
+    /// The matches are found on the read pool, against the last commit and under the request's
+    /// budget; a delete then removes them through the writer, in chunks of
+    /// [`DELETE_CHUNK`](super::delete_query::DELETE_CHUNK) ids per transaction, and with
+    /// `refresh` commits so search reflects it at once.
+    pub(super) async fn handle_delete_by_query(
+        &self,
+        index: String,
+        query: String,
+        mode: super::delete_query::DeleteMode,
+        refresh: bool,
+    ) -> Result<super::delete_query::DeleteTally, OrchestratorError> {
+        use super::delete_query::{DELETE_CHUNK, DeleteMode, DeleteTally};
+
+        let store = Arc::clone(self.store.as_ref().ok_or_else(|| {
+            OrchestratorError::NotReady("HybridStore not initialized".to_string())
+        })?);
+        let deadline = self
+            .read_budget
+            .map(|budget| storage::SearchDeadline::new(request_started_at(), budget));
+        let read_index = index.clone();
+        let found = self
+            .spawn_on_read_pool(move || {
+                store.delete_query_matches(&read_index, &query, deadline.as_ref())
+            })
+            .await?
+            .map_err(store_error_to_orchestrator)?;
+
+        let mut tally = DeleteTally {
+            matched: found.ids.len(),
+            skipped_inexact: found.skipped_inexact,
+            ..Default::default()
+        };
+        if mode == DeleteMode::Delete && !found.ids.is_empty() {
+            for chunk in found.ids.chunks(DELETE_CHUNK) {
+                tally.deleted += self
+                    .handle_batch_delete(index.clone(), chunk.to_vec())
+                    .await?;
+            }
+            if refresh {
+                self.admin_commit_via_channel(index).await?;
+            }
+        }
+        Ok(tally)
+    }
+
     /// Handles batch write requests via the dedicated writer thread.
     pub(super) async fn handle_batch_write(
         &self,

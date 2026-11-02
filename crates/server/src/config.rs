@@ -759,6 +759,16 @@ pub struct SearchConfig {
     #[serde(default = "default_match_elements_first")]
     pub match_elements_first: bool,
 
+    /// Most documents a delete by query removes without `confirm`, when the request names no
+    /// `max_docs` (default: 100000).
+    ///
+    /// A query broader than meant is refused with the count, and nothing is deleted; the operator
+    /// reads the number and sends the request again with `confirm` to delete them anyway. A
+    /// threshold, not a ceiling: `[security.limits] max_search_limit` bounds what a search may
+    /// return, while this only asks a large delete to be confirmed.
+    #[serde(default = "default_delete_max_docs")]
+    pub delete_max_docs: usize,
+
     /// Seconds of write inactivity on an index before it is committed anyway (default: 3).
     ///
     /// The idle commit. While writes keep arriving, `commit_interval_ms` bounds how long one
@@ -1696,6 +1706,7 @@ impl Default for SearchConfig {
             default_search_limit: default_search_limit(),
             default_array_limit: default_array_limit(),
             match_elements_first: default_match_elements_first(),
+            delete_max_docs: default_delete_max_docs(),
             supervisor_timeout_secs: default_supervisor_timeout_secs(),
             commit_interval_ms: default_commit_interval_ms(),
             stream_batch_size: default_stream_batch_size(),
@@ -1908,6 +1919,7 @@ config_defaults! {
     default_search_limit -> usize = 10;
     default_array_limit -> usize = cameodb_mcp::DEFAULT_ARRAY_LIMIT;
     default_match_elements_first -> bool = true;
+    default_delete_max_docs -> usize = 100_000;
     default_indexer_num_threads -> usize = 1;
     default_merge_num_threads -> usize = 2;
     default_supervisor_timeout_secs -> u64 = 3;

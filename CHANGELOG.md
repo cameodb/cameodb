@@ -89,6 +89,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   MCP tools' `matches` keeps every array's head. With `array 0`, the positions alone. On a
   cluster a node on an older build sends the head.
 
+- **Delete by query.** `POST /api/{index}/delete` with `{"query": ...}` removes the documents
+  the query matches, on every shard of every node, whatever the index's routing field. Exact
+  clauses only — value, `IN` and range on `string`, numeric, `date` and `ip` fields, `true`/`false`
+  on `boolean`, values on the document key, and a quoted phrase on a `text` field, checked against
+  the stored value so `company:"Acme Corp"` does not delete `ACME CORP`; prefixes, wildcards, `*`,
+  bare terms and a query with a dropped clause are refused before anything is deleted. A match
+  past `max_docs` (`[search] delete_max_docs`, 100000 by default) answers `409` with the count and
+  deletes nothing; `"confirm": true` deletes them. `dry_run` counts, `refresh` commits at the end.
+  It deletes what matched at each shard's last commit, with no version check, and names nodes
+  that did not answer. Charged per document like a bulk delete. The SDK's `delete_by_query` and
+  `cameodb client delete <index> --query '…'` do the same.
+
 ### Changed
 
 - **Tenant quotas reload live.** A changed `[security.tenants.*]` takes effect on SIGHUP,

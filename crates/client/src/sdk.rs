@@ -248,6 +248,19 @@ pub fn failure_status(error: &anyhow::Error) -> Option<u16> {
     error.downcast_ref::<HttpFailure>().map(HttpFailure::status)
 }
 
+/// What a delete by query asks for besides the query: see [`CameoClient::delete_by_query`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeleteByQueryOptions {
+    /// Most documents deleted without `confirm`; `None` is the node's `[search] delete_max_docs`.
+    pub max_docs: Option<usize>,
+    /// Delete even past `max_docs`.
+    pub confirm: bool,
+    /// Count what would be deleted, and delete nothing.
+    pub dry_run: bool,
+    /// Commit at the end, so search reflects the delete at once.
+    pub refresh: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct CameoClient {
     base_url: Url,
@@ -544,6 +557,52 @@ impl CameoClient {
         let url = self.base_url.join(&format!("api/{}/_bulk/delete", index))?;
         self.send_json(self.http.post(url).json(&ids), "Bulk delete")
             .await
+    }
+
+    /// Delete the documents `query` matches (`POST /api/{index}/delete`).
+    ///
+    /// Exact clauses only — the node refuses anything else, and a query with a dropped clause.
+    /// A match larger than the limit is answered, not raised: the `409` body comes back as `Ok`,
+    /// with `"code": "delete_limit_exceeded"` and the `"matched"` count, since the count is what
+    /// the caller decides on before sending the same request with `confirm`.
+    pub async fn delete_by_query(
+        &self,
+        index: &str,
+        query: &str,
+        options: &DeleteByQueryOptions,
+    ) -> Result<JsonValue> {
+        let url = self.base_url.join(&format!("api/{}/delete", index))?;
+        let mut body = serde_json::json!({"query": query});
+        if let Some(max_docs) = options.max_docs {
+            body["max_docs"] = serde_json::json!(max_docs);
+        }
+        for (flag, on) in [
+            ("confirm", options.confirm),
+            ("dry_run", options.dry_run),
+            ("refresh", options.refresh),
+        ] {
+            if on {
+                body[flag] = serde_json::json!(true);
+            }
+        }
+        let response = self
+            .http
+            .post(url)
+            .json(&body)
+            .send()
+            .await
+            .context("Delete by query failed: the request could not be sent")?;
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            return response
+                .json()
+                .await
+                .context("Delete by query: the answer could not be read");
+        }
+        self.checked(response, "Delete by query")
+            .await?
+            .json()
+            .await
+            .context("Delete by query: the answer could not be read")
     }
 
     pub async fn bulk_index(&self, index: &str, batch: &[JsonValue]) -> Result<JsonValue> {

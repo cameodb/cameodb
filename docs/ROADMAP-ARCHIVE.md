@@ -5048,6 +5048,136 @@ refuses is `400` and undone, an `admin` key is `403`, and a bounded provisioner 
 
 ---
 
+## S. Delete by query ✅ Done
+
+Opened 2026-11-02. Phase 17 delivered deletion by id, single and bulk, and filed `_delete_by_query`
+as a phase of its own: a search-then-delete loop, a decision about consistency while documents keep
+arriving, and the read-cache fix underneath it (I1, done). Scoped against the code at `38f75f0`.
+
+### S1 — Delete the documents a query matches
+
+✅ **Done 2026-11-02**, as decided below, with three things learned building it:
+
+- *A `text` clause must be required.* The stored-value check is per document, so it can only
+  narrow a conjunction: a `text` clause under `OR` or `NOT` is refused, naming why. Written into
+  the refusals and the API reference.
+- *Prefixes are refused by not expanding them.* The query is prepared with no prefix expanded, so
+  `f:abc*` is either caught by the screen (`prefix`) or left as a dropped clause, which refuses
+  the delete either way.
+- *A node that did not answer is not confirmed, not untouched.* Verified on three nodes with one
+  paused: it was named in `nodes.failed`, and its matches were deleted once it resumed — the
+  request had reached it before the timeout. The API reference says *not confirmed*, and to send
+  a `dry_run` to see what is left. A node on a build without `DeleteByQuery` cannot decode it and
+  is reported the same way.
+
+Where it is: `storage/src/delete_query.rs` — `HybridStore::delete_query_matches`: the screen over
+`PreparedQuery::screened_ast`, every match from a `DocSetCollector`, ids from the fast `id` column
+or the stored one, the `text` check in batches of 1024 against redb. `server/src/node/delete_query.rs`
+— `ClientOp::DeleteByQuery { mode: Count | Delete, refresh }`, run on a node's own shards by the
+engine or, for a peer, off the actor's mailbox; `RouterActor::delete_by_query` fans one phase out
+through `broadcast_fanout` and sums `DeleteTally`. `MicroshardActor::handle_delete_by_query`
+finds on the read pool and deletes through the writer, 10,000 ids per transaction. The handler,
+`delete_by_query_handler`, decides the limit, `confirm`, `dry_run` and the write charge between
+the two phases. `[search] delete_max_docs`, `--delete-max-docs`; SDK `delete_by_query` (a `409`
+answered, not raised); CLI and REPL `delete <index> --query`.
+
+Tests: `delete_query_test.rs` (every allowed type and clause, each refusal, the `text` check with
+case and arrays, 2,500 of 5,000 matched, a shard without the index), an HTTP test (dry run, 409,
+confirm with refresh, a request `max_docs`, the refusals, a missing index, the SDK's 409). On three
+Docker nodes: a dry run, a 409 and a confirmed delete through one node, every node then holding
+none of the matches and all the rest; a delete with one node paused.
+
+**Today.** A delete names an id. `DELETE /api/{index}/document` routes it like a write;
+`POST /api/{index}/_bulk/delete` groups ids by shard on the node that received it and forwards
+each share. Either way the shard's writer removes the redb row and issues `delete_term` in the
+transaction that appends the WAL entry (`handle_batch_delete`, `apply_batch`). On an index whose
+routing field is not `id`, a caller without the routing key is refused: a keyless delete is
+never fanned out. Removing every document that matches a condition means a search, a page at a
+time, then the ids.
+
+**Decided** (2026-11-02):
+
+1. **A shard deletes what it holds.** The query runs on every shard of every node, and each shard
+   deletes the matching ids it found — so no routing key is needed, whatever the routing field.
+2. **Exact matching only.** Allowed clauses, combined with `AND`, `OR` and `-`/`NOT`, with at least
+   one positive clause:
+
+   | Type | Clauses | Matches |
+   |---|---|---|
+   | `string` | `f:value`, `f: IN [a b]`, `f:[a TO b]` | the whole value, case-sensitive |
+   | `text` | `f:"exact value"`, quoted | the whole stored value, case-sensitive — see 3 |
+   | `i64`, `u64`, `f64` | value, `IN`, range | numerically |
+   | `date` | value, range | to the second, as indexed |
+   | `ip` | address, CIDR, `IN`, range | as addresses |
+   | `boolean` | `true` / `false` | exactly |
+   | `id`, a shadow field | value, `IN` | the document key |
+
+   Refused: `json`, `bytes` and `facet` fields, ghost columns, bare terms on the default fields,
+   prefixes, wildcards, `*`, regexes, fuzzy, a phrase with slop — and **any query of which a clause
+   was dropped**: a search runs what is left, but a dropped clause under `AND` widens a delete.
+3. **`text` is exact against the stored value.** The phrase finds candidates through the index;
+   the shard reads each candidate and deletes it only when the field's value, or one element of an
+   array, equals the quoted text exactly. Analysis lowercases and stems, so the index alone cannot
+   tell `"Acme Corp"` from `"acme corps"`. Candidates that fail are counted as `skipped_inexact`.
+4. **Over `max_docs` is refused, with the count; `confirm` deletes anyway.** The operator decides,
+   having seen the number — `confirm` rather than `force`, which reads as overriding a fault:
+   ```json
+   POST /api/intel/delete {"query": "status:expired"}
+   409 {"error": "the query matches 240512 documents, above max_docs 100000; nothing was deleted",
+        "code": "delete_limit_exceeded", "matched": 240512, "max_docs": 100000}
+
+   POST /api/intel/delete {"query": "status:expired", "confirm": true}
+   200 {"deleted": 240512, "matched": 240512, "skipped_inexact": 0,
+        "nodes": {"contacted": 3, "failed": []}, "took_ms": 8412}
+   ```
+   The limit is `"max_docs"` on the request, else a new `[search] delete_max_docs`, **100000** by
+   default — sized to what a node deletes comfortably in one request, not to a search page.
+   Neither existing search setting fits: `default_search_limit` (10) is a page size, and
+   `[security.limits] max_search_limit` (10000) is a hard ceiling no request may pass, where this
+   is a threshold an operator may confirm past. `confirm` skips only this check: the clause rules,
+   scopes and `write_documents_per_minute` still apply. `"dry_run": true` returns the count per
+   node and deletes nothing, at any size.
+5. **What matched at the last commit, no version check.** Each shard queries its last committed
+   searcher: a document written since is not deleted, and one updated since is deleted by id all
+   the same. Documented. `"refresh": true` commits at the end, so search reflects the deletion at
+   once; otherwise within the commit interval.
+6. **`POST /api/{index}/delete`, beside `search`.** A data operation takes a plain word, as
+   `search` and `document` do; the underscore marks meta and batch routes (`_bulk`, `_config`,
+   `_schema`). The query a caller searched with is the query it deletes with, so the two read as a
+   pair, and deletion by id stays where it is (`DELETE …/document?id=`, `_bulk/delete`). Rejected:
+   `_delete_by_query` (long), `search/delete` (a write nested under a read route), `_delete` (reads
+   as batch, and beside `_bulk/delete`), and `DELETE` with a body, which proxies drop — Phase 17's
+   reason for `_bulk/delete` being a `POST`.
+7. **Not atomic across nodes.** The response sums what each node deleted and names the nodes and
+   shards that failed; a partial result says so.
+
+**The approach.**
+
+- *Storage.* `HybridStore::delete_by_query(index, query, opts)`: `prepare_query_parser`, the type
+  screen of decision 2 walked over `PreparedQuery::screened_ast` (the field resolution
+  `matched.rs` does), refused on any discarded clause; every match collected (`DocSetCollector`, not
+  `TopDocs`) and its id resolved from the fast `id` column, else the stored one, as `search_keys`
+  does; for `text` clauses, the stored-value check; then the ids, in chunks (10,000 per redb
+  transaction), under the request's deadline. A counting mode for `dry_run` and the `max_docs`
+  check runs first and deletes nothing.
+- *Node.* `ClientOp::DeleteByQuery`, run where it is received, as a bulk op is: the count phase on
+  every node (this one and each broadcast peer), the limit decided once on the sum, then the delete
+  phase; per-node results merged.
+- *Surface.* `POST /api/{index}/delete` `{query, max_docs, confirm, dry_run, refresh}`,
+  capability `write`, its authz row, tenant and key index scopes as any write. Each deleted
+  document charged to `write_documents_per_minute`; one audit record with the query text. SDK
+  `delete_by_query`, CLI `delete <index> --query '…' [--dry-run] [--confirm] [--max-docs N]`. No MCP
+  tool: that surface does not write.
+
+**Tests.** Storage: each allowed type and clause; each refusal, a dropped clause included; `text`
+exactness (case, a stemmed near-miss skipped, an array element); `dry_run`; the limit and `confirm`;
+a match spanning several chunks; ids from a fast `id` column and from a stored one. Server: the
+route, its refusals and authz row, scopes, the 409 and `confirm`, `refresh`. Cluster: matches on all
+three nodes deleted through one, a frozen node reported as failed.
+
+**Docs.** `docs/API_REFERENCE.md` (the route, the type table, what it promises),
+`docs/CONFIGURATION.md`, the client README, `CHANGELOG.md`.
+
 ## Phases 1–9 — Foundations through advanced architecture ✅ Done
 
 **Phase 1**: Storage Durability & WAL Recovery ✅ Done

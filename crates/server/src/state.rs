@@ -68,6 +68,9 @@ pub struct AppState {
     /// Whether a cut array leads with the elements the query matched when a search does not
     /// say, from `[search] match_elements_first`. Resolved at the surface, as `array` is.
     pub match_elements_first: bool,
+    /// Most documents a delete by query removes without `confirm`, from
+    /// `[search] delete_max_docs`.
+    pub delete_max_docs: usize,
     /// Largest `array` a search may ask for, from `[security.limits] max_array_limit`.
     ///
     /// Enforced on HTTP and MCP alike, and advertised as the `maximum` of each MCP search
