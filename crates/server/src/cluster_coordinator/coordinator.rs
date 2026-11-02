@@ -706,8 +706,15 @@ impl ClusterCoordinator {
                             peer_addr: addr,
                         };
                     } else {
-                        warn!(%shard_id, node = %owner_node, "RouteOperation: owner address unknown, broadcasting");
-                        return RoutingDecision::Broadcast;
+                        // An owner on the ring this process never reached: a peer still
+                        // joining, or an identity that will not return — a node rebuilt with
+                        // an empty data directory comes back under a new one (OB27). A
+                        // broadcast cannot reach it either, and a write refused there was a
+                        // `500`; it is the same "not now" as a lost owner.
+                        warn!(%shard_id, node = %owner_node, "RouteOperation: owner address unknown");
+                        return RoutingDecision::Unavailable {
+                            node_id: owner_node,
+                        };
                     }
                 } else {
                     error!(%shard_id, "RouteOperation: CRITICAL - shard found but owner unknown! This indicates inconsistent state.");

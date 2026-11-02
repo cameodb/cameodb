@@ -687,11 +687,15 @@ impl RouterActor {
             Ok(RoutingDecision::Local) => self.handle_client_op(op).await,
             Ok(RoutingDecision::Broadcast) => {
                 // CRITICAL: Never broadcast write operations - this causes data duplication
-                // and inconsistency. Writes must be routed to a specific shard.
+                // and inconsistency. Writes must be routed to a specific shard. A keyed write
+                // gets here only when no shard claims its key yet — a ring still forming —
+                // which is "not now", a `503`, not a fault of this node (OB27).
                 if is_write_operation(&op) {
-                    return Err(OrchestratorError::Missing(
-                        "Write operation cannot be broadcast - routing failed".to_string(),
-                    ));
+                    return Err(OrchestratorError::PeerUnreachable {
+                        message: "no node in the cluster owns this key yet: the shard map is \
+                                  incomplete; retry once the cluster has converged"
+                            .to_string(),
+                    });
                 }
 
                 // Use streaming for search operations if enabled

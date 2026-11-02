@@ -104,6 +104,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing for a Cyrillic query until its documents are written again. Fields holding only Latin
   text are unaffected.
 
+### Fixed
+
+- **A write to a key whose owner was never reached answered `500`.** On a cluster, a write
+  whose shard belongs to a node this one has not connected to since it started — a peer still
+  joining, or the old identity of a node rebuilt with an empty data directory — answered
+  `500 Write operation cannot be broadcast - routing failed`. It now answers `503` naming the
+  owning node, as for a peer that was lost. A write arriving before any shard claims its key
+  answers `503` too.
+
 ## [0.3.8] - 2026-10-25
 
 **Upgrading from 0.3.7 or earlier: every configured API key digest has to be replaced once.**

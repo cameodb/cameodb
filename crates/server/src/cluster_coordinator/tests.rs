@@ -192,7 +192,7 @@ mod tests {
     }
 
     #[test]
-    fn decide_route_broadcasts_when_owner_address_missing() {
+    fn decide_route_unavailable_when_owner_address_missing() {
         let mut cc = ClusterCoordinator::new(make_cluster());
         let shard_id = Uuid::new_v4();
         let owner = Uuid::new_v4(); // not present in peer_nodes
@@ -208,8 +208,14 @@ mod tests {
         );
         cc.rebuild_ring();
 
-        let decision = cc.decide_route(Some("key-no-addr".into()), OperationType::Read);
-        assert!(matches!(decision, RoutingDecision::Broadcast));
+        // A broadcast cannot reach an owner with no address either; a write refused there was
+        // a `500` (OB27). Both a read and a write are told "not now", naming the owner.
+        for op in [OperationType::Read, OperationType::Write] {
+            match cc.decide_route(Some("key-no-addr".into()), op) {
+                RoutingDecision::Unavailable { node_id } => assert_eq!(node_id, owner),
+                other => panic!("expected Unavailable, got {other:?}"),
+            }
+        }
     }
 
     #[test]
