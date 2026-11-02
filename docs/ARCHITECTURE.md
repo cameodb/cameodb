@@ -399,7 +399,7 @@ CameoDB is designed as a **distributed, shared-nothing cluster**:
 
 For a detailed walkthrough of the node-side actors, routing decisions, remote flows, and metadata persistence, see:
 
-- [`docs/README.md`](README.md) — a worked distributed search, ingress to owner node and back
+- [`docs/README.md`](README.md) — the docs index, and how a write and a search cross the cluster
 
 ## 🔀 Operation Routing Workflows
 

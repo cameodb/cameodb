@@ -315,7 +315,9 @@ fn search_index_description() -> String {
         "Full-text search over one CameoDB index.\n\n\
          Results carry `_score` and, when a projection was requested, only the named fields in \
          the order given. Each array in a hit keeps at most `array` elements; a hit that lost \
-         elements names them in `_truncated_arrays` with their original lengths. A query the engine cannot fully interpret fails rather than returning \
+         elements names them in `_truncated_arrays` with their original lengths, and a cut array \
+         leads with the elements the query matched, their stored positions in \
+         `_matched_elements`. A query the engine cannot fully interpret fails rather than returning \
          partial results, and the error names the clause it could not use.\n\n\
          Call `describe_index` for an index's fields and their types before constructing a query \
          against unfamiliar data.\n\n{}",

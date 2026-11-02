@@ -433,7 +433,7 @@ pub const INLINE_MODIFIERS: &[(&str, &str, &str)] = &[
     (
         "array N",
         "Keep at most N elements of each array in a hit, the first ones in stored order, at any \
-         depth. A hit that lost elements carries `_truncated_arrays`, naming each shortened array \
+         depth — a cut array leads with the elements the query matched unless `matches off`. A hit that lost elements carries `_truncated_arrays`, naming each shortened array \
          by its path with the length it had; `array 0` is the lengths without the elements. \
          Without it the node's default applies, and N is bounded by a maximum the way `limit` is.",
         "string_ipv4:10.0.0.1 array 50",

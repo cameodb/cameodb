@@ -163,6 +163,7 @@ docker-compose -f docker/docker-compose-cluster.yml up -d
   - **Node 3 (Direct)**: `http://localhost:9483`
 - **Data Persistence**: Each node's data is stored in a separate subdirectory within `data/cameodb/`.
 - **Swarm Configuration**: `CAMEODB_CLUSTER_NAME`, `CAMEODB_CLUSTER_PORT`, `CAMEODB_SEED_NODES`, and `CAMEODB_CLUSTER_ENABLED` environment variables drive the Kademlia swarm. Update them per deployment needs.
+- **A node's data directory is its identity.** `node_identity.json` lives in it, beside the shards. A node restarted with its directory rejoins as itself; one started with an empty directory is a new node, and its old identity stays on every node's ring. Until there is an operation to remove it, the old identity's key ranges cannot be written — single writes to them answer `503` naming it — and the new node cannot learn an existing index's schema, because the lookup waits for every node the cluster has seen, the old identity included. Data on a lost node is not on any other: there is no replication yet. Keep each node's data directory, and restore it whole rather than starting a node empty.
 
 ### Custom Data Directory Setup
 

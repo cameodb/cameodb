@@ -20,7 +20,9 @@ By leveraging the **Kameo** actor framework and **Tokio**'s async runtime, Cameo
 * **Tiered Cache Sizing:** Dynamically budgets memory across active shards based on system RAM to ensure steady-state operational safety.
 * **Sophisticated Schema Detection:** Automatically infers and maps indices from raw data payloads via versatile columnar structural testing and verifiable format detections.
 * **Intelligent Data Loader:** Robust ingestion pipeline that transparently handles multiple formats (`CSV`, `TSV`, `JSON`, `JSONL`/`NDJSON`) and on-the-fly decompression (`Gzip`, `Zip`). It supports loading from local disk, mounted network paths, and directly streaming from HTTP(S) endpoints.
-* **Language-Aware Search:** Each text field names its analyzer, so a query for one form of a word finds the others: Snowball stemmers for English, Italian, German, French, Spanish and Portuguese (Portuguese with a plural step of our own, `pt_stem`; each but English also accent-insensitive, as `<lang>_stem_fold`, with `de_stem_fold` reading `ae`/`oe`/`ue` as umlauts), and a Croatian dictionary lemmatizer of our own (`hr_stem`, and `hr_stem_fold` for queries typed without diacritics), built from a CC0 corpus of 3 billion words. See [Tokenizers](docs/API_REFERENCE.md) and [tools/hr-lexicon](tools/hr-lexicon/README.md).
+* **Language-Aware Search:** Each text field names its analyzer, so a query for one form of a word finds the others: Snowball stemmers for English, Italian, German, French, Spanish and Portuguese (Italian and Portuguese with steps of our own that bring together the plurals and feminines Snowball leaves apart, `it_stem` and `pt_stem`; each but English also accent-insensitive, as `<lang>_stem_fold`, with `de_stem_fold` reading `ae`/`oe`/`ue` as umlauts), and a Croatian dictionary lemmatizer of our own (`hr_stem`, and `hr_stem_fold` for queries typed without diacritics), built from a CC0 corpus of 3 billion words, which reads Serbian Cyrillic as Latin. See [Tokenizers](docs/API_REFERENCE.md) and [tools/hr-lexicon](tools/hr-lexicon/README.md).
+* **Ghost Fields:** One stored text, searched through as many analyzers as it needs. A ghost field is a search column filled from another field — for every document, or for those whose language field says `en` — and never stored, so a multilingual text is kept once rather than once per stemmed column.
+* **Hits Sized for Their Reader:** One field of a threat-intelligence record can hold hundreds of thousands of addresses, so each array in a hit is capped (1000 elements by default) and the hit says what it lost in `_truncated_arrays`. A cut array leads with the elements the query matched, their stored positions in `_matched_elements`, so the evidence for a hit is in the hit however long the field.
 * **Consistent Hybrid Recovery:** Guarantees data consistency during startup by automatically recovering and syncing uncommitted records from the ACID datastore (KV) into the search index.
 * **Graceful Shutdowns:** Multi-phase process ensuring zero WAL replay on clean reboots.
 * **Contained Faults:** A panic fails one request rather than the process — caught at the read pool, the per-index write guard, the request handler and index warming. A writer thread that dies is respawned over the same store, and `/_cluster/health` turns red for a node whose data path has stopped serving (a dead or wedged writer, a wedged read pool) even while the cluster still calls itself green.
@@ -355,9 +357,10 @@ offered one that will be refused.
 ### Keys for many users: `include` and provisioning
 
 A service that signs users up — a portal — does not edit files. It holds one `provisioner` key
-and mints and revokes keys over HTTP, for users and agents (`/_keys`, each key scoped by its own
-`allowed_indexes`) or for companies as tenants (`/_tenants`, with their own index scope and
-quotas). The node writes the keys, as digests, into a folder the config `include`s, and the key
+and mints, rescopes and revokes keys over HTTP, for users and agents (`/_keys`, each key scoped by
+its own `allowed_indexes`, changed in place with `PATCH /_keys/{key_id}`) or for companies as
+tenants (`/_tenants`, with their own index scope and quotas). A provisioner key with
+`allowed_indexes` of its own grants only within them, so two services can share a node. The node writes the keys, as digests, into a folder the config `include`s, and the key
 ring reloads at once, quotas keeping their usage count:
 
 ```toml

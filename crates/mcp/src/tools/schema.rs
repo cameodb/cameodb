@@ -221,7 +221,7 @@ fn array_schema(max_array_limit: usize) -> JsonValue {
         "minimum": 0,
         "maximum": max_array_limit,
         "description": format!(
-            "Most elements kept of each array in a hit, up to {max_array_limit}; the first ones, in stored order, at any depth. A hit that lost elements carries `_truncated_arrays`, naming each shortened array by its path with the length it had. Pass 0 for the lengths without the elements. If omitted, the node's configured default applies, which is 1000 unless an operator changed it."
+            "Most elements kept of each array in a hit, up to {max_array_limit}; the first ones, in stored order, at any depth, unless `matches` leads a cut array with the elements the query matched. A hit that lost elements carries `_truncated_arrays`, naming each shortened array by its path with the length it had. Pass 0 for the lengths without the elements. If omitted, the node's configured default applies, which is 1000 unless an operator changed it."
         )
     })
 }

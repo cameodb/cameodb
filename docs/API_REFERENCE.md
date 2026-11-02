@@ -104,6 +104,7 @@ sooner puts the request back into the backlog it was shed from.
 | Status | What it means | What a client should do |
 |--------|---------------|-------------------------|
 | `503` + `Retry-After` | The node refused the work up front; nothing was executed | Retry after the header says, ideally with jitter |
+| `503`, *the node that owns this key (…) is not reachable* | On a cluster, a single-document write or delete whose owning node is down, still joining, or was never reached since this node started; nothing was written | Retry. If it lasts, the owner is down — or was started again with an empty data directory, which leaves its old identity owning those keys; see [Deployment](DEPLOYMENT.md#2-multi-node-cluster-deployment) |
 | `408` | The request timeout fired on work already in progress | Treat as unknown: a write may or may not have landed |
 | `429` + `Retry-After` | A rate limit, not a capacity limit — the per-caller token buckets in [`[security.limits]`](CONFIGURATION.md#rate-limiting-tool-calls-search-and-writes-securitylimits). One meters MCP tool calls and both search routes; the other meters the five write routes, in documents. Both off by default | Wait what the header says; the node is not overloaded |
 
@@ -154,7 +155,9 @@ curl -s -X POST http://localhost:9480/api/books/search \
 > A field list needs a comma between names, and the clause must sit in one run of `return`/`limit`/`offset`/`sort`/`array`/`matches` at the end of the query with query text in front of it. Anywhere else the keyword is searched for as a word, so `find tax return forms` is four terms. A `return` naming a field the index does not have is reported in `_discarded_clauses`.
 
 > **Array elements (`array`):** each array in a hit keeps at most `array` elements — the first
-> ones, in stored order, at any depth, including arrays inside objects and arrays of objects. One
+> ones, in stored order, at any depth, including arrays inside objects and arrays of objects; a cut
+> array of a document field leads with the elements the query matched instead (see `matches`
+> below). One
 > field of a threat-intelligence record can hold hundreds of thousands of addresses, megabytes on
 > its own, so the cap is on by default: a search that names none gets the node's
 > `[search] default_array_limit` (1000). Supply it in the payload — `"array": 50` — or inline, as

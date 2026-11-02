@@ -1045,7 +1045,8 @@ than per call.
 `max_search_limit` bounds how many hits come back; this bounds how large each one is. A single
 field of a threat-intelligence record can hold a few hundred thousand network addresses —
 megabytes in one hit, and a page of such hits floods any client or agent context. Every array in
-a hit keeps at most `array` elements: the first ones in stored order, at any depth, cut on the
+a hit keeps at most `array` elements: the first ones in stored order — or the ones the query
+matched first, under `[search] match_elements_first` — at any depth, cut on the
 shard that holds the document so the rest never cross the network. It defaults to **100000**,
 past which a caller is asking for an export rather than a search.
 
