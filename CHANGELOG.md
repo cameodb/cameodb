@@ -141,6 +141,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A damaged `metadata.redb` panicked the node at startup.** The file holds cluster bookkeeping
+  — configuration, shard assignments, the node registry, the ring snapshot — not documents. It is
+  now checked with redb's integrity check before it is read (6–7 ms on files of 0.8–3 MB). A
+  single node renames a damaged one `metadata.redb.damaged-<UTC timestamp>`, logs a warning naming
+  both files, and rebuilds it from its shards at that start; a node with clustering enabled refuses
+  to start, naming the file and the remedy, and leaves it in place. A panic inside redb while the
+  file opens is caught and handled the same way, and an error that is not damage — permissions,
+  a full disk — stops the node with that error instead of a panic.
 - **A write to a key whose owner was never reached answered `500`.** On a cluster, a write
   whose shard belongs to a node this one has not connected to since it started — a peer still
   joining, or the old identity of a node rebuilt with an empty data directory — answered

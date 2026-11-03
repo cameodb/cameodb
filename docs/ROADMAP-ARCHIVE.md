@@ -3723,6 +3723,49 @@ value on a path. The syntax reference, guidance and API reference say a path is 
 clause. Native json — paths, typed values and fast columns, which tantivy has — would make these
 clauses work rather than report them; that is a design decision of its own, not part of this fix.
 
+### OB31 — A damaged `metadata.redb` panics the node
+
+✅ **Done 2026-11-04.** Found 2026-11-03, with [OB30](../ROADMAP.md#ob30--two-processes-can-open-one-data-directory)
+as its cause: a node's `metadata.redb` was left with its user tables' root pointing at a page that
+held redb's own system tree, and both commit slots sharing it. The release build panicked inside
+redb loading the ring snapshot (`slice index starts at 60 but ends at 3`, `btree_base.rs`), the
+debug build earlier in redb's own allocator assertion while the file opened, and around both
+`ClusterStateStore::new` and `load_persisted_cluster` were called with `expect`.
+
+- **Checked before it is read.** `ClusterStateStore::open_for_startup` opens the file, runs
+  `check_integrity`, and only then loads it. Measured on three files of 0.8–3 MB: 6–7 ms for the
+  check, 11–13 ms for the whole open (release build, macOS). Shard stores are not checked this way
+  (78 s for a 10 GB store).
+- **Damage, and what is not.** A `Corrupted` error from the open or the check, an error loading a
+  file that passed the check other than I/O, and a panic anywhere in the open, check or load are
+  damage. An I/O error, a file held by another process or one needing a format upgrade stop the
+  node with that error and leave the file alone. The panic is caught with its report silenced on
+  the opening thread only — the hook is wrapped, not replaced, so a panic on any other thread is
+  reported as before — and its message goes into the warning instead of reading as a crash.
+- **Single node:** renamed `metadata.redb.damaged-<UTC timestamp>`, a warning naming both files,
+  and a new file, rebuilt from the shards at that start. **Cluster member:** refuses, naming the
+  file, what it holds and the remedy, and leaves it in place. The message says to restore the file
+  or rebuild the node, not to move it aside and let the node relearn its ring from its peers:
+  whether a member rebuilds correctly that way has not been verified.
+- **No `expect` on that path**; a refusal is logged and exits non-zero.
+- **A missing table and a damaged one are told apart.** The loaders treated any error opening a
+  table as the table not existing yet, and any error reading the cluster config as a format change
+  — both now only for `TableDoesNotExist` and a JSON error; anything else is returned.
+
+What a refused member's file looks like afterwards: its pages are unchanged, but redb marks a file
+it opened for writing as needing recovery and clears the mark only on a clean close, which a failed
+check does not reach — so the header's flag byte differs.
+
+Tests: unit tests in `cluster_state.rs` (an intact file loads in both modes; a new directory starts
+fresh; the 2026-11-03 damage, reproduced by overwriting every page holding the table names with the
+system tree's page, is set aside on a single node and refused on a member; a file of noise after its
+header is damage; a directory where the file should be is an error and is left alone), run in debug
+and release builds since they fail in different places; `tests/damaged_metadata.rs` end to end —
+30 documents written, a clean SIGTERM stop, the damage, a clustered start refused with the file's
+pages unchanged, a single-node start setting it aside and serving all 30, and a third start reading
+the rebuilt file cleanly. Docs: `docs/DEPLOYMENT.md` "When `metadata.redb` is damaged";
+`CHANGELOG.md`.
+
 ### F9 — Commit on a clock, not a count
 
 ✅ **Done 2026-09-26.** Found by the same pre-release profiling session: stack samples of bulk at

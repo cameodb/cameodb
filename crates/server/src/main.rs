@@ -470,6 +470,8 @@ async fn run(args: Vec<String>) -> Result<()> {
 
     let (keypair, identity) = swarm::load_node_identity(&primary_path)?;
 
+    let node_clustered = cameodb_config.network.cluster.enabled;
+
     // Create node configuration from loaded config
     let node_config = NodeConfig {
         storage_path: primary_path.clone(),
@@ -495,7 +497,7 @@ async fn run(args: Vec<String>) -> Result<()> {
         writer_core_affinity: cameodb_config.storage.writer_core_affinity,
         shard_affine_dispatch: cameodb_config.storage.shard_affine_dispatch,
         worker_core_affinity: cameodb_config.storage.worker_core_affinity,
-        clustered: cameodb_config.network.cluster.enabled,
+        clustered: node_clustered,
         implicit_index_creation: cameodb_config.security.implicit_index_creation,
         tenant_quotas: keyring.tenant_limits(),
         query_policy: cameodb_config.security.limits.query_policy(),
@@ -514,16 +516,17 @@ async fn run(args: Vec<String>) -> Result<()> {
     let node_id = orchestrator.identity().uuid;
     let node_name = orchestrator.identity().name.clone();
 
-    // Initialize cluster state store for persistent metadata
-    let state_store = Arc::new(
-        ClusterStateStore::new(primary_path.clone())
-            .expect("Failed to initialize cluster state store"),
-    );
-
-    // Load persisted cluster topology (if exists)
-    let persisted_cluster = state_store
-        .load_persisted_cluster()
-        .expect("Failed to load persisted cluster state");
+    // The cluster bookkeeping in `metadata.redb`, checked before it is read. A damaged file is
+    // set aside and rebuilt on a single node, and refused with its remedy on a cluster member.
+    let (state_store, persisted_cluster) =
+        match ClusterStateStore::open_for_startup(&primary_path, node_clustered) {
+            Ok(opened) => opened,
+            Err(e) => {
+                tracing::error!("Refusing to start: {e:#}");
+                return Err(e);
+            }
+        };
+    let state_store = Arc::new(state_store);
 
     // Initialize distributed cluster with derived remote messaging limits
     let distributed_cluster = DistributedCluster::new(

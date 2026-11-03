@@ -594,6 +594,26 @@ It returns at once, with what it started, and each shard logs `Merge complete` w
 before and after. It needs free disk for the merged segment while it runs. See the API
 reference for the report.
 
+### When `metadata.redb` is damaged
+
+`metadata.redb`, in the first directory of `storage.data_paths`, holds the node's cluster
+bookkeeping: cluster configuration, shard assignments, the node registry and the ring snapshot.
+It holds no documents — each shard's are in its own `store.redb`. The node checks it with redb's
+integrity check every time it starts, before reading it.
+
+- **Single node** (`[network.cluster] enabled = false`): a damaged file is renamed
+  `metadata.redb.damaged-<UTC timestamp>`, a warning names both files, and the node rebuilds the
+  file from its shards and starts. Every document is served as before. The `.damaged-*` file is
+  kept only for whoever wants to look at it; remove it once the node is serving.
+- **Cluster member**: the node refuses to start, names the file and leaves it in place. Its
+  assignments and ring are what its peers agree on, so it does not rebuild them alone. Restore
+  the file from a backup taken while the node was stopped, or rebuild the node: move its data
+  directory aside and start it empty.
+
+Two processes writing one data directory damage it this way: keep to one process per data
+directory, and see that a container's bind mount and a node on its host are not both pointed at
+it.
+
 ## 🪟 Windows: the MSI installer
 
 `cameodb-<version>-x64.msi` installs CameoDB as a Windows service, the way the `.deb` and `.rpm`

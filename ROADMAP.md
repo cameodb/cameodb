@@ -268,7 +268,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [OB28](docs/ROADMAP-ARCHIVE.md#ob28--two-range-shapes-were-dropped-without-a-word-or-failed-the-search) | **Two range shapes were dropped without a word or failed the search** — `field:[* TO *]` answered zero unreported, and a range on a json field was a 500; both are now reported dropped clauses, refused with 400 when nothing else is left | — | 2026-10-21 | ✅ |
 | [OB29](docs/ROADMAP-ARCHIVE.md#ob29--what-verifying-ob28-over-mcp-found) | **What verifying OB28 over MCP found** — a query whose every clause was dropped ran as match-all, a json path matched nothing unreported, and `validate_query` called a path an unknown field | — | 2026-10-21 | ✅ |
 | [OB30](#ob30--two-processes-can-open-one-data-directory) | **Two processes can open one data directory** — redb's file locks do not cross a container bind mount, and a node opens every store before it binds its port; two writers are what explains the `metadata.redb` found damaged on 2026-11-03. A data-directory lock taken first, with an owner record that names who holds it, on Unix and Windows | — | 2026-11-04 | 📋 |
-| [OB31](#ob31--a-damaged-metadataredb-panics-the-node) | **A damaged `metadata.redb` panics the node** — inside redb, and through two `expect`s around it; redb's repair cannot fix a corrupted primary commit. Checked at open; a single node sets the file aside and rebuilds it, a cluster member refuses with the remedy | — | 2026-11-04 | 📋 |
+| [OB31](docs/ROADMAP-ARCHIVE.md#ob31--a-damaged-metadataredb-panics-the-node) | **A damaged `metadata.redb` panicked the node** — inside redb, and through two `expect`s around it. Now checked at open (6–7 ms); a single node sets the file aside and rebuilds it, a cluster member refuses with the remedy | — | 2026-11-04 | ✅ |
 | [F9](docs/ROADMAP-ARCHIVE.md#f9--commit-on-a-clock-not-a-count) | **Commit on a clock, not a count** — bulk ingest 1.8–6.6×, a trickle searchable within 2 s, single writes unchanged | — | 2026-09-26 | ✅ |
 | [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
@@ -1864,6 +1864,7 @@ one node's disk therefore breaks the cluster until its metadata is edited by han
 
 - ✅ [**OB28 — Two range shapes were dropped without a word or failed the search**](docs/ROADMAP-ARCHIVE.md#ob28--two-range-shapes-were-dropped-without-a-word-or-failed-the-search)
 - ✅ [**OB29 — What verifying OB28 over MCP found**](docs/ROADMAP-ARCHIVE.md#ob29--what-verifying-ob28-over-mcp-found)
+- ✅ [**OB31 — A damaged `metadata.redb` panics the node**](docs/ROADMAP-ARCHIVE.md#ob31--a-damaged-metadataredb-panics-the-node)
 - ✅ [**F9 — Commit on a clock, not a count**](docs/ROADMAP-ARCHIVE.md#f9--commit-on-a-clock-not-a-count)
 
 ### OB30 — Two processes can open one data directory
@@ -1872,7 +1873,7 @@ one node's disk therefore breaks the cluster until its metadata is edited by han
 
 *What happened.* A node ran in a container with its data directory bind-mounted from the host. During
 the day, the data was damaged: at the container's start its `metadata.redb` read cleanly, and the
-next start after its clean shutdown panicked on it ([OB31](#ob31--a-damaged-metadataredb-panics-the-node)).
+next start after its clean shutdown panicked on it ([OB31](docs/ROADMAP-ARCHIVE.md#ob31--a-damaged-metadataredb-panics-the-node)).
 redb's `check_integrity` on a copy said *"Primary is corrupted despite 2-phase commit"*: the page the
 user tables' root points to held redb's own system tree (`allocator_state`, `data_pages_allocated`, …)
 and both commit slots point at that page, so there is no consistent commit to roll back to. A single
@@ -1942,45 +1943,6 @@ refused while a node holds the directory. `unlock` refuses while the lock is hel
 
 **Docs.** `docs/DEPLOYMENT.md`: one process per data directory, containers and bind mounts, `unlock`;
 `docs/CONFIGURATION.md` under `storage.data_paths`; `CHANGELOG.md`.
-
-### OB31 — A damaged `metadata.redb` panics the node
-
-📋 **Planned.** ~0.5 day. Found 2026-11-03, with [OB30](#ob30--two-processes-can-open-one-data-directory)
-as its cause.
-
-*What happens.* The release build panics inside redb while loading the ring snapshot —
-`slice index starts at 60 but ends at 3` at `btree_base.rs:1904`, a branch page whose key offsets are
-garbage. The debug build panics earlier, in redb's own check while the file opens. Around both,
-`ClusterStateStore::new` and `load_persisted_cluster` are called with `expect`, so even an error redb
-does return ends the process as a panic. redb's repair cannot help: with the primary commit corrupt
-despite two-phase commit and both slots sharing the damaged page, there is nothing consistent to roll
-back to.
-
-*What the file is.* Cluster configuration, shard assignments, the node registry and the ring
-snapshot — bookkeeping, not documents. Moved aside on a single node, it was rebuilt at the next start
-and every document was served (7.15 million, verified 2026-11-03).
-
-**Change.**
-
-1. **Check it when it opens.** `check_integrity` on `metadata.redb` after opening — the file is hundreds
-   of kilobytes, so the check costs milliseconds; measured and recorded. Shard stores are not checked
-   this way: 78 s for a 10 GB store.
-2. **On damage** — an open that fails, an integrity check that fails, or a panic while opening and
-   loading, caught as a last guard:
-   - **cluster disabled**: rename it `metadata.redb.damaged-<UTC timestamp>`, warn naming both files, and
-     start with a new one;
-   - **cluster enabled**: refuse to start, naming the file, what it holds and the remedy — move it aside
-     and the node relearns its ring from its peers. Whether a member rebuilds correctly that way is
-     verified before the message says so; until it is, the message says to restore it or rebuild the
-     node.
-3. **No `expect` on that path**: an error the operator can read, and a non-zero exit.
-
-**Tests.** A copy of `metadata.redb` with its user-table root page overwritten: a single node starts,
-the file is set aside under the new name, and the index is served; a node with clustering enabled
-refuses with the message. An intact file passes the check, and its cost is measured.
-
-**Docs.** `docs/DEPLOYMENT.md` troubleshooting: what `metadata.redb` is, when it is set aside, what a
-`.damaged-*` file is for; `CHANGELOG.md`.
 
 ---
 
