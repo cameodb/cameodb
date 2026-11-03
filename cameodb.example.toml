@@ -207,6 +207,17 @@ legacy_sse_enabled = true
 # rollup_secs = 10                       # how often counted totals are flushed
 # record_query_text = false              # a search for a name RECORDS that name — see docs
 
+# OAuth for MCP clients that connect by URL (ChatGPT, claude.ai, Claude Desktop): the user signs
+# in on the node's own page with the key they already hold, and the client gets a read-only token
+# for /mcp that ends when the key is revoked. Make the secret with
+# `cameodb keygen --oauth-secret-out <PATH>`; every node of a cluster holds the same file.
+# [security.oauth]
+# enabled = true
+# issuer = "https://db.example.com"          # the URL clients reach the node at
+# signing_key_file = "/etc/cameodb/keys/oauth-signing"
+# access_token_ttl_secs = 3600
+# refresh_token_ttl_secs = 2592000
+
 [network.cluster]
 enabled = false
 bind_address = "0.0.0.0"

@@ -21,8 +21,12 @@ use cameodb_mcp::{MCP_SESSION_ID_HEADER, McpShutdownHandle, mcp_router};
 use futures::StreamExt;
 use tokio::sync::Semaphore;
 use tower_http::{
-    catch_panic::CatchPanicLayer, compression::CompressionLayer, cors::CorsLayer,
-    decompression::RequestDecompressionLayer, limit::RequestBodyLimitLayer, timeout::TimeoutLayer,
+    catch_panic::CatchPanicLayer,
+    compression::CompressionLayer,
+    cors::{AllowOrigin, CorsLayer},
+    decompression::RequestDecompressionLayer,
+    limit::RequestBodyLimitLayer,
+    timeout::TimeoutLayer,
     trace::TraceLayer,
 };
 use tracing::{info, warn};
@@ -38,6 +42,10 @@ use crate::http_server::catalogue::{
     list_indexes_handler, update_schema_handler,
 };
 use crate::http_server::health::health_handler;
+use crate::http_server::oauth::{
+    authorization_server_handler, authorize_page_handler, authorize_submit_handler,
+    protected_resource_handler, register_handler, token_handler,
+};
 use crate::http_server::search::{search_handler, search_stream_handler};
 use crate::http_server::shed::{self, ShedLog};
 use crate::http_server::tenants::{
@@ -97,6 +105,7 @@ pub fn create_router(state: AppState, config: &RouterConfig<'_>) -> (Router, Mcp
     // handle the gate reads is the one `/_admin/keys/reload` swaps.
     let audit = Arc::clone(&state.audit);
     let keyring = Arc::clone(&state.keyring);
+    let oauth = state.oauth.clone();
 
     // Concurrency limiter: rejects with 503 when too many requests are in flight.
     //
@@ -178,8 +187,15 @@ pub fn create_router(state: AppState, config: &RouterConfig<'_>) -> (Router, Mcp
         } else {
             info!(origins = ?cors_allowed_origins, "CORS: restricting to configured origins");
         }
+        // The OAuth endpoints a browser-based MCP client calls with `fetch` answer any origin,
+        // whatever the list says: they hold nothing a credentialed request could reach, and a
+        // client cannot be expected to be on an operator's list before it has registered.
+        // Credentials stay disallowed, so no cookie or key rides along.
+        let open_oauth = oauth.is_some();
         CorsLayer::new()
-            .allow_origin(origins)
+            .allow_origin(AllowOrigin::predicate(move |origin, parts| {
+                origins.contains(origin) || (open_oauth && is_open_oauth_path(parts.uri.path()))
+            }))
             .allow_methods([
                 axum::http::Method::GET,
                 axum::http::Method::POST,
@@ -278,6 +294,33 @@ pub fn create_router(state: AppState, config: &RouterConfig<'_>) -> (Router, Mcp
         router
     };
 
+    // OAuth for MCP clients, mounted only when `[security.oauth]` is on — absent otherwise, as
+    // the admin API is. Public in the gate's table: a client calls these before it holds
+    // anything, and what each one checks is its own protection.
+    let router = if oauth.is_some() {
+        router
+            .route(
+                "/.well-known/oauth-protected-resource",
+                get(protected_resource_handler),
+            )
+            .route(
+                "/.well-known/oauth-protected-resource/mcp",
+                get(protected_resource_handler),
+            )
+            .route(
+                "/.well-known/oauth-authorization-server",
+                get(authorization_server_handler),
+            )
+            .route("/oauth/register", post(register_handler))
+            .route(
+                "/oauth/authorize",
+                get(authorize_page_handler).post(authorize_submit_handler),
+            )
+            .route("/oauth/token", post(token_handler))
+    } else {
+        router
+    };
+
     // A route that panics on demand, so the panic-isolation smoke test can prove the catch layer
     // turns a handler panic into a 500 against the built binary. Absent unless the feature is on.
     #[cfg(feature = "fault-injection")]
@@ -335,7 +378,11 @@ pub fn create_router(state: AppState, config: &RouterConfig<'_>) -> (Router, Mcp
         // so a flood of unauthenticated requests neither takes a concurrency permit nor has
         // a body buffered on its behalf.
         .layer(axum::middleware::from_fn_with_state(
-            crate::authz::GateState { keyring, audit },
+            crate::authz::GateState {
+                keyring,
+                audit,
+                oauth,
+            },
             crate::authz::authorize,
         ))
         .layer(cors_layer)
@@ -357,6 +404,19 @@ pub fn create_router(state: AppState, config: &RouterConfig<'_>) -> (Router, Mcp
         });
 
     (router, mcp_handle)
+}
+
+/// The OAuth endpoints any origin may call: discovery, registration and the token exchange.
+/// Not the approval page, which a browser navigates to rather than fetches.
+fn is_open_oauth_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/.well-known/oauth-protected-resource"
+            | "/.well-known/oauth-protected-resource/mcp"
+            | "/.well-known/oauth-authorization-server"
+            | "/oauth/register"
+            | "/oauth/token"
+    )
 }
 
 /// Panic on request, so the smoke test can prove a handler panic is caught. Feature-gated, so a

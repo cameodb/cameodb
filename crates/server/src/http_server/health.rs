@@ -240,8 +240,8 @@ pub struct HealthResponse {
 
 /// Handler for cluster health check.
 ///
-/// The only public route, and therefore the only one where the response has to depend on who
-/// is asking. An anonymous caller gets liveness and nothing else: node identity, cluster
+/// The one public route besides the OAuth endpoints — which answer every caller alike — and
+/// therefore the only one where the response has to depend on who is asking. An anonymous caller gets liveness and nothing else: node identity, cluster
 /// size, peer counts and index counts are a free reconnaissance report for anyone who can
 /// reach the port, and a load balancer needs none of it. Presenting any valid key — every
 /// role holds `Read` — restores the full body.

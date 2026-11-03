@@ -582,6 +582,10 @@ pub struct SecurityConfig {
     /// node writes no key file.
     #[serde(default)]
     pub managed_files: Option<ManagedFilesConfig>,
+
+    /// `[security.oauth]` — the node as the OAuth authorization server for `/mcp`, so a client
+    /// that cannot be handed a header signs in with a key instead. Off by default.
+    pub oauth: crate::oauth::OAuthConfig,
 }
 
 /// `[security.managed_files]`: the folder and file names of the key files the node writes.
@@ -650,6 +654,7 @@ impl Default for SecurityConfig {
             limits: crate::ratelimit::McpLimitsConfig::default(),
             audit: crate::audit::AuditConfig::default(),
             managed_files: None,
+            oauth: crate::oauth::OAuthConfig::default(),
         }
     }
 }
@@ -1134,6 +1139,12 @@ impl KeyEntry {
         self.digest.key_id()
     }
 
+    /// The whole digest: what an OAuth grant is bound to, where the 32-bit `key_id` would not
+    /// be enough to tell two keys apart.
+    pub fn digest(&self) -> &KeyDigest {
+        &self.digest
+    }
+
     pub fn label(&self) -> &str {
         &self.label
     }
@@ -1300,6 +1311,18 @@ impl KeyRing {
         }
         matched.cloned()
     }
+
+    /// The key with this digest, if the ring still holds it — how an OAuth token finds the key
+    /// it was minted from. Every entry is compared, as in [`Self::authenticate`].
+    pub fn by_digest(&self, digest: &KeyDigest) -> Option<Arc<KeyEntry>> {
+        let mut matched: Option<&Arc<KeyEntry>> = None;
+        for entry in &self.entries {
+            if entry.digest == *digest && matched.is_none() {
+                matched = Some(entry);
+            }
+        }
+        matched.cloned()
+    }
 }
 
 /// The live key ring, and what re-resolving it takes.
@@ -1409,6 +1432,9 @@ impl KeyReloader {
         }
         if security.audit != self.startup.audit {
             not_applied.push("security.audit");
+        }
+        if security.oauth != self.startup.oauth {
+            not_applied.push("security.oauth");
         }
 
         // The quotas before the ring, so a key of a new tenant is never accepted before the
@@ -1535,6 +1561,7 @@ Usage:
   cameodb keygen --role <admin|writer|reader|provisioner> [--label <NAME>]
                  [--allowed-indexes <A,B>]
                  [--key-out <PATH>] [--hash-out <PATH>]
+  cameodb keygen --oauth-secret-out <PATH>
 
 Options:
   --role <ROLE>             admin (everything), writer (read and write), reader (read only),
@@ -1545,6 +1572,9 @@ Options:
                             For `client --api-key-file`.
   --hash-out <PATH>         Write the digest to PATH, for `key_hash_file`: mode 0640, in the
                             group of its directory, so a service in that group reads it.
+  --oauth-secret-out <PATH> Write a new signing secret for [security.oauth] to PATH instead of
+                            minting a key: mode 0640, in the group of its directory. Copy
+                            the same file to every node.
   -h, --help                Show this message
 
 Without --key-out the key is printed to stdout and everything else to stderr, so redirecting
@@ -1559,6 +1589,7 @@ is how a working node stops working.";
     let mut allowed_indexes: Option<Vec<String>> = None;
     let mut key_out: Option<PathBuf> = None;
     let mut hash_out: Option<PathBuf> = None;
+    let mut oauth_secret_out: Option<PathBuf> = None;
 
     let mut args = args.into_iter().peekable();
     while let Some(arg) = args.next() {
@@ -1599,8 +1630,18 @@ is how a working node stops working.";
             }
             "--key-out" => key_out = Some(PathBuf::from(value("--key-out")?)),
             "--hash-out" => hash_out = Some(PathBuf::from(value("--hash-out")?)),
+            "--oauth-secret-out" => {
+                oauth_secret_out = Some(PathBuf::from(value("--oauth-secret-out")?))
+            }
             other => bail!("unknown option: {other}\n\n{USAGE}"),
         }
+    }
+
+    if let Some(path) = oauth_secret_out {
+        if role.is_some() || label.is_some() || key_out.is_some() || hash_out.is_some() {
+            bail!("--oauth-secret-out makes a signing secret, not a key; give it alone");
+        }
+        return write_oauth_secret(&path);
     }
 
     let role = role
@@ -1723,6 +1764,33 @@ is how a working node stops working.";
         config_advice = config_advice,
     );
 
+    Ok(())
+}
+
+/// `keygen --oauth-secret-out`: a new signing secret, and the config that reads it.
+///
+/// Unlike a key's digest, this file *is* a credential — anyone holding it can mint tokens for
+/// any key. It is 0640 rather than 0600 only because the service reads it as its group, the
+/// same arrangement as the TLS key; nothing is printed to stdout.
+fn write_oauth_secret(path: &Path) -> Result<()> {
+    let secret = crate::oauth::generate_secret()?;
+    write_new_secret_file(path, &secret, 0o640)
+        .with_context(|| format!("--oauth-secret-out {}", path.display()))?;
+    #[cfg(unix)]
+    if let Some(advice) = share_with_directory_group(path) {
+        eprintln!("⚠️  {advice}");
+    }
+    eprintln!(
+        "\nThe OAuth signing secret was written to {path} (mode 0640). Every node of a cluster \
+         needs the same file; replacing it signs every OAuth client out.\n\n\
+         Add to cameodb.toml:\n\n  \
+         [security.oauth]\n  \
+         enabled = true\n  \
+         issuer = \"https://<the node's external host>\"\n  \
+         signing_key_file = {file}\n",
+        path = path.display(),
+        file = toml_string(&path.display().to_string()),
+    );
     Ok(())
 }
 

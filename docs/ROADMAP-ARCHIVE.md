@@ -5178,6 +5178,76 @@ three nodes deleted through one, a frozen node reported as failed.
 **Docs.** `docs/API_REFERENCE.md` (the route, the type table, what it promises),
 `docs/CONFIGURATION.md`, the client README, `CHANGELOG.md`.
 
+---
+
+## T. OAuth for MCP clients ✅ Done
+
+Opened 2026-11-03. Web and desktop MCP clients (ChatGPT, Claude) connect to a remote MCP server
+through the OAuth flow the MCP specification defines, not through a header the user pastes into a
+config file. A user who holds a key — minted by an operator or by a provisioning portal through
+`/_keys` — should be able to add the node's `/mcp` URL to such a client and connect.
+
+### T1 — OAuth for MCP clients
+
+✅ **Done** 2026-11-03. Built and tested: everything below, with the tests named and the docs. Not
+yet connected from ChatGPT, claude.ai or Claude Desktop against a deployed node; what that check
+turns up — a redirect URI or registration field a client sends that is refused — is a new
+improvement item, not a reopening of this one.
+
+*Today.* `/mcp` answers a request without a key `401` with `WWW-Authenticate: Bearer
+realm="cameodb"`. A client following the MCP authorization spec then looks for the OAuth metadata
+the header does not point to, falls back to `POST /register` at the root, and the deny-by-default
+gate refuses that too: the connector fails with "Dynamic Client Registration rejected (HTTP 401)".
+
+**Decided** (2026-11-03):
+
+1. **The node is the authorization server**, in the same binary, for `/mcp` only. No identity
+   provider and nothing new to run. REST keeps keys.
+2. **The user signs in with the key they already hold**, on one HTML page the node serves at
+   `/oauth/authorize`. The key is checked by the ring exactly as a header key is.
+3. **A token is that key, narrowed to `read`.** It carries the key's full digest (never the 32-bit
+   `key_id`), and every request looks the key up in the live ring: revoking the key revokes every
+   token minted from it, and a changed `allowed_indexes` applies to the next request. Tenant
+   budget, rate limits, MCP session ownership and the audit label are the key's.
+4. **Stateless.** The client id, the authorization code, the access and refresh tokens are signed
+   with one HMAC-SHA256 secret, `[security.oauth] signing_key_file`, made by `keygen
+   --oauth-secret-out` and the same on every node. Nothing is stored or replicated, so a code
+   issued by one node is redeemed on another without R3. A code is single-use per node.
+5. Not in T1: delegating sign-in to a portal, tokens on REST, an external identity provider, Client
+   ID Metadata Documents, and revoking one grant without revoking the key.
+
+**Design.**
+
+- *Config.* `[security.oauth]`: `enabled`, `issuer` (the external URL, `https` unless loopback),
+  `signing_key_file`, `access_token_ttl_secs` (3600), `refresh_token_ttl_secs` (30 days). Needs
+  `[security] enabled` and `[mcp] enabled`. Bound at startup; a reload reports a change.
+- *Discovery*, public: `/.well-known/oauth-protected-resource` and its `/mcp` form (RFC 9728),
+  `/.well-known/oauth-authorization-server` (RFC 8414). The `401` from `/mcp` carries
+  `resource_metadata`.
+- *Registration*, `POST /oauth/register` (RFC 7591): the client id is the signed list of redirect
+  URIs — `https`, loopback `http` on any port, or a private-use scheme (RFC 8252). `none`,
+  `client_secret_post` and `client_secret_basic`; a secret is derived from the client id.
+- *Authorization*, `GET`/`POST /oauth/authorize`: `code` with PKCE `S256` only. The page names the
+  client as unverified and the host it returns to; the request travels signed in the form. A bad
+  client or redirect is shown, never redirected to. CSP `default-src 'none'`, `frame-ancestors
+  'none'`, no referrer, no store. The code lives 60 s and carries `iss` back (RFC 9207).
+- *Token*, `POST /oauth/token`: `authorization_code` with the verifier, and `refresh_token`, which
+  rotates. `resource` (RFC 8707) must name this node's `/mcp`; the token's audience is it.
+- *Gate.* A `cameo_at1_` bearer is verified — signature, expiry, audience — and resolved to the
+  key; it is accepted on `/mcp` alone and holds `read` whatever the key's role.
+- *CORS.* The discovery, registration and token endpoints answer any origin, without credentials.
+
+**Tests.** The flow end to end against the binary: discovery, register, authorize with a key, token,
+a tool call with the token; a refresh. Refused: a wrong verifier, a reused code, an expired or
+altered token, a token from another secret, a token on a REST route, a token after its key is
+revoked, an unregistered redirect.
+
+**Docs.** `docs/CONFIGURATION.md` (`[security.oauth]`), `docs/API_REFERENCE.md` (the endpoints),
+`docs/DEPLOYMENT.md` (the secret on every node, behind a proxy), the MCP README (connecting a client
+by URL), a `CHANGELOG.md` entry.
+
+---
+
 ## Phases 1–9 — Foundations through advanced architecture ✅ Done
 
 **Phase 1**: Storage Durability & WAL Recovery ✅ Done

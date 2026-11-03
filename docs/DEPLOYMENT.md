@@ -328,6 +328,35 @@ On Windows the MSI creates `C:\ProgramData\CameoDB\keys.d` with the service allo
 write it; the same `include` and `[security.managed_files]` lines work unchanged, since paths
 are relative to the config file. A file changed there reloads the keys by itself.
 
+### OAuth for MCP clients
+
+For users who connect ChatGPT, claude.ai or Claude Desktop by URL rather than by pasting a header,
+turn on [`[security.oauth]`](CONFIGURATION.md#oauth-for-mcp-clients-securityoauth): they sign in
+once on the node's own page with the key they already hold — a key minted by hand, or by a portal
+through `/_keys`.
+
+```bash
+# The signing secret: 0640 in the group of /etc/cameodb/keys, like a key's digest. It is a
+# credential — anyone holding it can mint tokens for any key — so it never leaves that folder.
+sudo cameodb keygen --oauth-secret-out /etc/cameodb/keys/oauth-signing
+```
+
+```toml
+[security.oauth]
+enabled = true
+issuer = "https://db.example.com"
+signing_key_file = "/etc/cameodb/keys/oauth-signing"
+```
+
+- **Behind a proxy**, `issuer` is the public URL, and the proxy passes `/.well-known/*` and
+  `/oauth/*` to the node with everything else. A proxy that forwards every path needs no change.
+- **On a cluster**, copy the same secret file to every node and give them the same `issuer`: the
+  node holds no OAuth state, so any node redeems a code another issued. Revoking a key reaches
+  tokens on the nodes its revocation reaches.
+- **Rotating the secret** signs every client out; users sign in again with their key.
+- Users add the connector with the URL `https://db.example.com/mcp` and no header. Clients that
+  take a header — Claude Code, scripts — keep using the key directly.
+
 ### Configuring from the environment
 
 For a node whose config comes from a secret manager rather than a file, one key can be

@@ -73,6 +73,8 @@ zeroize = "1.9"
 hex = "0.4"
 base64 = "0.23"
 getrandom = "0.4"
+hmac = "0.13"
+form_urlencoded = "1.2"
 
 [target.'cfg(target_env = "musl")'.dependencies]
 tikv-jemallocator = { version = "0.7", features = ["unprefixed_malloc_on_supported_platforms", "stats"] }

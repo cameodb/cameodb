@@ -88,6 +88,9 @@ pub struct AppState {
     /// SIGHUP both land on its `reload`, which swaps the ring underneath every
     /// in-flight reader.
     pub keyring: Arc<crate::auth::KeyReloader>,
+    /// The node's OAuth server for MCP clients; `None` unless `[security.oauth]` is on, and
+    /// then its routes are not mounted. Shared with the gate, which verifies its tokens.
+    pub oauth: Option<Arc<crate::oauth::OAuth>>,
     /// Keys and tenants managed through `/_keys` and `/_tenants`: the files
     /// `[security.managed_files]` names, rewritten under one lock and reloaded into `keyring`.
     pub tenants: Arc<crate::tenants::TenantStore>,

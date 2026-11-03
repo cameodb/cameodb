@@ -20,9 +20,10 @@ The reviews that filed whole groups are
 [O. Post-0.3.6 review](#o-post-036-review--the-base-for-the-next-iteration--partial).
 Features agreed after each release are filed as
 [P. Post-0.3.7 features](#p-post-037-features--partial),
-[Q. Post-0.3.8 features](docs/ROADMAP-ARCHIVE.md#q-post-038-features--done) (archived) and
-[R. Key and tenant provisioning](#r-key-and-tenant-provisioning--partial); Q and R are built and
-wait in `[Unreleased]` for 0.3.9.
+[Q. Post-0.3.8 features](docs/ROADMAP-ARCHIVE.md#q-post-038-features--done) (archived),
+[R. Key and tenant provisioning](#r-key-and-tenant-provisioning--partial) and
+[T. OAuth for MCP clients](docs/ROADMAP-ARCHIVE.md#t-oauth-for-mcp-clients--done) (archived); Q, R
+and T are built and wait in `[Unreleased]` for 0.3.9.
 
 ## How to read this file
 
@@ -71,6 +72,7 @@ on one.
 | Q — Post-0.3.8 features | ✅ Done, unreleased (0.3.9) | Q1, ghost fields — a column filled from another field of the stored body, for every document or under an `in` / `not_in` condition, never stored — done 2026-10-27. Q2, the Croatian analyzers read Serbian Cyrillic — done 2026-10-27. The `pt_stem`, `it_stem` and `es`/`fr`/`pt`/`de` `_stem_fold` analyzers of the same days are in the changelog, not filed here |
 | R — Key and tenant provisioning | ◐ Partial, R1 and R2 unreleased (0.3.9) | R1 and R2 done 2026-11-01, single node: included key and tenant files reloaded on change, live tenant quotas and scopes, `allowed_indexes` prefixes; a provisioner minting and revoking keys through `/_keys` (no tenant) and `/_tenants`, changing a key's indexes in place with `PATCH /_keys/{key_id}`, and granting only within its own `allowed_indexes`; client, SDK and a live suite, validated on Linux under systemd and across a restart. Left: R3, every change broadcast to every node, deferred until cluster support is decided — until then a change applies on the node that received it |
 | S — Delete by query | ✅ Done | S1, `POST /api/{index}/delete` — exact clauses, refused past `max_docs` unless confirmed — done 2026-11-02 |
+| T — OAuth for MCP clients | ✅ Done, unreleased (0.3.9) | T1, the node as the OAuth 2.1 authorization server for `/mcp` — discovery, dynamic client registration, an approval page taking the key the user holds, PKCE, refresh; stateless, tokens read-only and ended by revoking the key — done 2026-11-03 |
 
 ## Reconciliation, 2026-08-26
 
@@ -286,6 +288,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [R2](docs/ROADMAP-ARCHIVE.md#r2--the-key-manage-capability-and-the-tenant-api) | The `key-manage` capability and the tenant API — a `provisioner` role, `/_keys` for keys with no tenant and `/_tenants` outside `/_admin`, the node generating keys and writing their files; client, SDK and a live suite | — | 2026-11-01 | ✅ |
 | [R3](#r3--changes-reach-every-node) | Changes reach every node — whole tenant file and revision broadcast, catch-up on reconnect, the response names nodes that did not apply it — deferred until cluster support for provisioning is decided | — | 2026-11-01 | 💭 |
 | [S1](docs/ROADMAP-ARCHIVE.md#s1--delete-the-documents-a-query-matches) | Delete by query — `POST /api/{index}/delete`: every shard deletes the matches it holds; exact clauses only (`text` checked against the stored value); over `max_docs` refused with the count, `confirm` to proceed | — | 2026-11-02 | ✅ |
+| [T1](docs/ROADMAP-ARCHIVE.md#t1--oauth-for-mcp-clients) | OAuth for MCP clients — browser-based and desktop MCP clients connect with the OAuth flow the MCP specification defines; the user approves once with their existing key, and the token they get is that key's authority, read only — done 2026-11-03 | — | 2026-11-03 | ✅ |
 
 ---
 
@@ -2956,6 +2959,7 @@ was delivered, its stub stands above in its place; these groups were delivered w
 - ✅ [**M. The 0.3.5 goal set — multi-tenant exposure**](docs/ROADMAP-ARCHIVE.md#m-the-035-goal-set--multi-tenant-exposure--done) — M0–M8
 - ✅ [**Q. Post-0.3.8 features**](docs/ROADMAP-ARCHIVE.md#q-post-038-features--done) — Q1–Q2
 - ✅ [**S. Delete by query**](docs/ROADMAP-ARCHIVE.md#s-delete-by-query--done) — S1
+- ✅ [**T. OAuth for MCP clients**](docs/ROADMAP-ARCHIVE.md#t-oauth-for-mcp-clients--done) — T1
 
 The archive also holds the original write-up of every delivered phase, the measurements, and the settled decisions:
 what the affinity flags cost, what the audit trail costs, the non-goals recorded so they are not re-litigated, and the

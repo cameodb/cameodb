@@ -24,6 +24,7 @@ mod key_watch;
 mod logging;
 mod mcp;
 mod node;
+mod oauth;
 mod posture;
 mod query;
 mod ratelimit;
@@ -405,6 +406,14 @@ async fn run(args: Vec<String>) -> Result<()> {
         cameodb_config.security.clone(),
     )?);
 
+    // The node's OAuth server for MCP clients, when `[security.oauth]` is on. Read here rather
+    // than at the first request, so a missing or malformed secret stops the node at startup
+    // instead of failing every sign-in.
+    let oauth = oauth::OAuth::load(&cameodb_config.security.oauth)?;
+    if let Some(oauth) = &oauth {
+        tracing::info!(issuer = %oauth.issuer(), resource = %oauth.resource(), "OAuth for MCP clients enabled");
+    }
+
     // Name every configured key once at startup. The point is the `key_id`: an audit line or
     // a rejection carrying one has to be traceable back to a team without the key itself ever
     // appearing in a log. `validate()` already resolved these, so this cannot fail.
@@ -748,6 +757,7 @@ async fn run(args: Vec<String>) -> Result<()> {
         max_response_bytes: cameodb_config.effective_max_response_bytes(),
         audit: Arc::clone(&audit_sink),
         keyring: Arc::clone(&keyring),
+        oauth,
         tenants: Arc::new(tenants::TenantStore::new(
             Arc::clone(&keyring),
             node_id.to_string(),

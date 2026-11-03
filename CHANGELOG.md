@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **OAuth for MCP clients.** With `[security.oauth]` (`enabled`, `issuer`, `signing_key_file`), the
+  node is the OAuth 2.1 authorization server for its own `/mcp`, so ChatGPT, claude.ai, Claude
+  Desktop and other clients that connect by URL sign in without a header: discovery
+  (`/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`), dynamic
+  client registration (`POST /oauth/register`), an approval page where the user pastes the key
+  they already hold (`/oauth/authorize`, PKCE `S256` only), and `POST /oauth/token` with refresh.
+  The token acts as that key with `read` alone, on `/mcp` alone, and stops working when the key is
+  revoked. Nothing is stored: registrations, codes and tokens are signed with one secret, made by
+  `cameodb keygen --oauth-secret-out` and the same on every node. The `401` from `/mcp` now names
+  `resource_metadata` when the section is on, and every `401` for a presented key or token carries
+  `error="invalid_token"`.
 - **Keys minted and revoked through the node.** A `provisioner` key — a new role holding the new
   `key-manage` capability and nothing else — mints `writer` and `reader` keys over HTTP and
   revokes them: `POST /_keys`, `GET /_keys`, `DELETE /_keys/{key_id}` for users and agents with

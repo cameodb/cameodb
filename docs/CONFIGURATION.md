@@ -1408,6 +1408,49 @@ file is refused. The files it writes are mode 0600, the service's alone. The pac
 stay read-only to it, so the operator's own keys — the `provisioner` key among them — are out of
 the node's reach.
 
+### OAuth for MCP clients (`[security.oauth]`)
+
+Web and desktop MCP clients — ChatGPT, claude.ai, Claude Desktop — connect to a remote server by
+its URL and sign in through OAuth; they have nowhere to put an `Authorization` header. With this
+section the node is that sign-in: the user adds `https://<host>/mcp` to the client, a browser tab
+opens on the node's approval page, and they paste the `cameo_v1_…` key they already hold. The
+client gets a token; the key stays with the user.
+
+```bash
+# Once: the signing secret, the same file on every node of a cluster.
+sudo cameodb keygen --oauth-secret-out /etc/cameodb/keys/oauth-signing
+```
+
+```toml
+[security]
+enabled = true                       # required: a token is issued against a key
+
+[security.oauth]
+enabled = true
+issuer = "https://db.example.com"    # the URL clients reach the node at; https unless loopback
+signing_key_file = "/etc/cameodb/keys/oauth-signing"
+# access_token_ttl_secs = 3600       # default: one hour
+# refresh_token_ttl_secs = 2592000   # default: 30 days without use, then the key again
+```
+
+**A token is its key, read only.** It is bound to the key's full digest and looked up in the live
+key ring on every request, so revoking the key — `DELETE /_keys/{key_id}`, or removing its stanza
+and reloading — ends every token minted from it at its next request, and a changed
+`allowed_indexes` applies to the next call. Rate limits, the tenant budget, MCP session ownership
+and the audit label are the key's. A token is accepted on `/mcp` alone, and grants `read` whatever
+the key's role; REST callers keep using keys. Any key holding `read` can sign in.
+
+**Nothing is stored.** Client registrations, codes and tokens are signed with the secret, so a
+code issued by one node is redeemed on another and a restart forgets nothing. The cost: one grant
+cannot be revoked apart from its key, and a refresh token stays valid to its expiry even after it
+has been used. Replacing the secret signs every client out.
+
+`issuer` is the external URL, scheme and host only: behind a proxy the node cannot learn it from a
+request, and every URL a client is sent to, and the audience of every token, is built from it.
+Startup refuses the section without `[security] enabled`, without `[mcp] enabled`, without an
+issuer or a secret, with an `http` issuer that is not loopback (`localhost`, `127.0.0.1`, `[::1]`), or a secret file it cannot read.
+The section is bound at startup; a reload names it under `not_applied`.
+
 ### Rotation
 
 Keys are read at startup, and re-read on demand: `POST /_admin/keys/reload` (a `node-admin`
@@ -1432,7 +1475,7 @@ next request.
 What moves with a reload is `enabled`, the key list and the tenant quotas
 (`[security.tenants.*]`), plus the `--api-key-hash` override, which is re-applied rather than
 read from the file. A changed quota applies to the next mint and write, against the usage
-already measured — the reading is kept, not reset. `limits`, `audit` and
+already measured — the reading is kept, not reset. `limits`, `audit`, `oauth` and
 `implicit_index_creation` do not move — they are bound at startup, and the reload response
 names them under `not_applied` when the file changed them.
 

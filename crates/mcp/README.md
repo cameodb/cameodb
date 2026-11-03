@@ -582,6 +582,14 @@ Inside Claude Code, type `/mcp` to check server status and available tools.
 }
 ```
 
+### Connecting by URL, with OAuth (ChatGPT, claude.ai, Claude Desktop)
+
+On a node with `[security.oauth]` on (see `docs/CONFIGURATION.md`), a client that connects to a
+remote MCP server by URL needs nothing else: add a custom connector with the URL
+`https://<host>/mcp` and no header. The client registers itself, opens the node's approval page in
+a browser, and the user pastes their `cameo_v1_…` key there once. The client then holds a token
+that reads what the key reads and ends when the key is revoked; it refreshes it on its own.
+
 ### Claude Desktop
 
 Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:

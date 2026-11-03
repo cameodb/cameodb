@@ -47,6 +47,9 @@ pub struct GateState {
     /// of *this* request, not the ring as of boot.
     pub keyring: Arc<KeyReloader>,
     pub audit: Arc<AuditSink>,
+    /// The node's OAuth server, when `[security.oauth]` is on: what verifies a `cameo_at1_`
+    /// bearer on `/mcp`, and what the `401` there points a client to.
+    pub oauth: Option<Arc<crate::oauth::OAuth>>,
 }
 
 /// What a route requires of its caller.
@@ -160,6 +163,18 @@ const ROUTES: &[RouteRule] = &[
     rule("GET",    "/mcp/sse",                          Access::Mcp),
     rule("POST",   "/mcp/sse",                          Access::Mcp),
     rule("POST",   "/mcp/messages",                     Access::Mcp),
+
+    // OAuth for MCP clients (T1). Mounted only when `[security.oauth]` is on. Public because a
+    // client reaches them before it holds anything: discovery and registration hand out
+    // nothing a caller could use, the approval page checks the key it is given, and the token
+    // endpoint takes only what this node's secret signed.
+    rule("GET",    "/.well-known/oauth-protected-resource",     Access::Public),
+    rule("GET",    "/.well-known/oauth-protected-resource/mcp", Access::Public),
+    rule("GET",    "/.well-known/oauth-authorization-server",   Access::Public),
+    rule("POST",   "/oauth/register",                   Access::Public),
+    rule("GET",    "/oauth/authorize",                  Access::Public),
+    rule("POST",   "/oauth/authorize",                  Access::Public),
+    rule("POST",   "/oauth/token",                      Access::Public),
 ];
 
 /// A classified request: what it needs, and which index it names.
@@ -368,6 +383,9 @@ fn translate(capability: McpCapability) -> Capability {
 struct McpCaller {
     authz: Authz,
     peer: Option<std::net::IpAddr>,
+    /// Admitted on an OAuth token, which grants `read` alone whatever the key's role: a tool
+    /// that needs more is refused even when the key behind the token holds it.
+    read_only: bool,
 }
 
 impl McpAuthz for McpCaller {
@@ -388,11 +406,13 @@ impl McpAuthz for McpCaller {
     }
 
     fn has(&self, capability: McpCapability) -> bool {
-        McpAuthz::has(&self.authz, capability)
+        (!self.read_only || capability == McpCapability::Read)
+            && McpAuthz::has(&self.authz, capability)
     }
 
     fn has_on(&self, capability: McpCapability, index: &str) -> bool {
-        McpAuthz::has_on(&self.authz, capability, index)
+        (!self.read_only || capability == McpCapability::Read)
+            && McpAuthz::has_on(&self.authz, capability, index)
     }
 
     fn peer_addr(&self) -> Option<std::net::IpAddr> {
@@ -473,6 +493,9 @@ struct Refusal {
     /// and a compromised credential. A 401 has no identity by definition, so this is `None`
     /// and the audit trail counts it rather than naming it.
     identity: Option<Identity>,
+    /// A bearer was presented and refused, as against none presented: RFC 6750's
+    /// `error="invalid_token"`, which tells an OAuth client to refresh rather than start over.
+    invalid_token: bool,
 }
 
 /// The attributable part of a caller, copied out of the key entry.
@@ -503,6 +526,14 @@ impl Refusal {
             error: "Unauthorized",
             message: message.into(),
             identity: None,
+            invalid_token: false,
+        }
+    }
+
+    fn invalid_token(message: impl Into<String>) -> Self {
+        Self {
+            invalid_token: true,
+            ..Self::unauthorized(message)
         }
     }
 
@@ -512,6 +543,7 @@ impl Refusal {
             error: "Forbidden",
             message: message.into(),
             identity: None,
+            invalid_token: false,
         }
     }
 
@@ -531,7 +563,10 @@ impl IntoResponse for Refusal {
             // Names the scheme, so a client knows what to send rather than guessing.
             (
                 self.status,
-                [(header::WWW_AUTHENTICATE, "Bearer realm=\"cameodb\"")],
+                [(
+                    header::WWW_AUTHENTICATE,
+                    challenge(self.invalid_token, None),
+                )],
                 body,
             )
                 .into_response()
@@ -539,6 +574,22 @@ impl IntoResponse for Refusal {
             (self.status, body).into_response()
         }
     }
+}
+
+/// The `WWW-Authenticate` value of a `401`: the scheme, and on `/mcp` of a node that issues
+/// tokens, where a client learns how to get one (RFC 9728 §5.1).
+fn challenge(invalid_token: bool, resource_metadata: Option<&str>) -> axum::http::HeaderValue {
+    let mut value = String::from("Bearer realm=\"cameodb\"");
+    if let Some(url) = resource_metadata {
+        value.push_str(&format!(", resource_metadata=\"{url}\""));
+    }
+    if invalid_token {
+        value.push_str(", error=\"invalid_token\"");
+    }
+    // The URL is the configured issuer, already checked to be a plain origin; a value that
+    // still would not make a header falls back to the challenge without it.
+    axum::http::HeaderValue::from_str(&value)
+        .unwrap_or_else(|_| axum::http::HeaderValue::from_static("Bearer realm=\"cameodb\""))
 }
 
 /// Extract the token from `Authorization: Bearer <key>`.
@@ -584,14 +635,38 @@ fn note_unauthenticated_refusal() -> Option<u64> {
     should_log_refusal(count).then_some(count)
 }
 
+/// What the gate admitted: the caller, and the OAuth client acting for them, if one is.
+struct Admitted {
+    authz: Authz,
+    /// Set when the bearer was an OAuth access token: the client it was issued to, by hash.
+    /// Such a caller holds `read` alone, whatever its key's role.
+    oauth_client: Option<String>,
+}
+
+/// [`decide_with`] for a node that issues no OAuth tokens: what every test of the key path asks.
+#[cfg(test)]
 fn decide(
     keyring: &KeyRing,
     method: &str,
     path: &str,
     headers: &HeaderMap,
 ) -> Result<Authz, Refusal> {
+    decide_with(keyring, None, method, path, headers).map(|admitted| admitted.authz)
+}
+
+fn decide_with(
+    keyring: &KeyRing,
+    oauth: Option<&crate::oauth::OAuth>,
+    method: &str,
+    path: &str,
+    headers: &HeaderMap,
+) -> Result<Admitted, Refusal> {
+    let admit = |authz: Authz| Admitted {
+        authz,
+        oauth_client: None,
+    };
     if !keyring.enabled() {
-        return Ok(Authz::Disabled);
+        return Ok(admit(Authz::Disabled));
     }
 
     let classified = classify(method, path);
@@ -600,7 +675,7 @@ fn decide(
         // Nothing presented. Public routes are answerable; everything else — including
         // paths that do not exist — is refused without revealing which is which.
         return match classified.as_ref().map(|c| c.access) {
-            Some(Access::Public) => Ok(Authz::Anonymous),
+            Some(Access::Public) => Ok(admit(Authz::Anonymous)),
             _ => {
                 if let Some(total) = note_unauthenticated_refusal() {
                     warn!(
@@ -615,26 +690,55 @@ fn decide(
         };
     };
 
-    let Some(entry) = keyring.authenticate(token) else {
-        if let Some(total) = note_unauthenticated_refusal() {
-            warn!(
-                %method, %path, refused_so_far = total,
-                "auth: rejected an unrecognised API key"
-            );
+    // An OAuth access token, on a node that issues them. Only `/mcp` takes one: it is what the
+    // token's audience names, and REST callers have keys.
+    let (entry, oauth_client) = if let Some(oauth) = oauth
+        && token.starts_with(crate::oauth::ACCESS_PREFIX)
+    {
+        if !matches!(classified.as_ref().map(|c| c.access), Some(Access::Mcp)) {
+            return Err(Refusal::invalid_token(
+                "an OAuth token is accepted on /mcp only; this endpoint takes an API key",
+            ));
         }
-        return Err(Refusal::unauthorized(
-            "the API key presented is not recognised",
-        ));
+        match oauth.verify_access(keyring, token) {
+            Ok(grant) => (grant.entry, Some(grant.client)),
+            Err(refusal) => {
+                if let Some(total) = note_unauthenticated_refusal() {
+                    warn!(
+                        %method, %path, refused_so_far = total, reason = refusal.message(),
+                        "auth: rejected an OAuth token"
+                    );
+                }
+                return Err(Refusal::invalid_token(refusal.message()));
+            }
+        }
+    } else {
+        let Some(entry) = keyring.authenticate(token) else {
+            if let Some(total) = note_unauthenticated_refusal() {
+                warn!(
+                    %method, %path, refused_so_far = total,
+                    "auth: rejected an unrecognised API key"
+                );
+            }
+            return Err(Refusal::invalid_token(
+                "the API key presented is not recognised",
+            ));
+        };
+        (entry, None)
+    };
+    let admit = |entry: Arc<KeyEntry>| Admitted {
+        authz: Authz::Key(entry),
+        oauth_client: oauth_client.clone(),
     };
 
     // Authenticated. An unclassified path now falls through to the router, which answers
     // 404 — the caller has earned an honest answer about what exists.
     let Some(classified) = classified else {
-        return Ok(Authz::Key(entry));
+        return Ok(admit(entry));
     };
 
     let required = match classified.access {
-        Access::Public => return Ok(Authz::Key(entry)),
+        Access::Public => return Ok(admit(entry)),
         Access::Needs(capability) => capability,
         Access::Mcp => Capability::Read,
     };
@@ -695,7 +799,7 @@ fn decide(
         .by(&entry));
     }
 
-    Ok(Authz::Key(entry))
+    Ok(admit(entry))
 }
 
 /// The authentication and authorization layer.
@@ -724,12 +828,24 @@ pub async fn authorize(State(gate): State<GateState>, mut req: Request, next: Ne
         .audit
         .is_enabled()
         .then(|| peer_ip.map(|ip| ip.to_string()));
-    match decide(&gate.keyring.current(), &method, &path, req.headers()) {
-        Ok(authz) => {
+    match decide_with(
+        &gate.keyring.current(),
+        gate.oauth.as_deref(),
+        &method,
+        &path,
+        req.headers(),
+    ) {
+        Ok(Admitted {
+            authz,
+            oauth_client,
+        }) => {
             // Off at the default level, and the first thing worth turning on when an
             // operator asks who called what. The `key_id` is the whole point of minting one:
             // it ties a request to a key without the key appearing anywhere.
-            debug!(key_id = ?authz.key_id(), %method, %path, "auth: authorized");
+            debug!(
+                key_id = ?authz.key_id(), oauth_client = ?oauth_client, %method, %path,
+                "auth: authorized"
+            );
             let classified = classify(&method, &path);
             // Every request that reaches a handler carries its identity, including the
             // anonymous and auth-disabled cases. A handler asking "who is this?" always gets
@@ -741,6 +857,7 @@ pub async fn authorize(State(gate): State<GateState>, mut req: Request, next: Ne
                 let handle: McpAuthzRef = Arc::new(McpCaller {
                     authz: authz.clone(),
                     peer: peer_ip,
+                    read_only: oauth_client.is_some(),
                 });
                 req.extensions_mut().insert(handle);
             }
@@ -809,6 +926,20 @@ pub async fn authorize(State(gate): State<GateState>, mut req: Request, next: Ne
             response
         }
         Err(refusal) => {
+            // On `/mcp` of a node that issues tokens, the challenge says where to get one. Not
+            // elsewhere: a REST caller sent to the OAuth flow would get a token REST refuses.
+            let resource_metadata = gate
+                .oauth
+                .as_ref()
+                .filter(|_| {
+                    refusal.status == StatusCode::UNAUTHORIZED
+                        && matches!(
+                            classify(&method, &path).map(|c| c.access),
+                            Some(Access::Mcp)
+                        )
+                })
+                .map(|oauth| oauth.resource_metadata_url());
+            let invalid_token = refusal.invalid_token;
             if gate.audit.is_enabled() {
                 let identity = refusal.identity.clone().unwrap_or_default();
                 let identified = identity.key_id.is_some();
@@ -825,7 +956,14 @@ pub async fn authorize(State(gate): State<GateState>, mut req: Request, next: Ne
                     None => gate.audit.record(record),
                 }
             }
-            refusal.into_response()
+            let mut response = refusal.into_response();
+            if let Some(url) = resource_metadata {
+                response.headers_mut().insert(
+                    header::WWW_AUTHENTICATE,
+                    challenge(invalid_token, Some(&url)),
+                );
+            }
+            response
         }
     }
 }
@@ -2142,6 +2280,7 @@ mod tests {
                 GateState {
                     keyring: KeyReloader::for_test(keyring),
                     audit: crate::audit::AuditSink::disabled(),
+                    oauth: None,
                 },
                 authorize,
             ));
@@ -2179,6 +2318,7 @@ mod tests {
                 GateState {
                     keyring: Arc::clone(keyring),
                     audit: crate::audit::AuditSink::disabled(),
+                    oauth: None,
                 },
                 authorize,
             ));
@@ -2190,5 +2330,123 @@ mod tests {
             .expect("build request");
         *request.headers_mut() = headers;
         app.oneshot(request).await.expect("gate ran").status()
+    }
+
+    fn bearer(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn an_oauth_token_is_admitted_on_mcp_and_nowhere_else() {
+        let (key, config) = key_for(Role::Writer, None);
+        let ring = ring(vec![config]);
+        let oauth = crate::oauth::OAuth::for_test("https://db.example.com");
+        let entry = ring.authenticate(key.expose()).unwrap();
+        let token = oauth.access_token_for_test(&entry);
+
+        let admitted = decide_with(&ring, Some(&oauth), "POST", "/mcp", &bearer(&token))
+            .unwrap_or_else(|r| panic!("refused: {}", r.message));
+        assert!(admitted.oauth_client.is_some());
+        assert_eq!(admitted.authz.key_id(), Some(key.digest().key_id()));
+
+        // REST takes keys: the token's audience is /mcp.
+        let refused = decide_with(&ring, Some(&oauth), "GET", "/_indexes", &bearer(&token))
+            .err()
+            .unwrap();
+        assert_eq!(refused.status, StatusCode::UNAUTHORIZED);
+        assert!(refused.invalid_token);
+
+        // A node that issues no tokens does not recognise one.
+        assert!(decide_with(&ring, None, "POST", "/mcp", &bearer(&token)).is_err());
+
+        // The key gone from the ring takes the token with it.
+        let (_, other) = key_for(Role::Reader, None);
+        let refused = decide_with(
+            &self::ring(vec![other]),
+            Some(&oauth),
+            "POST",
+            "/mcp",
+            &bearer(&token),
+        )
+        .err()
+        .unwrap();
+        assert!(refused.message.contains("revoked"));
+    }
+
+    #[test]
+    fn an_oauth_caller_holds_read_alone() {
+        let (key, config) = key_for(Role::Writer, None);
+        let ring = ring(vec![config]);
+        let entry = ring.authenticate(key.expose()).unwrap();
+        let via_token = McpCaller {
+            authz: Authz::Key(Arc::clone(&entry)),
+            peer: None,
+            read_only: true,
+        };
+        assert!(via_token.has(McpCapability::Read));
+        assert!(!via_token.has(McpCapability::Write));
+        assert!(!via_token.has_on(McpCapability::Write, "docs"));
+        let via_key = McpCaller {
+            authz: Authz::Key(entry),
+            peer: None,
+            read_only: false,
+        };
+        assert!(via_key.has(McpCapability::Write));
+    }
+
+    #[tokio::test]
+    async fn the_401_on_mcp_points_to_the_resource_metadata() {
+        use tower::ServiceExt as _;
+
+        let (_, config) = key_for(Role::Reader, None);
+        let gate = GateState {
+            keyring: KeyReloader::for_test(ring(vec![config])),
+            audit: crate::audit::AuditSink::disabled(),
+            oauth: Some(Arc::new(crate::oauth::OAuth::for_test(
+                "https://db.example.com",
+            ))),
+        };
+        let app = axum::Router::new()
+            .route("/mcp", axum::routing::post(|| async { StatusCode::OK }))
+            .route("/_indexes", axum::routing::get(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn_with_state(gate, authorize));
+        let challenge = |method: &str, uri: &str, token: Option<&str>| {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            if let Some(token) = token {
+                *request.headers_mut() = bearer(token);
+            }
+            let app = app.clone();
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+                response.headers()[header::WWW_AUTHENTICATE]
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            }
+        };
+
+        assert_eq!(
+            challenge("POST", "/mcp", None).await,
+            "Bearer realm=\"cameodb\", resource_metadata=\"https://db.example.com/.well-known/oauth-protected-resource/mcp\""
+        );
+        assert!(
+            challenge("POST", "/mcp", Some("cameo_at1_e30.AAAA"))
+                .await
+                .ends_with(", error=\"invalid_token\"")
+        );
+        assert_eq!(
+            challenge("GET", "/_indexes", None).await,
+            "Bearer realm=\"cameodb\""
+        );
     }
 }

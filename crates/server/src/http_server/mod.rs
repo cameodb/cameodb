@@ -9,6 +9,7 @@ mod admin;
 mod catalogue;
 mod error;
 mod health;
+mod oauth;
 mod routes;
 mod search;
 mod shed;

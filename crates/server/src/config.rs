@@ -1194,6 +1194,10 @@ impl CameoDbConfig {
             .audit
             .validate()
             .map_err(|message| ConfigError::SecurityConfig { message })?;
+        self.security
+            .oauth
+            .validate(self.security.enabled, self.mcp.enabled)
+            .map_err(|message| ConfigError::SecurityConfig { message })?;
 
         // Posture rules run last: the checks above establish that individual values are
         // usable, and this decides whether the combination is allowed where this node sits.

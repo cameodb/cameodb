@@ -6,7 +6,8 @@ CameoDB provides a comprehensive REST API for document management, search, and s
 
 Authentication is **off by default**. With `[security] enabled = true`
 ([configuration](CONFIGURATION.md#authentication-security)), every route below except the
-health check requires a key:
+health check — and the [OAuth endpoints](#-oauth-for-mcp-clients), when they are on — requires a
+key:
 
 ```bash
 curl -H "Authorization: Bearer cameo_v1_…" http://localhost:9480/_indexes
@@ -17,7 +18,7 @@ refused. Refusals are:
 
 | Status | Meaning |
 |--------|---------|
-| `401 Unauthorized` | No key, or a key this node does not know. Carries `WWW-Authenticate: Bearer realm="cameodb"` |
+| `401 Unauthorized` | No key, or a key this node does not know. Carries `WWW-Authenticate: Bearer realm="cameodb"`, with `error="invalid_token"` when a key or token was presented and refused, and on the MCP routes of a node with [OAuth](#-oauth-for-mcp-clients) on, `resource_metadata="<issuer>/.well-known/oauth-protected-resource/mcp"` |
 | `403 Forbidden` | Authenticated, but the role, `allowed_indexes` or `index_overrides` do not cover this request — or the request would take the index owner's tenant past a quota ([Tenant quotas](CONFIGURATION.md#tenant-quotas-securitytenants)) |
 
 Both return `{"error": …, "message": …}`. An unknown path answers `401` without a key and
@@ -56,6 +57,9 @@ Both return `{"error": …, "message": …}`. An unknown path answers `401` with
 | `POST` `GET` `DELETE` | `/mcp` | `read` at the endpoint, then per tool |
 | `GET` `POST` | `/mcp/sse` | `read` at the endpoint, then per tool |
 | `POST` | `/mcp/messages` | `read` at the endpoint, then per tool |
+| `GET` | `/.well-known/oauth-protected-resource`, `…/mcp`, `/.well-known/oauth-authorization-server` | none (public), with [OAuth](#-oauth-for-mcp-clients) on |
+| `POST` | `/oauth/register`, `/oauth/token` | none (public), with OAuth on |
+| `GET` `POST` | `/oauth/authorize` | none (public) — the page takes a key, with OAuth on |
 
 Roles bundle these: `admin` holds all five, `writer` holds `read` and `write`, `reader` holds
 `read`, and `provisioner` holds `key-manage` alone. Where a path contains `{index}`, a key restricted with `allowed_indexes` is refused
@@ -67,7 +71,8 @@ schema — so `write` includes minting indexes unless the node sets
 [Configuration](CONFIGURATION.md#authentication-security)). With that off, such a write is
 refused `400` and the index has to be created explicitly with `PUT /api/{index}/_config`.
 
-**Health is the one public route, and its body depends on who is asking.** An anonymous
+**Health is the one public data-plane route, and its body depends on who is asking.** (The OAuth
+endpoints are public too, when they are on; they answer the same to everyone.) An anonymous
 caller gets liveness only; presenting any valid key returns the full body:
 
 ```bash
@@ -84,6 +89,36 @@ a load balancer needs neither.
 **Listings are filtered, not refused.** `/_indexes` and `/_cluster/_indexes` return only the
 indexes the key may see, with `total_indexes` adjusted to match — a count over a shorter list
 would itself disclose how many were withheld.
+
+### 🔓 OAuth for MCP clients
+
+With [`[security.oauth]`](CONFIGURATION.md#oauth-for-mcp-clients-securityoauth) on, the node is
+the OAuth 2.1 authorization server for its own `/mcp`, as the MCP authorization specification
+describes. A client given only the URL `https://<host>/mcp` runs the flow itself; nothing here is
+called by hand. Every route below is mounted only when the section is on.
+
+| Method | Path | Standard | |
+|--------|------|----------|---|
+| `GET` | `/.well-known/oauth-protected-resource/mcp` (and without `/mcp`) | RFC 9728 | `resource` (`<issuer>/mcp`), `authorization_servers`, `scopes_supported: ["read"]` |
+| `GET` | `/.well-known/oauth-authorization-server` | RFC 8414 | The endpoints below; `code` with PKCE `S256` only; grants `authorization_code` and `refresh_token` |
+| `POST` | `/oauth/register` | RFC 7591 | JSON: `redirect_uris` (required: `https`, `http` to localhost on any port, or a private-use scheme such as `com.example.app:/cb`), `client_name`, `token_endpoint_auth_method` (`none`, `client_secret_post`, `client_secret_basic`). `201` with `client_id`, and `client_secret` when one was asked for |
+| `GET` | `/oauth/authorize` | RFC 6749, 7636, 8707, 9207 | The approval page. `response_type=code`, `client_id`, `redirect_uri`, `code_challenge` with `code_challenge_method=S256`, `state`, `resource` (this node's `/mcp` if given) |
+| `POST` | `/oauth/authorize` | | The page's form: the user's key and `approve` or `deny`. Answers `303` to the client's `redirect_uri` with `code`, `state` and `iss`, or `error=access_denied` |
+| `POST` | `/oauth/token` | RFC 6749 | Form-encoded. `grant_type=authorization_code` with `code`, `redirect_uri`, `code_verifier`, `client_id`; or `grant_type=refresh_token` with `refresh_token`, `client_id`. A
+client registered with a secret sends `client_secret` too, or both in `Authorization: Basic`. Answers `access_token` (`cameo_at1_…`), `token_type: "Bearer"`, `expires_in`, `refresh_token` (rotated on each use), `scope: "read"` |
+
+**The token.** `Authorization: Bearer cameo_at1_…` on `/mcp` acts as the key that approved it,
+holding `read` alone: the key's `allowed_indexes`, rate limits, tenant budget and session
+ownership apply, and a tool needing more is refused. Any other route answers it `401`. Revoking the
+key revokes its tokens at their next request.
+
+**Refusals.** A request whose `client_id` or `redirect_uri` cannot be trusted is answered on the
+page (`400`) and never redirected; other authorization errors go back to the client as
+`error=…`. A wrong key re-shows the page. The token endpoint answers `400` with `invalid_grant`
+(a used, expired or foreign code, a wrong verifier, a revoked key), `invalid_request`,
+`unsupported_grant_type` or `invalid_target`, and `401` with `invalid_client`. The discovery,
+registration and token endpoints answer cross-origin requests from any origin, without
+credentials; the approval page cannot be framed.
 
 ### 🚦 Refusals under load
 
