@@ -267,6 +267,8 @@ first written down here, so the chronology stays visible under the cost ordering
 | [OB27](#ob27--a-replaced-node-never-leaves-the-cluster) | **A replaced node never leaves the cluster** — a node rebuilt with an empty data directory leaves its old identity's shards on every ring for good: writes to their key ranges answer 500, and the new node cannot learn an existing schema (503). The 500 is now a 503 (`888cb27`); `forget` needs O3 | — | 2026-10-18 | ◐ |
 | [OB28](docs/ROADMAP-ARCHIVE.md#ob28--two-range-shapes-were-dropped-without-a-word-or-failed-the-search) | **Two range shapes were dropped without a word or failed the search** — `field:[* TO *]` answered zero unreported, and a range on a json field was a 500; both are now reported dropped clauses, refused with 400 when nothing else is left | — | 2026-10-21 | ✅ |
 | [OB29](docs/ROADMAP-ARCHIVE.md#ob29--what-verifying-ob28-over-mcp-found) | **What verifying OB28 over MCP found** — a query whose every clause was dropped ran as match-all, a json path matched nothing unreported, and `validate_query` called a path an unknown field | — | 2026-10-21 | ✅ |
+| [OB30](#ob30--two-processes-can-open-one-data-directory) | **Two processes can open one data directory** — redb's file locks do not cross a container bind mount, and a node opens every store before it binds its port; two writers are what explains the `metadata.redb` found damaged on 2026-11-03. A data-directory lock taken first, with an owner record that names who holds it, on Unix and Windows | — | 2026-11-04 | 📋 |
+| [OB31](#ob31--a-damaged-metadataredb-panics-the-node) | **A damaged `metadata.redb` panics the node** — inside redb, and through two `expect`s around it; redb's repair cannot fix a corrupted primary commit. Checked at open; a single node sets the file aside and rebuilds it, a cluster member refuses with the remedy | — | 2026-11-04 | 📋 |
 | [F9](docs/ROADMAP-ARCHIVE.md#f9--commit-on-a-clock-not-a-count) | **Commit on a clock, not a count** — bulk ingest 1.8–6.6×, a trickle searchable within 2 s, single writes unchanged | — | 2026-09-26 | ✅ |
 | [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
 | [K2](#k2--the-merge-across-shards-and-nodes) | The merge across shards and nodes | 19 | 2026-08-27 | 📋 |
@@ -1863,6 +1865,122 @@ one node's disk therefore breaks the cluster until its metadata is edited by han
 - ✅ [**OB28 — Two range shapes were dropped without a word or failed the search**](docs/ROADMAP-ARCHIVE.md#ob28--two-range-shapes-were-dropped-without-a-word-or-failed-the-search)
 - ✅ [**OB29 — What verifying OB28 over MCP found**](docs/ROADMAP-ARCHIVE.md#ob29--what-verifying-ob28-over-mcp-found)
 - ✅ [**F9 — Commit on a clock, not a count**](docs/ROADMAP-ARCHIVE.md#f9--commit-on-a-clock-not-a-count)
+
+### OB30 — Two processes can open one data directory
+
+📋 **Planned.** ~1.5 days. Found 2026-11-03.
+
+*What happened.* A node ran in a container with its data directory bind-mounted from the host. During
+the day, the data was damaged: at the container's start its `metadata.redb` read cleanly, and the
+next start after its clean shutdown panicked on it ([OB31](#ob31--a-damaged-metadataredb-panics-the-node)).
+redb's `check_integrity` on a copy said *"Primary is corrupted despite 2-phase commit"*: the page the
+user tables' root points to held redb's own system tree (`allocator_state`, `data_pages_allocated`, …)
+and both commit slots point at that page, so there is no consistent commit to roll back to. A single
+writer cannot do this — its allocator knows which pages are live. Two writers with separate views of
+the file can. The shard's `store.redb` (10 GB) checked clean.
+
+*Reproduced* on a clone of the directory: the same image in a container, then a native node on the
+same directory. **Both opened `store.redb` and `metadata.redb`, and the native node came up healthy.**
+
+*Why nothing stopped it.*
+
+- redb locks its file with `fcntl` range locks (`LockFileEx` on Windows). Those work between processes
+  of one kernel. A Linux container on macOS or Windows (Docker Desktop, OrbStack) runs in a VM and
+  reaches the host's files through a file-sharing layer that does not carry the lock; WSL2 on `/mnt/c`
+  is the same, and NFS depends on its configuration.
+- The node opens every shard's store and `metadata.redb` **before** it binds its port. A second node
+  started while the first holds the port fails on the bind — after it has opened, and possibly
+  committed to, both. Nothing on the terminal says data was touched.
+- `cameodb compact` relies on the same lock: its help says a running node is not a hazard because
+  redb locks its files. Across that boundary it is.
+
+**Change.**
+
+1. **A data-directory lock, taken before anything in the directory is read** — before
+   `node_identity.json`, before any store — for every directory in `storage.data_paths`. Two files:
+   - `cameodb.lock`, held with an exclusive OS lock for the life of the process: `File::try_lock`,
+     `flock` on Unix and `LockFileEx` on Windows. Released by the OS when the process ends, however it
+     ends.
+   - `cameodb.owner`, written once the lock is held: node id, host name, process id, start time,
+     version. Removed on a clean shutdown. A separate file because a `LockFileEx` lock is mandatory: on
+     Windows another process could not read the owner from the locked file itself.
+2. **What startup decides:**
+   - The OS lock is held by someone → refuse, naming the owner from `cameodb.owner`: another process on
+     this machine.
+   - The lock is free and there is no owner file → take it.
+   - The owner file names **this host** → its process is gone (its OS lock would have stopped us) →
+     take over, logging the stale record.
+   - The owner file names **another host** — a container's host name is its own, so a container and its
+     host are two hosts → refuse: the OS lock cannot see that process. The message names its host,
+     process and start time, and says how to proceed: stop it, or `cameodb unlock <data path>` once it
+     is known not to be running.
+   - No timer and no heartbeat. A container restarted keeps its host name and takes over its own record;
+     one *re-created* after a crash has a new name and is refused until `unlock` — the price of that
+     case, paid only after an unclean exit.
+3. **Offline commands take the same lock**: `cameodb compact`, and anything else that opens a data
+   directory; `compact`'s help stops promising redb's lock.
+4. **`cameodb unlock <data path>`**: removes a stale `cameodb.owner` after showing it; refuses while the
+   OS lock is held on this machine.
+
+**Windows.** The same design holds, with these points:
+
+- Between native Windows processes on a local disk, redb's `LockFileEx` already refuses a second
+  node; the gap is the same as elsewhere — Docker Desktop bind mounts from a Windows drive into a Linux
+  container, and WSL2 processes on `/mnt/c`, whose Linux locks never reach Windows.
+- `File::try_lock` maps to `LockFileEx` — mandatory, which is why the owner record is a separate file.
+- The host name is `COMPUTERNAME` (`gethostname` on Unix). The MSI's service writes both files in its
+  own data directory under `C:\ProgramData\CameoDB`, which it already owns.
+- On an SMB share the server enforces `LockFileEx` across clients, so the OS lock holds there too.
+- Verified on Windows itself before this is closed: two native processes, and a Docker Desktop
+  container against a native node.
+
+**Tests.** A second process on the same directory is refused, naming the first. An owner record naming
+another host is refused; one naming this host with no lock held is taken over. A clean shutdown removes
+the record; a killed process leaves it, and the next start on the same host takes over. `compact` is
+refused while a node holds the directory. `unlock` refuses while the lock is held. Every directory of
+`data_paths` is locked, not only the first.
+
+**Docs.** `docs/DEPLOYMENT.md`: one process per data directory, containers and bind mounts, `unlock`;
+`docs/CONFIGURATION.md` under `storage.data_paths`; `CHANGELOG.md`.
+
+### OB31 — A damaged `metadata.redb` panics the node
+
+📋 **Planned.** ~0.5 day. Found 2026-11-03, with [OB30](#ob30--two-processes-can-open-one-data-directory)
+as its cause.
+
+*What happens.* The release build panics inside redb while loading the ring snapshot —
+`slice index starts at 60 but ends at 3` at `btree_base.rs:1904`, a branch page whose key offsets are
+garbage. The debug build panics earlier, in redb's own check while the file opens. Around both,
+`ClusterStateStore::new` and `load_persisted_cluster` are called with `expect`, so even an error redb
+does return ends the process as a panic. redb's repair cannot help: with the primary commit corrupt
+despite two-phase commit and both slots sharing the damaged page, there is nothing consistent to roll
+back to.
+
+*What the file is.* Cluster configuration, shard assignments, the node registry and the ring
+snapshot — bookkeeping, not documents. Moved aside on a single node, it was rebuilt at the next start
+and every document was served (7.15 million, verified 2026-11-03).
+
+**Change.**
+
+1. **Check it when it opens.** `check_integrity` on `metadata.redb` after opening — the file is hundreds
+   of kilobytes, so the check costs milliseconds; measured and recorded. Shard stores are not checked
+   this way: 78 s for a 10 GB store.
+2. **On damage** — an open that fails, an integrity check that fails, or a panic while opening and
+   loading, caught as a last guard:
+   - **cluster disabled**: rename it `metadata.redb.damaged-<UTC timestamp>`, warn naming both files, and
+     start with a new one;
+   - **cluster enabled**: refuse to start, naming the file, what it holds and the remedy — move it aside
+     and the node relearns its ring from its peers. Whether a member rebuilds correctly that way is
+     verified before the message says so; until it is, the message says to restore it or rebuild the
+     node.
+3. **No `expect` on that path**: an error the operator can read, and a non-zero exit.
+
+**Tests.** A copy of `metadata.redb` with its user-table root page overwritten: a single node starts,
+the file is set aside under the new name, and the index is served; a node with clustering enabled
+refuses with the message. An intact file passes the check, and its cost is measured.
+
+**Docs.** `docs/DEPLOYMENT.md` troubleshooting: what `metadata.redb` is, when it is set aside, what a
+`.damaged-*` file is for; `CHANGELOG.md`.
 
 ---
 
