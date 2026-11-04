@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+**Upgrading from 0.3.8.** No config change is needed for a node to start; every new section is
+off until set. Three things change what an existing deployment sees:
+
+- **Reindex** fields under `it_stem` or `it_stem_fold`, and fields under `hr_stem` or
+  `hr_stem_fold` that hold Cyrillic text: queries are now analyzed to terms those fields were not
+  indexed with (see Changed).
+- **On a cluster, upgrade every node first.** A schema with ghost fields is refused while any node
+  runs 0.3.8, and a node on 0.3.8 answers a cut array with its head rather than its matching
+  elements.
+- **A node claims its data directories** (`cameodb.lock`, `cameodb.owner`) before it reads them.
+  A container *re-created* after an unclean exit has a new host name and is refused until
+  `cameodb unlock <data path>`; a restarted one takes the record over. See DEPLOYMENT, "One
+  process per data directory".
+
+Upgrading from 0.3.7 or earlier, the 0.3.8 note on API key digests below applies as well.
+
+A key minted, changed or revoked through `/_keys` or `/_tenants` applies on the node that took
+the request; on a cluster, the other nodes do not see it.
+
 ### Added
 
 - **OAuth for MCP clients.** With `[security.oauth]` (`enabled`, `issuer`, `signing_key_file`), the

@@ -37,9 +37,10 @@ a key scoped to `read` covers the whole surface. Two details worth knowing:
 
 - The tool *catalogue* is already filtered to what the key may call, so an agent is not
   offered a tool its key would be refused for.
-- A client that cannot set headers cannot authenticate — an agent running inside a
-  sandboxed environment may need the key placed on the URL's behalf by a proxy, or the
-  deployment run with authorization off on a trusted network.
+- A client that cannot set headers — ChatGPT, claude.ai, Claude Desktop connecting by
+  URL — signs in with OAuth instead, once [`[security.oauth]`](#oauth-for-mcp-clients) is
+  on: the user pastes the key they hold on the node's approval page, and the token the
+  client receives acts as that key with `read` alone, on `/mcp` alone.
 
 ## Connecting clients
 

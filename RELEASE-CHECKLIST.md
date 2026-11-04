@@ -83,14 +83,19 @@ These are accepted, not fixed. They belong in release notes as much as here.
   HTTP and MCP endpoint to whoever can reach the port, `/_admin/*` included. That is a
   supported configuration for `local` and a warning for `internal`; `external` refuses to
   start without keys. Enabling it is one `cameodb keygen` and one stanza.
-- **An MCP client authenticates with an HTTP header or not at all.** The key travels as
-  `Authorization: Bearer`, so an MCP client that cannot set a header cannot reach an
-  authenticated node. There is no OAuth flow and no per-client credential issuance.
-- **API keys are read at startup and on request.** Adding or revoking one is add → reload
-  (`POST /_admin/keys/reload`, or SIGHUP) → migrate clients → remove → reload; a node holds the
-  ring it last read until one of those. There is no lockout or throttle on failed
-  authentication (against a 256-bit key it buys nothing and is itself a DoS lever — refusals
-  are counted and logged instead).
+- **An OAuth refresh token stays usable after use.** Nothing is stored, so a refresh is not
+  rotated or revoked on its own: a leaked one works until `approval_max_age_secs` (90 days by
+  default) from the user's approval, or until the key behind it is revoked. The token is
+  `read`-only and `/mcp`-only.
+- **A key change through `/_keys` or `/_tenants` reaches only the node that took it.** On a
+  cluster, mint and revoke on each node, or use key files distributed to every node (R3 is not
+  built). Keys in the config itself are still read at startup and on reload
+  (`POST /_admin/keys/reload`, SIGHUP, or a changed included file). There is no lockout or
+  throttle on failed authentication (against a 256-bit key it buys nothing and is itself a DoS
+  lever — refusals are counted and logged instead).
+- **Delete by query has no version check.** It deletes what matched at each shard's last
+  commit: a document written since is not deleted, and one updated since is deleted by its id
+  even if it no longer matches.
 - **Cluster peers are trusted by the PSK, not by API keys.** `allowed_indexes` is enforced at
   the HTTP/MCP ingress, where identity exists; it is not a defense against a compromised
   cluster member.
@@ -132,6 +137,23 @@ Signed off by:
 ## History
 
 <!-- Newest first. Append a filled-in template per release. -->
+
+## v0.3.9 — (in progress)
+
+Prepared on 2026-11-04 at `d71f362`; not yet cut. Done so far, on the host (macOS) tree:
+
+- `scripts/validate/deps.sh`: PASS (fmt, clippy, audit, deny; the three advisory exceptions,
+  RUSTSEC-2026-0118, RUSTSEC-2026-0119 and RUSTSEC-2024-0436, valid until 2026-12-31, still via
+  kameo 0.22.2 pinning libp2p 0.56).
+- `check-config --allow-unauthenticated`: OK on the root example, `crates/server/cameodb.toml` and
+  `crates/server/windows/cameodb.toml`.
+- Dependencies: zip, lzma-rust2 and ctutils updated; toml, toml_writer and serde-saphyr (published
+  2026-11-03/04) deliberately left for after the cut.
+
+Open before the cut: the version bump and CHANGELOG move; build and SBOM; the validation suites
+(unit, posture, auth, tls, artifact, and `remote-sources` on musl and Windows); the Windows build;
+and OB30's Windows checks — two native processes on one data directory, and a Docker Desktop
+container against a native node.
 
 ## v0.3.8 — 2026-10-25
 

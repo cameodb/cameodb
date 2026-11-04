@@ -7,9 +7,10 @@ code comments) is a heading in this file or in the archive. The archive is not d
 measurements and the rejected options are what stop a settled question being reopened, and
 several entries exist precisely to say *do not build this again*.
 
-**Last reconciled against the code: 2026-11-02, at 0.3.8 plus the unreleased 0.3.9 work (`55fd6a7`).**
-The pass is recorded under [Reconciliation, 2026-11-02](#reconciliation-2026-11-02): every open item
-was checked against the commits since the last reconciliation, and none had been closed unrecorded.
+**Last reconciled against the code: 2026-11-04, at 0.3.8 plus the unreleased 0.3.9 work (`ef4a991`).**
+The pass is recorded under [Reconciliation, 2026-11-04](#reconciliation-2026-11-04), after
+[2026-11-02](#reconciliation-2026-11-02): every open item was checked against the commits since the
+last reconciliation, and none had been closed unrecorded.
 Earlier passes stay recorded where they were made —
 [2026-08-26](#reconciliation-2026-08-26), [2026-09-01](#reconciliation-2026-09-01) and
 [2026-10-15](#reconciliation-2026-10-15), the last of which corrected Phase 16's premise about redb,
@@ -22,7 +23,8 @@ Features agreed after each release are filed as
 [P. Post-0.3.7 features](#p-post-037-features--partial),
 [Q. Post-0.3.8 features](docs/ROADMAP-ARCHIVE.md#q-post-038-features--done) (archived),
 [R. Key and tenant provisioning](#r-key-and-tenant-provisioning--partial) and
-[T. OAuth for MCP clients](docs/ROADMAP-ARCHIVE.md#t-oauth-for-mcp-clients--done) (archived); Q, R
+[S. Delete by query](docs/ROADMAP-ARCHIVE.md#s-delete-by-query--done) (archived) and
+[T. OAuth for MCP clients](docs/ROADMAP-ARCHIVE.md#t-oauth-for-mcp-clients--done) (archived); Q, R, S
 and T are built and wait in `[Unreleased]` for 0.3.9.
 
 ## How to read this file
@@ -71,7 +73,7 @@ on one.
 | P — Post-0.3.7 features | ◐ Partial | P1, a cap on how many elements of each array a search hit carries — a node default, a node maximum, and `array N` per request — done 2026-10-19. P2, one declaration of an index's default fields — `searched_by_default` dropped, the `--id` reload keeps the list — done 2026-10-20. P3, a schema read is a schema write — `PUT` takes a `GET`, which now reports every property the thumbprint covers — done 2026-10-21. P4, ip fields queried the way addresses are — CIDR, bare addresses, IPv4-bounded ranges, a fast ip sort — done 2026-10-21. P6, a cut array leads with the elements the query matched — `_matched_elements`, on by default — done 2026-11-02. Left: P5, native json fields — paths, typed values and ranges, planned |
 | Q — Post-0.3.8 features | ✅ Done, unreleased (0.3.9) | Q1, ghost fields — a column filled from another field of the stored body, for every document or under an `in` / `not_in` condition, never stored — done 2026-10-27. Q2, the Croatian analyzers read Serbian Cyrillic — done 2026-10-27. The `pt_stem`, `it_stem` and `es`/`fr`/`pt`/`de` `_stem_fold` analyzers of the same days are in the changelog, not filed here |
 | R — Key and tenant provisioning | ◐ Partial, R1 and R2 unreleased (0.3.9) | R1 and R2 done 2026-11-01, single node: included key and tenant files reloaded on change, live tenant quotas and scopes, `allowed_indexes` prefixes; a provisioner minting and revoking keys through `/_keys` (no tenant) and `/_tenants`, changing a key's indexes in place with `PATCH /_keys/{key_id}`, and granting only within its own `allowed_indexes`; client, SDK and a live suite, validated on Linux under systemd and across a restart. Left: R3, every change broadcast to every node, deferred until cluster support is decided — until then a change applies on the node that received it |
-| S — Delete by query | ✅ Done | S1, `POST /api/{index}/delete` — exact clauses, refused past `max_docs` unless confirmed — done 2026-11-02 |
+| S — Delete by query | ✅ Done, unreleased (0.3.9) | S1, `POST /api/{index}/delete` — exact clauses, refused past `max_docs` unless confirmed — done 2026-11-02 |
 | T — OAuth for MCP clients | ✅ Done, unreleased (0.3.9) | T1, the node as the OAuth 2.1 authorization server for `/mcp` — discovery, dynamic client registration, an approval page taking the key the user holds, PKCE, refresh; stateless, tokens read-only and ended by revoking the key — done 2026-11-03 |
 
 ## Reconciliation, 2026-08-26
@@ -203,6 +205,22 @@ the tree, rather than against this file.
 - **Next, agreed the same day:** OB27's 503 (done, `888cb27`), then P6 redesigned so a cut array
   leads with its matching elements. O3 with OB27's `forget`, CH3 and P5 follow; CH3's tie-break
   cannot be resumed from as filed and needs a total order on (sort key, id).
+
+---
+
+## Reconciliation, 2026-11-04
+
+Taken at the 0.3.9 prep. Checked against `git log 55fd6a7..ef4a991` and the tree.
+
+- **Closed since 2026-11-02, all recorded:** P6 (`69be7ec`), S1 (`7170a8e`), T1 (`538dbb2`, with
+  the redirect-URI, client-name and `approval_max_age_secs` follow-ups), OB31 (`9c7e9ee`). OB27
+  stays open: only its 503 is done (`888cb27`); `forget` waits on O3. OB30 is built (`2a293b5`)
+  and stays ◐ until its Windows checks, which belong with the Windows build of the release.
+- **What 0.3.9 carries:** Q1, Q2, R1, R2, P6, S1, T1, OB27's 503, OB30, OB31, and the
+  Portuguese, Italian and fold analyzers. R3 is not in it; the release notes and the release
+  checklist's known gaps say a key change reaches only the node that took it.
+- **Nothing else moved:** N11–N17, O3–O6, OB26, F11's automatic merge, CH3, P5, J2, J3 and K1–K3
+  stand as filed.
 
 ---
 
