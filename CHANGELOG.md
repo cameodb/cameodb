@@ -141,10 +141,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Two processes could open one data directory.** redb's file locks do not cross a container's
+  bind mount (Docker Desktop, OrbStack, WSL2 on `/mnt/c`, some NFS mounts), and a node opens every
+  store before it binds its port, so a node in a container and a node on its host could both open,
+  and write, the same files. A node now claims every directory in `storage.data_paths` before it
+  reads anything there: `cameodb.lock`, held with an OS lock, and `cameodb.owner`, naming the host,
+  process, start time, version and node. A second process is refused with that name. A record left
+  on this host by a process that did not exit cleanly is taken over at the next start; one naming
+  another host — a container is a host of its own — is refused until `cameodb unlock <data path>`
+  removes it. `cameodb compact` takes the same claim.
 - **A damaged `metadata.redb` panicked the node at startup.** The file holds cluster bookkeeping
   — configuration, shard assignments, the node registry, the ring snapshot — not documents. It is
   now checked with redb's integrity check before it is read (6–7 ms on files of 0.8–3 MB). A
-  single node renames a damaged one `metadata.redb.damaged-<UTC timestamp>`, logs a warning naming
+  single node renames a damaged one `metadata.redb.damaged-<UTC timestamp>`, logs an error naming
   both files, and rebuilds it from its shards at that start; a node with clustering enabled refuses
   to start, naming the file and the remedy, and leaves it in place. A panic inside redb while the
   file opens is caught and handled the same way, and an error that is not damage — permissions,

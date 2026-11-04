@@ -4461,6 +4461,7 @@ dependencies = [
  "sha2 0.11.1",
  "storage",
  "subtle",
+ "sysinfo",
  "tempfile",
  "thiserror 2.0.21",
  "tikv-jemalloc-sys",

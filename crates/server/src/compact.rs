@@ -4,8 +4,9 @@
 //! them, but the file stays at its high-water mark; only `Database::compact` moves the live pages
 //! down and truncates the rest. That needs the database to itself — no reader, no writer — and a
 //! running node shares every shard's store between its writer thread and the search workers, so
-//! this runs with the node stopped. redb locks its files, so a running node is not a hazard: the
-//! open fails and the command says why.
+//! this runs with the node stopped. It claims the data directories the way the node does
+//! (`data_lock.rs`), so a running node is not a hazard — not even one in a container whose bind
+//! mount does not carry redb's file locks: the claim fails and the command says why.
 //!
 //! Measured on 1 GB shards with 75% of their documents deleted: 1,028 MB → 310 MB in about 1.5 s
 //! each. Compaction rewrites the file in place, so it needs no free disk beyond what it frees.
@@ -123,8 +124,8 @@ Usage:
   cameodb compact [-c <PATH>] [--dry-run] [--jobs <N>]
   cameodb compact --rewrite [--keep] [-c <PATH>] [--dry-run] [--jobs <N>]
 
-Run it with the node stopped: redb locks its files, so it refuses to start while the node holds
-them. It works on every shard's store.redb and on metadata.redb under the configured data paths.
+Run it with the node stopped: it claims the data directories as the node does, and refuses
+while a node, or another compaction, holds them. It works on every shard's store.redb and on metadata.redb under the configured data paths.
 
 Options:
   -c, --config <PATH>   The node's config file, for its data paths
@@ -197,6 +198,20 @@ originals are as they were. Running the command again continues either way.";
     };
     let overrides = config::CliOverrides::parse(rest)?;
     let config = CameoDbConfig::load_unvalidated(&overrides)?;
+
+    // Claimed as a node claims them, before a file is opened, and held until this returns:
+    // redb's own locks do not cross a container's bind mount, so they cannot be relied on to
+    // stop a compaction under a running node.
+    // Only the directories that exist: a mistyped path is reported below as holding no
+    // files, not created.
+    let existing: Vec<PathBuf> = config
+        .storage
+        .data_paths
+        .iter()
+        .filter(|p| p.is_dir())
+        .cloned()
+        .collect();
+    let _data_lock = crate::data_lock::DataDirLock::acquire(&existing, "compact")?;
 
     let files = redb_files(&config);
     if files.is_empty() {

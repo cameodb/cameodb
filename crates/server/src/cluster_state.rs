@@ -208,7 +208,9 @@ impl ClusterStateStore {
                 aside.display()
             )
         })?;
-        warn!(
+        // At error level, not warning: a node logs errors only unless told otherwise (the
+        // Docker image is), and damage found on disk is not something to miss.
+        tracing::error!(
             damaged = %db_path.display(),
             set_aside = %aside.display(),
             reason = %damage,

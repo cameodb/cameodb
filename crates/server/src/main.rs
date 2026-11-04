@@ -18,6 +18,7 @@ mod cluster_state;
 mod cluster_state_machine;
 mod compact;
 mod config;
+mod data_lock;
 mod distributed;
 mod http_server;
 mod key_watch;
@@ -187,7 +188,13 @@ async fn run(args: Vec<String>) -> Result<()> {
         );
     }
 
-    // Offline: redb locks its files, so this refuses to run against a node that is up.
+    // Removes a data directory's owner record left by a process that is gone.
+    if subcommand == "unlock" {
+        return data_lock::run_unlock(args.into_iter().skip(2));
+    }
+
+    // Offline: it claims the data directories as the node does, so it refuses to run against a
+    // node that holds them.
     if subcommand == "compact" {
         return compact::run(args.into_iter().skip(2)).await;
     }
@@ -351,6 +358,7 @@ async fn run(args: Vec<String>) -> Result<()> {
              cameodb check-config [-c <PATH>] [--allow-unauthenticated]\n  \
              cameodb keygen --role <admin|writer|reader>\n  \
              cameodb compact [-c <PATH>] [--dry-run] [--jobs <N>] [--rewrite [--keep]]\n  \
+             cameodb unlock <DATA PATH>...\n  \
              cameodb service run [OPTIONS]                (Windows)\n  \
              cameodb client <subcommand>\n\n\
              Options:\n\
@@ -368,6 +376,8 @@ async fn run(args: Vec<String>) -> Result<()> {
              \u{20}                 --dry-run reports what each file would give back and changes nothing;\n  \
              \u{20}                 every file at once unless --jobs N limits it; --rewrite copies each\n  \
              \u{20}                 file into a new one instead, --keep keeping the original\n  \
+             unlock           Remove the record that claims a data directory for a process that is\n  \
+             \u{20}                 gone: one on another host, such as a removed container\n  \
              service          Windows: what the installed CameoDB service runs; not for a console\n  \
              client           Run the bundled client CLI (health, list, search, schema, data, delete, admin)\n\n\
              `cameodb <command> --help` describes each command.\n\n\
@@ -397,6 +407,19 @@ async fn run(args: Vec<String>) -> Result<()> {
         tracing::error!("Refusing to start: {e:#}");
         return Err(e);
     }
+
+    // Every data directory claimed before anything in it is read — node_identity.json, a store,
+    // metadata.redb. redb's own locks do not cross a container's bind mount, and the port is
+    // bound only after every store is open, so neither stops a second process in time. Held
+    // until `run` returns; dropping it removes the owner records.
+    let mut data_lock =
+        match data_lock::DataDirLock::acquire(&cameodb_config.storage.data_paths, "node") {
+            Ok(lock) => lock,
+            Err(e) => {
+                tracing::error!("Refusing to start: {e:#}");
+                return Err(e);
+            }
+        };
 
     // The live key ring, behind the handle `/_admin/keys/reload` and SIGHUP swap. The
     // overrides move into it — they are re-applied on every reload, which is how an
@@ -469,6 +492,7 @@ async fn run(args: Vec<String>) -> Result<()> {
         .expect("storage.data_paths must contain at least one entry");
 
     let (keypair, identity) = swarm::load_node_identity(&primary_path)?;
+    data_lock.record_node(format!("{} ({})", identity.name, identity.uuid))?;
 
     let node_clustered = cameodb_config.network.cluster.enabled;
 

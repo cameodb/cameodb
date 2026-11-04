@@ -267,7 +267,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [OB27](#ob27--a-replaced-node-never-leaves-the-cluster) | **A replaced node never leaves the cluster** — a node rebuilt with an empty data directory leaves its old identity's shards on every ring for good: writes to their key ranges answer 500, and the new node cannot learn an existing schema (503). The 500 is now a 503 (`888cb27`); `forget` needs O3 | — | 2026-10-18 | ◐ |
 | [OB28](docs/ROADMAP-ARCHIVE.md#ob28--two-range-shapes-were-dropped-without-a-word-or-failed-the-search) | **Two range shapes were dropped without a word or failed the search** — `field:[* TO *]` answered zero unreported, and a range on a json field was a 500; both are now reported dropped clauses, refused with 400 when nothing else is left | — | 2026-10-21 | ✅ |
 | [OB29](docs/ROADMAP-ARCHIVE.md#ob29--what-verifying-ob28-over-mcp-found) | **What verifying OB28 over MCP found** — a query whose every clause was dropped ran as match-all, a json path matched nothing unreported, and `validate_query` called a path an unknown field | — | 2026-10-21 | ✅ |
-| [OB30](#ob30--two-processes-can-open-one-data-directory) | **Two processes can open one data directory** — redb's file locks do not cross a container bind mount, and a node opens every store before it binds its port; two writers are what explains the `metadata.redb` found damaged on 2026-11-03. A data-directory lock taken first, with an owner record that names who holds it, on Unix and Windows | — | 2026-11-04 | 📋 |
+| [OB30](#ob30--two-processes-can-open-one-data-directory) | **Two processes can open one data directory** — redb's file locks do not cross a container bind mount, and a node opens every store before it binds its port; two writers are what explains the `metadata.redb` found damaged on 2026-11-03. A data-directory lock taken first, with an owner record that names who holds it. Built and verified on macOS with OrbStack (`cameodb unlock`, `compact` included); open: verification on Windows | — | 2026-11-04 | ◐ |
 | [OB31](docs/ROADMAP-ARCHIVE.md#ob31--a-damaged-metadataredb-panics-the-node) | **A damaged `metadata.redb` panicked the node** — inside redb, and through two `expect`s around it. Now checked at open (6–7 ms); a single node sets the file aside and rebuilds it, a cluster member refuses with the remedy | — | 2026-11-04 | ✅ |
 | [F9](docs/ROADMAP-ARCHIVE.md#f9--commit-on-a-clock-not-a-count) | **Commit on a clock, not a count** — bulk ingest 1.8–6.6×, a trickle searchable within 2 s, single writes unchanged | — | 2026-09-26 | ✅ |
 | [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
@@ -1869,7 +1869,21 @@ one node's disk therefore breaks the cluster until its metadata is edited by han
 
 ### OB30 — Two processes can open one data directory
 
-📋 **Planned.** ~1.5 days. Found 2026-11-03.
+◐ **Built 2026-11-04; open: verification on Windows.** Found 2026-11-03.
+
+*Status.* `data_lock.rs` claims every directory of `storage.data_paths` right after the config is
+validated — before `node_identity.json`, any store or `metadata.redb` — and the owner record gains
+the node's name and id once its identity is read. `compact` claims the directories that exist;
+`cameodb unlock` is in. The OS lock is `File::try_lock`; a filesystem that refuses locks (some NFS)
+is warned about and claimed by the owner record alone. The record is created with `create_new`, so
+of two processes on either side of a boundary only one writes it. Verified with OrbStack on macOS
+against an image built from the change: a native node on a container's bind-mounted directory is
+refused naming the container (the OS lock did not cross; the record did), a container on a native
+node's directory is refused, a clean `docker stop` removes the record, and a container killed and
+restarted under the same host name takes it over. Tests: `data_lock.rs` unit tests,
+`tests/data_dir_lock.rs`. **Left:** the Windows checks below — two native processes, and a Docker
+Desktop container against a native node.
+
 
 *What happened.* A node ran in a container with its data directory bind-mounted from the host. During
 the day, the data was damaged: at the container's start its `metadata.redb` read cleanly, and the

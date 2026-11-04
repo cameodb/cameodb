@@ -464,6 +464,21 @@ shard_affine_dispatch = false
 worker_core_affinity = false
 ```
 
+#### `data_paths` — one process per directory
+
+A node claims every directory in `data_paths` before it reads anything in it, and holds the
+claim until it exits: `cameodb.lock`, held with an OS lock, and `cameodb.owner`, which names the
+holder — host, process, start time, version and node. A second process on a claimed directory is
+refused with that name, whether it is another node or `cameodb compact`. List each directory once,
+and give each node directories of its own.
+
+The OS lock does not cross a container's bind mount (Docker Desktop, OrbStack, WSL2 on `/mnt/c`,
+some NFS mounts), so the owner record is what a process on the other side sees: a record naming
+another host — and a container is a host of its own — refuses the start. A process on this host
+that ended without a clean exit is taken over by the next start; one on another host is not, and
+`cameodb unlock <data path>` removes its record once that process is known not to be running.
+See DEPLOYMENT.md, "One process per data directory".
+
 #### CPU affinity
 
 Three flags, and only the first is on. All three place threads by a shard's **placement

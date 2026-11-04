@@ -3741,9 +3741,10 @@ debug build earlier in redb's own allocator assertion while the file opened, and
   damage. An I/O error, a file held by another process or one needing a format upgrade stop the
   node with that error and leave the file alone. The panic is caught with its report silenced on
   the opening thread only — the hook is wrapped, not replaced, so a panic on any other thread is
-  reported as before — and its message goes into the warning instead of reading as a crash.
-- **Single node:** renamed `metadata.redb.damaged-<UTC timestamp>`, a warning naming both files,
-  and a new file, rebuilt from the shards at that start. **Cluster member:** refuses, naming the
+  reported as before — and its message goes into the log line instead of reading as a crash.
+- **Single node:** renamed `metadata.redb.damaged-<UTC timestamp>`, an error naming both files —
+  error, not warning, because a node logs errors only by default, the Docker image included — and
+  a new file, rebuilt from the shards at that start. **Cluster member:** refuses, naming the
   file, what it holds and the remedy, and leaves it in place. The message says to restore the file
   or rebuild the node, not to move it aside and let the node relearn its ring from its peers:
   whether a member rebuilds correctly that way has not been verified.

@@ -165,6 +165,38 @@ docker-compose -f docker/docker-compose-cluster.yml up -d
 - **Swarm Configuration**: `CAMEODB_CLUSTER_NAME`, `CAMEODB_CLUSTER_PORT`, `CAMEODB_SEED_NODES`, and `CAMEODB_CLUSTER_ENABLED` environment variables drive the Kademlia swarm. Update them per deployment needs.
 - **A node's data directory is its identity.** `node_identity.json` lives in it, beside the shards. A node restarted with its directory rejoins as itself; one started with an empty directory is a new node, and its old identity stays on every node's ring. Until there is an operation to remove it, the old identity's key ranges cannot be written — single writes to them answer `503` naming it — and the new node cannot learn an existing index's schema, because the lookup waits for every node the cluster has seen, the old identity included. Data on a lost node is not on any other: there is no replication yet. Keep each node's data directory, and restore it whole rather than starting a node empty.
 
+### One process per data directory
+
+A data directory serves one process at a time. Two processes writing the same redb files damage
+them — this is how a `metadata.redb` was found damaged on 2026-11-03 — so a node claims every
+directory in `storage.data_paths` before it reads anything there, and `cameodb compact` does the
+same:
+
+- `cameodb.lock` is held with an exclusive OS lock for the life of the process, and released by
+  the OS however the process ends.
+- `cameodb.owner` names the holder — host, process id, start time, version, node — and is removed
+  on a clean exit.
+
+A second process is refused with the holder's name. **Containers and bind mounts:** a container
+on macOS or Windows (Docker Desktop, OrbStack), WSL2 on `/mnt/c`, and some NFS mounts reach the
+directory through a layer that does not carry the OS lock, so a node in a container and a node on
+its host could otherwise both open the same files. The owner record crosses that layer: a record
+naming another host refuses the start, and a container's host name is its own.
+
+After an unclean exit — a crash, `kill -9`, a power loss — the record stays behind:
+
+- a start on **the same host** (a restarted container keeps its host name) takes it over and logs
+  the stale record;
+- a start on **another host** (a container *re-created* after a crash has a new host name) is
+  refused until the record is removed. Once the process it names is known not to be running:
+
+```bash
+cameodb unlock /data/cameodb      # shows the record, then removes it
+```
+
+`unlock` refuses while a process on this machine holds the directory. Neither file is part of a
+backup: restore without them, or remove a restored `cameodb.owner` with `unlock`.
+
 ### Custom Data Directory Setup
 
 For production deployments, you may want to store CameoDB data on a separate disk or partition. Create a custom data directory with proper permissions:
@@ -531,7 +563,8 @@ systemctl start cameodb
 ```
 
 Run it as the user that owns the data directory (`sudo -u cameodb …`). It refuses to start
-while the node holds the files, rewrites each file in place so it needs no free disk of its
+while a node holds its data directories — a node in a container included, see "One process per
+data directory" — rewrites each file in place so it needs no free disk of its
 own, and took about 1.5 s per GB in testing (1,028 MB → 310 MB per shard after deleting 75%).
 It works on every file at once, with a 256 MB cache for each: four 1.4 GB shards took 18 s
 and peaked at 1.5 GB of memory, against 29 s one at a time. The work is bound by the disk, not
@@ -602,17 +635,16 @@ It holds no documents — each shard's are in its own `store.redb`. The node che
 integrity check every time it starts, before reading it.
 
 - **Single node** (`[network.cluster] enabled = false`): a damaged file is renamed
-  `metadata.redb.damaged-<UTC timestamp>`, a warning names both files, and the node rebuilds the
-  file from its shards and starts. Every document is served as before. The `.damaged-*` file is
+  `metadata.redb.damaged-<UTC timestamp>`, an error — shown at the default log level — names both
+  files, and the node rebuilds the file from its shards and starts. Every document is served as before. The `.damaged-*` file is
   kept only for whoever wants to look at it; remove it once the node is serving.
 - **Cluster member**: the node refuses to start, names the file and leaves it in place. Its
   assignments and ring are what its peers agree on, so it does not rebuild them alone. Restore
   the file from a backup taken while the node was stopped, or rebuild the node: move its data
   directory aside and start it empty.
 
-Two processes writing one data directory damage it this way: keep to one process per data
-directory, and see that a container's bind mount and a node on its host are not both pointed at
-it.
+Two processes writing one data directory damage it this way; the node now refuses a second
+process on its directories — see "One process per data directory".
 
 ## 🪟 Windows: the MSI installer
 
