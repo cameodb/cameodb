@@ -54,6 +54,7 @@ mod tests {
         assert!(
             test_dir
                 .to_string_lossy()
+                .replace('\\', "/")
                 .contains("cameodb_tests/cluster/test_utils_test")
         );
 
@@ -70,6 +71,7 @@ mod tests {
         assert!(
             identity_path
                 .to_string_lossy()
+                .replace('\\', "/")
                 .contains("cameodb_tests/cluster/identity_test")
         );
         assert!(

@@ -82,7 +82,7 @@ fn build_fault_binary() -> PathBuf {
 
     let binary = target
         .join(if release { "release" } else { "debug" })
-        .join("cameodb");
+        .join(format!("cameodb{}", std::env::consts::EXE_SUFFIX));
     assert!(
         binary.exists(),
         "built binary not found at {}",

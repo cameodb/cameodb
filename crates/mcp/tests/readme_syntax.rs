@@ -24,11 +24,12 @@ fn the_readme_syntax_table_matches_the_table() {
     assert!(begin < end, "README syntax markers are out of order");
 
     let block_start = begin + README_BEGIN.len();
-    let current = &readme[block_start..end];
+    // A Windows checkout may convert README.md to CRLF; the generated table is LF.
+    let current = &readme[block_start..end].replace("\r\n", "\n");
     let expected = format!("\n\n{}\n", markdown_reference());
 
     if std::env::var_os("UPDATE_DOCS").is_some() {
-        if current != expected {
+        if *current != expected {
             let updated = format!("{}{}{}", &readme[..block_start], expected, &readme[end..]);
             std::fs::write(&path, updated).expect("write README.md");
         }
@@ -36,7 +37,7 @@ fn the_readme_syntax_table_matches_the_table() {
     }
 
     assert_eq!(
-        current, expected,
+        *current, expected,
         "the README syntax table has drifted from `syntax`; regenerate with \
          UPDATE_DOCS=1 cargo test -p cameodb_mcp readme"
     );

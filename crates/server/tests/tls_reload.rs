@@ -5,6 +5,9 @@
 //! things a unit test cannot see together: the signal reaches the handler, the handler reaches
 //! the same `RustlsConfig` the listener was bound with, and the next handshake presents what
 //! was read. So this asks the listener what it presents, before and after.
+//!
+//! Unix only: the reload is SIGHUP, which Windows does not have.
+#![cfg(unix)]
 
 use std::io::Write as _;
 use std::net::TcpStream;

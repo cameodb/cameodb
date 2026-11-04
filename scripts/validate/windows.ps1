@@ -255,6 +255,36 @@ function Test-NoPanic([string]$Log) {
 
 # ---------------------------------------------------------------- smoke
 
+# A document written to a new index has to become searchable: the first write mints the index
+# and types its fields, then a scheduled commit makes it visible. On 2026-11-05 the server's
+# integration tests on Windows found seeded documents never searchable; this is the same path
+# against the release binary, with the node's log kept.
+function Invoke-WriteAndSearch([int]$Port) {
+    $base = "http://127.0.0.1:$Port"
+    $doc = @{ id = "d1"; doc = @{ id = "d1"; title = "rust programming"; tag = "active"; risk = @(5, 15) } } | ConvertTo-Json -Depth 5
+    try {
+        $null = Invoke-RestMethod -Method Put -Uri "$base/api/smoke/document" -Body $doc -ContentType "application/json" -TimeoutSec 10 -UseBasicParsing
+        Pass "a document is written to a new index"
+    } catch {
+        Fail "a document is written to a new index" $_.Exception.Message
+        return
+    }
+    foreach ($q in @("tag:active", "title:rust", "risk:[10 TO 20]")) {
+        $found = $null
+        $deadline = (Get-Date).AddSeconds(20)
+        while ((Get-Date) -lt $deadline) {
+            try {
+                $body = @{ query = $q; limit = 10 } | ConvertTo-Json
+                $found = Invoke-RestMethod -Method Post -Uri "$base/api/smoke/search" -Body $body -ContentType "application/json" -TimeoutSec 10 -UseBasicParsing
+                if ($found.total_hits -eq 1) { break }
+            } catch { $found = $_.Exception.Message }
+            Start-Sleep -Milliseconds 250
+        }
+        $ok = ($found -isnot [string]) -and ($null -ne $found) -and ($found.total_hits -eq 1)
+        Check $ok "the document is found by $q within 20 s" ($(if ($found -is [string]) { $found } else { $found | ConvertTo-Json -Depth 4 -Compress }))
+    }
+}
+
 function Invoke-Smoke {
     Section "smoke"
     $version = (Invoke-Native $Bin @("--version") 20).Text.Trim()
@@ -269,8 +299,10 @@ function Invoke-Smoke {
     $cfg = New-NodeConfig "smoke" @($data)
     $log = Join-Path $Work "smoke.log"
     $launcher = Start-Node $cfg $log
+    $failedBefore = $script:Failed
     if (Wait-Healthy $cfg.Port) {
         Pass "a node starts and answers /_cluster/health"
+        Invoke-WriteAndSearch $cfg.Port
         $owner = Get-Owner $data
         if ($owner) { [void](Stop-NodeClean ([int]$owner.pid)) } else { Stop-Process -Id $launcher.Id -Force -ErrorAction SilentlyContinue }
     } else {
@@ -279,6 +311,10 @@ function Invoke-Smoke {
         Get-Process cameodb -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $Bin } | Stop-Process -Force
     }
     Check (Test-NoPanic $log) "no panic in the node's log" (Get-Content $log -Raw -ErrorAction SilentlyContinue)
+    if ($script:Failed -gt $failedBefore -and (Test-Path $log)) {
+        Write-Host "  the node's log (warnings and errors), last 60 lines:"
+        Get-Content $log -Tail 60 | ForEach-Object { Write-Host "       $_" }
+    }
 }
 
 # ---------------------------------------------------------------- data-dir
@@ -364,7 +400,7 @@ function Invoke-DataDir {
     $foreignText = $foreign | ConvertTo-Json
     Set-Content -Path (Join-Path $data "cameodb.owner") -Value $foreignText -Encoding ascii
     $r = Invoke-Native $Bin @("-c", $cfg.Path) 60
-    Check (($r.Code -ne 0) -and ($r.Text -like "*host 3f9c0a7e21b4*") -and ($r.Text -like "*cameodb unlock*")) "a record from another host refuses the start and names `unlock`" $r.Text
+    Check (($r.Code -ne 0) -and ($r.Text -like "*host 3f9c0a7e21b4*") -and ($r.Text -like "*cameodb unlock*")) "a record from another host refuses the start and names unlock" $r.Text
     Check ((Test-Path (Join-Path $data "cameodb.owner"))) "and the record is left alone" "the record is gone"
     $r = Invoke-Native $Bin @("unlock", $data) 30
     Check (($r.Code -eq 0) -and ($r.Text -like "*3f9c0a7e21b4*")) "unlock shows the record and removes it" $r.Text

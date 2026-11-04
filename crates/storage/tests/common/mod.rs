@@ -49,6 +49,7 @@ mod tests {
         assert!(
             test_dir
                 .to_string_lossy()
+                .replace('\\', "/")
                 .contains("cameodb_tests/storage/test_utils_test")
         );
 

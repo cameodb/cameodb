@@ -3283,6 +3283,8 @@ mod learned_field_tests {
 /// non-durable commit's pages but publishes it on disk only with the next durable commit, so the
 /// copy holds exactly what a killed process would have left.
 #[cfg(test)]
+// Unix only: the crash is a copy of the open store, which Windows locks against reading.
+#[cfg(unix)]
 mod durability_barrier {
     use super::*;
     use redb::{ReadableDatabase, ReadableTableMetadata, TableDefinition};

@@ -9,6 +9,9 @@
 //! The crash is a copy of the file taken while the store still has it open: the state a
 //! killed process leaves on disk. Dropping the store instead would close redb cleanly, and no
 //! setting would ever be exercised.
+//!
+//! Unix only: Windows locks an open redb file against reading, so the copy cannot be taken.
+#![cfg(unix)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -450,7 +450,7 @@ mod tests {
             "include = [\"keys.d/*.toml\"]\n[security.tenants.acme]\nmax_indexes = 1\n",
             &[("keys.d/acme.toml", "[security.tenants.acme]\n".to_string())],
         );
-        let err = format!("{:#}", load(&main_path).unwrap_err());
+        let err = format!("{:#}", load(&main_path).unwrap_err()).replace('\\', "/");
         assert!(err.contains("keys.d/acme.toml"), "{err}");
         assert!(err.contains("cameodb.toml"), "{err}");
         assert!(err.contains("'acme'"), "{err}");
@@ -472,7 +472,7 @@ mod tests {
             ],
         );
         let config = load(&main_path).unwrap();
-        let err = format!("{:#}", config.security.load_keyring().unwrap_err());
+        let err = format!("{:#}", config.security.load_keyring().unwrap_err()).replace('\\', "/");
         assert!(err.contains("keys.d/a.toml"), "{err}");
         assert!(err.contains("keys.d/b.toml"), "{err}");
     }
@@ -488,7 +488,7 @@ mod tests {
                 "include = [\"keys.d/*.toml\"]\n",
                 &[("keys.d/x.toml", stray.to_string())],
             );
-            let err = format!("{:#}", load(&main_path).unwrap_err());
+            let err = format!("{:#}", load(&main_path).unwrap_err()).replace('\\', "/");
             assert!(err.contains("keys.d/x.toml"), "{stray}: {err}");
         }
     }
@@ -503,7 +503,7 @@ mod tests {
             "include = [\"keys.d/*.toml\"]\n",
             &[("keys.d/x.toml", file)],
         );
-        let err = format!("{:#}", load(&main_path).unwrap_err());
+        let err = format!("{:#}", load(&main_path).unwrap_err()).replace('\\', "/");
         assert!(err.contains("allowed_index"), "{err}");
         assert!(err.contains("entry 1"), "{err}");
     }
@@ -517,7 +517,7 @@ mod tests {
             "keys.d/acme?.toml",
         ] {
             let (_dir, main_path) = folder(&format!("include = [\"{pattern}\"]\n"), &[]);
-            let err = format!("{:#}", load(&main_path).unwrap_err());
+            let err = format!("{:#}", load(&main_path).unwrap_err()).replace('\\', "/");
             assert!(err.contains(pattern), "{pattern}: {err}");
         }
     }
@@ -547,7 +547,7 @@ mod tests {
                 "include = [\"keys.d/*.toml\"]\n",
                 &[("keys.d/acme.toml", bad)],
             );
-            let err = format!("{:#}", load(&main_path).unwrap_err());
+            let err = format!("{:#}", load(&main_path).unwrap_err()).replace('\\', "/");
             assert!(err.contains("[provisioning]"), "{err}");
         }
     }
@@ -657,7 +657,7 @@ mod tests {
                     ("other.d/.keep", String::new()),
                 ],
             );
-            let err = format!("{:#}", load(&main_path).unwrap_err());
+            let err = format!("{:#}", load(&main_path).unwrap_err()).replace('\\', "/");
             assert!(err.contains("[security.managed_files]"), "{names}: {err}");
             assert!(err.contains(says), "{include} {dir} {names}: {err}");
         }

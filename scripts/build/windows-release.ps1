@@ -21,7 +21,8 @@
   Everything printed is also written to dist\<version>\windows-verify\verify-<commit>.log, which is
   the evidence to attach to the release record. It is kept out of windows\ because publish.sh
   copies everything in that folder to the download site. A stage that fails stops the run, except test and
-  validate, which both run so one report carries every failure.
+  validate. A failed test stage does not stop validate or msi either: build.sh treats it as a
+  warning, so the record carries it to the release machine instead.
 
   Afterwards, copy dist\<version>\windows\ to dist\<version>\windows\ on the release machine and
   run scripts/release/release.sh --stage build there, as the release README describes.
@@ -122,6 +123,9 @@ Start-Transcript -Path $LogFile -Force | Out-Null
 
 $Results = [ordered]@{}
 $Failed = $false
+# A failed test stage is reported and fails the run's exit code, but does not stop validate or
+# msi: build.sh on the release machine treats it as a warning, not a refusal.
+$TestsFailed = $false
 
 try {
     Write-Host "CameoDB $Version  commit $Commit$(if ($Dirty) { ' (uncommitted changes)' })  on $env:COMPUTERNAME"
@@ -192,7 +196,7 @@ try {
     if (& $Run "test") {
         Step "cargo test --workspace"
         if ((Invoke-Tool cargo @("test", "--workspace", "--no-fail-fast")) -eq 0) { $Results["test"] = "PASS" }
-        else { $Results["test"] = "FAIL"; $Failed = $true; Bad "cargo test --workspace failed; the validate stage still runs" }
+        else { $Results["test"] = "FAIL"; $TestsFailed = $true; Bad "cargo test --workspace failed; validate and msi still run" }
     }
 
     # ------------------------------------------------------------ validate
@@ -274,4 +278,4 @@ finally {
     }
     $record | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $LogDir "verify.json") -Encoding ascii
 }
-exit $(if ($Failed) { 1 } else { 0 })
+exit $(if ($Failed -or $TestsFailed) { 1 } else { 0 })
