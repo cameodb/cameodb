@@ -407,20 +407,35 @@ fn loopback_parts(uri: &str) -> Option<(&str, &str)> {
     Some((host, path))
 }
 
+/// Characters that change how a name reads without showing: bidi controls, which can make
+/// "Claude" out of "edualC" (U+202E), zero-width characters, the soft hyphen and tag characters.
+/// Kept out of the client names the approval page shows.
+fn is_invisible(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{061C}' | '\u{180E}'
+        | '\u{200B}'..='\u{200F}'
+        | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{206F}'
+        | '\u{FEFF}'
+        | '\u{FFF9}'..='\u{FFFB}'
+        | '\u{E0000}'..='\u{E007F}')
+}
+
 /// Why a redirect URI cannot be registered, if it cannot.
 ///
 /// `https`; `http` to loopback; or a private-use scheme, which RFC 8252 §7.1 asks to be a
 /// reversed domain name — the dot is what keeps out `javascript:` and `data:`. No fragment, as
-/// RFC 6749 §3.1.2 requires.
+/// RFC 6749 §3.1.2 requires. ASCII only, as RFC 3986 has it (an international host is written
+/// in punycode), so the host the approval page shows cannot hide bidi controls or look-alikes.
 fn check_redirect_uri(uri: &str) -> Result<(), String> {
     if uri.len() > MAX_REDIRECT_URI_LEN {
         return Err(format!(
             "a redirect URI is longer than {MAX_REDIRECT_URI_LEN} characters"
         ));
     }
-    if uri.contains('#') || uri.chars().any(|c| c.is_whitespace() || c.is_control()) {
+    if uri.contains('#') || uri.bytes().any(|b| !b.is_ascii_graphic()) {
         return Err(format!(
-            "{uri:?} is not a redirect URI: no fragment and no whitespace"
+            "{uri:?} is not a redirect URI: printable ASCII only, no fragment and no whitespace"
         ));
     }
     let Some((scheme, rest)) = uri.split_once(':') else {
@@ -668,7 +683,11 @@ impl OAuth {
             check_redirect_uri(uri).map_err(|e| OAuthError::new("invalid_redirect_uri", e))?;
         }
         let name = name
-            .map(|n| n.chars().filter(|c| !c.is_control()).collect::<String>())
+            .map(|n| {
+                n.chars()
+                    .filter(|&c| !c.is_control() && !is_invisible(c))
+                    .collect::<String>()
+            })
             .map(|n| {
                 n.trim()
                     .chars()
@@ -1356,9 +1375,13 @@ mod tests {
             "http://localhost.evil.example/cb",
             "https:///cb",
             "not a uri",
+            "https://claude.ai\u{202E}evil.example/cb",
+            "https://xn--80ak6aa92e.com/cb\u{200B}",
+            "https://аpple.com/cb",
         ] {
             assert!(check_redirect_uri(bad).is_err(), "{bad}");
         }
+        assert!(check_redirect_uri("https://xn--80ak6aa92e.com/cb").is_ok());
 
         let o = oauth();
         let (id, _, _) = o
@@ -1386,6 +1409,31 @@ mod tests {
                 .is_none()
         );
         assert_eq!(client.redirect_uri(None), Some("http://127.0.0.1/callback"));
+    }
+
+    #[test]
+    fn client_names_lose_invisible_and_bidi_characters() {
+        let o = oauth();
+        for (given, shown) in [
+            ("\u{202E}edualC", Some("edualC")),
+            ("Cl\u{200B}aude\u{FEFF}", Some("Claude")),
+            ("\u{2066}My app\u{2069}\u{E0041}", Some("My app")),
+            ("Čitač · Reader", Some("Čitač · Reader")),
+            ("\u{200B}\u{202E}", None),
+        ] {
+            let (id, _, _) = o
+                .register(
+                    vec!["https://client.example/callback".to_string()],
+                    Some(given.to_string()),
+                    ClientAuth::None,
+                )
+                .unwrap();
+            assert_eq!(
+                o.client(&id).unwrap().client.name.as_deref(),
+                shown,
+                "{given:?}"
+            );
+        }
     }
 
     #[test]
