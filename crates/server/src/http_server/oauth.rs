@@ -521,12 +521,16 @@ fn approval_page(
     let problem = problem
         .map(|p| format!(r#"<p class="problem" role="alert">{}</p>"#, escape(p)))
         .unwrap_or_default();
+    // The three facts to check, each on its own line. The heading stays generic: any client can
+    // call itself anything, so its name is shown as a claim, and the return address, which it
+    // cannot fake, is what the closing line asks the person to check.
     let body = format!(
         r#"<h1>Connect to CameoDB</h1>
-<p><strong>{name}</strong> <span class="muted">(name not verified)</span> asks to read the
-CameoDB indexes your key can read, through MCP.</p>
-<p>After you approve, your browser returns to <strong>{host}</strong>. If you did not start this
-from that application, deny.</p>
+<dl class="facts">
+<dt>Application</dt><dd><strong>{name}</strong> <span class="muted">(name not verified)</span></dd>
+<dt>Returns to</dt><dd><strong>{host}</strong></dd>
+<dt>Access</dt><dd>Read only, the indexes your key can read</dd>
+</dl>
 {problem}
 <form method="post" action="/oauth/authorize" autocomplete="off">
 <input type="hidden" name="request" value="{sealed}">
@@ -537,8 +541,8 @@ from that application, deny.</p>
 <button type="submit" name="decision" value="deny" class="secondary" formnovalidate>Deny</button>
 </div>
 </form>
-<p class="muted">The application never sees your key. It receives a token that reads what your
-key reads, and stops working when the key is revoked.</p>"#,
+<p class="muted">Didn't start this yourself, from {host}? Deny.<br>
+The application never sees your key; revoking the key ends its access.</p>"#,
         name = escape(&client_label(client)),
         host = escape(&redirect_host(redirect_uri)),
         sealed = escape(sealed),
@@ -563,15 +567,20 @@ fn page(status: StatusCode, body: &str) -> Response {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CameoDB authorization</title>
 <style>
-:root {{ color-scheme: light dark; --fg:#1b1b1f; --bg:#f6f6f8; --card:#fff; --muted:#666; --accent:#3b5bdb; --err:#c92a2a; }}
-@media (prefers-color-scheme: dark) {{ :root {{ --fg:#e8e8ec; --bg:#141417; --card:#1e1e23; --muted:#9a9aa3; --accent:#7c94f2; --err:#ff8787; }} }}
+:root {{ color-scheme: light dark; --fg:#1b1b1f; --bg:#f6f6f8; --card:#fff; --muted:#666; --line:#e3e3e8; --accent:#3b5bdb; --on-accent:#fff; --err:#c92a2a; }}
+@media (prefers-color-scheme: dark) {{ :root {{ --fg:#e8e8ec; --bg:#141417; --card:#1e1e23; --muted:#9a9aa3; --line:#2e2e35; --accent:#7c94f2; --on-accent:#10121a; --err:#ff8787; }} }}
 body {{ margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 system-ui, sans-serif; }}
 main {{ max-width:440px; margin:48px auto; padding:24px; background:var(--card); border-radius:12px; }}
 h1 {{ font-size:1.3rem; margin-top:0; }}
 label {{ display:block; font-weight:600; margin:16px 0 6px; }}
 input[type=password] {{ width:100%; box-sizing:border-box; padding:10px; font:inherit; border:1px solid var(--muted); border-radius:8px; background:transparent; color:inherit; }}
 .buttons {{ display:flex; gap:12px; margin-top:16px; }}
-button {{ flex:1; padding:10px; font:inherit; border-radius:8px; border:1px solid var(--accent); background:var(--accent); color:#fff; cursor:pointer; }}
+button {{ flex:1; padding:10px; font:inherit; font-weight:600; border-radius:8px; border:1px solid var(--accent); background:var(--accent); color:var(--on-accent); cursor:pointer; }}
+.facts {{ display:grid; grid-template-columns:max-content 1fr; gap:10px 16px; margin:20px 0; padding:14px 0; border-block:1px solid var(--line); }}
+.facts dt {{ color:var(--muted); font-size:.9rem; padding-top:.1rem; }}
+.facts dd {{ margin:0; overflow-wrap:anywhere; }}
+strong {{ font-weight:650; }}
+@media (max-width:360px) {{ .facts {{ grid-template-columns:1fr; gap:2px; }} .facts dd {{ margin-bottom:8px; }} }}
 button.secondary {{ background:transparent; color:var(--fg); border-color:var(--muted); }}
 .muted {{ color:var(--muted); font-size:.9rem; }}
 .problem {{ color:var(--err); font-weight:600; }}
