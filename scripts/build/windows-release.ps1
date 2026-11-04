@@ -10,7 +10,7 @@
                 .NET, WiX and its Util extension; the six crates agree on the version
     build       cargo build --release -p server, then --version must read this release and not
                 carry +fault-injection
-    test        cargo test --workspace (debug profile, so target\release\cameodb.exe is not
+    test        cargo test --workspace --no-fail-fast (debug profile, so target\release\cameodb.exe is not
                 replaced by a test build)
     validate    scripts\validate\windows.ps1: smoke, data-dir (OB30), remote-sources, and
                 the optional docker checks when -DockerImage is given
@@ -185,13 +185,13 @@ try {
         if ($reported -like "*+fault-injection*") { $Results["build"] = "FAIL"; $Failed = $true; throw "$Exe reports '$reported': a fault-injection build must not be released" }
         if ($reported -ne "cameodb $Version") { $Results["build"] = "FAIL"; $Failed = $true; throw "$Exe reports '$reported', not 'cameodb $Version'; rebuild" }
         $BuiltHash = (Get-FileHash $Exe -Algorithm SHA256).Hash.ToLowerInvariant()
-        if (& $Run "build") { Ok "$reported, sha256 $($BuiltHash.Substring(0, 16))…"; $Results["build"] = "PASS" }
+        if (& $Run "build") { Ok "$reported, sha256 $($BuiltHash.Substring(0, 16))..."; $Results["build"] = "PASS" }
     }
 
     # ------------------------------------------------------------ test
     if (& $Run "test") {
         Step "cargo test --workspace"
-        if ((Invoke-Tool cargo @("test", "--workspace")) -eq 0) { $Results["test"] = "PASS" }
+        if ((Invoke-Tool cargo @("test", "--workspace", "--no-fail-fast")) -eq 0) { $Results["test"] = "PASS" }
         else { $Results["test"] = "FAIL"; $Failed = $true; Bad "cargo test --workspace failed; the validate stage still runs" }
     }
 

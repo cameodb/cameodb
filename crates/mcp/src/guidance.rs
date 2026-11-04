@@ -123,7 +123,10 @@ mod tests {
     fn the_repository_skill_matches_the_orchestrator_prompt() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../.devin/skills/cameodb-agent.md");
-        let on_disk = std::fs::read_to_string(&path).expect("read cameodb-agent.md");
+        // A Windows checkout may convert the file to CRLF (git's autocrlf); the prompt is LF.
+        let on_disk = std::fs::read_to_string(&path)
+            .expect("read cameodb-agent.md")
+            .replace("\r\n", "\n");
 
         if std::env::var_os("UPDATE_DOCS").is_some() {
             if on_disk != ORCHESTRATOR_SKILL {

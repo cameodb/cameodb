@@ -326,7 +326,7 @@ function Invoke-DataDir {
         Check (-not (Test-Path (Join-Path $data2 "cameodb.owner"))) "from every data path" "$data2\cameodb.owner is still there"
         Check (Test-NoPanic $log) "and the log has no panic" (Get-Content $log -Raw)
     } else {
-        Skip "a Ctrl+C stop removes the owner record — the signal did not stop the node from here; stop the MSI service instead (Stop-Service CameoDB) and check C:\ProgramData\CameoDB\data for cameodb.owner"
+        Skip "a Ctrl+C stop removes the owner record - the signal did not stop the node from here; stop the MSI service instead (Stop-Service CameoDB) and check C:\ProgramData\CameoDB\data for cameodb.owner"
     }
 
     $r = Invoke-Native $Bin @("compact", "-c", $cfg.Path) 120
@@ -358,7 +358,7 @@ function Invoke-DataDir {
     Check ((Get-Content $log2 -Raw -ErrorAction SilentlyContinue) -like "*taking over a data directory*") "and the log says it took over" (Get-Content $log2 -Raw -ErrorAction SilentlyContinue)
     if ($taken) { [void](Stop-NodeClean ([int]$taken.pid)) } else { Stop-Process -Id $launcher.Id -Force -ErrorAction SilentlyContinue }
 
-    # A record naming another host — what a container leaves — stops the node until `unlock`.
+    # A record naming another host - what a container leaves - stops the node until `unlock`.
     $foreign = $left | ConvertTo-Json | ConvertFrom-Json
     $foreign.host = "3f9c0a7e21b4"
     $foreignText = $foreign | ConvertTo-Json
