@@ -767,12 +767,20 @@ fn remove_if_present(path: &Path) -> Result<()> {
     }
 }
 
-/// Make a rename in the directory holding `path` durable.
+/// Make a rename in the directory holding `path` durable. On Unix that is an fsync of the
+/// directory. Windows cannot open a directory as a file (`Access is denied`), and NTFS journals
+/// the rename itself, so there is nothing to do there.
+#[cfg(unix)]
 fn sync_dir(path: &Path) -> Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::File::open(dir)
         .and_then(|d| d.sync_all())
         .with_context(|| format!("syncing {}", dir.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 /// The free disk each rewrite in progress has claimed for its copy, so that two at once do not
