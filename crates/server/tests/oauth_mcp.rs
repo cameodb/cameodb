@@ -453,6 +453,42 @@ async fn a_wrong_verifier_and_a_denial_get_no_token() {
     assert_eq!(page.status(), 400);
     assert!(page.headers().get("location").is_none());
 
+    // Other bad requests are shown too, even to a registered redirect: anyone can register one,
+    // so redirecting before the user acts would make the node an open redirector.
+    let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+    for bad in [
+        vec![
+            ("response_type", "token"),
+            ("code_challenge", challenge),
+            ("code_challenge_method", "S256"),
+        ],
+        vec![("response_type", "code")],
+        vec![
+            ("response_type", "code"),
+            ("code_challenge", challenge),
+            ("code_challenge_method", "plain"),
+        ],
+        vec![
+            ("response_type", "code"),
+            ("code_challenge", challenge),
+            ("code_challenge_method", "S256"),
+            ("resource", "https://elsewhere.example/mcp"),
+        ],
+    ] {
+        let mut pairs = vec![
+            ("client_id", client_id.as_str()),
+            ("redirect_uri", REDIRECT),
+        ];
+        pairs.extend(bad);
+        let page = http()
+            .get(format!("{}/oauth/authorize?{}", node.url, form(&pairs)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(page.status(), 400, "{pairs:?}");
+        assert!(page.headers().get("location").is_none(), "{pairs:?}");
+    }
+
     // A registration naming a redirect the node will not send a browser to is refused.
     let resp = http()
         .post(format!("{}/oauth/register", node.url))

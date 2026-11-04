@@ -180,13 +180,26 @@ fn normalize_issuer(issuer: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-/// Whether `authority` (`host[:port]`) names this machine.
+/// Whether `authority` is exactly `host[:port]` with a loopback host and a numeric port.
+///
+/// Nothing else is allowed in it: `localhost:1@evil.example` reads as loopback up to the first
+/// `:`, but a browser sends it to `evil.example` with `localhost:1` as userinfo.
 fn is_loopback_host(authority: &str) -> bool {
-    let host = match authority.strip_prefix('[') {
-        Some(v6) => v6.split(']').next().unwrap_or_default(),
-        None => authority.split(':').next().unwrap_or_default(),
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(v6) => match v6.split_once(']') {
+            Some(parts) => parts,
+            None => return false,
+        },
+        None => match authority.find(':') {
+            Some(i) => authority.split_at(i),
+            None => (authority, ""),
+        },
     };
-    matches!(host, "localhost" | "127.0.0.1" | "::1")
+    let port_ok = port.is_empty()
+        || port.strip_prefix(':').is_some_and(|p| {
+            !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit())
+        });
+    port_ok && matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
 /// Seconds since the epoch. A clock before 1970 is a broken host, read as 0 so every
@@ -1333,6 +1346,14 @@ mod tests {
             "javascript:alert(1)",
             "data:text/html,x",
             "https://user@evil.example/cb",
+            "http://localhost:1@evil.example/cb",
+            "http://localhost@evil.example/cb",
+            "http://127.0.0.1:80@evil.example/cb",
+            "http://[::1]@evil.example/cb",
+            "http://localhost:1\\@evil.example/cb",
+            "http://localhost:/cb",
+            "http://localhost:80x/cb",
+            "http://localhost.evil.example/cb",
             "https:///cb",
             "not a uri",
         ] {
@@ -1356,6 +1377,12 @@ mod tests {
         assert!(
             client
                 .redirect_uri(Some("http://127.0.0.1:53124/other"))
+                .is_none()
+        );
+        // A registered loopback client cannot be pointed off the machine through userinfo.
+        assert!(
+            client
+                .redirect_uri(Some("http://127.0.0.1:1@evil.example/callback"))
                 .is_none()
         );
         assert_eq!(client.redirect_uri(None), Some("http://127.0.0.1/callback"));

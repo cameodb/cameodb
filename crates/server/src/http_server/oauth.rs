@@ -168,9 +168,11 @@ pub(super) struct AuthorizeParams {
 
 /// `GET /oauth/authorize` — the approval page.
 ///
-/// Errors follow RFC 6749 §4.1.2.1: a request whose client or redirect URI cannot be trusted is
-/// answered on this page and never redirected, since redirecting would send the browser wherever
-/// the request said; every other error goes back to the client.
+/// Every error is answered on this page and none is redirected. A request whose client or
+/// redirect URI cannot be trusted must not be (RFC 6749 §4.1.2.1). The others could go back to
+/// the client, but anyone can register a client, so an error redirect sent before the user acts
+/// would make this host a redirector to any address (RFC 9700 §4.11.2). The client hears back
+/// only after the user approves or denies.
 pub(super) async fn authorize_page_handler(
     State(state): State<AppState>,
     params: Result<Query<AuthorizeParams>, QueryRejection>,
@@ -195,32 +197,20 @@ pub(super) async fn authorize_page_handler(
         );
     };
     let redirect_uri = redirect_uri.to_string();
-    let back = |error: &'static str, description: &str| {
-        redirect_with(
-            &redirect_uri,
-            &[
-                ("error", error),
-                ("error_description", description),
-                ("iss", oauth.issuer()),
-            ],
-            params.state.as_deref(),
-        )
-    };
 
     if params.response_type.as_deref() != Some("code") {
-        return back("unsupported_response_type", "response_type must be code");
+        return error_page("The application sent a request this server does not support.");
     }
     let challenge = match params.code_challenge.as_deref() {
         Some(c) if is_s256_challenge(c) => c,
-        _ => return back("invalid_request", "a PKCE code_challenge is required"),
+        _ => return error_page("The application's request is missing its PKCE challenge."),
     };
     if params.code_challenge_method.as_deref() != Some("S256") {
-        return back("invalid_request", "code_challenge_method must be S256");
+        return error_page("The application's request must use PKCE with S256.");
     }
     if !oauth.accepts_resource(params.resource.as_deref()) {
-        return back(
-            "invalid_target",
-            "this server issues tokens for its /mcp only",
+        return error_page(
+            "The application asked for access to something other than this server's /mcp.",
         );
     }
 

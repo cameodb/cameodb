@@ -112,9 +112,11 @@ holding `read` alone: the key's `allowed_indexes`, rate limits, tenant budget an
 ownership apply, and a tool needing more is refused. Any other route answers it `401`. Revoking the
 key revokes its tokens at their next request.
 
-**Refusals.** A request whose `client_id` or `redirect_uri` cannot be trusted is answered on the
-page (`400`) and never redirected; other authorization errors go back to the client as
-`error=…`. A wrong key re-shows the page. The token endpoint answers `400` with `invalid_grant`
+**Refusals.** A malformed authorization request (an unknown `client_id` or `redirect_uri`, a
+`response_type` other than `code`, missing or non-`S256` PKCE, another `resource`) is answered
+on the page (`400`) and never redirected, since anyone can register a client and its address.
+The client hears back only after the user acts: `code`, or `error=access_denied`. A wrong key
+re-shows the page. The token endpoint answers `400` with `invalid_grant`
 (a used, expired or foreign code, a wrong verifier, a revoked key), `invalid_request`,
 `unsupported_grant_type` or `invalid_target`, and `401` with `invalid_client`. The discovery,
 registration and token endpoints answer cross-origin requests from any origin, without
