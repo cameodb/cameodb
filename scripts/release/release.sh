@@ -17,7 +17,8 @@
 # every release has a manual gap in the middle. Signing everything before that file arrives
 # would publish a release with Windows missing.
 #
-# Flags are passed through: --commit reaches publish, --allow-unhardened reaches build.
+# Flags are passed through: --commit reaches publish, --allow-unhardened and
+# --allow-unverified-windows reach build.
 
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -27,6 +28,7 @@ HERE="$(dirname "${BASH_SOURCE[0]}")"
 STAGES="build,sbom"
 COMMIT=""
 ALLOW_UNHARDENED=""
+ALLOW_UNVERIFIED_WINDOWS=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -34,6 +36,7 @@ while [ $# -gt 0 ]; do
         --stage=*) STAGES="${1#--stage=}"; shift ;;
         --commit)  COMMIT="--commit"; shift ;;
         --allow-unhardened) ALLOW_UNHARDENED="--allow-unhardened"; shift ;;
+        --allow-unverified-windows) ALLOW_UNVERIFIED_WINDOWS="--allow-unverified-windows"; shift ;;
         -h|--help) usage "${BASH_SOURCE[0]}" ;;
         *) die "unknown argument '$1' (see --help)" ;;
     esac
@@ -65,7 +68,7 @@ printf '%s%s CameoDB %s — stages: %s %s\n' "$_c_bold" '::' "$VERSION" "$STAGES
 
 for s in $(printf '%s' "$STAGES" | tr ',' ' '); do
     case "$s" in
-        build)   "$HERE/build.sh" ${ALLOW_UNHARDENED:+$ALLOW_UNHARDENED} ;;
+        build)   "$HERE/build.sh" ${ALLOW_UNHARDENED:+$ALLOW_UNHARDENED} ${ALLOW_UNVERIFIED_WINDOWS:+$ALLOW_UNVERIFIED_WINDOWS} ;;
         sbom)    "$HERE/sbom.sh" ;;
         sign)    "$HERE/sign.sh" ;;
         publish) "$HERE/publish.sh" ${COMMIT:+$COMMIT} ;;

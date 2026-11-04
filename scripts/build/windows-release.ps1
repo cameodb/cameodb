@@ -105,10 +105,11 @@ if ($versions.Count -ne 1) { Write-Host "error: the crates disagree on the versi
 $Version = $versions[0]
 
 $Commit = "unknown"
+$FullCommit = $null
 $Dirty = $false
 if (Get-Command git -ErrorAction SilentlyContinue) {
     $sha = Get-ToolOutput git @("rev-parse", "--short=12", "HEAD")
-    if ($sha -match '^[0-9a-f]{7,}$') { $Commit = $sha }
+    if ($sha -match '^[0-9a-f]{7,}$') { $Commit = $sha; $FullCommit = Get-ToolOutput git @("rev-parse", "HEAD") }
     $Dirty = [bool](Get-ToolOutput git @("status", "--porcelain"))
 }
 
@@ -242,9 +243,35 @@ finally {
             Write-Host ("    {0,-36} {1,12:N0} bytes" -f $_.Name, $_.Length)
         }
         Write-Host "Copy that folder to dist\$Version\windows\ on the release machine, then run"
-        Write-Host "scripts/release/release.sh --stage build there. Record the stage lines above and"
+        Write-Host "scripts/release/release.sh --stage build there, which checks verify.json against the"
+        Write-Host "files. Copy dist\$Version\windows-verify\ with it. Record the stage lines above and"
         Write-Host "the log ($LogFile) in RELEASE-CHECKLIST.md."
     }
     Stop-Transcript | Out-Null
+
+    # The record scripts/release/build.sh checks on the release machine: which commit, which
+    # files (by hash), which stages passed. Written for a failed run too, so a failure travels
+    # with the files and cannot be mistaken for a pass. ASCII, which every reader accepts.
+    function Get-Sha([string]$Path) {
+        if (Test-Path $Path) { (Get-FileHash $Path -Algorithm SHA256).Hash.ToLowerInvariant() } else { $null }
+    }
+    $stagedExe = Join-Path $Dist "cameodb.exe"
+    $stagedMsi = Join-Path $Dist "cameodb-$Version-x64.msi"
+    $stages = [ordered]@{}
+    foreach ($name in @("preflight", "build", "test", "validate", "msi")) {
+        $stages[$name] = if ($Results.Contains($name)) { $Results[$name] } else { "not run" }
+    }
+    $record = [ordered]@{
+        version      = $Version
+        commit       = $FullCommit
+        dirty        = $Dirty
+        host         = $env:COMPUTERNAME
+        finished_utc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        rustc        = (Get-ToolOutput rustc @("--version"))
+        exe_sha256   = $(if (Test-Path $stagedExe) { Get-Sha $stagedExe } else { Get-Sha $Exe })
+        msi_sha256   = (Get-Sha $stagedMsi)
+        stages       = $stages
+    }
+    $record | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $LogDir "verify.json") -Encoding ascii
 }
 exit $(if ($Failed) { 1 } else { 0 })

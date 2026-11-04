@@ -58,7 +58,8 @@ box is a question that has not been answered, not a formality.
    tree, which is where the sign stage will look for it. One command covers the Windows half of
    steps 3–5 and this one: preflight, build, `cargo test --workspace`, `scripts\validate\windows.ps1`
    (smoke, one process per data directory, `remote-sources`) and the MSI. Paste its stage summary
-   into the release record; the log is `dist\<version>\windows-verify\verify-<commit>.log`.
+   into the release record; the log is `dist\<version>\windows-verify\verify-<commit>.log`, beside
+   `verify.json`, which `release.sh --stage build` checks against the staged files.
    ```powershell
    .\scripts\build\windows-release.ps1
    ```

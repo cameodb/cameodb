@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Stage 1 — build every artifact this machine can build, and stage it under dist/<version>/.
 #
-#   scripts/release/build.sh [--allow-unhardened]
+#   scripts/release/build.sh [--allow-unhardened] [--allow-unverified-windows]
 #
 # What gets built here:
 #   mac/cameodb                     native host build (Apple Silicon)
@@ -10,7 +10,10 @@
 #   linux/cameodb-<v>-1.<arch>.rpm  packaged from the binary above — not rebuilt
 #
 # Windows is not built here. Build it on the Windows machine and drop the .exe into
-# dist/<version>/windows/ before running the sign stage; see scripts/release/README.md.
+# dist/<version>/windows/ before running the sign stage; see scripts/release/README.md. The
+# record that machine's scripts\build\windows-release.ps1 leaves in dist/<version>/windows-verify/
+# is checked against the staged files: every stage passed, on a clean tree, at a commit that is
+# this release's code, for the very cameodb.exe and .msi staged here.
 #
 # The DEB and RPM deliberately wrap the *same* binary that ships standalone, via
 # `--no-build`. build-packages.sh rebuilds in Docker, which is the same `release` profile and
@@ -22,9 +25,11 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 ALLOW_UNHARDENED=0
+ALLOW_UNVERIFIED_WINDOWS=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --allow-unhardened) ALLOW_UNHARDENED=1; shift ;;
+        --allow-unverified-windows) ALLOW_UNVERIFIED_WINDOWS=1; shift ;;
         -h|--help) usage "${BASH_SOURCE[0]}" ;;
         *) reject_unknown_arg "$1" ;;
     esac
@@ -231,6 +236,52 @@ if [ -f "$WIN_EXE" ]; then
     else
         warn "no windows/cameodb-$VERSION-x64.msi: Windows ships as the bare .exe only"
         info "build it on the Windows machine with scripts/build/build-msi.ps1"
+    fi
+    # What the Windows machine says it did, from scripts\build\windows-release.ps1. Everything
+    # below ties that record to the files staged here: the hashes say it is about these very
+    # artifacts, the commit says which code they were built from.
+    WIN_RECORD="$DIST/windows-verify/verify.json"
+    if [ -f "$WIN_RECORD" ]; then
+        rec() { jq -r "$1" < <(LC_ALL=C tr -d '\357\273\277' < "$WIN_RECORD"); }
+        [ "$(rec .version)" = "$VERSION" ] \
+            || die "windows-verify/verify.json is for '$(rec .version)', but this release is $VERSION"
+        [ "$(rec .dirty)" = "false" ] \
+            || die "windows-verify/verify.json says the Windows tree had uncommitted changes; build the release commit from a clean checkout and run windows-release.ps1 again"
+        for stage in preflight build validate msi; do
+            [ "$(rec ".stages.$stage")" = "PASS" ] \
+                || die "windows-verify/verify.json: stage '$stage' is '$(rec ".stages.$stage")', not PASS; fix it and run windows-release.ps1 again"
+        done
+        [ "$(rec .stages.test)" = "PASS" ] \
+            || warn "windows-verify/verify.json: the test stage is '$(rec .stages.test)' — cargo test --workspace was not run to a pass on Windows"
+        [ "$(rec .exe_sha256)" = "$(shasum -a 256 "$WIN_EXE" | cut -d' ' -f1)" ] \
+            || die "windows-verify/verify.json was made for a different cameodb.exe than the one staged here; copy windows/ and windows-verify/ from the same run"
+        if [ -f "$WIN_MSI" ]; then
+            [ "$(rec .msi_sha256)" = "$(shasum -a 256 "$WIN_MSI" | cut -d' ' -f1)" ] \
+                || die "windows-verify/verify.json was made for a different installer than the one staged here; copy windows/ and windows-verify/ from the same run"
+        else
+            die "windows-verify/verify.json records an installer, but no cameodb-$VERSION-x64.msi is staged"
+        fi
+        win_commit="$(rec .commit)"
+        git cat-file -e "$win_commit^{commit}" 2>/dev/null \
+            || die "windows-verify/verify.json names commit $win_commit, which this repository does not have; fetch it"
+        if [ "$win_commit" = "$(git rev-parse HEAD)" ]; then
+            ok "Windows verified at this commit, on $(rec .host), $(rec .finished_utc)"
+        else
+            # A later commit that only touches docs or the release record does not change what
+            # was built; one that touches the code, the lockfile or the toolchain does.
+            changed="$(git diff --name-only "$win_commit" HEAD -- crates Cargo.toml Cargo.lock rust-toolchain.toml)"
+            [ -z "$changed" ] \
+                || die "Windows was built at ${win_commit:0:12}, and the code has changed since:
+$(printf '%s\n' "$changed" | sed 's/^/       /')
+     Build and verify it again on the Windows machine"
+            ok "Windows verified at ${win_commit:0:12} on $(rec .host); $(git rev-list --count "$win_commit"..HEAD) later commit(s), none touching code"
+        fi
+    elif [ "$ALLOW_UNVERIFIED_WINDOWS" -eq 1 ]; then
+        warn "no windows-verify/verify.json: the Windows build is unverified (--allow-unverified-windows)"
+    else
+        die "no dist/$VERSION/windows-verify/verify.json: nothing says the Windows build was tested.
+     Run scripts\\build\\windows-release.ps1 on the Windows machine and copy dist\\$VERSION\\ over,
+     or pass --allow-unverified-windows for a bare .exe you vouch for yourself"
     fi
     info "will be signed and hashed with the rest"
 else

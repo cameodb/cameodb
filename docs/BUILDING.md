@@ -288,7 +288,9 @@ It builds `target\release\cameodb.exe`, checks it reports this release's version
 | `cameodb-<version>-x64.msi` | the installer |
 | `cameodb-<version>-x64.msi.version` | the version and the SHA-256 of the `cameodb.exe` inside it |
 
-Copy that folder to `dist/<version>/windows/` on the release machine. `build.sh` refuses an MSI
+Copy `dist\<version>\` (`windows\` and, from `windows-release.ps1`, `windows-verify\`) to
+`dist/<version>/` on the release machine. `build.sh` refuses a Windows build whose
+`windows-verify/verify.json` does not match the staged files, and an MSI
 whose recorded version is not the release's, or whose packaged `cameodb.exe` is not the one
 staged beside it, so the two have to come from the same run.
 

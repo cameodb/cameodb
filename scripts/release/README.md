@@ -202,8 +202,19 @@ Built and verified on the Windows machine with `scripts\build\windows-release.ps
 [docs/BUILDING.md](../../docs/BUILDING.md#building-the-windows-installer-msi)): preflight, build,
 `cargo test --workspace`, the Windows validation suite and `build-msi.ps1`, which stages the
 program, the installer and their sidecars in `dist\<version>\windows\`. Its log goes to
-`dist\<version>\windows-verify\`, outside the folder that `publish.sh` copies to the site — copy
-only `windows\` to the release machine. Copy that folder to
+`dist\<version>\windows-verify\`, outside the folder that `publish.sh` copies to the site, beside
+`verify.json`, the record of the run. Copy the whole `dist\<version>\` folder to the release
+machine; the build stage then checks `verify.json` against what is staged, and refuses a Windows
+build it cannot tie to a passing run:
+
+| Checked | Refused when |
+|---|---|
+| the record exists | missing — `--allow-unverified-windows` accepts a bare `.exe` you vouch for yourself |
+| `version` | it is not this release |
+| `dirty` | the Windows tree had uncommitted changes |
+| `stages` | preflight, build, validate or msi is not `PASS` (a test stage that is not `PASS` only warns) |
+| `exe_sha256`, `msi_sha256` | they differ from the staged `cameodb.exe` and `.msi`: the record is about other files |
+| `commit` | this repository does not have it, or the code (`crates/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`) has changed since; later commits touching only docs or the release record are fine | Copy that folder to
 exactly this path here:
 
 ```
