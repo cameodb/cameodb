@@ -182,8 +182,13 @@ async fn a_second_process_on_a_held_data_directory_is_refused() {
     await_ready(first_port).await;
     let log = stop(first);
     assert!(!log.contains("panicked at"), "{log}");
-    assert!(owner(&data).is_none(), "removed on a clean stop");
-    assert!(owner(&second_path).is_none(), "removed on a clean stop");
+    // Windows has no SIGTERM to send: `stop` kills the node, which leaves its record. The clean
+    // stop there is checked by scripts/validate/windows.ps1, with a console Ctrl+C.
+    #[cfg(unix)]
+    {
+        assert!(owner(&data).is_none(), "removed on a clean stop");
+        assert!(owner(&second_path).is_none(), "removed on a clean stop");
+    }
 
     // With the node stopped, compact runs.
     let compact = run(&["compact".as_ref(), "-c".as_ref(), first_config.as_os_str()]).await;
