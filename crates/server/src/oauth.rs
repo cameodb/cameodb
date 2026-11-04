@@ -91,8 +91,13 @@ pub struct OAuthConfig {
     pub access_token_ttl_secs: u64,
 
     /// How long a refresh token lives (default: 30 days). The user signs in again with their key
-    /// only after this much time without the client using it.
+    /// after this much time without the client using it.
     pub refresh_token_ttl_secs: u64,
+
+    /// How long one approval lasts, refreshes included (default: 90 days). A refresh token stays
+    /// usable after it has been used, since nothing is stored to retire it; this bounds what a
+    /// stolen one is worth. After it the user pastes their key again.
+    pub approval_max_age_secs: u64,
 }
 
 impl Default for OAuthConfig {
@@ -103,6 +108,7 @@ impl Default for OAuthConfig {
             signing_key_file: None,
             access_token_ttl_secs: 3600,
             refresh_token_ttl_secs: 30 * 24 * 3600,
+            approval_max_age_secs: 90 * 24 * 3600,
         }
     }
 }
@@ -139,12 +145,20 @@ impl OAuthConfig {
                     .to_string(),
             );
         }
-        if self.access_token_ttl_secs == 0 || self.refresh_token_ttl_secs == 0 {
+        if self.access_token_ttl_secs == 0
+            || self.refresh_token_ttl_secs == 0
+            || self.approval_max_age_secs == 0
+        {
             return Err("security.oauth token lifetimes must be above 0".to_string());
         }
         if self.refresh_token_ttl_secs < self.access_token_ttl_secs {
             return Err("security.oauth.refresh_token_ttl_secs is shorter than \
                         access_token_ttl_secs, so a token could never be refreshed"
+                .to_string());
+        }
+        if self.approval_max_age_secs < self.access_token_ttl_secs {
+            return Err("security.oauth.approval_max_age_secs is shorter than \
+                        access_token_ttl_secs"
                 .to_string());
         }
         Ok(())
@@ -504,6 +518,11 @@ struct TokenClaims {
     client: String,
     aud: String,
     exp: u64,
+    /// When the user approved, carried unchanged through every refresh: no token of this
+    /// approval outlives `auth_time + approval_max_age`. Absent from tokens issued before it
+    /// existed (0.3.9), which count from when they were issued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth_time: Option<u64>,
     #[serde(rename = "j")]
     nonce: String,
 }
@@ -588,6 +607,7 @@ pub struct OAuth {
     signer: Signer,
     access_ttl: u64,
     refresh_ttl: u64,
+    approval_max_age: u64,
     /// Redeemed codes and when each expires; the per-node half of single use.
     redeemed: Mutex<HashMap<String, u64>>,
 }
@@ -613,12 +633,14 @@ impl OAuth {
             .as_deref()
             .context("security.oauth.signing_key_file is required")?;
         let key = read_secret(path)?;
-        Ok(Some(Arc::new(Self::with_key(
+        let mut oauth = Self::with_key(
             issuer,
             key,
             config.access_token_ttl_secs,
             config.refresh_token_ttl_secs,
-        ))))
+        );
+        oauth.approval_max_age = config.approval_max_age_secs;
+        Ok(Some(Arc::new(oauth)))
     }
 
     fn with_key(issuer: String, key: SigningKey, access_ttl: u64, refresh_ttl: u64) -> Self {
@@ -628,6 +650,7 @@ impl OAuth {
             signer: Signer(key),
             access_ttl,
             refresh_ttl,
+            approval_max_age: OAuthConfig::default().approval_max_age_secs,
             redeemed: Mutex::new(HashMap::new()),
         }
     }
@@ -844,12 +867,12 @@ impl OAuth {
         // client with the right verifier.
         self.redeem_once(code, grant.exp)?;
         let entry = self.live_key(ring, &grant.key)?;
-        Ok(self.issue_tokens(&entry, &grant.client))
+        Ok(self.issue_tokens(&entry, &grant.client, now()))
     }
 
     /// `grant_type=refresh_token`. Rotates: the answer carries a new refresh token. The old one
-    /// stays valid until it expires, since nothing is stored to retire it; revoking the key is
-    /// what ends them all.
+    /// stays valid until it expires, since nothing is stored to retire it, but no refresh reaches
+    /// past the approval's `approval_max_age`; revoking the key ends them all at once.
     pub fn refresh(
         &self,
         ring: &KeyRing,
@@ -876,8 +899,17 @@ impl OAuth {
                 format!("this server issues tokens for {} only", self.resource),
             ));
         }
+        // A token from before `auth_time` existed counts from its own issue.
+        let auth_time = claims
+            .auth_time
+            .unwrap_or_else(|| claims.exp.saturating_sub(self.refresh_ttl));
+        if now() >= auth_time.saturating_add(self.approval_max_age) {
+            return Err(OAuthError::invalid_grant(
+                "this approval has reached its maximum age; sign in again with your key",
+            ));
+        }
         let entry = self.live_key(ring, &claims.key)?;
-        Ok(self.issue_tokens(&entry, &claims.client))
+        Ok(self.issue_tokens(&entry, &claims.client, auth_time))
     }
 
     fn redeem_once(&self, code: &str, exp: u64) -> Result<(), OAuthError> {
@@ -907,16 +939,20 @@ impl OAuth {
             })
     }
 
-    fn issue_tokens(&self, entry: &KeyEntry, client: &str) -> TokenPair {
+    /// Both tokens for an approval given at `auth_time`, neither outliving its maximum age.
+    fn issue_tokens(&self, entry: &KeyEntry, client: &str, auth_time: u64) -> TokenPair {
         let key = entry.digest().to_config_value();
         let now = now();
+        let end = auth_time.saturating_add(self.approval_max_age);
+        let access_exp = (now + self.access_ttl).min(end);
         let access_token = self.signer.seal(
             ACCESS_PREFIX,
             &TokenClaims {
                 key: key.clone(),
                 client: client.to_string(),
                 aud: self.resource.clone(),
-                exp: now + self.access_ttl,
+                exp: access_exp,
+                auth_time: Some(auth_time),
                 nonce: nonce(),
             },
         );
@@ -926,14 +962,15 @@ impl OAuth {
                 key,
                 client: client.to_string(),
                 aud: self.resource.clone(),
-                exp: now + self.refresh_ttl,
+                exp: (now + self.refresh_ttl).min(end),
+                auth_time: Some(auth_time),
                 nonce: nonce(),
             },
         );
         TokenPair {
             access_token,
             refresh_token,
-            expires_in: self.access_ttl,
+            expires_in: access_exp.saturating_sub(now),
         }
     }
 
@@ -946,7 +983,7 @@ impl OAuth {
     /// An access token for `entry`, as the token endpoint would issue it.
     #[cfg(test)]
     pub fn access_token_for_test(&self, entry: &KeyEntry) -> String {
-        self.issue_tokens(entry, "test-client").access_token
+        self.issue_tokens(entry, "test-client", now()).access_token
     }
 
     // --- The gate -----------------------------------------------------------------------------
@@ -1258,6 +1295,75 @@ mod tests {
         );
     }
 
+    /// A refresh token for `client` that expires in an hour, for an approval given at
+    /// `auth_time` (`None`: a token from before the field existed).
+    fn refresh_token_from(
+        o: &OAuth,
+        entry: &KeyEntry,
+        client: &str,
+        auth_time: Option<u64>,
+    ) -> String {
+        o.signer.seal(
+            REFRESH_PREFIX,
+            &TokenClaims {
+                key: entry.digest().to_config_value(),
+                client: client_hash(client),
+                aud: o.resource.clone(),
+                exp: now() + 3600,
+                auth_time,
+                nonce: nonce(),
+            },
+        )
+    }
+
+    #[test]
+    fn refreshing_never_reaches_past_the_approvals_maximum_age() {
+        let o = oauth();
+        let max = o.approval_max_age;
+        let (ring, key) = ring(Role::Reader);
+        let entry = ring.authenticate(key.expose()).unwrap();
+        let client = public_client(&o);
+
+        // Approved long enough ago: refused, however fresh the refresh token itself is.
+        let old = refresh_token_from(&o, &entry, &client, Some(now() - max));
+        let err = o.refresh(&ring, &creds(&client), &old, None).err().unwrap();
+        assert_eq!(err.error, "invalid_grant");
+
+        // Ten minutes left: both new tokens end with the approval, and say so.
+        let auth_time = now() - max + 600;
+        let near = refresh_token_from(&o, &entry, &client, Some(auth_time));
+        let pair = o.refresh(&ring, &creds(&client), &near, None).unwrap();
+        assert!(pair.expires_in <= 600, "{}", pair.expires_in);
+        let claims: TokenClaims = o.signer.open(REFRESH_PREFIX, &pair.refresh_token).unwrap();
+        assert_eq!(claims.auth_time, Some(auth_time));
+        assert!(claims.exp <= auth_time + max);
+        let access: TokenClaims = o.signer.open(ACCESS_PREFIX, &pair.access_token).unwrap();
+        assert!(access.exp <= auth_time + max);
+
+        // A token from before `auth_time` existed counts from its own issue (exp - refresh TTL),
+        // so it still refreshes now and carries that time on.
+        let legacy = refresh_token_from(&o, &entry, &client, None);
+        let pair = o.refresh(&ring, &creds(&client), &legacy, None).unwrap();
+        let claims: TokenClaims = o.signer.open(REFRESH_PREFIX, &pair.refresh_token).unwrap();
+        let counted_from = claims.auth_time.unwrap();
+        assert!(counted_from.abs_diff(now() + 3600 - o.refresh_ttl) <= 2);
+
+        // A fresh approval carries its own time.
+        let code = code_for(&o, &ring, &key, &client);
+        let pair = o
+            .exchange_code(
+                &ring,
+                &creds(&client),
+                &code,
+                Some("https://client.example/callback"),
+                Some(&verifier()),
+                None,
+            )
+            .unwrap();
+        let claims: TokenClaims = o.signer.open(REFRESH_PREFIX, &pair.refresh_token).unwrap();
+        assert!(claims.auth_time.unwrap() + 5 >= now());
+    }
+
     #[test]
     fn an_expired_token_is_refused() {
         let o = oauth();
@@ -1270,6 +1376,7 @@ mod tests {
                 client: "c".to_string(),
                 aud: o.resource.clone(),
                 exp: now() - 1,
+                auth_time: None,
                 nonce: nonce(),
             },
         );

@@ -17,7 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   they already hold (`/oauth/authorize`, PKCE `S256` only), and `POST /oauth/token` with refresh.
   The token acts as that key with `read` alone, on `/mcp` alone, and stops working when the key is
   revoked. Nothing is stored: registrations, codes and tokens are signed with one secret, made by
-  `cameodb keygen --oauth-secret-out` and the same on every node. The `401` from `/mcp` now names
+  `cameodb keygen --oauth-secret-out` and the same on every node. Refreshing never reaches past
+  `approval_max_age_secs` (90 days) from the user's approval, so a leaked refresh token, which
+  stays usable after use, has an end. Redirect URIs are printable ASCII, loopback ones exactly
+  `host[:port]`, and request errors are shown on the page rather than redirected before the user
+  acts. The `401` from `/mcp` now names
   `resource_metadata` when the section is on, and every `401` for a presented key or token carries
   `error="invalid_token"`.
 - **Keys minted and revoked through the node.** A `provisioner` key — a new role holding the new

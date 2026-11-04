@@ -1446,6 +1446,7 @@ issuer = "https://db.example.com"    # the URL clients reach the node at; https 
 signing_key_file = "/etc/cameodb/keys/oauth-signing"
 # access_token_ttl_secs = 3600       # default: one hour
 # refresh_token_ttl_secs = 2592000   # default: 30 days without use, then the key again
+# approval_max_age_secs = 7776000    # default: 90 days from the approval, refreshes included
 ```
 
 **A token is its key, read only.** It is bound to the key's full digest and looked up in the live
@@ -1458,7 +1459,10 @@ the key's role; REST callers keep using keys. Any key holding `read` can sign in
 **Nothing is stored.** Client registrations, codes and tokens are signed with the secret, so a
 code issued by one node is redeemed on another and a restart forgets nothing. The cost: one grant
 cannot be revoked apart from its key, and a refresh token stays valid to its expiry even after it
-has been used. Replacing the secret signs every client out.
+has been used, which OAuth 2.1 asks a public client's not to. What bounds it is
+`approval_max_age_secs`: every token carries the time the user approved, and no refresh reaches
+past that plus the maximum, so a leaked refresh token is worth that long at most. Then the user
+pastes their key again. Replacing the secret signs every client out.
 
 `issuer` is the external URL, scheme and host only: behind a proxy the node cannot learn it from a
 request, and every URL a client is sent to, and the audience of every token, is built from it.

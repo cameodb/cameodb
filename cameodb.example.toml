@@ -217,6 +217,7 @@ legacy_sse_enabled = true
 # signing_key_file = "/etc/cameodb/keys/oauth-signing"
 # access_token_ttl_secs = 3600
 # refresh_token_ttl_secs = 2592000
+# approval_max_age_secs = 7776000             # 90 days; then the user pastes their key again
 
 [network.cluster]
 enabled = false
