@@ -238,7 +238,27 @@ wix extension list -g                                  # lists WixToolset.Util.w
 > The EULA is WiX's Open Source Maintenance Fee: an organisation that earns revenue with WiX is
 > expected to pay its maintainers a fee. Read it before accepting on your organisation's behalf.
 
-**4. Run the script** from the repository root, at the release commit:
+**4. Run the pass** from the repository root, at the release commit. `windows-release.ps1` is the
+whole Windows side of a release in one command — preflight, build, `cargo test --workspace`, the
+Windows validation suite, then the MSI:
+
+```powershell
+.\scripts\build\windows-release.ps1
+.\scripts\build\windows-release.ps1 -SkipTests                              # without cargo test
+.\scripts\build\windows-release.ps1 -Stage build,validate                 # some stages only
+```
+
+The preflight checks each tool this section installs, and that the tree is clean at a known
+commit, before anything is built. Everything printed is also kept in
+`dist\<version>\windows-verify\verify-<commit>.log`, which is the evidence for the release record,
+and the stage summary at the end is what goes into `RELEASE-CHECKLIST.md`. The validation stage is
+`scripts\validate\windows.ps1`, which also runs alone against any `cameodb.exe`: a node starting, one
+process per data directory ([OB30](../ROADMAP.md#ob30--two-processes-can-open-one-data-directory))
+between native processes, and `remote-sources` against the Windows certificate store. Nothing
+here needs Docker or WSL2; `-DockerImage` adds optional Linux-container checks and is not part of
+a release.
+
+To build and package only, run the script it calls:
 
 ```powershell
 .\scripts\build\build-msi.ps1 -Build
@@ -251,12 +271,12 @@ is closed:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\scripts\build\build-msi.ps1 -Build
+.\scripts\build\windows-release.ps1
 ```
 
-or in one line, `powershell -ExecutionPolicy Bypass -File .\scripts\build\build-msi.ps1 -Build`.
+or in one line, `powershell -ExecutionPolicy Bypass -File .\scripts\build\windows-release.ps1`.
 A checkout copied from another machine, rather than cloned, may also carry the downloaded-file
-mark; `Unblock-File .\scripts\build\build-msi.ps1` removes it.
+mark; `Get-ChildItem -Recurse .\scripts -Filter *.ps1 | Unblock-File` removes it.
 
 It builds `target\release\cameodb.exe`, checks it reports this release's version, and writes to
 `dist\<version>\windows\`:

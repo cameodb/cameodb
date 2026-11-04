@@ -198,9 +198,12 @@ valid, and any other is suffixed (`cameodb-aarch64`).
 
 ### Windows
 
-Built on the Windows machine with `scripts\build\build-msi.ps1 -Build` (see
-[docs/BUILDING.md](../../docs/BUILDING.md#building-the-windows-installer-msi)), which stages the
-program, the installer and their sidecars in `dist\<version>\windows\`. Copy that folder to
+Built and verified on the Windows machine with `scripts\build\windows-release.ps1` (see
+[docs/BUILDING.md](../../docs/BUILDING.md#building-the-windows-installer-msi)): preflight, build,
+`cargo test --workspace`, the Windows validation suite and `build-msi.ps1`, which stages the
+program, the installer and their sidecars in `dist\<version>\windows\`. Its log goes to
+`dist\<version>\windows-verify\`, outside the folder that `publish.sh` copies to the site — copy
+only `windows\` to the release machine. Copy that folder to
 exactly this path here:
 
 ```

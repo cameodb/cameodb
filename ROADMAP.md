@@ -215,7 +215,7 @@ Taken at the 0.3.9 prep. Checked against `git log 55fd6a7..ef4a991` and the tree
 - **Closed since 2026-11-02, all recorded:** P6 (`69be7ec`), S1 (`7170a8e`), T1 (`538dbb2`, with
   the redirect-URI, client-name and `approval_max_age_secs` follow-ups), OB31 (`9c7e9ee`). OB27
   stays open: only its 503 is done (`888cb27`); `forget` waits on O3. OB30 is built (`2a293b5`)
-  and stays ◐ until its Windows checks, which belong with the Windows build of the release.
+  and stays ◐ until its native Windows run, which belongs with the Windows build of the release; Docker Desktop on Windows is deliberately not checked.
 - **What 0.3.9 carries:** Q1, Q2, R1, R2, P6, S1, T1, OB27's 503, OB30, OB31, and the
   Portuguese, Italian and fold analyzers. R3 is not in it; the release notes and the release
   checklist's known gaps say a key change reaches only the node that took it.
@@ -285,7 +285,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [OB27](#ob27--a-replaced-node-never-leaves-the-cluster) | **A replaced node never leaves the cluster** — a node rebuilt with an empty data directory leaves its old identity's shards on every ring for good: writes to their key ranges answer 500, and the new node cannot learn an existing schema (503). The 500 is now a 503 (`888cb27`); `forget` needs O3 | — | 2026-10-18 | ◐ |
 | [OB28](docs/ROADMAP-ARCHIVE.md#ob28--two-range-shapes-were-dropped-without-a-word-or-failed-the-search) | **Two range shapes were dropped without a word or failed the search** — `field:[* TO *]` answered zero unreported, and a range on a json field was a 500; both are now reported dropped clauses, refused with 400 when nothing else is left | — | 2026-10-21 | ✅ |
 | [OB29](docs/ROADMAP-ARCHIVE.md#ob29--what-verifying-ob28-over-mcp-found) | **What verifying OB28 over MCP found** — a query whose every clause was dropped ran as match-all, a json path matched nothing unreported, and `validate_query` called a path an unknown field | — | 2026-10-21 | ✅ |
-| [OB30](#ob30--two-processes-can-open-one-data-directory) | **Two processes can open one data directory** — redb's file locks do not cross a container bind mount, and a node opens every store before it binds its port; two writers are what explains the `metadata.redb` found damaged on 2026-11-03. A data-directory lock taken first, with an owner record that names who holds it. Built and verified on macOS with OrbStack (`cameodb unlock`, `compact` included); open: verification on Windows | — | 2026-11-04 | ◐ |
+| [OB30](#ob30--two-processes-can-open-one-data-directory) | **Two processes can open one data directory** — redb's file locks do not cross a container bind mount, and a node opens every store before it binds its port; two writers are what explains the `metadata.redb` found damaged on 2026-11-03. A data-directory lock taken first, with an owner record that names who holds it. Built and verified on macOS with OrbStack (`cameodb unlock`, `compact` included); Windows is verified between native processes only, by `scripts/validate/windows.ps1` — open until that run is recorded | — | 2026-11-04 | ◐ |
 | [OB31](docs/ROADMAP-ARCHIVE.md#ob31--a-damaged-metadataredb-panics-the-node) | **A damaged `metadata.redb` panicked the node** — inside redb, and through two `expect`s around it. Now checked at open (6–7 ms); a single node sets the file aside and rebuilds it, a cluster member refuses with the remedy | — | 2026-11-04 | ✅ |
 | [F9](docs/ROADMAP-ARCHIVE.md#f9--commit-on-a-clock-not-a-count) | **Commit on a clock, not a count** — bulk ingest 1.8–6.6×, a trickle searchable within 2 s, single writes unchanged | — | 2026-09-26 | ✅ |
 | [K1](#k1--min-and-max-in-the-engine) | min and max in the engine, refused before any shard runs | 19 | 2026-08-27 | 📋 |
@@ -1887,7 +1887,7 @@ one node's disk therefore breaks the cluster until its metadata is edited by han
 
 ### OB30 — Two processes can open one data directory
 
-◐ **Built 2026-11-04; open: verification on Windows.** Found 2026-11-03.
+◐ **Built 2026-11-04; open: the native Windows run, recorded.** Found 2026-11-03.
 
 *Status.* `data_lock.rs` claims every directory of `storage.data_paths` right after the config is
 validated — before `node_identity.json`, any store or `metadata.redb` — and the owner record gains
@@ -1899,8 +1899,13 @@ against an image built from the change: a native node on a container's bind-moun
 refused naming the container (the OS lock did not cross; the record did), a container on a native
 node's directory is refused, a clean `docker stop` removes the record, and a container killed and
 restarted under the same host name takes it over. Tests: `data_lock.rs` unit tests,
-`tests/data_dir_lock.rs`. **Left:** the Windows checks below — two native processes, and a Docker
-Desktop container against a native node.
+`tests/data_dir_lock.rs`. **Left:** the native Windows run — `scripts/validate/windows.ps1`, part
+of `scripts/build/windows-release.ps1`, checks a second node, `compact` and `unlock` refused, a
+Ctrl+C stop, a killed node's record, and another host's record. **Decided 2026-11-04: Docker
+Desktop on Windows is not checked.** Windows users run the node natively (the MSI), WSL2 is not a
+supported way to run it, and the mechanism — the owner record where the OS lock does not cross —
+is the one verified with OrbStack on macOS. The script's optional `-DockerImage` checks stay for
+anyone who wants them.
 
 
 *What happened.* A node ran in a container with its data directory bind-mounted from the host. During
@@ -1964,8 +1969,8 @@ same directory. **Both opened `store.redb` and `metadata.redb`, and the native n
 - The host name is `COMPUTERNAME` (`gethostname` on Unix). The MSI's service writes both files in its
   own data directory under `C:\ProgramData\CameoDB`, which it already owns.
 - On an SMB share the server enforces `LockFileEx` across clients, so the OS lock holds there too.
-- Verified on Windows itself before this is closed: two native processes, and a Docker Desktop
-  container against a native node.
+- Verified on Windows itself before this is closed: native processes, by the script above. A
+  Docker Desktop container against a native node is not (decided 2026-11-04, see Status).
 
 **Tests.** A second process on the same directory is refused, naming the first. An owner record naming
 another host is refused; one naming this host with no lock held is taken over. A clean shutdown removes

@@ -54,8 +54,16 @@ box is a question that has not been answered, not a formality.
    the port. The flag records that the shipped default is deliberate; drop it and read the
    failure if you are considering changing that default. Everything else it reports still has to
    be reviewed.
-8. **Build Windows on the Windows machine** and copy the result into the staging tree, which
-   is where the sign stage will look for it.
+8. **Build and verify Windows on the Windows machine** and copy the result into the staging
+   tree, which is where the sign stage will look for it. One command covers the Windows half of
+   steps 3–5 and this one: preflight, build, `cargo test --workspace`, `scripts\validate\windows.ps1`
+   (smoke, one process per data directory, `remote-sources`) and the MSI. Paste its stage summary
+   into the release record; the log is `dist\<version>\windows-verify\verify-<commit>.log`.
+   ```powershell
+   .\scripts\build\windows-release.ps1
+   ```
+   `-DockerImage` is optional and not part of a release: it adds Linux-container checks on a
+   Windows folder, which are not needed to ship. The result goes here:
    ```
    dist/<version>/windows/cameodb.exe
    ```
@@ -152,8 +160,9 @@ Prepared on 2026-11-04 at `d71f362`; not yet cut. Done so far, on the host (macO
 
 Open before the cut: the version bump and CHANGELOG move; build and SBOM; the validation suites
 (unit, posture, auth, tls, artifact, and `remote-sources` on musl and Windows); the Windows build;
-and OB30's Windows checks — two native processes on one data directory, and a Docker Desktop
-container against a native node.
+and OB30's native Windows run (`scripts\build\windows-release.ps1`: two processes on one data
+directory, Ctrl+C stop, killed node, another host's record). Docker Desktop on Windows is not
+checked, by decision: Windows runs the node natively, and the mechanism was verified with OrbStack.
 
 ## v0.3.8 — 2026-10-25
 

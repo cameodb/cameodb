@@ -33,6 +33,24 @@ the check for when one arrives some other way.
 | `cluster` (opt-in) | Three nodes in Docker: started together they find each other and agree on one ring, and a node started before its seeds joins once they are up; new-index writes and index deletes on every node at once leave every node answering; new indexes minted on every node at once (by single and by bulk writes), one new index written through every node at the same moment, and bulk writes sent through every node at once, are neither refused nor stalled, and each contested index is minted by exactly one node; a schema with ghost fields declared through one node is held at one thumbprint by every node, and writes through each feed them; two nodes restarted together rejoin, converge and serve, and no committed document is lost; with one node frozen (`docker pause`) the others keep answering, and once it resumes the ring converges, every node serves and nothing is lost; no panic. Prints `METRIC` lines — storm latency and timeouts, latency while a peer is frozen and whether health noticed, time to converge, peer-loss and connection counts — to compare across builds | Formation, gossip and the cross-node actor asks exist only between processes that reach each other over libp2p |
 | `artifact` | A Linux release binary has no interpreter and no `NEEDED` entries, is hardened as intended, and starts | Every property here is silently droppable — rustc falls back from `-static-pie` to `-static` with a warning when the linker refuses it, and `cargo zigbuild` triggers exactly that. Passing the flag and having the property are different claims, and only the second one ships |
 
+## Windows
+
+The bash suites do not run on Windows. `windows.ps1` (PowerShell 5.1 or later) is the part that has to be
+answered there, against `target\release\cameodb.exe`: a node starts and answers health on the
+shipped config; one process per data directory — a second node, `compact` and `unlock` refused
+while a node holds it, a Ctrl+C stop removing the owner record, a killed node's record taken over,
+another host's record refused until `unlock`; optionally, with `-DockerImage`, the same directory against a Linux
+container on Docker Desktop, both ways round (not part of a release check); and `remote-sources` against the Windows certificate
+store. It is normally run by `scripts\build\windows-release.ps1`, which builds first.
+
+```powershell
+.\scripts\validate\windows.ps1
+.\scripts\validate\windows.ps1 -Suite data-dir
+```
+
+The Rust integration tests of the data-directory lock check the clean-stop record on Unix only:
+Windows has no SIGTERM to send a test's child, so that one is checked here with a console Ctrl+C.
+
 ## Cluster suite
 
 Not in the default run: it builds a Docker image from the repo (or uses `CLUSTER_IMAGE`) and

@@ -20,7 +20,7 @@ The version is read from `crates/*/Cargo.toml` and never passed as an argument.
 
 ```bash
 scripts/release/release.sh --stage build,sbom    # binaries, DEB, RPM, SPDX, CycloneDX
-#   ... build cameodb.exe on the Windows machine → dist/<version>/windows/
+#   ... on the Windows machine: scripts\build\windows-release.ps1 → dist/<version>/windows/
 scripts/release/release.sh --stage sign
 scripts/release/publish.sh                       # dry run: add / same / replace report
 scripts/release/publish.sh --commit
