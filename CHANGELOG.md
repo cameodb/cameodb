@@ -164,6 +164,18 @@ the request; on a cluster, the other nodes do not see it.
 
 ### Fixed
 
+- **On Windows, a write could leave an index unwritable and its documents unsearchable.**
+  Tantivy replaces `.managed.json` before each new segment file and `meta.json` at each commit by
+  renaming a temporary file over it, and Windows refuses that rename while another handle — most
+  often the antivirus scanning the copy written a moment earlier — holds the old file. The
+  indexing writer died with `Access is denied` naming a segment file, and on a machine with
+  Defender on, a first write to a new index hit it more often than not. The replace is now
+  retried for up to about two seconds while the file is held. Separately, on every platform: a
+  commit that found its writer gone, after a writer died or was removed, logged an error every
+  few seconds and left the documents it held unsearchable until the next write to the index. It
+  now reopens the index, which replays them from the WAL, and commits them.
+- **`cameodb compact` failed on Windows** syncing the data directory after a rewrite, which
+  Windows does not allow; it no longer syncs a directory there.
 - **Two processes could open one data directory.** redb's file locks do not cross a container's
   bind mount (Docker Desktop, OrbStack, WSL2 on `/mnt/c`, some NFS mounts), and a node opens every
   store before it binds its port, so a node in a container and a node on its host could both open,

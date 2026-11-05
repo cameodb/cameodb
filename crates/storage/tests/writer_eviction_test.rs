@@ -135,6 +135,30 @@ fn a_restart_after_an_eviction_still_has_every_document() {
     );
 }
 
+/// The supervisor's commit, with no write after the writer went, reopens the index and
+/// publishes what it held. It used to report the missing writer every tick and leave the
+/// documents unsearchable until the next write to the index.
+#[test]
+fn a_commit_with_no_write_after_an_eviction_publishes_the_documents() {
+    let dir = TempDir::new().expect("temp dir");
+    let store = open_store(dir.path());
+    store
+        .store_schema("evict", &searchable_schema())
+        .expect("store schema");
+
+    write_docs(&store, "evict", 1..=12);
+    store.force_remove_writer("evict");
+    store
+        .commit_index("evict")
+        .expect("a commit reopens the index and replays the WAL");
+
+    let hits = search_hit_count(&store, "evict", "title:document");
+    assert_eq!(
+        hits, 12,
+        "a commit after the writer went should publish all 12 documents, got {hits}"
+    );
+}
+
 /// An eviction with no write after it leaves the documents only in the WAL, where startup
 /// recovery replays them.
 ///

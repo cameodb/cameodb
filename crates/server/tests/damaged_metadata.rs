@@ -3,6 +3,11 @@
 //! The file holds cluster bookkeeping — configuration, shard assignments, the node registry and
 //! the ring snapshot — not documents. A single node sets a damaged one aside and rebuilds it from
 //! its shards; a cluster member refuses to start and says why. Neither panics.
+//!
+//! Unix only: the damage is laid over a file a clean shutdown wrote, and the node is stopped
+//! cleanly with SIGTERM. Windows has no signal this test can send, and a killed node never
+//! writes the page holding redb's allocator state that the damage is copied from.
+#![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -79,27 +84,20 @@ async fn await_ready(client: &CameoClient) {
     panic!("node never became healthy");
 }
 
-/// Stops the node the way an operator does, and returns what it printed: SIGTERM and a clean shutdown where there is one,
-/// which is what preceded the damage found on 2026-11-03.
+/// Stops the node the way an operator does, and returns what it printed: SIGTERM and a clean
+/// shutdown, which is what preceded the damage found on 2026-11-03.
 fn stop(mut child: Child) -> String {
-    #[cfg(unix)]
-    {
-        let _ = Command::new("kill")
-            .arg("-TERM")
-            .arg(child.id().to_string())
-            .status();
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while child.try_wait().expect("wait").is_none() {
-            assert!(
-                Instant::now() < deadline,
-                "the node did not stop on SIGTERM"
-            );
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = child.kill();
+    let _ = Command::new("kill")
+        .arg("-TERM")
+        .arg(child.id().to_string())
+        .status();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while child.try_wait().expect("wait").is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the node did not stop on SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(100));
     }
     // Both streams: the log is on stdout, a panic's report on stderr.
     let output = child.wait_with_output().expect("node output");

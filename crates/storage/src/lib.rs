@@ -35,6 +35,7 @@ use thiserror::Error;
 mod analysis;
 mod deadline;
 mod delete_query;
+mod directory;
 mod matched;
 mod merge;
 mod projection;

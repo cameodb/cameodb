@@ -266,16 +266,26 @@ pub(crate) static RECOVERY_GATE: LazyLock<RecoveryGate> = LazyLock::new(|| Recov
     released: Condvar::new(),
 });
 
-/// Opens the Tantivy index at `path` with this engine's tokenizers registered.
+/// Opens the Tantivy index at `path` with this engine's tokenizers registered, through
+/// [`IndexDirectory`](crate::directory::IndexDirectory).
 pub(crate) fn open_tantivy_index(path: &Path) -> Result<Index, StoreError> {
-    let index = Index::open_in_dir(path)?;
+    let index = Index::open(
+        crate::directory::IndexDirectory::open(path).map_err(tantivy::TantivyError::from)?,
+    )?;
     register_tokenizers(&index);
     Ok(index)
 }
 
-/// Creates a Tantivy index at `path` with this engine's tokenizers registered.
+/// Creates a Tantivy index at `path` with this engine's tokenizers registered, through
+/// [`IndexDirectory`](crate::directory::IndexDirectory).
 pub(crate) fn create_tantivy_index(path: &Path, schema: Schema) -> Result<Index, StoreError> {
-    let index = Index::create_in_dir(path, schema)?;
+    let directory =
+        crate::directory::IndexDirectory::open(path).map_err(tantivy::TantivyError::from)?;
+    // What `Index::create_in_dir` checks, which `Index::create` would instead overwrite.
+    if Index::exists(&directory).map_err(tantivy::TantivyError::from)? {
+        return Err(tantivy::TantivyError::IndexAlreadyExists.into());
+    }
+    let index = Index::create(directory, schema, tantivy::IndexSettings::default())?;
     register_tokenizers(&index);
     Ok(index)
 }
@@ -2196,23 +2206,32 @@ impl HybridStore {
         // guard used to live to the end of the commit, so every insert and remove on that shard
         // of `writers` — opening another index, closing one — waited out a Tantivy commit; and a
         // thread holding a map guard while it waits on a mutex is the shape OB14 deadlocked on.
-        let Some(writer_arc) = self
+        let cached = self
             .writers
             .get(index)
-            .map(|writer| Arc::clone(writer.value()))
-        else {
-            // Pending operations with no writer: the buffered documents were dropped
-            // together with the writer (admin eviction, forced removal). They are NOT in
-            // Tantivy, so the WAL must be kept and the recovery checkpoint must not move —
-            // the next open replays them.
-            tracing::error!(
-                index = %index,
-                ops_pending = ops_pending,
-                "commit_index: writer missing with pending operations; keeping WAL for replay"
-            );
-            return Err(StoreError::IndexNotFound(format!(
-                "no writer for index {index} with {ops_pending} pending operations"
-            )));
+            .map(|writer| Arc::clone(writer.value()));
+        let writer_arc = match cached {
+            Some(writer_arc) => writer_arc,
+            None => {
+                // Pending operations with no writer: the buffered documents were dropped
+                // together with the writer (a dead writer retired, a forced removal). They are
+                // not in Tantivy, but they are durable in redb with their WAL entries, and the
+                // checkpoint has not moved past them — so opening the index replays them into a
+                // fresh writer, which this commit then publishes.
+                //
+                // Reporting the missing writer and waiting for the next write to reopen it, as
+                // this used to, left an acknowledged document unsearchable for as long as the
+                // index went unwritten, with the supervisor logging the same error every tick.
+                tracing::warn!(
+                    index = %index,
+                    ops_pending = ops_pending,
+                    "commit_index: no writer for pending operations; reopening the index, \
+                     which replays them"
+                );
+                let (writer_arc, _) = self.get_or_create_index(index)?;
+                self.invalidate_size_cache(index);
+                writer_arc
+            }
         };
 
         let committed_seq = {
@@ -2222,9 +2241,16 @@ impl HybridStore {
                 Err(e) => {
                     // A failed commit leaves a writer Tantivy does not promise is usable, and
                     // one whose indexing thread died fails every commit from here on. The
-                    // checkpoint has not moved, so the next open replays what it held.
+                    // checkpoint has not moved, so reopening replays what it held, and the
+                    // next commit publishes it.
                     drop(writer);
-                    self.retire_dead_writer(index, &writer_arc, &e);
+                    if let Err(reopen) = self.reopen_after_dead_writer(index, writer_arc, &e) {
+                        tracing::warn!(
+                            index = %index,
+                            error = %reopen,
+                            "Reopen after a failed commit failed; the next commit retries it"
+                        );
+                    }
                     return Err(e);
                 }
             }
