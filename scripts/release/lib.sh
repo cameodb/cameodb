@@ -119,6 +119,7 @@ staged_artifacts() {
         ! -name 'MANIFEST.txt' \
         ! -name '*.version' \
         ! -name '.unhardened' \
+        ! -name '.build-commit' \
         ! -name '.DS_Store' \
         | sort
 }

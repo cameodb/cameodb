@@ -147,7 +147,7 @@ Signed off by:
 
 <!-- Newest first. Append a filled-in template per release. -->
 
-## v0.3.9 — (in progress)
+## v0.3.9 — 2026-11-05
 
 Prepared on 2026-11-04 at `d71f362`; not yet cut. Done so far, on the host (macOS) tree:
 
@@ -174,10 +174,56 @@ before it found and fixed:
 - Tests that assumed Unix paths, line endings, signals or file locking (`2de8f17`, `0e36b72`),
   and a `RUST_LOG` left in the window by an earlier run (`21a6b43`).
 
-Open: the Windows run at 0.3.9; build and SBOM; the validation suites (unit, posture, auth, tls,
-artifact, and `remote-sources` on musl); sign and publish. Docker Desktop on Windows is not
-checked, by decision: Windows runs the node natively, and the mechanism was verified with
-OrbStack.
+Docker Desktop on Windows is not checked, by decision: Windows runs the node natively, and the
+mechanism was verified with OrbStack.
+
+Commit: `3e36143`, `chore(release): 0.3.9`. Windows run at 0.3.9 on HPENVY, native, finished
+2026-11-05 09:43 UTC from a clean tree: preflight, build, test, validate (39/39, none skipped) and
+msi all PASS; `verify.json` and `verify-3e361431ce57.log` in `dist/0.3.9/windows-verify/`.
+`release.sh --stage build,sbom` on the Mac accepted it against this commit.
+
+Built targets, all by rustc 1.99.0 (`rust-toolchain.toml`):
+
+| Artifact | sha256 |
+|---|---|
+| `mac/cameodb` (arm64, 32M) | `c7b2a65f…6ada` |
+| `linux/cameodb` (x86_64-unknown-linux-musl, static-pie, 40M) | `0cd0486f…0001` |
+| `linux/cameodb_0.3.9_amd64.deb` (13M) | `9de5f72b…2485` |
+| `linux/cameodb-0.3.9-1.x86_64.rpm` (14M) | `cd9f9cd7…7cfe` |
+| `windows/cameodb.exe` (43M, reports `cameodb 0.3.9`) | `1b10548c…5b66` |
+| `windows/cameodb-0.3.9-x64.msi` (15M, packages the staged exe) | `e6478fa3…3465` |
+
+SPDX (595 packages) and CycloneDX (594 components, `Cargo.lock`: 594), no local paths.
+
+| Suite | Host build | musl | windows | notes |
+|-------|-----------|------|---------|-------|
+| deps           | PASS |  |  | 10/10 |
+| unit           | PASS |  | PASS | windows: `cargo test --workspace` |
+| posture        | PASS |  |  |  |
+| auth           | PASS |  |  |  |
+| provisioning   | PASS |  |  |  |
+| tls            | PASS |  |  |  |
+| remote-sources | PASS | PASS | PASS | musl: `dist/0.3.9/linux/cameodb` in `cameo-builder-base-amd64:1.99.0`, 4/4 |
+| artifact       | PASS |  |  | 17 passed, 1 skipped |
+
+`scripts/validate/all.sh` ran 2026-11-05 10:59–11:07 against `target/release/cameodb`, identical
+to `dist/0.3.9/mac/cameodb`. `check-config --allow-unauthenticated` re-run on the three shipped
+configs at the release binary: OK, the same four accepted `internal` warnings (tls, admin_api,
+auth, rate).
+
+Skipped checks and why: `artifact`, position independence on the local
+`target/aarch64-unknown-linux-musl` build (aarch64-musl static-pie segfaults), not a shipped
+target; the shipped x86-64 binary passed every check.
+Known gaps acknowledged: yes — the standing list above is unchanged.
+
+Signed and published 2026-11-05 by goranc: all ten artifacts signed by
+`https://dl.cameodb.com/cosign.pub` (both SBOMs, the four Linux files, the Mac binary, the Windows
+exe and MSI, and the two `windows-verify` files), `SHA256SUMS` verified. The first `MANIFEST.txt`
+said "dirty at build time" because publish asked git at publish time, when this record was being
+written; the build itself ran on a clean `3e36143`. Build now records the commit and tree state in
+`dist/<version>/.build-commit` and publish reads that.
+
+Signed off by: goranc
 
 ## v0.3.8 — 2026-10-25
 

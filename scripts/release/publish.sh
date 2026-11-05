@@ -70,8 +70,12 @@ fi
 
 {
     printf 'CameoDB %s\n' "$VERSION"
-    printf 'commit    %s%s\n' "$(git -C "$PROJECT_ROOT" rev-parse HEAD)" \
-        "$([ -n "$(git -C "$PROJECT_ROOT" status --porcelain)" ] && printf ' (dirty at build time)')"
+    if [ -f "$DIST/.build-commit" ]; then
+        printf 'commit    %s\n' "$(cat "$DIST/.build-commit")"
+    else
+        printf 'commit    %s (at publish; the build did not record one)\n' \
+            "$(git -C "$PROJECT_ROOT" rev-parse HEAD)"
+    fi
     printf 'built     %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     printf 'signed by %s\n' "$COSIGN_PUB_URL"
     printf 'verify    cosign verify-blob --key cosign.pub --bundle <artifact>.bundle <artifact>\n'

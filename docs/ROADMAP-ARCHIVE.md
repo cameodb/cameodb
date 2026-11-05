@@ -3723,9 +3723,106 @@ value on a path. The syntax reference, guidance and API reference say a path is 
 clause. Native json — paths, typed values and fast columns, which tantivy has — would make these
 clauses work rather than report them; that is a design decision of its own, not part of this fix.
 
+### OB30 — Two processes can open one data directory
+
+✅ **Done 2026-11-05.** Built 2026-11-04; found 2026-11-03. The native Windows run is recorded
+with the 0.3.9 release (RELEASE-CHECKLIST.md, v0.3.9).
+
+*Status.* `data_lock.rs` claims every directory of `storage.data_paths` right after the config is
+validated — before `node_identity.json`, any store or `metadata.redb` — and the owner record gains
+the node's name and id once its identity is read. `compact` claims the directories that exist;
+`cameodb unlock` is in. The OS lock is `File::try_lock`; a filesystem that refuses locks (some NFS)
+is warned about and claimed by the owner record alone. The record is created with `create_new`, so
+of two processes on either side of a boundary only one writes it. Verified with OrbStack on macOS
+against an image built from the change: a native node on a container's bind-mounted directory is
+refused naming the container (the OS lock did not cross; the record did), a container on a native
+node's directory is refused, a clean `docker stop` removes the record, and a container killed and
+restarted under the same host name takes it over. Tests: `data_lock.rs` unit tests,
+`tests/data_dir_lock.rs`. **Windows, native:** `scripts/validate/windows.ps1`, part of
+`scripts/build/windows-release.ps1`, passed on HPENVY at 0.3.9 (`3e36143`, 2026-11-05), checking a second node, `compact` and `unlock` refused, a
+Ctrl+C stop, a killed node's record, and another host's record. **Decided 2026-11-04: Docker
+Desktop on Windows is not checked.** Windows users run the node natively (the MSI), WSL2 is not a
+supported way to run it, and the mechanism — the owner record where the OS lock does not cross —
+is the one verified with OrbStack on macOS. The script's optional `-DockerImage` checks stay for
+anyone who wants them.
+
+
+*What happened.* A node ran in a container with its data directory bind-mounted from the host. During
+the day, the data was damaged: at the container's start its `metadata.redb` read cleanly, and the
+next start after its clean shutdown panicked on it ([OB31](#ob31--a-damaged-metadataredb-panics-the-node)).
+redb's `check_integrity` on a copy said *"Primary is corrupted despite 2-phase commit"*: the page the
+user tables' root points to held redb's own system tree (`allocator_state`, `data_pages_allocated`, …)
+and both commit slots point at that page, so there is no consistent commit to roll back to. A single
+writer cannot do this — its allocator knows which pages are live. Two writers with separate views of
+the file can. The shard's `store.redb` (10 GB) checked clean.
+
+*Reproduced* on a clone of the directory: the same image in a container, then a native node on the
+same directory. **Both opened `store.redb` and `metadata.redb`, and the native node came up healthy.**
+
+*Why nothing stopped it.*
+
+- redb locks its file with `fcntl` range locks (`LockFileEx` on Windows). Those work between processes
+  of one kernel. A Linux container on macOS or Windows (Docker Desktop, OrbStack) runs in a VM and
+  reaches the host's files through a file-sharing layer that does not carry the lock; WSL2 on `/mnt/c`
+  is the same, and NFS depends on its configuration.
+- The node opens every shard's store and `metadata.redb` **before** it binds its port. A second node
+  started while the first holds the port fails on the bind — after it has opened, and possibly
+  committed to, both. Nothing on the terminal says data was touched.
+- `cameodb compact` relies on the same lock: its help says a running node is not a hazard because
+  redb locks its files. Across that boundary it is.
+
+**Change.**
+
+1. **A data-directory lock, taken before anything in the directory is read** — before
+   `node_identity.json`, before any store — for every directory in `storage.data_paths`. Two files:
+   - `cameodb.lock`, held with an exclusive OS lock for the life of the process: `File::try_lock`,
+     `flock` on Unix and `LockFileEx` on Windows. Released by the OS when the process ends, however it
+     ends.
+   - `cameodb.owner`, written once the lock is held: node id, host name, process id, start time,
+     version. Removed on a clean shutdown. A separate file because a `LockFileEx` lock is mandatory: on
+     Windows another process could not read the owner from the locked file itself.
+2. **What startup decides:**
+   - The OS lock is held by someone → refuse, naming the owner from `cameodb.owner`: another process on
+     this machine.
+   - The lock is free and there is no owner file → take it.
+   - The owner file names **this host** → its process is gone (its OS lock would have stopped us) →
+     take over, logging the stale record.
+   - The owner file names **another host** — a container's host name is its own, so a container and its
+     host are two hosts → refuse: the OS lock cannot see that process. The message names its host,
+     process and start time, and says how to proceed: stop it, or `cameodb unlock <data path>` once it
+     is known not to be running.
+   - No timer and no heartbeat. A container restarted keeps its host name and takes over its own record;
+     one *re-created* after a crash has a new name and is refused until `unlock` — the price of that
+     case, paid only after an unclean exit.
+3. **Offline commands take the same lock**: `cameodb compact`, and anything else that opens a data
+   directory; `compact`'s help stops promising redb's lock.
+4. **`cameodb unlock <data path>`**: removes a stale `cameodb.owner` after showing it; refuses while the
+   OS lock is held on this machine.
+
+**Windows.** The same design holds, with these points:
+
+- Between native Windows processes on a local disk, redb's `LockFileEx` already refuses a second
+  node; the gap is the same as elsewhere — Docker Desktop bind mounts from a Windows drive into a Linux
+  container, and WSL2 processes on `/mnt/c`, whose Linux locks never reach Windows.
+- `File::try_lock` maps to `LockFileEx` — mandatory, which is why the owner record is a separate file.
+- The host name is `COMPUTERNAME` (`gethostname` on Unix). The MSI's service writes both files in its
+  own data directory under `C:\ProgramData\CameoDB`, which it already owns.
+- On an SMB share the server enforces `LockFileEx` across clients, so the OS lock holds there too.
+- Verified on Windows itself before this is closed: native processes, by the script above. A
+  Docker Desktop container against a native node is not (decided 2026-11-04, see Status).
+
+**Tests.** A second process on the same directory is refused, naming the first. An owner record naming
+another host is refused; one naming this host with no lock held is taken over. A clean shutdown removes
+the record; a killed process leaves it, and the next start on the same host takes over. `compact` is
+refused while a node holds the directory. `unlock` refuses while the lock is held. Every directory of
+`data_paths` is locked, not only the first.
+
+**Docs.** `docs/DEPLOYMENT.md`: one process per data directory, containers and bind mounts, `unlock`;
+`docs/CONFIGURATION.md` under `storage.data_paths`; `CHANGELOG.md`.
+
 ### OB31 — A damaged `metadata.redb` panics the node
 
-✅ **Done 2026-11-04.** Found 2026-11-03, with [OB30](../ROADMAP.md#ob30--two-processes-can-open-one-data-directory)
+✅ **Done 2026-11-04.** Found 2026-11-03, with [OB30](#ob30--two-processes-can-open-one-data-directory)
 as its cause: a node's `metadata.redb` was left with its user tables' root pointing at a page that
 held redb's own system tree, and both commit slots sharing it. The release build panicked inside
 redb loading the ring snapshot (`slice index starts at 60 but ends at 3`, `btree_base.rs`), the

@@ -253,7 +253,7 @@ commit, before anything is built. Everything printed is also kept in
 `dist\<version>\windows-verify\verify-<commit>.log`, which is the evidence for the release record,
 and the stage summary at the end is what goes into `RELEASE-CHECKLIST.md`. The validation stage is
 `scripts\validate\windows.ps1`, which also runs alone against any `cameodb.exe`: a node starting, one
-process per data directory ([OB30](../ROADMAP.md#ob30--two-processes-can-open-one-data-directory))
+process per data directory ([OB30](ROADMAP-ARCHIVE.md#ob30--two-processes-can-open-one-data-directory))
 between native processes, and `remote-sources` against the Windows certificate store. Nothing
 here needs Docker or WSL2; `-DockerImage` adds optional Linux-container checks and is not part of
 a release.
