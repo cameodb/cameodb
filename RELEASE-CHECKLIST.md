@@ -159,11 +159,25 @@ Prepared on 2026-11-04 at `d71f362`; not yet cut. Done so far, on the host (macO
 - Dependencies: zip, lzma-rust2 and ctutils updated; toml, toml_writer and serde-saphyr (published
   2026-11-03/04) deliberately left for after the cut.
 
-Open before the cut: the version bump and CHANGELOG move; build and SBOM; the validation suites
-(unit, posture, auth, tls, artifact, and `remote-sources` on musl and Windows); the Windows build;
-and OB30's native Windows run (`scripts\build\windows-release.ps1`: two processes on one data
-directory, Ctrl+C stop, killed node, another host's record). Docker Desktop on Windows is not
-checked, by decision: Windows runs the node natively, and the mechanism was verified with OrbStack.
+Windows dry run at 0.3.8, on HPENVY, native (no Docker, no WSL2), with
+`scripts\build\windows-release.ps1`: five runs, the last all PASS at `21a6b43` (2026-11-05) —
+preflight, build, `cargo test --workspace` in full, validate 39/39 (smoke write and search,
+OB30's data-directory checks including the Ctrl+C stop, remote-sources) and the MSI. The runs
+before it found and fixed:
+
+- ASCII-only scripts (Windows PowerShell 5.1 reads BOM-less UTF-8 as Windows-1252) and a
+  backtick-escaped quote (`2377ff6`, `2de8f17`).
+- `cameodb compact` failing to fsync a directory on Windows (`65a78b2`).
+- Tantivy's `.managed.json`/`meta.json` replace refused while the antivirus held the file, which
+  killed the writer on a first write to a new index; and a commit that found its writer gone
+  never reopening it (`0e36b72`).
+- Tests that assumed Unix paths, line endings, signals or file locking (`2de8f17`, `0e36b72`),
+  and a `RUST_LOG` left in the window by an earlier run (`21a6b43`).
+
+Open: the Windows run at 0.3.9; build and SBOM; the validation suites (unit, posture, auth, tls,
+artifact, and `remote-sources` on musl); sign and publish. Docker Desktop on Windows is not
+checked, by decision: Windows runs the node natively, and the mechanism was verified with
+OrbStack.
 
 ## v0.3.8 — 2026-10-25
 
