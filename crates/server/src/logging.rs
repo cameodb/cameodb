@@ -58,6 +58,12 @@ impl Logging {
     /// Apply `[logging]`: its level, unless `RUST_LOG` is set, and its log file.
     pub fn apply(&self, config: &LoggingConfig) -> Result<()> {
         let rust_log = std::env::var("RUST_LOG").is_ok_and(|v| !v.trim().is_empty());
+        self.apply_with(config, rust_log)
+    }
+
+    /// [`Logging::apply`], told whether `RUST_LOG` is set rather than reading it, so a test does
+    /// not depend on the environment it runs in.
+    fn apply_with(&self, config: &LoggingConfig, rust_log: bool) -> Result<()> {
         if let (Some(level), false) = (&config.level, rust_log) {
             let filter = EnvFilter::try_new(level)
                 .with_context(|| format!("logging.level {level:?} is not a valid filter"))?;
@@ -99,12 +105,16 @@ mod tests {
         let _guard = tracing::subscriber::set_default(subscriber);
 
         tracing::error!("before the config: standard output only");
+        // As if RUST_LOG were unset: set, it overrides the level this test is about.
         logging
-            .apply(&LoggingConfig {
-                directory: Some(logs.clone()),
-                max_files: 3,
-                level: Some("info".into()),
-            })
+            .apply_with(
+                &LoggingConfig {
+                    directory: Some(logs.clone()),
+                    max_files: 3,
+                    level: Some("info".into()),
+                },
+                false,
+            )
             .unwrap();
         tracing::info!("an info line, let through by the level");
         tracing::debug!("a debug line, held back by it");

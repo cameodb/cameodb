@@ -79,12 +79,25 @@ if (-not $Suite) {
 
 # The node and the client read CAMEODB_* from the environment; an exported value changes what a
 # check measures. Dropped for this process and its children, names reported.
-$dropped = @(Get-ChildItem Env: | Where-Object { $_.Name -like "CAMEODB_*" } | ForEach-Object { $_.Name })
+#
+# A script's environment is the PowerShell window's: what it changes outlives it, and RUST_LOG=warn
+# left behind made a later `cargo test` in the same window fail a logging test. Everything changed
+# here is put back when the suite ends.
+$SavedEnv = @{}
+foreach ($item in @(Get-ChildItem Env: | Where-Object { $_.Name -like "CAMEODB_*" -or $_.Name -eq "RUST_LOG" })) {
+    $SavedEnv[$item.Name] = $item.Value
+}
+$dropped = @($SavedEnv.Keys | Where-Object { $_ -like "CAMEODB_*" })
 foreach ($name in $dropped) { Remove-Item "Env:$name" }
 if ($dropped.Count -gt 0) {
     Write-Host "note: ignoring $($dropped -join ', ') from the environment; the suite runs without it"
 }
 $env:RUST_LOG = "warn"
+
+function Restore-Environment {
+    Remove-Item Env:RUST_LOG -ErrorAction SilentlyContinue
+    foreach ($name in $SavedEnv.Keys) { Set-Item "Env:$name" $SavedEnv[$name] }
+}
 
 $Work = Join-Path ([System.IO.Path]::GetTempPath()) ("cameodb-win-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
 New-Item -ItemType Directory -Path $Work | Out-Null
@@ -545,6 +558,7 @@ try {
     Get-Process cameodb -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $Bin } | Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 300
     Remove-Item -Recurse -Force $Work -ErrorAction SilentlyContinue
+    Restore-Environment
 }
 
 Write-Host ""

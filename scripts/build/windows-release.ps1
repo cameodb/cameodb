@@ -195,7 +195,14 @@ try {
     # ------------------------------------------------------------ test
     if (& $Run "test") {
         Step "cargo test --workspace"
-        if ((Invoke-Tool cargo @("test", "--workspace", "--no-fail-fast")) -eq 0) { $Results["test"] = "PASS" }
+        # The tests run without RUST_LOG, as they do on the Mac: a value left in this window -
+        # by an earlier validate run, say - changes what the logging tests see.
+        $SavedRustLog = $env:RUST_LOG
+        if ($SavedRustLog) { Write-Host "note: RUST_LOG=$SavedRustLog is set in this window; the tests run without it" }
+        Remove-Item Env:RUST_LOG -ErrorAction SilentlyContinue
+        try { $testExit = Invoke-Tool cargo @("test", "--workspace", "--no-fail-fast") }
+        finally { if ($SavedRustLog) { $env:RUST_LOG = $SavedRustLog } }
+        if ($testExit -eq 0) { $Results["test"] = "PASS" }
         else { $Results["test"] = "FAIL"; $TestsFailed = $true; Bad "cargo test --workspace failed; validate and msi still run" }
     }
 
