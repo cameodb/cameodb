@@ -62,11 +62,14 @@ info "commit $(git rev-parse --short HEAD)"
 
 mkdir -p "$DIST/mac" "$DIST/linux" "$DIST/windows"
 
-# The commit and tree state these artifacts were built from, for MANIFEST.txt. Publish runs
-# later, by which time the release record has usually been edited; asking git then would
-# describe that tree, not this build.
-printf '%s%s\n' "$(git rev-parse HEAD)" \
-    "$([ -n "$(git status --porcelain)" ] && printf ' (dirty at build time)')" > "$DIST/.build-commit"
+# The commit and tree state these artifacts were built from, and when the build started, for
+# MANIFEST.txt. Publish runs later, by which time the release record has usually been edited;
+# asking git or the clock then would describe that tree and that moment, not this build.
+{
+    printf '%s%s\n' "$(git rev-parse HEAD)" \
+        "$([ -n "$(git status --porcelain)" ] && printf ' (dirty at build time)')"
+    date -u '+%Y-%m-%dT%H:%M:%SZ'
+} > "$DIST/.build-commit"
 
 # ---------------------------------------------------------------- macOS (host native)
 

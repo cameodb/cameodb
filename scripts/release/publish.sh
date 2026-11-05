@@ -70,13 +70,22 @@ fi
 
 {
     printf 'CameoDB %s\n' "$VERSION"
+    build_commit="" build_time=""
     if [ -f "$DIST/.build-commit" ]; then
-        printf 'commit    %s\n' "$(cat "$DIST/.build-commit")"
+        { IFS= read -r build_commit; IFS= read -r build_time; } < "$DIST/.build-commit" || true
+    fi
+    if [ -n "$build_commit" ]; then
+        printf 'commit    %s\n' "$build_commit"
     else
         printf 'commit    %s (at publish; the build did not record one)\n' \
             "$(git -C "$PROJECT_ROOT" rev-parse HEAD)"
     fi
-    printf 'built     %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    if [ -n "$build_time" ]; then
+        printf 'built     %s\n' "$build_time"
+    else
+        printf 'built     %s (published; the build did not record its time)\n' \
+            "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    fi
     printf 'signed by %s\n' "$COSIGN_PUB_URL"
     printf 'verify    cosign verify-blob --key cosign.pub --bundle <artifact>.bundle <artifact>\n'
     printf '\n%-52s %10s  %s\n' 'artifact' 'size' 'signed'
