@@ -211,12 +211,20 @@ impl HybridStore {
     /// Smart refresh strategy for reader cache
     /// Tries fast reload first, falls back to remove + recreate if reload fails
     /// This preserves cache when possible while ensuring data freshness
+    ///
+    /// Either way the searchable view changes here, so the index's cached sizes go with it.
+    /// The write that preceded a commit dropped them already, but a stats request in between
+    /// measured the reader as it stood and cached that for `index_cache_expiry`; without this
+    /// a client waiting on the node's own commit read the pre-commit count for the hour.
     pub(crate) fn smart_refresh_reader(&self, index: &str) -> Result<(), StoreError> {
+        // Dropped after the reload, on both paths, not before it: a stats request between a
+        // drop and the reload would measure the old reader and cache it again.
         // Fast path: Try to reload existing reader
         if let Some(reader_ref) = self.readers.get(index) {
             match reader_ref.value().reload() {
                 Ok(_) => {
                     tracing::debug!(index = %index, "Reader reloaded successfully (fast path)");
+                    self.invalidate_size_cache(index);
                     return Ok(());
                 }
                 Err(e) => {
@@ -227,6 +235,7 @@ impl HybridStore {
 
         // Fallback: Remove and recreate (reliable path)
         self.readers.remove(index);
+        self.invalidate_size_cache(index);
         tracing::debug!(index = %index, "Reader cache cleared, will recreate on next search (reliable path)");
         Ok(())
     }

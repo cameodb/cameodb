@@ -35,6 +35,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An index's document count could stay at its pre-commit value for an hour.** `/_indexes`
+  serves counts and sizes from a per-shard cache kept up to an hour. A write batch dropped the
+  entry, but before the commit that made the batch searchable, so a request in between measured
+  the old reader and cached it, and the commit did not drop it again. A client that cannot
+  commit (a key without `node-admin`, waiting on the node's own commit clock) read the old count
+  for the hour: a load with deletes on a 4-shard node reported 181 documents more than it held,
+  while a search counted the right number. Every reader reload — on a commit, after recovery,
+  after a merge — now drops the index's cached sizes, so the count follows the next commit
+  (about 4 s after the deletes on a 2-second commit clock, where it stayed past 90 s before).
+  The cache stays: a count with `data_size=true` walks the document store.
 - **Startup reports the shards the node runs with, not the setting.** The configuration block
   printed `Number of shards:` from `num_shards_init`, which is read only on the first start from
   empty data paths: a node restarted with the setting changed kept its shards on disk while

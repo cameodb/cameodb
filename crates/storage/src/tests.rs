@@ -721,6 +721,68 @@ mod tests {
         assert!(!cache.contains_key(&(true, "a".to_string())));
     }
 
+    /// A commit makes the cached sizes stale, so it drops them.
+    ///
+    /// A write batch drops them too, but before its documents are searchable: a stats request
+    /// between the batch and the commit that publishes it measures the old reader and caches
+    /// that for `index_cache_expiry` (an hour). A client that cannot commit — a key without
+    /// `node-admin`, waiting on the node's own commit clock — then read a count that did not
+    /// move for the hour: a gazette load on a 4-shard node reported 181 documents its deletes
+    /// had already removed, past every wait the loader allowed.
+    #[test]
+    fn a_commit_drops_the_cached_sizes_it_makes_stale() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = HybridStore::new(small_store_config(&temp_dir), 1).expect("store");
+        let index = "gazette";
+        store
+            .store_schema_and_cache(index, &IndexSchema::default())
+            .expect("store schema");
+        for id in ["d1", "d2", "d3"] {
+            store
+                .apply_write(
+                    index,
+                    WalOp::Put {
+                        id: id.to_string(),
+                        json_blob: Some(serde_json::json!({ "title": id })),
+                    },
+                )
+                .expect("write");
+        }
+        store.commit_index(index).expect("commit");
+        let count = |store: &HybridStore| {
+            store
+                .gather_index_stats(false)
+                .expect("stats")
+                .per_index
+                .get(index)
+                .expect("the index")
+                .document_count
+        };
+        assert_eq!(count(&store), 3);
+
+        store
+            .apply_write(
+                index,
+                WalOp::Delete {
+                    id: "d1".to_string(),
+                },
+            )
+            .expect("delete");
+        // Not committed: the reader still holds d1, and this measurement is cached.
+        assert_eq!(
+            count(&store),
+            3,
+            "the delete is not searchable before a commit"
+        );
+
+        store.commit_index(index).expect("commit");
+        assert_eq!(
+            count(&store),
+            2,
+            "the commit published the delete; the cached count of 3 must not outlive it"
+        );
+    }
+
     /// A commit does not re-walk the index directory to refresh the memory budget.
     ///
     /// `commit_index` used to call `get_optimal_memory_budget` on every commit, which is a
