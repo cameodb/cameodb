@@ -5412,7 +5412,7 @@ not be searched by word.
 - *Table:* OpenCC commit `fae2a0a` (2026-10-29), which gives the measured 3,221 pairs; 2,974 after
   the steps, 11,896 bytes. 256 non-BMP pairs are dropped, not 257: 薴 already has an OpenCC entry
   (薴→苧→苎), so 9 of the 10 overrides add a pair. All 14 reviewed pairs agree with Unihan 18.0
-  `kSimplifiedVariant`. Generator: `tools/zh-fold` (uv project, standard library only).
+  `kSimplifiedVariant`. Generator: `tools/zh-fold` (uv project, standard library only), `tools/cjk-fold` since U2.
 - *MCP:* `describe_index` already reports each field's `tokenizer`; a query rule says how to write a
   word in a `cjk` or `cjk_fold` field.
 - *Open items* below stay open: full-width Latin, the compatibility ideographs, and 覆→复.
@@ -5436,7 +5436,7 @@ glosses in the same field. `"내려 가다"` finds `내려가다`, so a Korean p
 Two limits come from the text, not the analyzer:
 - A word broken by inline ruby (`世《よ》の中《なか》`) is not one run.
 - `cjk` does not join Japanese old-style and new-style kanji (`淸吉` / `清吉`). That would be a
-  Japanese fold: filed as [U2](../ROADMAP.md#u2--japanese-and-korean-folds-old-style-kanji-and-hanja).
+  Japanese fold: built as [U2](#u2--japanese-and-korean-folds-old-style-kanji-and-hanja).
 - A loader must join hard-wrapped CJK lines without a space, as the Gutenberg extractor does.
 
 
@@ -5606,6 +5606,142 @@ named, as for the other `_fold` analyzers; a `CHANGELOG.md` entry; the MCP `desc
 names them.
 
 ---
+
+### U2 — Japanese and Korean folds: old-style kanji and Hanja
+
+✅ **Done** 2026-11-06. Built and tested as designed below, the same day it was filed from the
+Project Gutenberg case, once its Japanese books were searchable under `cjk`. U1 recorded the limit:
+`cjk` does not join `淸吉` and `清吉`.
+
+**As built**, where it differs from or settles the design:
+
+- *Japanese table: 905 pairs, 3.6 KB.*
+  - 408 reversed OpenCC old forms, 364 `kJapaneseNewVariant` pairs, 44 overrides, 460
+    compatibility ideographs and 47 chains resolved (劒→劍→剣).
+  - OpenCC's six conflicts each carry a `# @reverse-prefer:` line in the file itself (鹽→塩, 畫→画,
+    鋪→舗, 莊→荘, 鬥→闘, 驅→駆). The build follows those lines and refuses a conflict without one.
+    With them, Unihan agrees with OpenCC on every character both hold.
+  - No standard kanji (常用 2010) is a key.
+- *The overrides are 44, not about a dozen.* Among them: the four old forms with no Unihan variant
+  (逹 靑 淸 尙), 畵→画 (OpenCC maps 畵 to itself), two `kZVariant` and 38 `kSemanticVariant` pairs.
+  The build checks each Unihan reference against `Unihan_Variants.txt`; that check caught one
+  wrong code point, 泪, which now folds via 淚. 呑→吞 is left out because it points the wrong way:
+  呑 is the Japanese standard form.
+- *Korean table: 8,465 pairs, 33.9 KB*, as designed. The initial-sound rule and the jamo
+  composition are done in code (`initial_sound`, `compose`), not in the table.
+- *Runtime.* The Chinese-only `ChineseFold` became `CharFold`, with one `CHINESE` and one
+  `JAPANESE` table, plus `KoreanFold`. The arrays are `static`, since 34 KB is over clippy's limit
+  for a `const` array.
+- *Generator.* `tools/cjk-fold` replaces `tools/zh-fold` and builds all three tables. The Chinese
+  arrays come out identical; the file was renamed `fold_table.rs` → `zh_table.rs`.
+- *Licence.* `licenses/LICENSE-UNICODE-3.0` is the text from unicode.org; the top-level `LICENSE`
+  lists it.
+
+**Measured end to end** (release build, a scratch node; the 21 Japanese books and the Korean
+dictionary, with `cjk`, `cjk_ja_fold` and `cjk_ko_fold` as ghosts of one text). For every Japanese
+query tried, `cjk_ja_fold` finds exactly the chunks holding the word in either form, and the old
+form finds the same chunks:
+
+| Query (old form) | Chunks with the new form | With either form | `cjk` | `cjk_ja_fold` |
+|---|---|---|---|---|
+| 清吉 (淸吉) | 0 | 11 | 0 | 11 |
+| 学校 (學校) | 36 | 174 | 36 | 174 |
+| 国 (國) | 244 | 467 | 244 | 467 |
+| 達 (逹) | 167 | 417 | 167 | 417 |
+| 気持 (氣持) | 150 | 215 | 150 | 215 |
+| 強い (强い) | 103 | 174 | 103 | 174 |
+| 世の中 | 59 | 59 | 59 | 59 |
+
+Korean, on one document in Hanja (`女子大學에 入學한 李氏의 歷史 工夫`) and one in Hangul:
+- under `cjk_ko_fold`, 여자, 女子, 대학, 입학, 이씨, 역사, 歷史 and 공부 each find both documents;
+- under `cjk`, each finds only the one in its own script;
+- a document stored as conjoining jamo is found by 한국 and 가족.
+
+**Today.** Two scripts of one language stay apart under `cjk`.
+
+- *Japanese* was written in old-style kanji (旧字体) until the 1946–1949 reforms. A modern query
+  finds none of it: `清吉`, `読書` and `気持` miss `淸吉`, `讀書` and `氣持`.
+- *Korean* writes many words in Hanja in older and formal text (`家族` for `가족`), so a Hangul query
+  misses them. Korean can also be stored as conjoining jamo (NFD) instead of syllables, which
+  match nothing typed normally.
+
+`cjk_fold` is no answer for either. Japanese simplified its kanji differently from Chinese (氣 is
+気 in Japanese, 气 in Chinese; 圖 is 図 and 图), so the Chinese table would turn old Japanese into
+Chinese forms that no Japanese query uses.
+
+**Measured** on the 21 Japanese books of Project Gutenberg (509,622 kanji, mostly 1900s–1920s
+literature; Aozora ruby stripped by the loader):
+
+| Table | Pairs | Kanji occurrences folded |
+|---|---|---|
+| OpenCC `JPShinjitaiCharacters.txt` (commit `fae2a0a`), reversed | 408 | 29,761 (5.84%) |
+| Unihan 18.0 `kJapaneseNewVariant` | 364 | 27,494 (5.39%) |
+| Both, merged | 470 | 29,761 (5.84%) |
+
+- *The two sources agree* on 300 of the 302 characters they share. They differ on 鹽 (OpenCC 䀋,
+  Unihan 塩) and 莊 (庄 / 荘); Unihan's form is the Japanese one in both cases.
+- *OpenCC's reversed table has six conflicts*, where one old form sits under two new ones: 鹽, 畫,
+  鋪, 莊, 驅 and 鬥. Each takes Unihan's value, or the 常用 form where Unihan has none.
+- *Neither source holds the commonest old forms of this corpus.* These are variants of one
+  component that Unicode encodes apart: 逹 342, 强 241, 靑 238, 淸 172, 敎 166, 飮 119, 吿 50,
+  尙 49, 耻 33, 塲 27, 决 22, 囘 20. About 1,500 occurrences in all. They go in a reviewed
+  `overrides.tsv`, each line with its reference (Unihan `kZVariant` or `kSemanticVariant` where
+  it has one).
+- *Unihan's semantic variants are too loose to take whole*: they include 只→子, 捌→八 and 愈→愉.
+  The 1956 書きかえ pairs (慾→欲, 歎→嘆, 煖→暖, 廻→回, 盃→杯) are different characters that a
+  modern text replaced. They are left out of the first table, and each is a judgment call to make
+  against a corpus.
+
+Korean has no corpus here. Gutenberg's one Korean item is a Korean–English dictionary (5739),
+with 25 Hanja words. All 25 fold, by the rule below, to the dictionary's own Hangul headword (家族
+가족, 工夫 공부, 無窮花 무궁화, 太極旗 태극기).
+
+**Design.** Two analyzers, registered beside `cjk` and `cjk_fold`. Each places a fold filter
+ahead of `CjkBigram`, as `cjk_fold` does:
+
+- *`cjk_ja_fold`*: a `JapaneseFold` filter maps each old-style kanji to its new form, one
+  character to one. The table merges the two sources above with the overrides. The compatibility
+  ideographs U+F900–U+FAFF go to their canonical form (神 U+FA19 → 神 U+795E), and from there
+  through the table. Chains are resolved so the fold is idempotent. BMP only, with every key and
+  value a 3-byte character, so the token is rewritten in place and its offsets stay exact. Size
+  is about 2 KB. Japanese only: `cjk_fold` stays the Chinese analyzer.
+- *`cjk_ko_fold`*: a `KoreanFold` filter does three things.
+  - *Jamo are composed into syllables* (the Hangul part of NFC, by arithmetic, with no tables).
+  - *Each Hanja becomes its Hangul reading.* The table is Unihan `kHangul`: 8,465 BMP characters,
+    of which 270 are compatibility ideographs. Where a character has several readings (383 do),
+    the fold takes the one flagged `E`, then `0`, then the first. 74 characters take a reading
+    other than the first listed (樂 → 락, not 낙).
+  - *The initial-sound rule (두음법칙) applies to the first Hanja of each run.* So 女子 folds to 여자
+    and 子女 to 자녀, 李 to 이, 樂園 to 낙원, as South Korean spelling writes them.
+  The values are Hangul syllables, 3 bytes like the keys. Size is about 33 KB.
+
+  A Hangul query then finds text written in Hanja, and a Hanja query is folded the same way.
+  The fold is lossy where the language is ambiguous, and that is accepted:
+  - one reading per character (金 is 금, never the surname 김);
+  - the initial-sound rule misses a word that starts inside a Hanja run (新女性 → 신녀성, not 신여성);
+  - North Korean spelling, which has no initial-sound rule, folds to the southern forms.
+
+*Data.* `tools/zh-fold` becomes `tools/cjk-fold`, with one generator for all three tables. The
+Chinese table must come out with identical arrays. Sources are pinned by commit or date and
+sha256, and each table's `MANIFEST.txt` lines carry the counts and a checksum the storage tests
+verify.
+- *Licences:* OpenCC is Apache-2.0, credited as in U1. Unihan is under the Unicode License v3,
+  which asks for its notice with the derived data. The plan is `licenses/LICENSE-UNICODE-3.0` plus
+  the credit line in the manifest; `deny.toml` already accepts Unicode-3.0 for dependencies.
+
+*Reindex.* None for existing fields: `cjk` and `cjk_fold` do not change. A field moved to a new
+analyzer is rebuilt by reloading it.
+
+**Tests.**
+- *Japanese:* `淸吉` ≡ `清吉`, `讀書` ≡ `読書`, `氣` ≡ `気`, `鹽` ≡ `塩`. A 書きかえ pair such as 慾 /
+  欲 stays apart. Kana, Hangul and Latin come out as under `cjk`.
+- *Korean:* `家族` ≡ `가족`, `女子` ≡ `여자`, `子女` ≡ `자녀`. Jamo `ᄒ ᅡ ᆫ` (NFD) ≡ `한`. Kana and
+  Latin come out as under `cjk`.
+- *Both tables:* sorted, in range, idempotent, and matching the manifest. A fixture search with
+  each fold.
+
+**Consumer.** The Gutenberg case: `text_ja` moves to `cjk_ja_fold`, and Korean gets its own
+`text_ko` on `cjk_ko_fold` once a Korean-language book is in its collection.
 
 ## Phases 1–9 — Foundations through advanced architecture ✅ Done
 

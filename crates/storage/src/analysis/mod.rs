@@ -22,7 +22,7 @@ use tantivy::tokenizer::{
 };
 
 pub(crate) use accents::SuffixAccents;
-pub(crate) use cjk::{ChineseFold, CjkBigram};
+pub(crate) use cjk::{CharFold, CjkBigram, KoreanFold};
 pub(crate) use croatian::{CroatianStemmer, SerbianCyrillic};
 pub(crate) use german::GermanSpelling;
 pub(crate) use italian::ItalianStemmer;
@@ -54,6 +54,8 @@ pub(crate) const TOKENIZERS: &[&str] = &[
     "en_stem",
     "cjk",
     "cjk_fold",
+    "cjk_ja_fold",
+    "cjk_ko_fold",
     "de_stem",
     "de_stem_fold",
     "es_stem",
@@ -221,7 +223,25 @@ pub(crate) fn register_tokenizers(index: &Index) {
     manager.register(
         "cjk_fold",
         cjk()
-            .filter(ChineseFold)
+            .filter(CharFold::CHINESE)
+            .filter(CjkBigram)
+            .filter(RemoveLongFilter::limit(MAX_INDEXED_TOKEN_LEN + 1))
+            .build(),
+    );
+    // Japanese old-style kanji folded to the post-war forms, so `淸吉` and `清吉` find each other.
+    manager.register(
+        "cjk_ja_fold",
+        cjk()
+            .filter(CharFold::JAPANESE)
+            .filter(CjkBigram)
+            .filter(RemoveLongFilter::limit(MAX_INDEXED_TOKEN_LEN + 1))
+            .build(),
+    );
+    // Korean Hanja read as Hangul, and jamo composed, so `家族` and `가족` find each other.
+    manager.register(
+        "cjk_ko_fold",
+        cjk()
+            .filter(KoreanFold)
             .filter(CjkBigram)
             .filter(RemoveLongFilter::limit(MAX_INDEXED_TOKEN_LEN + 1))
             .build(),

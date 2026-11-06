@@ -23,10 +23,11 @@ CameoDB's storage engine combines two complementary storage systems:
   `-trice`), `pt_stem` (plurals to the singular and feminines to the masculine, then Snowball), the accent-insensitive `it_stem_fold` · `es_stem_fold` ·
   `fr_stem_fold` · `pt_stem_fold` · `de_stem_fold` (`src/analysis/accents.rs`, `german.rs`), and `hr_stem` / `hr_stem_fold`, a Croatian lemmatizer whose data
   (`src/analysis/croatian/data`, 5.45 MB, embedded) is built by
-  [`tools/hr-lexicon`](../../tools/hr-lexicon/README.md), and `cjk` / `cjk_fold` for Chinese,
-  Japanese and Korean (`src/analysis/cjk`: each character alone and paired with the next;
-  `cjk_fold` folds traditional Chinese to simplified by a 12 KB table built by
-  [`tools/zh-fold`](../../tools/zh-fold/README.md)). The tokenizer decides the terms written,
+  [`tools/hr-lexicon`](../../tools/hr-lexicon/README.md), and `cjk` · `cjk_fold` ·
+  `cjk_ja_fold` · `cjk_ko_fold` for Chinese, Japanese and Korean (`src/analysis/cjk`: each
+  character alone and paired with the next; the folds take traditional Chinese to simplified,
+  Japanese old-style kanji to new, and Korean Hanja to Hangul, by tables of 12, 4 and 34 KB built
+  by [`tools/cjk-fold`](../../tools/cjk-fold/README.md)). The tokenizer decides the terms written,
   so a change to what a name produces means reindexing the fields that use it.
 
 ### Multi-Tenant Architecture

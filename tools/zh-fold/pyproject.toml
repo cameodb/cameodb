@@ -1,9 +1,0 @@
-[project]
-name = "zh-fold"
-version = "0.1.0"
-description = "Builds the traditional-to-simplified fold table behind the cjk_fold analyzer"
-requires-python = ">=3.11"
-dependencies = []
-
-[tool.uv]
-package = false

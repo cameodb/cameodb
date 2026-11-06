@@ -1,4 +1,5 @@
-//! Chinese, Japanese and Korean, searchable by word: the `cjk` and `cjk_fold` analyzers.
+//! Chinese, Japanese and Korean, searchable by word: the `cjk`, `cjk_fold`, `cjk_ja_fold` and
+//! `cjk_ko_fold` analyzers.
 //!
 //! Chinese and Japanese put no spaces between words, and every Han, kana or Hangul character is
 //! alphanumeric, so `SimpleTokenizer` makes one term of a whole clause between two punctuation
@@ -8,15 +9,29 @@
 //! analyzer splits becomes a phrase over those positions, so `道` matches the character wherever it
 //! stands, and `孔子` matches only where 孔 and 子 stand together.
 //!
-//! [`ChineseFold`] maps each traditional character to its simplified form ahead of the pairs, so
-//! `學而` and `学而` are one term. The table is a fold, not a conversion: it only has to give the
-//! text and the query one form, never correct simplified text, so one character goes to one, with
-//! no context. Traditional to simplified is the direction that folds (many to one); the reverse
-//! branches (发 → 發 or 髮). For Chinese only: the table would take Japanese old-style kanji to
-//! Chinese forms Japanese text does not use, so `cjk` is the analyzer for Japanese and Korean.
+//! Three folds run ahead of the pairs, one per language, each giving two spellings of one word a
+//! single form. A fold is not a conversion: it only has to give the text and the query the same
+//! form, never correct text, so one character goes to one, with no context.
+//!
+//! - [`CharFold::CHINESE`] (`cjk_fold`) maps traditional characters to simplified, so `學而` and
+//!   `学而` are one term. Traditional to simplified is the direction that folds (many to one); the
+//!   reverse branches (发 → 發 or 髮).
+//! - [`CharFold::JAPANESE`] (`cjk_ja_fold`) maps old-style kanji to the post-war forms, so `淸吉`
+//!   and `清吉` are one term. Japanese simplified differently from Chinese (氣 is 気, not 气), so
+//!   neither table may take the other's language.
+//! - [`KoreanFold`] (`cjk_ko_fold`) reads each Hanja as its Hangul syllable, so `家族` and `가족`
+//!   are one term, with the initial-sound rule on the first Hanja of a run.
 
 mod data {
-    include!("data/fold_table.rs");
+    pub(super) mod zh {
+        include!("data/zh_table.rs");
+    }
+    pub(super) mod ja {
+        include!("data/ja_table.rs");
+    }
+    pub(super) mod ko {
+        include!("data/ko_table.rs");
+    }
 }
 
 use tantivy::tokenizer::{Token, TokenFilter, TokenStream, Tokenizer};
@@ -219,67 +234,267 @@ impl<T: TokenStream> TokenStream for CjkBigramTokenStream<T> {
     }
 }
 
-/// The folded form of `c`: simplified for a traditional character in the table, `c` otherwise.
-fn fold(c: char) -> char {
-    // Every key is in U+3400–U+9FFF; anything else, Latin and kana included, returns here.
-    if !('\u{3400}'..='\u{9FFF}').contains(&c) {
-        return c;
+/// One generated table: `KEYS` sorted, each key's folded form at the same index of `VALUES`.
+/// Every key is a Han character (U+3400–U+9FFF) or a compatibility ideograph (U+F900–U+FAFF).
+pub(crate) struct Table {
+    keys: &'static [u16],
+    values: &'static [u16],
+}
+
+impl Table {
+    /// The folded form of `c`, or `None` when the table leaves it as it is.
+    fn get(&self, c: char) -> Option<char> {
+        // Anything outside the key ranges, Latin, kana and Hangul included, returns here.
+        if !matches!(c as u32, 0x3400..=0x9FFF | 0xF900..=0xFAFF) {
+            return None;
+        }
+        let at = self.keys.binary_search(&(c as u16)).ok()?;
+        char::from_u32(u32::from(self.values[at]))
     }
-    match data::KEYS.binary_search(&(c as u16)) {
-        Ok(at) => char::from_u32(u32::from(data::VALUES[at])).unwrap_or(c),
-        Err(_) => c,
+
+    fn fold(&self, c: char) -> char {
+        self.get(c).unwrap_or(c)
     }
 }
 
-/// The token filter folding traditional Chinese to simplified, one character to one. Placed
-/// ahead of [`CjkBigram`], so the pairs are made of folded characters.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct ChineseFold;
+static ZH: Table = Table {
+    keys: &data::zh::KEYS,
+    values: &data::zh::VALUES,
+};
+static JA: Table = Table {
+    keys: &data::ja::KEYS,
+    values: &data::ja::VALUES,
+};
+static KO: Table = Table {
+    keys: &data::ko::KEYS,
+    values: &data::ko::VALUES,
+};
 
-impl TokenFilter for ChineseFold {
-    type Tokenizer<T: Tokenizer> = ChineseFoldFilter<T>;
+/// Whether a token may hold a key of any table: U+3400–U+9FFF has a UTF-8 lead byte of
+/// 0xE3–0xE9, U+F900–U+FAFF one of 0xEF. A token without either has nothing to fold.
+fn may_fold(text: &str) -> bool {
+    text.bytes().any(|b| matches!(b, 0xE3..=0xE9 | 0xEF))
+}
 
-    fn transform<T: Tokenizer>(self, tokenizer: T) -> ChineseFoldFilter<T> {
-        ChineseFoldFilter { inner: tokenizer }
+/// The token filter folding one character to one by a [`Table`]: traditional Chinese to
+/// simplified, or old-style kanji to new. Placed ahead of [`CjkBigram`], so the pairs are made of
+/// folded characters.
+#[derive(Clone, Copy)]
+pub(crate) struct CharFold {
+    table: &'static Table,
+}
+
+impl CharFold {
+    /// Traditional Chinese to simplified: `cjk_fold`. For Chinese only: it would take Japanese
+    /// old-style kanji to Chinese forms Japanese text does not use.
+    pub(crate) const CHINESE: CharFold = CharFold { table: &ZH };
+    /// Japanese old-style kanji (旧字体) to the post-war forms: `cjk_ja_fold`.
+    pub(crate) const JAPANESE: CharFold = CharFold { table: &JA };
+}
+
+impl TokenFilter for CharFold {
+    type Tokenizer<T: Tokenizer> = CharFoldFilter<T>;
+
+    fn transform<T: Tokenizer>(self, tokenizer: T) -> CharFoldFilter<T> {
+        CharFoldFilter {
+            inner: tokenizer,
+            table: self.table,
+        }
     }
 }
 
 #[derive(Clone)]
-pub(crate) struct ChineseFoldFilter<T> {
+pub(crate) struct CharFoldFilter<T> {
+    inner: T,
+    table: &'static Table,
+}
+
+impl<T: Tokenizer> Tokenizer for CharFoldFilter<T> {
+    type TokenStream<'a> = CharFoldTokenStream<T::TokenStream<'a>>;
+
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
+        CharFoldTokenStream {
+            tail: self.inner.token_stream(text),
+            table: self.table,
+            buffer: String::new(),
+        }
+    }
+}
+
+pub(crate) struct CharFoldTokenStream<T> {
+    tail: T,
+    table: &'static Table,
+    /// Where a folded token is written before it is swapped in, kept so a stream allocates once.
+    buffer: String,
+}
+
+impl<T: TokenStream> TokenStream for CharFoldTokenStream<T> {
+    fn advance(&mut self) -> bool {
+        if !self.tail.advance() {
+            return false;
+        }
+        let text = &mut self.tail.token_mut().text;
+        // Keys and values are all 3-byte characters, so the length never changes and the token's
+        // offsets stay exact.
+        if may_fold(text) && text.chars().any(|c| self.table.get(c).is_some()) {
+            self.buffer.clear();
+            self.buffer.extend(text.chars().map(|c| self.table.fold(c)));
+            std::mem::swap(text, &mut self.buffer);
+        }
+        true
+    }
+
+    fn token(&self) -> &Token {
+        self.tail.token()
+    }
+
+    fn token_mut(&mut self) -> &mut Token {
+        self.tail.token_mut()
+    }
+}
+
+/// A Hangul syllable is an initial (19), a vowel (21) and an optional final (27 and none):
+/// `0xAC00 + (initial * 21 + vowel) * 28 + final`.
+const SYLLABLE_BASE: u32 = 0xAC00;
+const SYLLABLE_LAST: u32 = 0xD7A3;
+const VOWELS: u32 = 21;
+const FINALS: u32 = 28;
+
+/// The initial-sound rule (두음법칙) on the first syllable of a word read from Hanja, as South
+/// Korean spelling writes it: ㄹ before ㅑ ㅒ ㅕ ㅖ ㅛ ㅠ ㅣ becomes silent ㅇ, and before any other
+/// vowel ㄴ (李 리 → 이, 歷史 력사 → 역사, 樂園 락원 → 낙원); ㄴ before ㅕ ㅛ ㅠ ㅣ becomes ㅇ
+/// (女子 녀자 → 여자).
+fn initial_sound(syllable: char) -> char {
+    const NIEUN: u32 = 2;
+    const RIEUL: u32 = 5;
+    const IEUNG: u32 = 11;
+    let code = syllable as u32;
+    if !(SYLLABLE_BASE..=SYLLABLE_LAST).contains(&code) {
+        return syllable;
+    }
+    let index = code - SYLLABLE_BASE;
+    let (initial, vowel, last) = (
+        index / (VOWELS * FINALS),
+        index / FINALS % VOWELS,
+        index % FINALS,
+    );
+    // Vowel indexes: ㅑ 2, ㅒ 3, ㅕ 6, ㅖ 7, ㅛ 12, ㅠ 17, ㅣ 20.
+    let to = match (initial, vowel) {
+        (RIEUL, 2 | 3 | 6 | 7 | 12 | 17 | 20) | (NIEUN, 6 | 12 | 17 | 20) => IEUNG,
+        (RIEUL, _) => NIEUN,
+        _ => return syllable,
+    };
+    char::from_u32(SYLLABLE_BASE + (to * VOWELS + vowel) * FINALS + last).unwrap_or(syllable)
+}
+
+/// A leading consonant and a vowel of the conjoining jamo (U+1100–U+1112, U+1161–U+1175), as
+/// Hangul arrives decomposed (NFD), joined into their syllable.
+fn compose(lead: char, vowel: char) -> Option<char> {
+    let (l, v) = (lead as u32, vowel as u32);
+    if (0x1100..=0x1112).contains(&l) && (0x1161..=0x1175).contains(&v) {
+        char::from_u32(SYLLABLE_BASE + ((l - 0x1100) * VOWELS + (v - 0x1161)) * FINALS)
+    } else {
+        None
+    }
+}
+
+/// A syllable without a final and a trailing jamo consonant (U+11A8–U+11C2), joined.
+fn add_final(syllable: char, trail: char) -> Option<char> {
+    let (s, t) = (syllable as u32, trail as u32);
+    let open =
+        (SYLLABLE_BASE..=SYLLABLE_LAST).contains(&s) && (s - SYLLABLE_BASE).is_multiple_of(FINALS);
+    if open && (0x11A8..=0x11C2).contains(&t) {
+        char::from_u32(s + (t - 0x11A7))
+    } else {
+        None
+    }
+}
+
+/// The token filter reading Korean Hanja as Hangul, for `cjk_ko_fold`. Placed ahead of
+/// [`CjkBigram`]. Within a token it:
+///
+/// - composes conjoining jamo into syllables, the Hangul part of NFC, so decomposed text matches
+///   a query typed normally;
+/// - replaces each Hanja by its reading, one syllable per character, by Unihan `kHangul`;
+/// - applies the initial-sound rule to the first Hanja of each run, so `女子` folds to `여자` and
+///   `子女` to `자녀`.
+///
+/// One reading per character is lossy where Korean is ambiguous (金 is 금, never the surname 김),
+/// and a word starting inside a Hanja run keeps its dictionary initial (新女性 → 신녀성).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct KoreanFold;
+
+impl TokenFilter for KoreanFold {
+    type Tokenizer<T: Tokenizer> = KoreanFoldFilter<T>;
+
+    fn transform<T: Tokenizer>(self, tokenizer: T) -> KoreanFoldFilter<T> {
+        KoreanFoldFilter { inner: tokenizer }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct KoreanFoldFilter<T> {
     inner: T,
 }
 
-impl<T: Tokenizer> Tokenizer for ChineseFoldFilter<T> {
-    type TokenStream<'a> = ChineseFoldTokenStream<T::TokenStream<'a>>;
+impl<T: Tokenizer> Tokenizer for KoreanFoldFilter<T> {
+    type TokenStream<'a> = KoreanFoldTokenStream<T::TokenStream<'a>>;
 
     fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
-        ChineseFoldTokenStream {
+        KoreanFoldTokenStream {
             tail: self.inner.token_stream(text),
             buffer: String::new(),
         }
     }
 }
 
-pub(crate) struct ChineseFoldTokenStream<T> {
+pub(crate) struct KoreanFoldTokenStream<T> {
     tail: T,
     /// Where a folded token is written before it is swapped in, kept so a stream allocates once.
     buffer: String,
 }
 
-impl<T: TokenStream> TokenStream for ChineseFoldTokenStream<T> {
+impl<T: TokenStream> TokenStream for KoreanFoldTokenStream<T> {
     fn advance(&mut self) -> bool {
         if !self.tail.advance() {
             return false;
         }
         let text = &mut self.tail.token_mut().text;
-        // U+3400–U+9FFF is encoded with a lead byte of 0xE3–0xE9; a token without one has
-        // nothing to fold. Keys and values are all 3-byte characters, so the length never changes
-        // and the token's offsets stay exact.
-        if text.bytes().any(|b| (0xE3..=0xE9).contains(&b)) && text.chars().any(|c| fold(c) != c) {
-            self.buffer.clear();
-            self.buffer.extend(text.chars().map(fold));
-            std::mem::swap(text, &mut self.buffer);
+        // Conjoining jamo have the lead byte 0xE1 (U+1000–U+1FFF); with neither jamo nor a key,
+        // the token passes as it is.
+        let jamo = text.bytes().any(|b| b == 0xE1);
+        if !jamo && !(may_fold(text) && text.chars().any(|c| KO.get(c).is_some())) {
+            return true;
         }
+        self.buffer.clear();
+        let mut in_run = false;
+        for c in text.chars() {
+            if let Some(reading) = KO.get(c) {
+                self.buffer.push(if in_run {
+                    reading
+                } else {
+                    initial_sound(reading)
+                });
+                in_run = true;
+                continue;
+            }
+            in_run = false;
+            let joined = self
+                .buffer
+                .chars()
+                .next_back()
+                .and_then(|last| compose(last, c).or_else(|| add_final(last, c)));
+            match joined {
+                Some(syllable) => {
+                    self.buffer.pop();
+                    self.buffer.push(syllable);
+                }
+                None => self.buffer.push(c),
+            }
+        }
+        // A Hanja and its syllable are both 3 bytes, so only composed jamo shorten the token;
+        // then [`CjkBigram`] gives each piece the whole token's offsets.
+        std::mem::swap(text, &mut self.buffer);
         true
     }
 
@@ -550,9 +765,134 @@ mod tests {
         for text in ["ひらがな カタカナ", "한국어", "Größe ABC 123"] {
             assert_eq!(terms("cjk_fold", text), terms("cjk", text), "{text}");
         }
-        // Japanese is bigrammed by `cjk_fold` too, but its kanji would be folded: Japanese fields
-        // take `cjk`.
-        assert_eq!(terms("cjk", "學校"), ["學", "學校", "校"]);
+        // Japanese is bigrammed by `cjk_fold` too, but its kanji would be folded to Chinese forms:
+        // Japanese fields take `cjk_ja_fold`.
+        assert_eq!(terms("cjk_fold", "気氣"), terms("cjk_fold", "気气"));
+    }
+
+    #[test]
+    fn cjk_ja_fold_joins_old_and_new_kanji() {
+        for (a, b) in [
+            ("淸吉", "清吉"),
+            ("讀書", "読書"),
+            ("氣持", "気持"),
+            ("學校", "学校"),
+            ("國", "国"),
+            ("鹽", "塩"),
+            ("畫", "画"),
+            ("畵", "画"),
+            ("靑い", "青い"),
+            ("强い", "強い"),
+            ("劒", "剣"),
+            // A compatibility ideograph is the character it stands for, then folds on: 神 U+FA19.
+            ("\u{FA19}", "神"),
+        ] {
+            assert_eq!(
+                terms("cjk_ja_fold", a),
+                terms("cjk_ja_fold", b),
+                "{a} ≡ {b}"
+            );
+        }
+        // The Chinese simplified forms stay apart from the Japanese ones, and a 書きかえ pair,
+        // two characters a reform replaced one by the other, is left apart until a corpus asks.
+        for (a, b) in [("気", "气"), ("図", "图"), ("慾", "欲"), ("呑", "吞")] {
+            assert_ne!(
+                terms("cjk_ja_fold", a),
+                terms("cjk_ja_fold", b),
+                "{a} ≠ {b}"
+            );
+        }
+        for text in [
+            "ひらがな カタカナ",
+            "한국어",
+            "Größe ABC 123",
+            "清吉は東京へ",
+        ] {
+            assert_eq!(terms("cjk_ja_fold", text), terms("cjk", text), "{text}");
+        }
+        let f = Fixture::new(
+            "cjk_ja_fold",
+            &["淸吉と云ふ若い刺靑師", "清吉は青年", "國語"],
+        );
+        assert_eq!(f.found("清吉"), vec![0, 1]);
+        assert_eq!(f.found("刺青"), vec![0]);
+        assert_eq!(f.found("国語"), vec![2]);
+        assert_eq!(
+            f.highlight("清吉", "淸吉と云ふ若い刺靑師"),
+            "<b>淸吉</b>と云ふ若い刺靑師"
+        );
+    }
+
+    #[test]
+    fn cjk_ko_fold_reads_hanja_as_hangul() {
+        for (a, b) in [
+            ("家族", "가족"),
+            ("工夫", "공부"),
+            ("無窮花", "무궁화"),
+            // The initial-sound rule on the first Hanja of a run, not inside it.
+            ("女子", "여자"),
+            ("子女", "자녀"),
+            ("李", "이"),
+            ("歷史", "역사"),
+            ("樂園", "낙원"),
+            ("老人", "노인"),
+            ("勞動", "노동"),
+            // Mixed script in one word, as Korean writes it: the run ends at the Hangul.
+            ("家族과", "가족과"),
+            ("韓國語", "한국어"),
+        ] {
+            assert_eq!(
+                terms("cjk_ko_fold", a),
+                terms("cjk_ko_fold", b),
+                "{a} ≡ {b}"
+            );
+        }
+        assert_eq!(terms("cjk_ko_fold", "子女"), ["자", "자녀", "녀"]);
+        // Conjoining jamo (NFD) are the syllables they spell.
+        assert_eq!(
+            terms(
+                "cjk_ko_fold",
+                "\u{1112}\u{1161}\u{11AB}\u{1100}\u{116E}\u{11A8}"
+            ),
+            terms("cjk_ko_fold", "한국")
+        );
+        for text in ["ひらがな カタカナ", "한국어 문법", "Größe ABC 123"] {
+            assert_eq!(terms("cjk_ko_fold", text), terms("cjk", text), "{text}");
+        }
+        let f = Fixture::new("cjk_ko_fold", &["家族 a family", "우리 가족", "女子大學"]);
+        assert_eq!(f.found("가족"), vec![0, 1]);
+        assert_eq!(f.found("家族"), vec![0, 1]);
+        assert_eq!(f.found("여자"), vec![2]);
+        assert_eq!(f.found("family"), vec![0]);
+        assert_eq!(f.highlight("가족", "家族 a family"), "<b>家族</b> a family");
+    }
+
+    #[test]
+    fn the_initial_sound_rule() {
+        for (from, to) in [
+            ('녀', '여'),
+            ('뇨', '요'),
+            ('뉴', '유'),
+            ('니', '이'),
+            ('랴', '야'),
+            ('력', '역'),
+            ('례', '예'),
+            ('룡', '용'),
+            ('류', '유'),
+            ('림', '임'),
+            ('라', '나'),
+            ('래', '내'),
+            ('로', '노'),
+            ('뢰', '뇌'),
+            ('루', '누'),
+            ('릉', '능'),
+            ('나', '나'),
+            ('노', '노'),
+            ('가', '가'),
+            ('A', 'A'),
+        ] {
+            assert_eq!(initial_sound(from), to, "{from}");
+        }
     }
 
     /// A clause longer than the token cap is split, not dropped; a Latin atom over it still is.
@@ -564,34 +904,78 @@ mod tests {
         assert_eq!(terms("cjk", &atom), ["道"]);
     }
 
+    /// Each table: its size, sorted keys in range, values in range and never keys themselves (the
+    /// fold is idempotent).
     #[test]
-    fn the_table_is_sorted_in_range_and_idempotent() {
-        assert_eq!(data::KEYS.len(), 2_974);
-        assert!(data::KEYS.windows(2).all(|w| w[0] < w[1]));
-        for (&k, &v) in data::KEYS.iter().zip(&data::VALUES) {
-            for c in [k, v] {
-                assert!((0x3400..=0x9FFF).contains(&c), "U+{c:04X}");
+    fn the_tables_are_sorted_in_range_and_idempotent() {
+        type Ranges = &'static [(u16, u16)];
+        const HAN: Ranges = &[(0x3400, 0x9FFF)];
+        const HAN_OR_COMPAT: Ranges = &[(0x3400, 0x9FFF), (0xF900, 0xFAFF)];
+        const HANGUL: Ranges = &[(0xAC00, 0xD7A3)];
+        let inside = |ranges: Ranges, c: u16| ranges.iter().any(|&(lo, hi)| (lo..=hi).contains(&c));
+        let cases: [(&str, &Table, usize, Ranges, Ranges); 3] = [
+            ("zh", &ZH, 2_974, HAN, HAN),
+            ("ja", &JA, 905, HAN_OR_COMPAT, HAN),
+            ("ko", &KO, 8_465, HAN_OR_COMPAT, HANGUL),
+        ];
+        for (name, table, size, keys_in, values_in) in cases {
+            assert_eq!(table.keys.len(), size, "{name}");
+            assert_eq!(table.values.len(), size, "{name}");
+            assert!(table.keys.windows(2).all(|w| w[0] < w[1]), "{name}");
+            for (&k, &v) in table.keys.iter().zip(table.values) {
+                assert!(inside(keys_in, k), "{name} key U+{k:04X}");
+                assert!(inside(values_in, v), "{name} value U+{v:04X}");
+                assert_ne!(k, v, "{name}");
+                let folded = char::from_u32(u32::from(v)).unwrap();
+                assert_eq!(
+                    table.fold(folded),
+                    folded,
+                    "{name} U+{k:04X} → U+{v:04X} folds again"
+                );
             }
-            assert_ne!(k, v);
-            let folded = char::from_u32(u32::from(v)).unwrap();
-            assert_eq!(fold(folded), folded, "U+{k:04X} → U+{v:04X} folds again");
         }
     }
 
     #[test]
-    fn the_manifest_matches_the_committed_table() {
+    fn the_manifest_matches_the_committed_tables() {
         let manifest = include_str!("data/MANIFEST.txt");
-        let line = manifest
-            .lines()
-            .find(|l| l.starts_with("file\tfold_table.rs\t"))
-            .expect("fold_table.rs line");
-        let digest = Sha256::digest(include_bytes!("data/fold_table.rs"));
-        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(
-            line.rsplit('\t').next(),
-            Some(hex.as_str()),
-            "regenerate the manifest"
-        );
-        assert!(manifest.contains(&format!("pairs {}", data::KEYS.len())));
+        for (name, bytes, pairs) in [
+            (
+                "zh_table.rs",
+                &include_bytes!("data/zh_table.rs")[..],
+                ZH.keys.len(),
+            ),
+            (
+                "ja_table.rs",
+                &include_bytes!("data/ja_table.rs")[..],
+                JA.keys.len(),
+            ),
+            (
+                "ko_table.rs",
+                &include_bytes!("data/ko_table.rs")[..],
+                KO.keys.len(),
+            ),
+        ] {
+            let file = format!("file\t{name}\t");
+            let line = manifest
+                .lines()
+                .find(|l| l.starts_with(&file))
+                .unwrap_or_else(|| panic!("{name} line"));
+            let hex: String = Sha256::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            assert_eq!(
+                line.rsplit('\t').next(),
+                Some(hex.as_str()),
+                "regenerate the manifest"
+            );
+            let counts = format!("counts\t{name}\t");
+            let line = manifest
+                .lines()
+                .find(|l| l.starts_with(&counts))
+                .unwrap_or_else(|| panic!("{name} counts"));
+            assert!(line.ends_with(&format!("pairs {pairs}")), "{line}");
+        }
     }
 }

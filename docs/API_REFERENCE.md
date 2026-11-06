@@ -834,7 +834,9 @@ exactly as the documents were. Omitted, it is `default`.
 | `hr_stem` | `default`, then each word to its dictionary form: `članka`, `člancima` → `članak`; `odlučila` → `odlučiti`; `Umagu` → `umag`. Terms keep their diacritics. Serbian Cyrillic is read as its Latin spelling, so `камен` and `kamen` are one term |
 | `hr_stem_fold` | The same with diacritics removed first, so `zupanija` finds `županije` and `fazana` finds `Fažana`, and with Serbian Cyrillic read as Latin. The usual choice for Croatian text people search |
 | `cjk` | For Chinese, Japanese and Korean. `default`, then each run of CJK characters (Han, kana, Hangul) indexed as every character alone and every pair of neighbours, so `道` finds the character anywhere and `孔子` finds 孔 and 子 only where they stand together. Latin words and numbers in the same text are indexed as `default` indexes them |
-| `cjk_fold` | `cjk` with traditional Chinese folded to simplified first, so `學習` finds `学习`, `為` finds `爲` and `为`, and `看着` finds `看著`. For Chinese only; Japanese takes `cjk` |
+| `cjk_fold` | `cjk` with traditional Chinese folded to simplified first, so `學習` finds `学习`, `為` finds `爲` and `为`, and `看着` finds `看著`. For Chinese only; Japanese takes `cjk_ja_fold` |
+| `cjk_ja_fold` | `cjk` with Japanese old-style kanji (旧字体) folded to the post-war forms first, so `清吉` finds `淸吉`, `読書` finds `讀書` and `気` finds `氣`. For Japanese only |
+| `cjk_ko_fold` | `cjk` with Korean Hanja read as Hangul first, so `가족` finds `家族` and `여자` finds `女子`, and decomposed Hangul (jamo) read as the syllables it spells. For Korean only |
 
 Tokens longer than 128 bytes are dropped by every tokenizer but `raw` and `whitespace`. A name
 not in this table is refused with `400` naming the field: the node could not build the index.
@@ -864,9 +866,24 @@ text in both, and variant spellings meet (`裏`, `裡`, `里`; `著`, `着`). Fo
 different words that simplified spells alike: 雲 *cloud* and 云 *say*, 後 *after* and 后
 *empress*, 髮 *hair* and 發 *emit*, 乾 *dry* and 幹 *do*, 穀 *grain* and 谷 *valley*. A word of two
 or more characters mostly tells them apart again. Pairs that are different words in both scripts
-stay apart (`象`/`像`, `坐`/`座`), as do `覆` and `复`. Japanese kanji must not be folded — the
-table would turn old-style kanji into Chinese forms Japanese does not use — so a corpus in both
-languages takes a field per language: `cjk_fold` for Chinese, `cjk` for Japanese and Korean.
+stay apart (`象`/`像`, `坐`/`座`), as do `覆` and `复`. Japanese kanji must not take that table —
+it would turn old-style kanji into Chinese forms Japanese does not use (氣 is 気 in Japanese, 气 in
+Chinese) — so a corpus in several of these languages takes a field per language.
+
+`cjk_ja_fold` folds Japanese old-style kanji, as books printed before the post-war reforms write
+them, to the forms in use since, by a table of 905 pairs: OpenCC's Japanese list reversed and
+Unihan's `kJapaneseNewVariant`, with reviewed additions for old forms both lack (`淸`, `靑`, `逹`,
+`强`, `敎`), and the compatibility ideographs taken to the characters they stand for. Two
+characters that the 1956 spelling reform replaced one by the other (`慾` and `欲`, `歎` and `嘆`)
+stay apart.
+
+`cjk_ko_fold` reads each Hanja as its Hangul syllable, by Unihan's `kHangul` (8,465 characters),
+so text written in Hanja and a query in Hangul find each other, and a query in Hanja is read the
+same way. The first Hanja of a run takes the initial-sound rule of South Korean spelling (`女子`
+is `여자`, `子女` is `자녀`, `李` is `이`). One reading serves each character, so a character with
+two meanings read apart takes the common one (`金` is `금`, not the surname `김`), and a word that
+starts inside a run of Hanja keeps its dictionary reading (`新女性` reads `신녀성`). Hangul stored
+decomposed, as conjoining jamo, is read as the syllables it spells.
 
 **Ghost fields.** A text searched under more than one analyzer — stemmed and as written, or
 stemmed by the language of its row — needs a column per analyzer, and a column is filled from a

@@ -24,6 +24,8 @@ All license texts are available under `licenses/`:
 - `licenses/LICENSE-APACHE-2.0`
 - `licenses/LICENSE-MIT`
 - `licenses/LICENSE-FSL-1.1-APACHE-2.0`
+- `licenses/LICENSE-UNICODE-3.0`: the notice of the Unicode data (Unihan) that the Japanese and
+  Korean fold tables in `crates/storage/src/analysis/cjk/data` are derived from
 
 ## Using CameoDB
 

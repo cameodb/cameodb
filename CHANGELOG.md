@@ -19,7 +19,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first, by a 12 KB table of 2,974 pairs derived from OpenCC's `TSCharacters.txt` (Apache-2.0)
   with reviewed overrides (`著`→`着`, `藉`→`借`, `瞭`→`了` and others), so either script finds both;
   it is for Chinese only. Both are new names: existing fields are unchanged, and a field uses them
-  by declaring one. The table is built by `tools/zh-fold`.
+  by declaring one. The table is built by `tools/cjk-fold`.
+- **`cjk_ja_fold` and `cjk_ko_fold` tokenizers: old and new Japanese kanji, Korean Hanja and
+  Hangul, find each other.** `cjk` keeps two spellings of one word apart, and `cjk_fold`'s Chinese
+  table would turn Japanese into Chinese forms (氣 to 气, where Japanese writes 気). `cjk_ja_fold`
+  folds old-style kanji to the post-war forms first (`淸吉` and `清吉`, `讀書` and `読書`), by a
+  table of 905 pairs from OpenCC's `JPShinjitaiCharacters.txt` reversed and Unihan
+  `kJapaneseNewVariant`, with reviewed additions and the compatibility ideographs; on 21 Japanese
+  novels of 1900–1930 it folds about 6% of the kanji. `cjk_ko_fold` reads each Hanja as its Hangul
+  syllable by Unihan `kHangul`, with the initial-sound rule on the first of a run (`女子` and
+  `여자`, `子女` and `자녀`), and composes decomposed Hangul. New names: existing fields, `cjk_fold`
+  included, are unchanged. The tables are built by `tools/cjk-fold`, which replaces
+  `tools/zh-fold` and gives the Chinese table unchanged. Unihan is under the Unicode License v3,
+  added as `licenses/LICENSE-UNICODE-3.0`.
 
 ### Fixed
 

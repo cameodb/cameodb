@@ -1,0 +1,9 @@
+[project]
+name = "cjk-fold"
+version = "0.1.0"
+description = "Builds the fold tables behind the cjk_fold, cjk_ja_fold and cjk_ko_fold analyzers"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv]
+package = false

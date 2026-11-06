@@ -1,0 +1,56 @@
+# Overrides for cjk_ja_fold, applied over OpenCC JPShinjitaiCharacters.txt (reversed) and Unihan
+# kJapaneseNewVariant. Columns (tab-separated): old, new, reason, reference
+# Each line is a reviewed pair that neither source holds. Measured on the 21 Japanese books of
+# Project Gutenberg (509,622 kanji); the count is the old form's occurrences there. Unihan is cited,
+# never copied.
+# Reviewed and left out:
+# - 呑→吞: 呑 is the Japanese standard form; 吞 is the Chinese one.
+# - 籐→藤 (rattan, wisteria), 炮→砲, 棹→櫂, 涌→湧, 譚→談: different words, or both forms in use.
+# - 只→子, 捌→八, 肆→四, 愈→愉, 匈→胸, 晁→朝, 灬→火, 艸→草, 蕈→菌, 寔→實: Unihan semantic
+#   variants that are not the same word in Japanese.
+# - The 1956 書きかえ replacements, kept apart until a corpus shows the fold is wanted: 慾→欲,
+#   歎→嘆, 煖→暖, 饑→飢, 廻→回, 盃→杯, 吊→弔, 泛→汎, 馭→御, 吃→喫, 澹→淡, 犇→奔, 糺→糾.
+逹	達	variant of 達 in pre-war print; 342 occurrences	no Unihan variant; U+9039 is 達 U+9054 with 幸 for 羍
+靑	青	the 康熙 form of 青; 238	no Unihan variant; U+9751 → U+9752
+淸	清	the 康熙 form of 清 (淸吉); 172	no Unihan variant; U+6DF8 → U+6E05
+尙	尚	the 康熙 form of 尚; 49	no Unihan variant; U+5C19 → U+5C1A
+畵	画	OpenCC maps 畵 to itself; 畫 already folds to 画; 29	OpenCC JPShinjitaiCharacters 画 畫
+强	強	the 康熙 form of 強; 241	Unihan kSemanticVariant U+5F3A → U+5F37
+敎	教	the 康熙 form of 教; 166	Unihan kSemanticVariant U+654E → U+6559
+飮	飲	the 康熙 form of 飲; 119	Unihan kZVariant U+98EE → U+98F2
+隸	隷	the 康熙 form of 隷; 4	Unihan kZVariant U+96B8 → U+96B7
+吿	告	the 康熙 form of 告; 50	Unihan kSemanticVariant U+543F → U+544A
+烟	煙	variant of 煙 'smoke'; 49	Unihan kSemanticVariant U+70DF → U+7159
+耻	恥	variant of 恥; 33	Unihan kSemanticVariant U+803B → U+6065
+塲	場	variant of 場; 27	Unihan kSemanticVariant U+5872 → U+5834
+决	決	variant of 決; 22	Unihan kSemanticVariant U+51B3 → U+6C7A
+囘	回	variant of 回; 20	Unihan kSemanticVariant U+56D8 → U+56DE
+迯	逃	variant of 逃; 9	Unihan kSemanticVariant U+8FEF → U+9003
+欝	鬱	the common abbreviation of 鬱, 常用 since 2010; 8	Unihan kSemanticVariant U+6B1D → U+9B31
+皷	鼓	variant of 鼓; 7	Unihan kSemanticVariant U+76B7 → U+9F13
+葢	蓋	variant of 蓋; 7	Unihan kSemanticVariant U+8462 → U+84CB
+鰕	蝦	variant of 蝦 'shrimp'; 7	Unihan kSemanticVariant U+9C15 → U+8766
+膓	腸	variant of 腸; 7	Unihan kSemanticVariant U+8193 → U+8178
+甞	嘗	variant of 嘗; 6	Unihan kSemanticVariant U+751E → U+5617
+煑	煮	variant of 煮; 5	Unihan kSemanticVariant U+7151 → U+716E
+刄	刃	variant of 刃; 5	Unihan kSemanticVariant U+5204 → U+5203
+凾	函	variant of 函; 4	Unihan kSemanticVariant U+51FE → U+51FD
+懼	惧	the 康熙 form of 惧, 常用 since 2010 (危懼, 危惧); 3	Unihan kSemanticVariant U+61FC → U+60E7
+咏	詠	variant of 詠; 2	Unihan kSemanticVariant U+548F → U+8A60
+泪	淚	variant of 淚 'tears', which folds on to 涙; 2	Unihan kSemanticVariant U+6CEA → U+6DDA
+燄	焰	variant of 焰; 2	Unihan kSemanticVariant U+71C4 → U+7130
+劒	劍	variant of 劍, which folds on to 剣; 2	Unihan kSemanticVariant U+5292 → U+528D
+躶	裸	variant of 裸; 2	Unihan kSemanticVariant U+8EB6 → U+88F8
+冲	沖	variant of 沖; 1	Unihan kSemanticVariant U+51B2 → U+6C96
+溯	遡	variant of 遡; 1	Unihan kSemanticVariant U+6EAF → U+9061
+窗	窓	variant of 窓; 1	Unihan kSemanticVariant U+7A97 → U+7A93
+昻	昂	variant of 昂; 1	Unihan kSemanticVariant U+663B → U+6602
+廐	厩	variant of 厩; 1	Unihan kSemanticVariant U+5ED0 → U+53A9
+噐	器	variant of 器; 1	Unihan kSemanticVariant U+5650 → U+5668
+畆	畝	variant of 畝; 1	Unihan kSemanticVariant U+7546 → U+755D
+禀	稟	variant of 稟; 1	Unihan kSemanticVariant U+7980 → U+7A1F
+綫	線	variant of 線; 1	Unihan kSemanticVariant U+7DAB → U+7DDA
+憇	憩	variant of 憩; 1	Unihan kSemanticVariant U+6187 → U+61A9
+况	況	variant of 況; 1	Unihan kSemanticVariant U+51B5 → U+6CC1
+黏	粘	variant of 粘; 1	Unihan kSemanticVariant U+9ECF → U+7C98
+姙	妊	variant of 妊; 1	Unihan kSemanticVariant U+59D9 → U+598A
