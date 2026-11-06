@@ -1,0 +1,18 @@
+# Overrides for cjk_fold, applied over the first value of each OpenCC TSCharacters.txt entry.
+# Columns (tab-separated): traditional, folded, reason, reference
+# Each line is a reviewed pair, and its reference is the character's Unihan kSimplifiedVariant
+# (first value). OpenCC leaves every `traditional` here unchanged, except 薴. Unihan is cited,
+# never copied.
+# Reviewed and left out: 幺→么 and 阪→坂 (both stand as written in simplified: 幺 'smallest',
+# 大阪), 戠→只 (not a simplification of the same word), 覆→复 (覆 'cover' is its own word in
+# simplified; 答覆→答复 is lost until a corpus shows it).
+著	着	traditional books write 著 for the particle 着 too; 5,728 Gutenberg occurrences, 63% of OpenCC's misses	Unihan kSimplifiedVariant U+8457 → U+7740
+藉	借	藉口, 憑藉 are written 借口, 凭借 in simplified	Unihan kSimplifiedVariant U+85C9 → U+501F
+瞭	了	明瞭, 瞭解 are written 明了, 了解 in simplified	Unihan kSimplifiedVariant U+77AD → U+4E86
+衹	只	variant of 祇/只 'only'	Unihan kSimplifiedVariant U+8879 → U+53EA
+彞	彝	variant of 彝	Unihan kSimplifiedVariant U+5F5E → U+5F5D
+嶴	岙	place names	Unihan kSimplifiedVariant U+5DB4 → U+5C99
+薴	苎	OpenCC reaches it through 苧 too; stated so the pair does not depend on the chain	Unihan kSimplifiedVariant U+85B4 → U+82E7 → U+82CE
+唚	吣	rare	Unihan kSimplifiedVariant U+551A → U+5423
+垵	埯	rare	Unihan kSimplifiedVariant U+57B5 → U+57EF
+礆	硷	rare	Unihan kSimplifiedVariant U+7906 → U+7877

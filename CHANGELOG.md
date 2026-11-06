@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`cjk` and `cjk_fold` tokenizers: Chinese, Japanese and Korean searchable by word.** Every
+  analyzer so far made one term of a whole clause between two punctuation marks, so only a query
+  for exactly that clause matched (on a sample of classical Chinese books, `道` found 11% of the
+  chunks holding it and `孔子` 4%). `cjk` indexes each Han, kana or Hangul character alone and
+  paired with the next, at one position, and a query word becomes a phrase over them: a character
+  matches wherever it stands, a word where its characters stand together. Latin words and numbers
+  in the same text index as under `default`. `cjk_fold` folds traditional Chinese to simplified
+  first, by a 12 KB table of 2,974 pairs derived from OpenCC's `TSCharacters.txt` (Apache-2.0)
+  with reviewed overrides (`著`→`着`, `藉`→`借`, `瞭`→`了` and others), so either script finds both;
+  it is for Chinese only. Both are new names: existing fields are unchanged, and a field uses them
+  by declaring one. The table is built by `tools/zh-fold`.
+
 ### Fixed
 
 - **Startup reports the shards the node runs with, not the setting.** The configuration block

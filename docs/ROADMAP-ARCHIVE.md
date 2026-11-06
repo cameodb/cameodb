@@ -5389,6 +5389,224 @@ by URL), a `CHANGELOG.md` entry.
 
 ---
 
+## U. Post-0.3.9 features ✅ Done
+
+Opened 2026-11-06. Scoped against the code at `992c2a2` (tantivy 0.26.1).
+
+### U1 — CJK analyzers: Chinese, Japanese and Korean searchable by word
+
+✅ **Done** 2026-11-06. Built and tested as designed below, with the tests named and the docs. Filed
+the same day from the Project Gutenberg case, where the Chinese books were stored correctly but could
+not be searched by word.
+
+**As built**, where it differs from or settles the design:
+
+- *The phrase over equal offsets works* (first step): `孔子` matches only adjacent 孔 and 子, two
+  occurrences score above one, and tantivy's `SnippetGenerator` highlights `<b>孔子</b>`. No fallback.
+- *The token cap comes last* in both chains, after the split. Ahead of it, as the design placed it,
+  a clause longer than 42 characters would have been dropped whole. A Latin atom over the cap is
+  still dropped.
+- *Offsets* of each character and pair point into the original text. When lowercasing has changed a
+  token's length (`İ`), every piece takes the whole token's offsets, so none can fall inside a
+  character.
+- *Table:* OpenCC commit `fae2a0a` (2026-10-29), which gives the measured 3,221 pairs; 2,974 after
+  the steps, 11,896 bytes. 256 non-BMP pairs are dropped, not 257: 薴 already has an OpenCC entry
+  (薴→苧→苎), so 9 of the 10 overrides add a pair. All 14 reviewed pairs agree with Unihan 18.0
+  `kSimplifiedVariant`. Generator: `tools/zh-fold` (uv project, standard library only).
+- *MCP:* `describe_index` already reports each field's `tokenizer`; a query rule says how to write a
+  word in a `cjk` or `cjk_fold` field.
+- *Open items* below stay open: full-width Latin, the compatibility ideographs, and 覆→复.
+
+**Measured end to end** (release build, one node, `default` on the text, `cjk` and `cjk_fold` as
+ghosts). The 15 Chinese books, 3,546 chunks: `cjk` finds exactly the chunks containing the query
+for every query tried.
+
+| Query | Chunks containing it | `default` | `cjk` | `cjk_fold` |
+|---|---|---|---|---|
+| 道 | 2,555 | 155 | 2,555 | 2,555 |
+| 天地 | 131 | 1 | 131 | 131 |
+| 孔子 | 89 | 0 | 89 | 89 |
+| 一個 / 一个 | 1,136 / 27 | 3 / 0 | 1,136 / 27 | 1,163 / 1,163 |
+| 學而時習之 / 学而时习之 | 1 / 0 | 1 / 0 | 1 / 0 | 1 / 1 |
+
+Japanese (羅生門, 刺靑) and Korean (Gutenberg's one Korean item, a Korean–English dictionary)
+under `cjk`: 下人, 老婆, 京都 and きりぎりす are each found in every chunk that holds them, where
+`default` found none or half. The Korean dictionary matches by Hangul word and by its English
+glosses in the same field. `"내려 가다"` finds `내려가다`, so a Korean phrase does not depend on spacing.
+Two limits come from the text, not the analyzer:
+- A word broken by inline ruby (`世《よ》の中《なか》`) is not one run.
+- `cjk` does not join Japanese old-style and new-style kanji (`淸吉` / `清吉`). That would be a
+  Japanese fold, a new item if a corpus needs it.
+- A loader must join hard-wrapped CJK lines without a space, as the Gutenberg extractor does.
+
+
+**Today.** Every analyzer starts from tantivy's `SimpleTokenizer`, which splits on characters that
+are not `char::is_alphanumeric`. A Han, kana or Hangul character is alphanumeric, and Chinese and
+Japanese put no spaces between words, so a whole clause between two punctuation marks becomes one
+term. Only a query that is exactly such a clause matches. On the 15 Chinese books of the Gutenberg
+sample (1.4 M characters, `default` tokenizer):
+
+| Query | Chunks containing it | Hits |
+|---|---|---|
+| 學而時習之 (a whole clause) | 1 | 1 |
+| 道 | 2,737 | 292 (11%) |
+| 天地 | 132 | 5 (4%) |
+| 孔子 | 85 | 3 (4%) |
+
+Those few hits are accidents: places where a line break or a stray character happened to cut a
+clause. Clauses are short (median 5 characters), so the 128-byte cap
+([`MAX_INDEXED_TOKEN_LEN`](../crates/storage/src/analysis/mod.rs)) drops almost nothing (3 of 243k tokens).
+
+**What tantivy offers, and why not:**
+
+- *`NgramTokenizer`* (built in): every token has position 0, so a query of several n-grams matches
+  any document holding them anywhere, in any order; it also cuts Latin words into n-grams.
+- *Dictionary segmenters* (third-party crates): `tantivy-jieba` / `cang-jie` (jieba, trained on modern simplified Chinese;
+  Gutenberg's Chinese is about 99% traditional and mostly classical, which it segments badly),
+  `lindera-tantivy` (IPADIC/UniDic for Japanese, ko-dic for Korean, CC-CEDICT for Chinese; best
+  Japanese precision, tens of MB of dictionaries in the binary), ICU4X `icu_segmenter` (models
+  trained on modern text). Each adds a dependency and a model for a precision gain bigrams mostly
+  recover through phrase matching.
+
+**Design.** Two analyzers, registered in `register_tokenizers` and listed in `TOKENIZERS`:
+
+- *`cjk`* — `SimpleTokenizer`, the token cap, `LowerCaser`, then a `CjkBigram` filter. Within a token,
+  each run of CJK characters (Han, Hiragana, Katakana, Hangul, and the compatibility ideographs)
+  is emitted as every character alone *and* every overlapping pair, both at the position of the
+  first character (Lucene's `CJKBigramFilter` with `outputUnigrams`). A run of one character is that
+  character alone. Text outside a run comes out as `default` would emit it, so Latin words, numbers
+  and digests in a CJK field still match as they do today. Pairs never cross punctuation, because
+  the tokenizer has already split there.
+- *`cjk_fold`* — the same, with a `ChineseFold` filter ahead of `CjkBigram`: each traditional
+  character mapped to its simplified form, one character to one character, by our own table of
+  2,974 pairs (see *Data*). The fold does not have to produce correct simplified text. It only needs
+  a form that the text and the query both fold to. So none of OpenCC's phrase machinery is needed.
+  Traditional to simplified is the direction that folds: many traditional forms map to one simplified one.
+  The reverse direction branches (发 → 發 or 髮) and would need context. For Chinese only. Japanese kanji
+  must not take it: the table maps old-style kanji to Chinese simplified forms Japanese text does not use.
+
+*Query side.* The query parser already does the rest: a query word that analyzes into several
+tokens becomes a `PhraseQuery` built from each token's position (`query_parser.rs`, the
+`positions_and_terms` path), and `PhraseQuery::new_with_offset_and_slop` sorts by offset without
+refusing equal ones. So `道` is one term; `孔子` is the phrase {孔@0, 孔子@0, 子@1}; `學而時習之` is the
+phrase of its pairs and characters. Each matches exactly where the characters stand together. **First
+step of the work:** a tantivy-level test that a phrase with two terms at one offset matches, scores
+and highlights correctly. If it does not, the fallback is pairs only (one per position) plus the single
+character for a one-character run, which loses one-character queries inside words.
+
+*Data.* OpenCC is not used as a library: no crate, no C++ and no runtime dictionary. Most of
+OpenCC serves conversion, not folding:
+- `STPhrases` (1 MB) picks the right traditional character from context.
+- The TW/HK phrase and variant tables carry regional vocabulary.
+- The seal-script and Japanese shinjitai tables serve other scripts.
+
+Only its character table, `TSCharacters.txt`, is a fold, and the table is derived from it. The table is
+generated like the Croatian lexicon:
+
+1. A `tools/zh-fold/` script reads `TSCharacters.txt` at a pinned OpenCC commit and takes the first
+   value of each entry.
+2. It applies `overrides.tsv`, a short hand-reviewed list of fixes. Each line names its reason and
+   its reference, Unihan `kSimplifiedVariant` (see *Measured*).
+3. It keeps only pairs where both characters are in the Basic Multilingual Plane, and resolves chains
+   so that the fold is idempotent (`fold(fold(c)) == fold(c)`).
+4. It writes `crates/storage/src/analysis/cjk/data/` with a `MANIFEST.txt`: the source, the commit,
+   the overrides' sha256 and the counts.
+
+The output is two sorted `[u16; 2974]` arrays, keys and values, included as a Rust constant: **12 KB**,
+with no parsing at start-up and no allocation.
+
+*Lookup.* A character outside U+3400–U+9FFF returns at once, which covers all Latin text and kana.
+Otherwise a binary search runs, about 12 steps over 6 KB of keys that stay in the CPU cache. Every
+key and value is a 3-byte UTF-8 character, so the fold rewrites the token's bytes in place without
+reallocating. If profiling ever shows the search, a 3.4 KB presence bitmap over U+3400–U+9FFF with
+per-word rank counts makes it constant time at the same total size. The pair generation costs far
+more, so this is not planned.
+
+*Attribution.* OpenCC is Apache-2.0, the licence of the storage crate, and
+`licenses/LICENSE-APACHE-2.0` is already in the tree. OpenCC ships no `NOTICE` file. Apache-2.0
+§4 asks a derived work to credit its source and say it was changed. The `MANIFEST.txt` and a
+comment on the table say: "derived from OpenCC `TSCharacters.txt` (Apache-2.0, commit …), reduced
+to BMP pairs, with overrides". The overrides are our own reviewed list. Unihan is cited there as
+the reference, and no Unihan file is copied, so the Unicode licence notice is not needed.
+
+**Measured** (Gutenberg sample, 15 Chinese books, Python simulation of both analyzers):
+
+- *Fold reach.* Folding changes 26.3% of character occurrences (2,123 of 6,344 distinct characters).
+  Of the 2,000 most frequent two-character words, 763 (38%) are spelled differently in simplified.
+  680 of those find nothing typed in simplified without the fold; with it, all 763 find every
+  occurrence.
+- *Variants joined.* Variant spellings inside traditional text meet too: 爲 82 / 為 6,070,
+  裏 1,444 / 裡 1,653, 個 7,874 / 个 689.
+- *Price.* 4.2% of single-character hits and 3.5% of two-character hits come from another original
+  form. Inspected, the largest are variants of one word (一個/一个, 那裏/那裡), which is the gain. Real
+  merges of different words: 雲 cloud / 云 say, 後 after / 后 empress, 髮 hair / 發 emit,
+  乾 dry / 幹 do / 干, 穀 grain / 谷 valley, 醜 / 丑, 薑 / 姜, 鬥 / 斗. A two-character query mostly
+  separates them again, as `de_stem_fold` joins `Größe` and `große` and context separates them.
+  (Fold reach and price measured with OpenCC's table alone. The overrides below change 0.4% of
+  occurrences.)
+- *Table source.* The test that matters is whether a simplified character a user types (the GB2312
+  set) folds to the same character as its traditional form. Corpus occurrences the fold misses:
+
+  | Table | Pairs | Missed occurrences |
+  |---|---|---|
+  | OpenCC `TSCharacters`, first value | 3,221 | 9,106 (0.65%) |
+  | Unihan `kSimplifiedVariant`, first value | 6,870 | 7,964 (0.57%) |
+  | OpenCC + Unihan where OpenCC leaves a character unchanged | 3,235 | 3,165 (0.23%) |
+  | the same, BMP only | 2,978 | 3,165 (0.23%) |
+  | the same, reviewed: 幺→么, 阪→坂, 戠→只 and 覆→复 dropped (the design) | 2,974 | 3,354 (0.24%) |
+
+  - **OpenCC's one big gap is 著/着: 5,728 occurrences, 63% of its misses.** OpenCC keeps 著 apart
+    because both characters exist in simplified, but traditional books write 著 for the particle
+    too, so a simplified query for 看着 finds nothing. Unihan maps 著 → 着.
+  - **Unihan alone misses** 裡/里 and 淨/净, which OpenCC folds.
+  - **The merge adds 14 pairs. 10 are kept as overrides:**
+    - 著→着, 藉→借, 瞭→了, 衹→只, 彞→彝, 嶴→岙;
+    - the rare 薴→苎, 唚→吣, 垵→埯, 礆→硷.
+  - **4 are dropped:**
+    - 幺→么 and 阪→坂: both characters stand as written in simplified (幺 'smallest', 大阪);
+    - 戠→只: not a simplification of the same word;
+    - 覆→复: see *Open*.
+  - **Dropping them costs 189 occurrences** of simplified-query misses.
+  - **The 3,165 left should stay unmatched.** They are different words that both exist in both
+    scripts (呆/待, 象/像, 坐/座, 具/俱), so a fix there would only merge words.
+  - **Dropping the non-BMP pairs costs nothing.** They are 257 pairs between rare extension
+    characters: 39 occurrences in the corpus, none in the miss count above.
+- *Size.* 1.40 M single-character tokens (6,351 distinct) and 1.16 M pairs (313,882 distinct) on the sample, against
+  245 k clause tokens today. Measured in Tantivy only: the stored body is unchanged, and with a
+  ghost field ([Q1](#q1--ghost-fields-index-columns-derived-from-another-field-under-a-condition))
+  redb pays nothing.
+
+**Use.** A field per script, fed as a ghost by language. In the Gutenberg schema:
+`text_zh` = `cjk_fold` for `lang` zh, and `text_ja` = `cjk` for ja and ko when such books are
+loaded (full catalogue: zh 443, ja 21, ko 1).
+
+**Open.**
+
+- Fold full-width Latin and digits (Ａ１ → A1, NFKC width only) in both analyzers. Likely yes; it is cheap.
+- 覆→复: Unihan's mapping holds for 答覆→答复, but 覆 (cover, 覆盖) is its own word in simplified too.
+  Proposed: leave it out of the overrides, as the reviewed table does; revisit if a corpus shows 答覆.
+- The 460 CJK compatibility ideographs (U+F900–FAFF) could fold to their unified forms in the same
+  table, as NFC would. Cheap, but the Gutenberg sample holds none.
+- Whether `cjk` should skip lowercasing outside the runs. It should not: `default` lowercases.
+- A Japanese dictionary analyzer (`lindera`): deferred until a real Japanese corpus asks for it.
+
+**Cost.** Two analyzers, two filters of about 150 lines together, one generated 12 KB table, one
+generator script, no new crate.
+Existing fields are unaffected: these are new names. Indexes start using them by declaring a field.
+
+**Tests.** Per analyzer: a character, a pair, a clause and a mixed Latin/CJK token analyze as
+designed; the phrase over equal offsets matches (the first step above); `cjk_fold` makes 學而 ≡ 学而,
+為 ≡ 爲 ≡ 为, 裏 ≡ 裡 ≡ 里, 著 ≡ 着, and keeps 象 ≠ 像 and 坐 ≠ 座; Japanese kana are bigrammed, not
+folded; the token cap test covers both names; the `every_listed_tokenizer_is_registered` test
+passes with both added. On the table: keys strictly ascending, every key and value
+in U+3400–U+9FFF, the fold idempotent, and the `MANIFEST.txt` sha256 matching the committed data.
+
+**Docs.** Both rows in the tokenizer table of `docs/API_REFERENCE.md`, with the fold's merges
+named, as for the other `_fold` analyzers; a `CHANGELOG.md` entry; the MCP `describe_index` text
+names them.
+
+---
+
 ## Phases 1–9 — Foundations through advanced architecture ✅ Done
 
 **Phase 1**: Storage Durability & WAL Recovery ✅ Done

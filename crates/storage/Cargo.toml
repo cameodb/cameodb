@@ -31,3 +31,5 @@ sysinfo = { workspace = true }
 [dev-dependencies]
 uuid = { workspace = true }
 tempfile = "3.27.0"
+# The cjk fold table test checks the MANIFEST checksum; already in the lock through client/server.
+sha2 = "0.11"

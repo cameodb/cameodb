@@ -26,7 +26,7 @@ Features agreed after each release are filed as
 [S. Delete by query](docs/ROADMAP-ARCHIVE.md#s-delete-by-query--done) (archived) and
 [T. OAuth for MCP clients](docs/ROADMAP-ARCHIVE.md#t-oauth-for-mcp-clients--done) (archived); Q, R, S
 and T are built and wait in `[Unreleased]` for 0.3.9.
-[U. Post-0.3.9 features](#u-post-039-features--planned) is open from 2026-11-06.
+[U. Post-0.3.9 features](docs/ROADMAP-ARCHIVE.md#u-post-039-features--done) (archived), opened 2026-11-06 with U1, is built and waits in `[Unreleased]`.
 
 ## How to read this file
 
@@ -76,7 +76,7 @@ on one.
 | R — Key and tenant provisioning | ◐ Partial, R1 and R2 unreleased (0.3.9) | R1 and R2 done 2026-11-01, single node: included key and tenant files reloaded on change, live tenant quotas and scopes, `allowed_indexes` prefixes; a provisioner minting and revoking keys through `/_keys` (no tenant) and `/_tenants`, changing a key's indexes in place with `PATCH /_keys/{key_id}`, and granting only within its own `allowed_indexes`; client, SDK and a live suite, validated on Linux under systemd and across a restart. Left: R3, every change broadcast to every node, deferred until cluster support is decided — until then a change applies on the node that received it |
 | S — Delete by query | ✅ Done, unreleased (0.3.9) | S1, `POST /api/{index}/delete` — exact clauses, refused past `max_docs` unless confirmed — done 2026-11-02 |
 | T — OAuth for MCP clients | ✅ Done, unreleased (0.3.9) | T1, the node as the OAuth 2.1 authorization server for `/mcp` — discovery, dynamic client registration, an approval page taking the key the user holds, PKCE, refresh; stateless, tokens read-only and ended by revoking the key — done 2026-11-03 |
-| U — Post-0.3.9 features | 📋 Planned | U1, CJK analyzers — `cjk` (characters and character pairs, so Chinese, Japanese and Korean are searchable by word) and `cjk_fold` (traditional Chinese folded to simplified first, so a query in either script finds both) |
+| U — Post-0.3.9 features | ✅ Done, unreleased | U1, CJK analyzers — `cjk` (characters and character pairs, so Chinese, Japanese and Korean are searchable by word) and `cjk_fold` (traditional Chinese folded to simplified first, so a query in either script finds both) — done 2026-11-06 |
 
 ## Reconciliation, 2026-08-26
 
@@ -311,7 +311,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [R3](#r3--changes-reach-every-node) | Changes reach every node — whole tenant file and revision broadcast, catch-up on reconnect, the response names nodes that did not apply it — deferred until cluster support for provisioning is decided | — | 2026-11-01 | 💭 |
 | [S1](docs/ROADMAP-ARCHIVE.md#s1--delete-the-documents-a-query-matches) | Delete by query — `POST /api/{index}/delete`: every shard deletes the matches it holds; exact clauses only (`text` checked against the stored value); over `max_docs` refused with the count, `confirm` to proceed | — | 2026-11-02 | ✅ |
 | [T1](docs/ROADMAP-ARCHIVE.md#t1--oauth-for-mcp-clients) | OAuth for MCP clients — browser-based and desktop MCP clients connect with the OAuth flow the MCP specification defines; the user approves once with their existing key, and the token they get is that key's authority, read only — done 2026-11-03 | — | 2026-11-03 | ✅ |
-| [U1](#u1--cjk-analyzers-chinese-japanese-and-korean-searchable-by-word) | CJK analyzers — `cjk` indexes each Chinese, Japanese or Korean character alone and paired with the next, at one position, so a character, a word or a clause matches exactly; `cjk_fold` folds traditional Chinese to simplified first (a 12 KB table of 2,974 pairs derived from OpenCC's character list, with reviewed overrides), so either script finds both. Today a clause between punctuation is one term and only a whole clause matches | — | 2026-11-06 | 📋 |
+| [U1](docs/ROADMAP-ARCHIVE.md#u1--cjk-analyzers-chinese-japanese-and-korean-searchable-by-word) | CJK analyzers — `cjk` indexes each Chinese, Japanese or Korean character alone and paired with the next, at one position, so a character, a word or a clause matches exactly; `cjk_fold` folds traditional Chinese to simplified first (a 12 KB table of 2,974 pairs derived from OpenCC's character list, with reviewed overrides), so either script finds both. done 2026-11-06 | — | 2026-11-06 | ✅ |
 
 ---
 
@@ -2975,182 +2975,6 @@ what a cluster does; a `CHANGELOG.md` entry.
 
 ---
 
-## U. Post-0.3.9 features 📋 Planned
-
-Opened 2026-11-06. Scoped against the code at `992c2a2` (tantivy 0.26.1).
-
-### U1 — CJK analyzers: Chinese, Japanese and Korean searchable by word
-
-📋 **Planned.** Filed 2026-11-06 from the Project Gutenberg case (`cameodb-case/gutenberg`), where
-the Chinese books are stored correctly but cannot be searched by word.
-
-**Today.** Every analyzer starts from tantivy's `SimpleTokenizer`, which splits on characters that
-are not `char::is_alphanumeric`. A Han, kana or Hangul character is alphanumeric, and Chinese and
-Japanese put no spaces between words, so a whole clause between two punctuation marks becomes one
-term. Only a query that is exactly such a clause matches. On the 15 Chinese books of the Gutenberg
-sample (1.4 M characters, `default` tokenizer):
-
-| Query | Chunks containing it | Hits |
-|---|---|---|
-| 學而時習之 (a whole clause) | 1 | 1 |
-| 道 | 2,737 | 292 (11%) |
-| 天地 | 132 | 5 (4%) |
-| 孔子 | 85 | 3 (4%) |
-
-Those few hits are accidents: places where a line break or a stray character happened to cut a
-clause. Clauses are short (median 5 characters), so the 128-byte cap
-([`MAX_INDEXED_TOKEN_LEN`](crates/storage/src/analysis/mod.rs)) drops almost nothing (3 of 243k tokens).
-
-**What tantivy offers, and why not:**
-
-- *`NgramTokenizer`* (built in): every token has position 0, so a query of several n-grams matches
-  any document holding them anywhere, in any order; it also cuts Latin words into n-grams.
-- *Dictionary segmenters* (third-party crates): `tantivy-jieba` / `cang-jie` (jieba, trained on modern simplified Chinese;
-  Gutenberg's Chinese is about 99% traditional and mostly classical, which it segments badly),
-  `lindera-tantivy` (IPADIC/UniDic for Japanese, ko-dic for Korean, CC-CEDICT for Chinese; best
-  Japanese precision, tens of MB of dictionaries in the binary), ICU4X `icu_segmenter` (models
-  trained on modern text). Each adds a dependency and a model for a precision gain bigrams mostly
-  recover through phrase matching.
-
-**Design.** Two analyzers, registered in `register_tokenizers` and listed in `TOKENIZERS`:
-
-- *`cjk`* — `SimpleTokenizer`, the token cap, `LowerCaser`, then a `CjkBigram` filter. Within a token,
-  each run of CJK characters (Han, Hiragana, Katakana, Hangul, and the compatibility ideographs)
-  is emitted as every character alone *and* every overlapping pair, both at the position of the
-  first character (Lucene's `CJKBigramFilter` with `outputUnigrams`). A run of one character is that
-  character alone. Text outside a run comes out as `default` would emit it, so Latin words, numbers
-  and digests in a CJK field still match as they do today. Pairs never cross punctuation, because
-  the tokenizer has already split there.
-- *`cjk_fold`* — the same, with a `ChineseFold` filter ahead of `CjkBigram`: each traditional
-  character mapped to its simplified form, one character to one character, by our own table of
-  2,974 pairs (see *Data*). The fold does not have to produce correct simplified text. It only needs
-  a form that the text and the query both fold to. So none of OpenCC's phrase machinery is needed.
-  Traditional to simplified is the direction that folds: many traditional forms map to one simplified one.
-  The reverse direction branches (发 → 發 or 髮) and would need context. For Chinese only. Japanese kanji
-  must not take it: the table maps old-style kanji to Chinese simplified forms Japanese text does not use.
-
-*Query side.* The query parser already does the rest: a query word that analyzes into several
-tokens becomes a `PhraseQuery` built from each token's position (`query_parser.rs`, the
-`positions_and_terms` path), and `PhraseQuery::new_with_offset_and_slop` sorts by offset without
-refusing equal ones. So `道` is one term; `孔子` is the phrase {孔@0, 孔子@0, 子@1}; `學而時習之` is the
-phrase of its pairs and characters. Each matches exactly where the characters stand together. **First
-step of the work:** a tantivy-level test that a phrase with two terms at one offset matches, scores
-and highlights correctly. If it does not, the fallback is pairs only (one per position) plus the single
-character for a one-character run, which loses one-character queries inside words.
-
-*Data.* OpenCC is not used as a library: no crate, no C++ and no runtime dictionary. Most of
-OpenCC serves conversion, not folding:
-- `STPhrases` (1 MB) picks the right traditional character from context.
-- The TW/HK phrase and variant tables carry regional vocabulary.
-- The seal-script and Japanese shinjitai tables serve other scripts.
-
-Only its character table, `TSCharacters.txt`, is a fold, and the table is derived from it. The table is
-generated like the Croatian lexicon:
-
-1. A `tools/zh-fold/` script reads `TSCharacters.txt` at a pinned OpenCC commit and takes the first
-   value of each entry.
-2. It applies `overrides.tsv`, a short hand-reviewed list of fixes. Each line names its reason and
-   its reference, Unihan `kSimplifiedVariant` (see *Measured*).
-3. It keeps only pairs where both characters are in the Basic Multilingual Plane, and resolves chains
-   so that the fold is idempotent (`fold(fold(c)) == fold(c)`).
-4. It writes `crates/storage/src/analysis/cjk/data/` with a `MANIFEST.txt`: the source, the commit,
-   the overrides' sha256 and the counts.
-
-The output is two sorted `[u16; 2974]` arrays, keys and values, included as a Rust constant: **12 KB**,
-with no parsing at start-up and no allocation.
-
-*Lookup.* A character outside U+3400–U+9FFF returns at once, which covers all Latin text and kana.
-Otherwise a binary search runs, about 12 steps over 6 KB of keys that stay in the CPU cache. Every
-key and value is a 3-byte UTF-8 character, so the fold rewrites the token's bytes in place without
-reallocating. If profiling ever shows the search, a 3.4 KB presence bitmap over U+3400–U+9FFF with
-per-word rank counts makes it constant time at the same total size. The pair generation costs far
-more, so this is not planned.
-
-*Attribution.* OpenCC is Apache-2.0, the licence of the storage crate, and
-`licenses/LICENSE-APACHE-2.0` is already in the tree. OpenCC ships no `NOTICE` file. Apache-2.0
-§4 asks a derived work to credit its source and say it was changed. The `MANIFEST.txt` and a
-comment on the table say: "derived from OpenCC `TSCharacters.txt` (Apache-2.0, commit …), reduced
-to BMP pairs, with overrides". The overrides are our own reviewed list. Unihan is cited there as
-the reference, and no Unihan file is copied, so the Unicode licence notice is not needed.
-
-**Measured** (Gutenberg sample, 15 Chinese books, Python simulation of both analyzers):
-
-- *Fold reach.* Folding changes 26.3% of character occurrences (2,123 of 6,344 distinct characters).
-  Of the 2,000 most frequent two-character words, 763 (38%) are spelled differently in simplified.
-  680 of those find nothing typed in simplified without the fold; with it, all 763 find every
-  occurrence.
-- *Variants joined.* Variant spellings inside traditional text meet too: 爲 82 / 為 6,070,
-  裏 1,444 / 裡 1,653, 個 7,874 / 个 689.
-- *Price.* 4.2% of single-character hits and 3.5% of two-character hits come from another original
-  form. Inspected, the largest are variants of one word (一個/一个, 那裏/那裡), which is the gain. Real
-  merges of different words: 雲 cloud / 云 say, 後 after / 后 empress, 髮 hair / 發 emit,
-  乾 dry / 幹 do / 干, 穀 grain / 谷 valley, 醜 / 丑, 薑 / 姜, 鬥 / 斗. A two-character query mostly
-  separates them again, as `de_stem_fold` joins `Größe` and `große` and context separates them.
-  (Fold reach and price measured with OpenCC's table alone. The overrides below change 0.4% of
-  occurrences.)
-- *Table source.* The test that matters is whether a simplified character a user types (the GB2312
-  set) folds to the same character as its traditional form. Corpus occurrences the fold misses:
-
-  | Table | Pairs | Missed occurrences |
-  |---|---|---|
-  | OpenCC `TSCharacters`, first value | 3,221 | 9,106 (0.65%) |
-  | Unihan `kSimplifiedVariant`, first value | 6,870 | 7,964 (0.57%) |
-  | OpenCC + Unihan where OpenCC leaves a character unchanged | 3,235 | 3,165 (0.23%) |
-  | the same, BMP only | 2,978 | 3,165 (0.23%) |
-  | the same, reviewed: 幺→么, 阪→坂, 戠→只 and 覆→复 dropped (the design) | 2,974 | 3,354 (0.24%) |
-
-  - **OpenCC's one big gap is 著/着: 5,728 occurrences, 63% of its misses.** OpenCC keeps 著 apart
-    because both characters exist in simplified, but traditional books write 著 for the particle
-    too, so a simplified query for 看着 finds nothing. Unihan maps 著 → 着.
-  - **Unihan alone misses** 裡/里 and 淨/净, which OpenCC folds.
-  - **The merge adds 14 pairs. 10 are kept as overrides:**
-    - 著→着, 藉→借, 瞭→了, 衹→只, 彞→彝, 嶴→岙;
-    - the rare 薴→苎, 唚→吣, 垵→埯, 礆→硷.
-  - **4 are dropped:**
-    - 幺→么 and 阪→坂: both characters stand as written in simplified (幺 'smallest', 大阪);
-    - 戠→只: not a simplification of the same word;
-    - 覆→复: see *Open*.
-  - **Dropping them costs 189 occurrences** of simplified-query misses.
-  - **The 3,165 left should stay unmatched.** They are different words that both exist in both
-    scripts (呆/待, 象/像, 坐/座, 具/俱), so a fix there would only merge words.
-  - **Dropping the non-BMP pairs costs nothing.** They are 257 pairs between rare extension
-    characters: 39 occurrences in the corpus, none in the miss count above.
-- *Size.* 1.40 M single-character tokens (6,351 distinct) and 1.16 M pairs (313,882 distinct) on the sample, against
-  245 k clause tokens today. Measured in Tantivy only: the stored body is unchanged, and with a
-  ghost field ([Q1](docs/ROADMAP-ARCHIVE.md#q1--ghost-fields-index-columns-derived-from-another-field-under-a-condition))
-  redb pays nothing.
-
-**Use.** A field per script, fed as a ghost by language. In the Gutenberg schema:
-`text_zh` = `cjk_fold` for `lang` zh, and `text_ja` = `cjk` for ja and ko when such books are
-loaded (full catalogue: zh 443, ja 21, ko 1).
-
-**Open.**
-
-- Fold full-width Latin and digits (Ａ１ → A1, NFKC width only) in both analyzers. Likely yes; it is cheap.
-- 覆→复: Unihan's mapping holds for 答覆→答复, but 覆 (cover, 覆盖) is its own word in simplified too.
-  Proposed: leave it out of the overrides, as the reviewed table does; revisit if a corpus shows 答覆.
-- The 460 CJK compatibility ideographs (U+F900–FAFF) could fold to their unified forms in the same
-  table, as NFC would. Cheap, but the Gutenberg sample holds none.
-- Whether `cjk` should skip lowercasing outside the runs. It should not: `default` lowercases.
-- A Japanese dictionary analyzer (`lindera`): deferred until a real Japanese corpus asks for it.
-
-**Cost.** Two analyzers, two filters of about 150 lines together, one generated 12 KB table, one
-generator script, no new crate.
-Existing fields are unaffected: these are new names. Indexes start using them by declaring a field.
-
-**Tests.** Per analyzer: a character, a pair, a clause and a mixed Latin/CJK token analyze as
-designed; the phrase over equal offsets matches (the first step above); `cjk_fold` makes 學而 ≡ 学而,
-為 ≡ 爲 ≡ 为, 裏 ≡ 裡 ≡ 里, 著 ≡ 着, and keeps 象 ≠ 像 and 坐 ≠ 座; Japanese kana are bigrammed, not
-folded; the token cap test covers both names; the `every_listed_tokenizer_is_registered` test
-passes with both added. On the table: keys strictly ascending, every key and value
-in U+3400–U+9FFF, the fold idempotent, and the `MANIFEST.txt` sha256 matching the committed data.
-
-**Docs.** Both rows in the tokenizer table of `docs/API_REFERENCE.md`, with the fold's merges
-named, as for the other `_fold` analyzers; a `CHANGELOG.md` entry; the MCP `describe_index` text
-names them.
-
----
-
 ## Delivered work, in the archive
 
 Delivered work is in [docs/ROADMAP-ARCHIVE.md](docs/ROADMAP-ARCHIVE.md), kept in full. Where an item of a group still open
@@ -3161,6 +2985,7 @@ was delivered, its stub stands above in its place; these groups were delivered w
 - ✅ [**Q. Post-0.3.8 features**](docs/ROADMAP-ARCHIVE.md#q-post-038-features--done) — Q1–Q2
 - ✅ [**S. Delete by query**](docs/ROADMAP-ARCHIVE.md#s-delete-by-query--done) — S1
 - ✅ [**T. OAuth for MCP clients**](docs/ROADMAP-ARCHIVE.md#t-oauth-for-mcp-clients--done) — T1
+- ✅ [**U. Post-0.3.9 features**](docs/ROADMAP-ARCHIVE.md#u-post-039-features--done) — U1
 
 The archive also holds the original write-up of every delivered phase, the measurements, and the settled decisions:
 what the affinity flags cost, what the audit trail costs, the non-goals recorded so they are not re-litigated, and the

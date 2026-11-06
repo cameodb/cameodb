@@ -362,6 +362,12 @@ pub const RULES: &[&str] = &[
      schema update promotes them, so check the `indexed` flag before naming a field.",
     SHADOW_FIELD,
     GHOST_FIELD,
+    "A text field whose `tokenizer` is `cjk` or `cjk_fold` holds Chinese, Japanese or Korean. \
+     Write a word as its characters, with no spaces: `text_zh:孔子` matches only where 孔 and 子 \
+     stand together, and a single character matches wherever it stands. Spaces between the \
+     characters make each a separate clause that matches anywhere in the text. Under `cjk_fold` \
+     traditional and simplified spellings find each other (`學習` finds `学习`); under `cjk` \
+     they do not.",
     "A term with no field in front of it searches the index's default fields, which may be fewer \
      than all of its text fields: an index can declare them, and a node caps how many are \
      searched. Each field's `default_search` flag says whether a bare term reaches it, and a \

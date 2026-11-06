@@ -9,6 +9,7 @@
 //! (`hr_stem` is a dictionary lemmatizer, `it_stem` a Snowball stemmer): users pick by language.
 
 mod accents;
+mod cjk;
 mod croatian;
 mod german;
 mod italian;
@@ -21,6 +22,7 @@ use tantivy::tokenizer::{
 };
 
 pub(crate) use accents::SuffixAccents;
+pub(crate) use cjk::{ChineseFold, CjkBigram};
 pub(crate) use croatian::{CroatianStemmer, SerbianCyrillic};
 pub(crate) use german::GermanSpelling;
 pub(crate) use italian::ItalianStemmer;
@@ -50,6 +52,8 @@ pub(crate) const TOKENIZERS: &[&str] = &[
     "raw",
     "whitespace",
     "en_stem",
+    "cjk",
+    "cjk_fold",
     "de_stem",
     "de_stem_fold",
     "es_stem",
@@ -197,6 +201,29 @@ pub(crate) fn register_tokenizers(index: &Index) {
             .filter(SerbianCyrillic)
             .filter(AsciiFoldingFilter)
             .filter(CroatianStemmer::folded())
+            .build(),
+    );
+
+    // Chinese, Japanese and Korean: each CJK character alone and paired with the next, at one
+    // position, so a query word becomes a phrase that matches where its characters stand together.
+    // The cap comes last, unlike the chains above: ahead of the split it would drop a whole clause
+    // longer than 42 characters, and after it it still drops a Latin atom over the cap.
+    let cjk = || TextAnalyzer::builder(SimpleTokenizer::default()).filter(LowerCaser);
+    manager.register(
+        "cjk",
+        cjk()
+            .filter(CjkBigram)
+            .filter(RemoveLongFilter::limit(MAX_INDEXED_TOKEN_LEN + 1))
+            .build(),
+    );
+    // Traditional Chinese folded to simplified before the pairs are made, so either script finds
+    // both. Chinese only: Japanese kanji must not take the fold.
+    manager.register(
+        "cjk_fold",
+        cjk()
+            .filter(ChineseFold)
+            .filter(CjkBigram)
+            .filter(RemoveLongFilter::limit(MAX_INDEXED_TOKEN_LEN + 1))
             .build(),
     );
 }

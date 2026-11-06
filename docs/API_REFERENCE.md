@@ -833,6 +833,8 @@ exactly as the documents were. Omitted, it is `default`.
 | `de_stem_fold` | `default`, then umlauts written `ae` `oe` `ue` read as the umlaut (`ue` not after a vowel or `q`), accents removed, and the German stemmer, so `Haeuser` finds `Häuser` and `Groesse` finds `Größe`. `de_stem` already finds `Hauser` |
 | `hr_stem` | `default`, then each word to its dictionary form: `članka`, `člancima` → `članak`; `odlučila` → `odlučiti`; `Umagu` → `umag`. Terms keep their diacritics. Serbian Cyrillic is read as its Latin spelling, so `камен` and `kamen` are one term |
 | `hr_stem_fold` | The same with diacritics removed first, so `zupanija` finds `županije` and `fazana` finds `Fažana`, and with Serbian Cyrillic read as Latin. The usual choice for Croatian text people search |
+| `cjk` | For Chinese, Japanese and Korean. `default`, then each run of CJK characters (Han, kana, Hangul) indexed as every character alone and every pair of neighbours, so `道` finds the character anywhere and `孔子` finds 孔 and 子 only where they stand together. Latin words and numbers in the same text are indexed as `default` indexes them |
+| `cjk_fold` | `cjk` with traditional Chinese folded to simplified first, so `學習` finds `学习`, `為` finds `爲` and `为`, and `看着` finds `看著`. For Chinese only; Japanese takes `cjk` |
 
 Tokens longer than 128 bytes are dropped by every tokenizer but `raw` and `whitespace`. A name
 not in this table is refused with `400` naming the field: the node could not build the index.
@@ -849,6 +851,22 @@ word holding any Cyrillic letter outside the Serbian alphabet — Russian, Bulga
 Macedonian — is left as written. The dictionary is Croatian and so ijekavian: an ekavian form often
 meets its ijekavian word (`vreme` → `vrijeme`), but not always (`pesma` stays `pesma`). A text in
 two languages is best split into a field per language, each with its own tokenizer.
+
+Chinese and Japanese put no spaces between words, so `default` makes one term of everything
+between two punctuation marks, and only a query for that whole clause finds it. `cjk` needs no
+dictionary: a query word is analysed into its characters and pairs and matched as a phrase, so it
+finds exactly the places where its characters stand in that order, as a word or inside a longer
+one. Write a query word without spaces (`孔子`, not `孔 子`). The terms are more numerous than
+the text's words — about one character and one pair per character — which is the index's cost.
+`cjk_fold` folds each traditional character to its simplified form by a table of 2,974 pairs
+derived from OpenCC's character list, one character to one, so a query in either script finds
+text in both, and variant spellings meet (`裏`, `裡`, `里`; `著`, `着`). Folding joins a few
+different words that simplified spells alike: 雲 *cloud* and 云 *say*, 後 *after* and 后
+*empress*, 髮 *hair* and 發 *emit*, 乾 *dry* and 幹 *do*, 穀 *grain* and 谷 *valley*. A word of two
+or more characters mostly tells them apart again. Pairs that are different words in both scripts
+stay apart (`象`/`像`, `坐`/`座`), as do `覆` and `复`. Japanese kanji must not be folded — the
+table would turn old-style kanji into Chinese forms Japanese does not use — so a corpus in both
+languages takes a field per language: `cjk_fold` for Chinese, `cjk` for Japanese and Korean.
 
 **Ghost fields.** A text searched under more than one analyzer — stemmed and as written, or
 stemmed by the language of its row — needs a column per analyzer, and a column is filled from a
