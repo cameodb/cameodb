@@ -5436,7 +5436,7 @@ glosses in the same field. `"내려 가다"` finds `내려가다`, so a Korean p
 Two limits come from the text, not the analyzer:
 - A word broken by inline ruby (`世《よ》の中《なか》`) is not one run.
 - `cjk` does not join Japanese old-style and new-style kanji (`淸吉` / `清吉`). That would be a
-  Japanese fold, a new item if a corpus needs it.
+  Japanese fold: filed as [U2](../ROADMAP.md#u2--japanese-and-korean-folds-old-style-kanji-and-hanja).
 - A loader must join hard-wrapped CJK lines without a space, as the Gutenberg extractor does.
 
 

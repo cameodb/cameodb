@@ -26,7 +26,7 @@ Features agreed after each release are filed as
 [S. Delete by query](docs/ROADMAP-ARCHIVE.md#s-delete-by-query--done) (archived) and
 [T. OAuth for MCP clients](docs/ROADMAP-ARCHIVE.md#t-oauth-for-mcp-clients--done) (archived); Q, R, S
 and T are built and wait in `[Unreleased]` for 0.3.9.
-[U. Post-0.3.9 features](docs/ROADMAP-ARCHIVE.md#u-post-039-features--done) (archived), opened 2026-11-06 with U1, is built and waits in `[Unreleased]`.
+[U. Post-0.3.9 features](#u-post-039-features--partial), opened 2026-11-06: U1 is built and waits in `[Unreleased]`, U2 is planned.
 
 ## How to read this file
 
@@ -76,7 +76,7 @@ on one.
 | R — Key and tenant provisioning | ◐ Partial, R1 and R2 unreleased (0.3.9) | R1 and R2 done 2026-11-01, single node: included key and tenant files reloaded on change, live tenant quotas and scopes, `allowed_indexes` prefixes; a provisioner minting and revoking keys through `/_keys` (no tenant) and `/_tenants`, changing a key's indexes in place with `PATCH /_keys/{key_id}`, and granting only within its own `allowed_indexes`; client, SDK and a live suite, validated on Linux under systemd and across a restart. Left: R3, every change broadcast to every node, deferred until cluster support is decided — until then a change applies on the node that received it |
 | S — Delete by query | ✅ Done, unreleased (0.3.9) | S1, `POST /api/{index}/delete` — exact clauses, refused past `max_docs` unless confirmed — done 2026-11-02 |
 | T — OAuth for MCP clients | ✅ Done, unreleased (0.3.9) | T1, the node as the OAuth 2.1 authorization server for `/mcp` — discovery, dynamic client registration, an approval page taking the key the user holds, PKCE, refresh; stateless, tokens read-only and ended by revoking the key — done 2026-11-03 |
-| U — Post-0.3.9 features | ✅ Done, unreleased | U1, CJK analyzers — `cjk` (characters and character pairs, so Chinese, Japanese and Korean are searchable by word) and `cjk_fold` (traditional Chinese folded to simplified first, so a query in either script finds both) — done 2026-11-06 |
+| U — Post-0.3.9 features | ◐ Partial, U1 unreleased | U1, CJK analyzers — `cjk` (characters and character pairs, so Chinese, Japanese and Korean are searchable by word) and `cjk_fold` (traditional Chinese folded to simplified first, so a query in either script finds both) — done 2026-11-06. Left: U2, Japanese and Korean folds — `cjk_ja_fold` (old-style kanji to new) and `cjk_ko_fold` (Hanja to Hangul, with the initial-sound rule) — planned |
 
 ## Reconciliation, 2026-08-26
 
@@ -312,6 +312,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [S1](docs/ROADMAP-ARCHIVE.md#s1--delete-the-documents-a-query-matches) | Delete by query — `POST /api/{index}/delete`: every shard deletes the matches it holds; exact clauses only (`text` checked against the stored value); over `max_docs` refused with the count, `confirm` to proceed | — | 2026-11-02 | ✅ |
 | [T1](docs/ROADMAP-ARCHIVE.md#t1--oauth-for-mcp-clients) | OAuth for MCP clients — browser-based and desktop MCP clients connect with the OAuth flow the MCP specification defines; the user approves once with their existing key, and the token they get is that key's authority, read only — done 2026-11-03 | — | 2026-11-03 | ✅ |
 | [U1](docs/ROADMAP-ARCHIVE.md#u1--cjk-analyzers-chinese-japanese-and-korean-searchable-by-word) | CJK analyzers — `cjk` indexes each Chinese, Japanese or Korean character alone and paired with the next, at one position, so a character, a word or a clause matches exactly; `cjk_fold` folds traditional Chinese to simplified first (a 12 KB table of 2,974 pairs derived from OpenCC's character list, with reviewed overrides), so either script finds both. done 2026-11-06 | — | 2026-11-06 | ✅ |
+| [U2](#u2--japanese-and-korean-folds-old-style-kanji-and-hanja) | Japanese and Korean folds — `cjk_ja_fold` maps old-style kanji to the new forms (淸吉 finds 清吉; OpenCC and Unihan `kJapaneseNewVariant`, 470 pairs plus reviewed overrides), `cjk_ko_fold` reads Hanja as Hangul (家族 finds 가족; Unihan `kHangul`, the initial-sound rule on each run's first character) | — | 2026-11-06 | 📋 |
 
 ---
 
@@ -2975,6 +2976,103 @@ what a cluster does; a `CHANGELOG.md` entry.
 
 ---
 
+## U. Post-0.3.9 features ◐ Partial
+
+Opened 2026-11-06. Scoped against the code at `d39d17f` (tantivy 0.26.1), where U1 left it.
+
+- ✅ [**U1 — CJK analyzers: Chinese, Japanese and Korean searchable by word**](docs/ROADMAP-ARCHIVE.md#u1--cjk-analyzers-chinese-japanese-and-korean-searchable-by-word)
+
+### U2 — Japanese and Korean folds: old-style kanji and Hanja
+
+📋 **Planned.** Filed 2026-11-06 from the Project Gutenberg case, once its Japanese books were
+searchable under `cjk`. U1 recorded the limit: `cjk` does not join `淸吉` and `清吉`.
+
+**Today.** Two scripts of one language stay apart under `cjk`.
+
+- *Japanese* was written in old-style kanji (旧字体) until the 1946–1949 reforms. A modern query
+  finds none of it: `清吉`, `読書` and `気持` miss `淸吉`, `讀書` and `氣持`.
+- *Korean* writes many words in Hanja in older and formal text (`家族` for `가족`), so a Hangul query
+  misses them. Korean can also be stored as conjoining jamo (NFD) instead of syllables, which
+  match nothing typed normally.
+
+`cjk_fold` is no answer for either. Japanese simplified its kanji differently from Chinese (氣 is
+気 in Japanese, 气 in Chinese; 圖 is 図 and 图), so the Chinese table would turn old Japanese into
+Chinese forms that no Japanese query uses.
+
+**Measured** on the 21 Japanese books of Project Gutenberg (509,622 kanji, mostly 1900s–1920s
+literature; Aozora ruby stripped by the loader):
+
+| Table | Pairs | Kanji occurrences folded |
+|---|---|---|
+| OpenCC `JPShinjitaiCharacters.txt` (commit `fae2a0a`), reversed | 408 | 29,761 (5.84%) |
+| Unihan 18.0 `kJapaneseNewVariant` | 364 | 27,494 (5.39%) |
+| Both, merged | 470 | 29,761 (5.84%) |
+
+- *The two sources agree* on 300 of the 302 characters they share. They differ on 鹽 (OpenCC 䀋,
+  Unihan 塩) and 莊 (庄 / 荘); Unihan's form is the Japanese one in both cases.
+- *OpenCC's reversed table has six conflicts*, where one old form sits under two new ones: 鹽, 畫,
+  鋪, 莊, 驅 and 鬥. Each takes Unihan's value, or the 常用 form where Unihan has none.
+- *Neither source holds the commonest old forms of this corpus.* These are variants of one
+  component that Unicode encodes apart: 逹 342, 强 241, 靑 238, 淸 172, 敎 166, 飮 119, 吿 50,
+  尙 49, 耻 33, 塲 27, 决 22, 囘 20. About 1,500 occurrences in all. They go in a reviewed
+  `overrides.tsv`, each line with its reference (Unihan `kZVariant` or `kSemanticVariant` where
+  it has one).
+- *Unihan's semantic variants are too loose to take whole*: they include 只→子, 捌→八 and 愈→愉.
+  The 1956 書きかえ pairs (慾→欲, 歎→嘆, 煖→暖, 廻→回, 盃→杯) are different characters that a
+  modern text replaced. They are left out of the first table, and each is a judgment call to make
+  against a corpus.
+
+Korean has no corpus here. Gutenberg's one Korean item is a Korean–English dictionary (5739),
+with 25 Hanja words. All 25 fold, by the rule below, to the dictionary's own Hangul headword (家族
+가족, 工夫 공부, 無窮花 무궁화, 太極旗 태극기).
+
+**Design.** Two analyzers, registered beside `cjk` and `cjk_fold`. Each places a fold filter
+ahead of `CjkBigram`, as `cjk_fold` does:
+
+- *`cjk_ja_fold`*: a `JapaneseFold` filter maps each old-style kanji to its new form, one
+  character to one. The table merges the two sources above with the overrides. The compatibility
+  ideographs U+F900–U+FAFF go to their canonical form (神 U+FA19 → 神 U+795E), and from there
+  through the table. Chains are resolved so the fold is idempotent. BMP only, with every key and
+  value a 3-byte character, so the token is rewritten in place and its offsets stay exact. Size
+  is about 2 KB. Japanese only: `cjk_fold` stays the Chinese analyzer.
+- *`cjk_ko_fold`*: a `KoreanFold` filter does three things.
+  - *Jamo are composed into syllables* (the Hangul part of NFC, by arithmetic, with no tables).
+  - *Each Hanja becomes its Hangul reading.* The table is Unihan `kHangul`: 8,465 BMP characters,
+    of which 270 are compatibility ideographs. Where a character has several readings (383 do),
+    the fold takes the one flagged `E`, then `0`, then the first. 74 characters take a reading
+    other than the first listed (樂 → 락, not 낙).
+  - *The initial-sound rule (두음법칙) applies to the first Hanja of each run.* So 女子 folds to 여자
+    and 子女 to 자녀, 李 to 이, 樂園 to 낙원, as South Korean spelling writes them.
+  The values are Hangul syllables, 3 bytes like the keys. Size is about 33 KB.
+
+  A Hangul query then finds text written in Hanja, and a Hanja query is folded the same way.
+  The fold is lossy where the language is ambiguous, and that is accepted:
+  - one reading per character (金 is 금, never the surname 김);
+  - the initial-sound rule misses a word that starts inside a Hanja run (新女性 → 신녀성, not 신여성);
+  - North Korean spelling, which has no initial-sound rule, folds to the southern forms.
+
+*Data.* `tools/zh-fold` becomes `tools/cjk-fold`, with one generator for all three tables. The
+Chinese table must come out with identical arrays. Sources are pinned by commit or date and
+sha256, and each table's `MANIFEST.txt` lines carry the counts and a checksum the storage tests
+verify.
+- *Licences:* OpenCC is Apache-2.0, credited as in U1. Unihan is under the Unicode License v3,
+  which asks for its notice with the derived data. The plan is `licenses/LICENSE-UNICODE-3.0` plus
+  the credit line in the manifest; `deny.toml` already accepts Unicode-3.0 for dependencies.
+
+*Reindex.* None for existing fields: `cjk` and `cjk_fold` do not change. A field moved to a new
+analyzer is rebuilt by reloading it.
+
+**Tests.**
+- *Japanese:* `淸吉` ≡ `清吉`, `讀書` ≡ `読書`, `氣` ≡ `気`, `鹽` ≡ `塩`. A 書きかえ pair such as 慾 /
+  欲 stays apart. Kana, Hangul and Latin come out as under `cjk`.
+- *Korean:* `家族` ≡ `가족`, `女子` ≡ `여자`, `子女` ≡ `자녀`. Jamo `ᄒ ᅡ ᆫ` (NFD) ≡ `한`. Kana and
+  Latin come out as under `cjk`.
+- *Both tables:* sorted, in range, idempotent, and matching the manifest. A fixture search with
+  each fold.
+
+**Consumer.** The Gutenberg case: `text_ja` moves to `cjk_ja_fold`, and Korean gets its own
+`text_ko` on `cjk_ko_fold` once a Korean-language book is in its collection.
+
 ## Delivered work, in the archive
 
 Delivered work is in [docs/ROADMAP-ARCHIVE.md](docs/ROADMAP-ARCHIVE.md), kept in full. Where an item of a group still open
@@ -2985,7 +3083,6 @@ was delivered, its stub stands above in its place; these groups were delivered w
 - ✅ [**Q. Post-0.3.8 features**](docs/ROADMAP-ARCHIVE.md#q-post-038-features--done) — Q1–Q2
 - ✅ [**S. Delete by query**](docs/ROADMAP-ARCHIVE.md#s-delete-by-query--done) — S1
 - ✅ [**T. OAuth for MCP clients**](docs/ROADMAP-ARCHIVE.md#t-oauth-for-mcp-clients--done) — T1
-- ✅ [**U. Post-0.3.9 features**](docs/ROADMAP-ARCHIVE.md#u-post-039-features--done) — U1
 
 The archive also holds the original write-up of every delivered phase, the measurements, and the settled decisions:
 what the affinity flags cost, what the audit trail costs, the non-goals recorded so they are not re-litigated, and the
