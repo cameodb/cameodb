@@ -597,11 +597,19 @@ async fn run(args: Vec<String>) -> Result<()> {
     orchestrator.set_remote_peer_pool(Arc::clone(&remote_peer_pool));
 
     // NOW initialize default shards (after coordinator is set)
+    // Shards are the node's: created here only on empty data paths, and found on disk on every
+    // later start, when num_shards_init is not read. The report below says which happened.
     let init_shards = cameodb_config.storage.num_shards_init;
+    let mut shards_created = false;
     if orchestrator.shard_count() == 0 && init_shards > 0 {
         let started = orchestrator.create_initial_shards(init_shards).await;
         println!("Initialized {started} shards");
+        shards_created = true;
     }
+    let active_shards = orchestrator.shard_count();
+    let shards_line = cameodb_config
+        .storage
+        .shard_report(active_shards, shards_created);
 
     // Register all shards with coordinator (including newly created ones)
     if let Err(err) = orchestrator.register_all_shards_with_coordinator().await {
@@ -939,10 +947,7 @@ async fn run(args: Vec<String>) -> Result<()> {
     println!();
     println!("⚙️  Configuration:");
     println!("  Data Paths: {:?}", cameodb_config.storage.data_paths);
-    println!(
-        "  Number of shards: {}",
-        cameodb_config.storage.num_shards_init
-    );
+    println!("  Number of shards: {shards_line}");
     let durability_label = if cameodb_config.storage.wal_sync {
         "Immediate"
     } else {

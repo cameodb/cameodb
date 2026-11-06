@@ -1271,4 +1271,35 @@ max_response_bytes = 16777216
         let bad = cli(&["--profile", "nonsense"]);
         assert!(CameoDbConfig::apply_overrides(CameoDbConfig::default(), &bad).is_err());
     }
+
+    fn storage_with_init(n: usize) -> StorageConfig {
+        let mut storage = CameoDbConfig::default().storage;
+        storage.num_shards_init = n;
+        storage
+    }
+
+    #[test]
+    fn shard_report_states_the_count_alone_when_it_matches_or_was_just_created() {
+        assert_eq!(storage_with_init(4).shard_report(4, false), "4");
+        // Created this start: the cap may have given fewer than asked, and that is not a mismatch
+        // with what is on disk.
+        assert_eq!(storage_with_init(4).shard_report(2, true), "2");
+    }
+
+    #[test]
+    fn shard_report_names_the_setting_that_was_not_applied() {
+        // The case that misled: a node first started with one shard, restarted with four set.
+        assert_eq!(
+            storage_with_init(4).shard_report(1, false),
+            "1 (num_shards_init = 4 applies only to empty data paths)"
+        );
+    }
+
+    #[test]
+    fn shard_report_says_when_initialization_is_off() {
+        assert_eq!(
+            storage_with_init(0).shard_report(3, false),
+            "3 (num_shards_init = 0: none created automatically)"
+        );
+    }
 }

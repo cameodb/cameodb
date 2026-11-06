@@ -467,7 +467,8 @@ pub struct StorageConfig {
     pub default_batch_size: usize,
 
     /// If no shards exist on first startup, create this many shards (default: 4)
-    /// Set to 0 to disable automatic initialization.
+    /// Set to 0 to disable automatic initialization. Read only then: a node with shards on disk
+    /// keeps them whatever this says (see `StorageConfig::shard_report`).
     #[serde(default = "default_num_shards_init")]
     pub num_shards_init: usize,
 
@@ -533,6 +534,24 @@ impl StorageConfig {
     /// Return the primary data path (first in sorted list), if configured.
     pub fn primary_path(&self) -> Option<&PathBuf> {
         self.data_paths.first()
+    }
+
+    /// The startup line on shards: the node's shard count, and the setting when it disagrees.
+    ///
+    /// Shards belong to the node. They are created once, on empty data paths, and found again on
+    /// every later start; `num_shards_init` is not read then. Printing only the setting told an
+    /// operator who had changed it that the node now had that many shards, when it kept the ones
+    /// on disk. `active` is the node's shard count after startup; `created` is true when this
+    /// start created them.
+    pub fn shard_report(&self, active: usize, created: bool) -> String {
+        let configured = self.num_shards_init;
+        if created || active == configured {
+            format!("{active}")
+        } else if configured == 0 {
+            format!("{active} (num_shards_init = 0: none created automatically)")
+        } else {
+            format!("{active} (num_shards_init = {configured} applies only to empty data paths)")
+        }
     }
 }
 

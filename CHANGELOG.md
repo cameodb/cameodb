@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Startup reports the shards the node runs with, not the setting.** The configuration block
+  printed `Number of shards:` from `num_shards_init`, which is read only on the first start from
+  empty data paths: a node restarted with the setting changed kept its shards on disk while
+  reporting the new number. It now prints the node's shard count, and when that differs from
+  `num_shards_init` says so on the line (`1 (num_shards_init = 4 applies only to empty data
+  paths)`). CONFIGURATION describes
+  `num_shards_init` as the node's shard count, fixed when its data is created, and the two ways to
+  change it.
+
 ## [0.3.9] - 2026-11-05
 
 **Upgrading from 0.3.8.** No config change is needed for a node to start; every new section is

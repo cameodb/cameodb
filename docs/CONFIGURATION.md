@@ -450,7 +450,15 @@ default_batch_size = 1000
 # them. They are created once, when the node starts on empty data paths, and persisted there —
 # one `shard-<uuid>` directory each. Every later start discovers those directories and opens
 # them; this setting is not read again. So the shard count is fixed when the node's data is
-# initialized: changing it means a fresh data directory and reloading the data.
+# initialized — with indexes or without, empty or not: what counts is the shard directories.
+# Changing it, with the node stopped:
+#   - a fresh data directory, then reload the data; or
+#   - remove only the `shard-*` directories: the node keeps its identity and the index
+#     schemas (they live in metadata.redb) and creates the new shards on the next start, but
+#     every document goes with the old shards, so the data is reloaded all the same.
+# Startup reports the count the node runs with, "Number of shards: 1", and when it differs
+# from this setting says so on that line:
+#   Number of shards: 1 (num_shards_init = 4 applies only to empty data paths)
 #
 # Four is the measured optimum for write throughput on a single node, and eight is roughly
 # a third slower — a bulk request fans out to every shard and waits for the slowest. Raise
