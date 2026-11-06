@@ -444,14 +444,22 @@ wal_segment_size_mb = 64
 # throughput much — see "Write throughput: what actually moves it".
 default_batch_size = 1000
 
-# Initial number of shards per index (default: 4).
+# Number of shards the node creates on its first start (default: 4).
+#
+# Shards belong to the node, not to an index: every index on the node is spread over all of
+# them. They are created once, when the node starts on empty data paths, and persisted there —
+# one `shard-<uuid>` directory each. Every later start discovers those directories and opens
+# them; this setting is not read again. So the shard count is fixed when the node's data is
+# initialized: changing it means a fresh data directory and reloading the data.
 #
 # Four is the measured optimum for write throughput on a single node, and eight is roughly
 # a third slower — a bulk request fans out to every shard and waits for the slowest. Raise
 # this for data volume and parallel recovery, not for ingest speed.
 num_shards_init = 4
 
-# Maximum shards allowed on this node (default: 8)
+# Maximum shards allowed on this node (default: 8). Not lower than the shards already on
+# disk: past the cap a shard is left unopened (a warning at startup), and its documents go
+# unserved.
 max_shards_per_node = 8
 
 # Pin each shard's writer thread to a dedicated CPU core (default: true)
@@ -1739,7 +1747,9 @@ below.
 Sharding pays to about four and then reverses. A bulk request fans out to *every* shard and
 waits for the slowest, so each added shard buys parallelism and pays a tail-latency tax on every
 request; past four the tax wins. Raise `num_shards_init` for data volume and parallel recovery
-if you need to — not for write throughput.
+if you need to — not for write throughput. The setting only acts when the node first creates its
+data: an existing node keeps the shards it has (see `num_shards_init` above), so measuring
+another count means starting from empty data paths.
 
 #### What does not help
 

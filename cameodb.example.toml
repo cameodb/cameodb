@@ -265,6 +265,8 @@ wal_sync = true
 quick_repair = true
 wal_segment_size_mb = 64
 default_batch_size = 5000
+# Shards the node creates on its first start, on empty data paths; persisted there and fixed
+# afterwards (a later change is not read). See docs/CONFIGURATION.md.
 num_shards_init = 4
 max_shards_per_node = 8
 
