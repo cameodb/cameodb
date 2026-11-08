@@ -27,6 +27,7 @@ Features agreed after each release are filed as
 [T. OAuth for MCP clients](docs/ROADMAP-ARCHIVE.md#t-oauth-for-mcp-clients--done) (archived); Q, R, S
 and T are built and wait in `[Unreleased]` for 0.3.9.
 [U. Post-0.3.9 features](docs/ROADMAP-ARCHIVE.md#u-post-039-features--done) (archived), opened 2026-11-06 with U1 and U2, is built and waits in `[Unreleased]`.
+[V. Cluster HA](#v-cluster-ha--replication-the-two-node-mirror-and-elasticity--planned), opened 2026-11-08, is the design for replication, the two-node mirror and elasticity, and the order of the cluster work.
 
 ## How to read this file
 
@@ -61,7 +62,7 @@ on one.
 | 12 — MCP server integration | ◐ Partial | Streaming, semantic routing, the documentation pass, and compliance tests and benchmarks |
 | 13 — Thread-per-core & memory operations | ◐ Partial | Stage 2f.2 (CPU arenas) and 2f.3 (per-arena jemalloc stats) — both with the evidence against 2f.2 |
 | 14 — Security hardening | ◐ Partial | Stage C3 only (per-index role overrides); complexity caps deferred. Posture items C3–C8 all closed, C8 by M3 on 2026-09-20 |
-| 15 — HA: reindex, replication, migration | 📋 Planned | All three stages |
+| 15 — HA: reindex, replication, migration | 📋 Planned | All three stages, designed and built as [V](#v-cluster-ha--replication-the-two-node-mirror-and-elasticity--planned): D1 is V11, D2 is V5 and V9, D3 is V10 and V12 |
 | 16 — Boot & OOM recovery at scale | ◐ Partial | Stage 3's deeper warming options, and the measurement on the reporting node — now with `quick_repair` on and off; E5 (a cap on open indexes) done by M1, E6 (redb's crash repair) done 2026-10-15, E1 (Stage 4.2) overtaken by F9 |
 | 17 — Record deletion | ✅ Done | — |
 | 18 — Field types: Facet and JSON | ◐ Partial | J2 and J3 — a json field behaves exactly like a text one. J1 (facet writable) and OB1 (the `fast` three-state prerequisite) are done. No migration for what remains |
@@ -76,6 +77,7 @@ on one.
 | R — Key and tenant provisioning | ◐ Partial, R1 and R2 unreleased (0.3.9) | R1 and R2 done 2026-11-01, single node: included key and tenant files reloaded on change, live tenant quotas and scopes, `allowed_indexes` prefixes; a provisioner minting and revoking keys through `/_keys` (no tenant) and `/_tenants`, changing a key's indexes in place with `PATCH /_keys/{key_id}`, and granting only within its own `allowed_indexes`; client, SDK and a live suite, validated on Linux under systemd and across a restart. Left: R3, every change broadcast to every node, deferred until cluster support is decided — until then a change applies on the node that received it |
 | S — Delete by query | ✅ Done, unreleased (0.3.9) | S1, `POST /api/{index}/delete` — exact clauses, refused past `max_docs` unless confirmed — done 2026-11-02 |
 | T — OAuth for MCP clients | ✅ Done, unreleased (0.3.9) | T1, the node as the OAuth 2.1 authorization server for `/mcp` — discovery, dynamic client registration, an approval page taking the key the user holds, PKCE, refresh; stateless, tokens read-only and ended by revoking the key — done 2026-11-03 |
+| V — Cluster HA | 📋 Planned | V1–V13, opened 2026-11-08. A cluster is partitioned (`replication_factor = 1`, today's behaviour, for systems that are not critical or whose HA is in the hardware) or replicated; two nodes are partitioned or a mirror. Phase 1, HA: the mirror — document versions, the change stream, the copy operation (V2–V5), with OB26 and the schema round working with a peer down; no shard placement needed. Phase 2, a robust partitioned cluster: V1, V13, N11, N17's cluster items, O4, then cluster metadata on a quorum of voters with a single-key compare-and-set, no Raft log, and shards owned by the cluster (V6–V8). Phase 3: move, drain, rebalance (V10) and replication with fewer copies than nodes (V9). Phase 4: online reindex and splitting (V11, V12) |
 | U — Post-0.3.9 features | ✅ Done, unreleased | U1, CJK analyzers — `cjk` (characters and character pairs, so Chinese, Japanese and Korean are searchable by word) and `cjk_fold` (traditional Chinese folded to simplified first, so a query in either script finds both) — done 2026-11-06. U2, Japanese and Korean folds — `cjk_ja_fold` (old-style kanji to new) and `cjk_ko_fold` (Hanja to Hangul, with the initial-sound rule) — done 2026-11-06 |
 
 ## Reconciliation, 2026-08-26
@@ -249,9 +251,9 @@ first written down here, so the chronology stays visible under the cost ordering
 | [C2](#c2--query-complexity-caps) | Query complexity caps | 14 | 2026-08-10 | 💭 |
 | [C3](docs/ROADMAP-ARCHIVE.md#c3--fail-closed-on-unauthenticated-internal) … [C6](docs/ROADMAP-ARCHIVE.md#c6--redact-the-cluster-psk-in-debug) | Posture hardening: four items from the 2026-09-01 review — C3 and C4 done | 14 | 2026-09-01 | ◐ |
 | [C7](docs/ROADMAP-ARCHIVE.md#c7--a-500-printed-the-nodes-internal-error-text) | A `500` printed the node's internal error text | 14 | 2026-09-01 | ✅ |
-| [D1](#d1--reindex) | Reindex | 15 | 2026-08-15 | 📋 |
-| [D2](#d2--replication) | Replication | 15 | 2026-08-15 | 📋 |
-| [D3](#d3--migration) | Migration | 15 | 2026-08-15 | 📋 |
+| [D1](#d1--reindex) | Reindex — built as V11 | 15 | 2026-08-15 | 📋 |
+| [D2](#d2--replication) | Replication — built as V5 and V9 | 15 | 2026-08-15 | 📋 |
+| [D3](#d3--migration) | Migration — built as V10 and V12 | 15 | 2026-08-15 | 📋 |
 | [E1](#e1--stage-42--a-max-wal-size-commit-trigger) | Stage 4.2 — a max-WAL-size commit trigger — overtaken by F9's commit clock and backstop | 16 | 2026-08-19 | ⏭️ |
 | [E2](#e2--stage-3s-deeper-warming-options) | Stage 3's deeper warming options | 16 | 2026-08-19 | 📋 |
 | [E3](#e3--measure-recovery-on-the-reporting-node) | Measure recovery on the reporting node — with `quick_repair` on and off | 16 | 2026-08-19 | 📋 |
@@ -313,6 +315,19 @@ first written down here, so the chronology stays visible under the cost ordering
 | [T1](docs/ROADMAP-ARCHIVE.md#t1--oauth-for-mcp-clients) | OAuth for MCP clients — browser-based and desktop MCP clients connect with the OAuth flow the MCP specification defines; the user approves once with their existing key, and the token they get is that key's authority, read only — done 2026-11-03 | — | 2026-11-03 | ✅ |
 | [U1](docs/ROADMAP-ARCHIVE.md#u1--cjk-analyzers-chinese-japanese-and-korean-searchable-by-word) | CJK analyzers — `cjk` indexes each Chinese, Japanese or Korean character alone and paired with the next, at one position, so a character, a word or a clause matches exactly; `cjk_fold` folds traditional Chinese to simplified first (a 12 KB table of 2,974 pairs derived from OpenCC's character list, with reviewed overrides), so either script finds both. done 2026-11-06 | — | 2026-11-06 | ✅ |
 | [U2](docs/ROADMAP-ARCHIVE.md#u2--japanese-and-korean-folds-old-style-kanji-and-hanja) | Japanese and Korean folds — `cjk_ja_fold` maps old-style kanji to the new forms (淸吉 finds 清吉; OpenCC and Unihan `kJapaneseNewVariant`, 470 pairs plus reviewed overrides), `cjk_ko_fold` reads Hanja as Hangul (家族 finds 가족; Unihan `kHangul`, the initial-sound rule on each run's first character). done 2026-11-06 | — | 2026-11-06 | ✅ |
+| [V1](#v1--a-node-that-brings-new-shards-cannot-join-a-cluster-that-holds-data) | A node that brings new shards cannot join a cluster that holds data — its tokens take key ranges and no document moves; refused until V8 | 15 | 2026-11-08 | 📋 |
+| [V2](#v2--document-versions-and-delete-markers) | Document versions and delete markers — a hybrid clock per write, newest wins; a storage format change | 15 | 2026-11-08 | 📋 |
+| [V3](#v3--the-wal-kept-until-replicas-confirm-it-and-the-change-stream) | The WAL kept until replicas confirm it, and the change stream | 15 | 2026-11-08 | 📋 |
+| [V4](#v4--the-copy-operation-one-index-from-one-node-to-another-with-catch-up) | The copy operation — one index from one node to another, with catch-up; serves replica fill, move, reindex and split | 15 | 2026-11-08 | 📋 |
+| [V5](#v5--the-mirror-two-nodes-every-document-on-both) | The mirror — phase 1 of HA: a cluster whose `replication_factor` equals its node count, each node holding every document; either serves everything when the other is lost | 15 | 2026-11-08 | 📋 |
+| [V6](#v6--metadata-records-on-a-majority-of-voters) | Metadata records on a majority of voters — OB26 rebuilt on it | 15 | 2026-11-08 | 📋 |
+| [V7](#v7--compare-and-set-on-one-key-and-the-voter-list) | Compare-and-set on one key, and the voter list — the topology lock, the witness, OB27's `forget` | 15 | 2026-11-08 | 📋 |
+| [V8](#v8--shards-belong-to-the-cluster-placement-on-a-version-checked-at-the-replica) | Shards belong to the cluster; placement on a version, checked at the replica — absorbs O3 and N15's shard-map item | 15 | 2026-11-08 | 📋 |
+| [V9](#v9--replication-with-fewer-copies-than-nodes) | Replication with fewer copies than nodes | 15 | 2026-11-08 | 📋 |
+| [V10](#v10--move-drain-and-rebalance) | Move, drain and rebalance | 15 | 2026-11-08 | 📋 |
+| [V11](#v11--online-reindex-and-index-aliases) | Online reindex, and index aliases | 15 | 2026-11-08 | 📋 |
+| [V12](#v12--splitting-a-shard) | Splitting a shard | 15 | 2026-11-08 | 📋 |
+| [V13](#v13--a-node-whose-disks-move-to-another-machine-rejoins-as-itself) | A node whose disks move to another machine rejoins as itself — the recovery a partitioned cluster relies on when its HA is in the hardware | 15 | 2026-11-09 | 📋 |
 
 ---
 
@@ -593,6 +608,11 @@ nothing from D2 and D3, and D1 has a documented workaround — declare fields up
 [A2](#a2--the-documentation-pass) is responsible for teaching.
 
 Stages are provisional and not yet ordered beyond their dependencies.
+
+**Designed 2026-11-08 as [V. Cluster HA](#v-cluster-ha--replication-the-two-node-mirror-and-elasticity--planned)**, which is where the order and the decisions now
+live: D1 is built as V11, D2 as V5 (the two-node mirror) and V9, D3 as V10 and V12. The
+dependency of D2 on D1 below no longer holds — a replica is filled by V4's copy operation, which
+writes documents through the target's own write path, so no reindex is needed first.
 
 ### D1 — Reindex
 
@@ -1813,7 +1833,8 @@ stays there.
 
 ### OB26 — A restarted node waits on every expected peer before it leaves bootstrap
 
-📋 **Planned, low priority.** Read from the code 2026-10-15; reproduced in Docker 2026-10-18 at
+📋 **Planned, low priority — rebuilt on [V6](#v6--metadata-records-on-a-majority-of-voters)** (2026-11-08): bootstrap ends when a quorum of voters is
+reachable, at the first peer in a two-node mirror, or at a deadline. Read from the code 2026-10-15; reproduced in Docker 2026-10-18 at
 `7696b4a` — the mode is real, and no client sees it. `bootstrap_complete` becomes true in
 `evaluate_and_transition_state` only when no expected node is inactive (`coordinator.rs:510–513`) —
 every node in the snapshot or the configuration, connected. Until then `PeerDiscovered` skips the
@@ -1873,7 +1894,8 @@ one node's disk therefore breaks the cluster until its metadata is edited by han
 1. ✅ **The 500 becomes a 503** naming the unreachable owner, as for a lost peer — done 2026-11-02
    (`888cb27`): an owner with no known address routes as `Unavailable`, and a keyed write that
    still reaches a broadcast is `PeerUnreachable`.
-2. **`POST /_admin/cluster/nodes/{node_id}/forget`** (and the CLI): refused while the node is
+2. **`POST /_admin/cluster/nodes/{node_id}/forget`** (and the CLI) — built on
+   [V7](#v7--compare-and-set-on-one-key-and-the-voter-list)'s compare-and-set on the voter list, with a tombstone (2026-11-08): refused while the node is
    connected; removes it from `expected_nodes` and its shards from the map, persists, and
    propagates. Propagation is the hard part: a merge prunes only the *sender's* shards, so any other
    node's push or pull would bring the forgotten shards back within 10 s. It needs
@@ -2433,7 +2455,7 @@ as two extensions (`Caller` and `Authz`) where one extractor would do.
   before; the refusal keys differ (`document N:` and `{id}:`); `forward_write` fails when
   `items_written` is missing, `forward_delete` defaults it to 0. **Change:** `partition_by_owner`
   and `forward_share`.
-- **Shard map sync.** Five mechanisms: the DHT publish at bootstrap, the stability push
+- **Shard map sync** — absorbed by [V8](#v8--shards-belong-to-the-cluster-placement-on-a-version-checked-at-the-replica) (2026-11-08), on V6's quorum records. Five mechanisms: the DHT publish at bootstrap, the stability push
   (`coordinator.rs:538–583`), `RegisterLocalShards` into `ExchangeShardsWithPeer` into a query
   and a push and a fallback push (`:806–857`, `:2261–2320`), the `PeerDiscovered` push and pull
   with a hand-rolled 5× backoff (`:1417–1510`), and the periodic `SyncShardMaps` pull (`:2379`).
@@ -2589,7 +2611,9 @@ O6 last, reconciling the architecture document after the code it describes has m
 
 ### O3 — Shard maps merge on a version, not on recency
 
-**Planned.** Re-read 2026-10-18 against `7696b4a` and the OB26 runs; now the prerequisite of
+**Planned — absorbed by [V8](#v8--shards-belong-to-the-cluster-placement-on-a-version-checked-at-the-replica)** (2026-11-08): the version moves from each owner's
+shard set to each shard's placement, held on V6's quorum records rather than merged on push and
+pull. The analysis below stands as the reason. Re-read 2026-10-18 against `7696b4a` and the OB26 runs; now the prerequisite of
 [OB27](#ob27--a-replaced-node-never-leaves-the-cluster)'s `forget`, which makes it the next cluster item
 rather than a Phase 15 one.
 
@@ -2945,7 +2969,9 @@ system index.
 ### R3 — Changes reach every node
 
 💭 **Deferred.** ~3–4 days. Needs R2. R1 and R2 serve a single node completely; this is taken up
-when cluster support for provisioning is decided. Filed with its design so it is not re-derived.
+when cluster support for provisioning is decided. Since 2026-11-08 the broadcast below is to be
+built on [V6](#v6--metadata-records-on-a-majority-of-voters): a tenant file is a newest-version record on a majority of voters, which
+gives the catch-up and the ordering this design spells out by hand. Filed with its design so it is not re-derived.
 
 **Design.**
 
@@ -2973,6 +2999,395 @@ revision settle by node id.
 
 **Docs.** The single-node limit in `docs/API_REFERENCE.md` and `docs/DEPLOYMENT.md` replaced by
 what a cluster does; a `CHANGELOG.md` entry.
+
+---
+
+## V. Cluster HA — replication, the two-node mirror and elasticity 📋 Planned
+
+Opened 2026-11-08, scoped against the code at `25a1a4e`. A cluster is partitioned, as today, or
+replicated: a replicated cluster that loses a node keeps its data and keeps serving it, and two
+nodes run as a partitioned pair or as a mirror of each other. Either kind grows, shrinks and
+rebalances while it serves, and a partitioned cluster becomes as robust as its hardware lets it. This group is the design for [Phase 15](#d-phase-15--high-availability-reindex-replication--migration--planned):
+D1, D2 and D3 are built as the items below. It absorbs [O3](#o3--shard-maps-merge-on-a-version-not-on-recency)
+and N15's shard-map item, and [OB26](#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap),
+[OB27](#ob27--a-replaced-node-never-leaves-the-cluster)'s `forget` and [R3](#r3--changes-reach-every-node)
+are built on it. The design is meant to be iterated: each pass adds to the
+[iteration log](#iteration-log) and settles or adds open questions, so a later change does not
+reopen a settled one without saying why.
+
+**Decided** (2026-11-08):
+
+1. **Replication is logical, not a copy of files.** A replica is filled by reading documents from
+   redb and writing them through the target's own write path, which builds its own Tantivy index.
+   Files are not copied because one `store.redb` per shard holds every index's `data_`, `wal_`
+   and schema tables together; redb has no copy of a live file; Tantivy deletes files a merge
+   retires while a copy would still be reading them; and both formats belong to the build, which
+   a rolling upgrade mixes.
+2. **One copy operation serves four purposes**: filling a replica, moving a shard, reindexing
+   under a new schema, and splitting a shard by key range ([V4](#v4--the-copy-operation-one-index-from-one-node-to-another-with-catch-up)).
+   Reindex is therefore no longer a prerequisite of replication, as D2 recorded.
+3. **No Raft log.** Writes never go through agreement: each document carries a version, and the
+   newest version wins wherever two copies meet ([V2](#v2--document-versions-and-delete-markers)).
+   Qdrant keeps its data path out of consensus the same way, and runs Raft for metadata only.
+4. **Cluster metadata is held on a quorum of voters, built on our own peer layer**, not on a Raft
+   log ([V6](#v6--metadata-records-on-a-majority-of-voters), [V7](#v7--compare-and-set-on-one-key-and-the-voter-list)).
+   Kademlia stays for discovery and hints. Records with one natural writer keep the newest
+   version on a majority; the few decisions that must be exclusive — admitting or removing a
+   voter, taking the topology lock — use a compare-and-set on one key. Agreement switches on with
+   the cluster: one node decides alone, three or more decide by majority.
+5. **A cluster is partitioned or replicated, chosen by `replication_factor`** (third pass,
+   2026-11-09). `[network.cluster] replication_factor = 1`, the default, is a **partitioned**
+   cluster: each document on one node, as today. `2` or more is a **replicated** cluster: each
+   document on that many nodes. A **mirror** is a replicated cluster whose factor equals its node
+   count, so every node holds every document; two nodes with `replication_factor = 2` are the
+   mirror. Two nodes are therefore configured as partitioned or mirrored, and three or more as
+   partitioned or replicated.
+6. **Partitioned stays a first-class mode, not a step towards replication.** It is the lower-risk
+   choice for a system that is not critical, and for one whose HA is in the hardware: a RAID
+   array survives a failed disk, and a failed machine's disks boot in a healthy one, the node
+   rejoining as itself because its identity is its data directory
+   ([V13](#v13--a-node-whose-disks-move-to-another-machine-rejoins-as-itself)). Everything built
+   for the cluster that does not need a second copy — the stability items, the metadata quorum,
+   placement, move, drain and rebalance — serves it as well.
+7. **"Shard" keeps its meaning; the modes are named, not the unit.** A shard is already both the
+   node's data segment (`shard-<uuid>`, its own `store.redb` and `indices/`) and the cluster's unit
+   of placement (its 256 tokens on the ring), as an Elasticsearch shard is. A second word —
+   partition, tablet — would suggest a second level that does not exist, and renaming the unit
+   would touch directories, configuration and metrics. So: *partitioned* and *replicated*
+   clusters, a *mirror*, and `replication_factor`, the name Cassandra, Kafka and Qdrant use for
+   the number of copies.
+8. **The mirror is the first phase of HA** ([V5](#v5--the-mirror-two-nodes-every-document-on-both)).
+   Every document is on both nodes; either takes reads and writes; losing one blocks nothing; a
+   partition is survived by both sides writing and converging afterwards. The price is a write
+   capacity of one node, twice the disk, and the network round trip on each write. It is
+   configured as a cluster, but placement needs no ring: with the factor at the node count, each
+   node routes a document to its own shards by its id, so the nodes need not have the same shard
+   count, and V6–V8 are not needed. It does run the cluster's membership, so the parts of it that
+   assume every peer is present — OB26's bootstrap and the all-node schema round — are fixed for
+   it in the same phase. (The second pass had made the mirror two single nodes outside the
+   cluster; the third keeps that independence from placement but configures it as a cluster.)
+9. **One topology change at a time**, enforced by the topology lock (V7). With two nodes and no
+    witness there is no majority, so a topology change needs both nodes, or an operator who
+    declares the other one gone.
+10. **The order, in phases.** *Phase 1, HA:* the mirror — V2, V3, V4 and V5, with OB26 and the
+    schema round made to work with a peer down. *Phase 2, a robust partitioned cluster:* V1, V13,
+    N11, N17's cluster items and O4, then the metadata quorum and shard placement (V6–V8, with
+    OB27 on them). *Phase 3, elasticity:* moving, draining and rebalancing (V10), which a
+    partitioned cluster needs as much as a replicated one, and replication with fewer copies
+    than nodes (V9). *Phase 4:* online reindex and splitting (V11, V12).
+
+**What the code has today** (read 2026-11-08):
+
+- **A shard's place on the ring is its own**: 256 tokens from its UUID
+  (`register_shard_for_routing`, `orchestrator.rs:5000`), so a shard can change nodes without its
+  key ranges changing. But shards belong to nodes: each node creates `num_shards_init` of its own
+  on first start, and a write goes to the shard that owns its key (`router.rs:340`,
+  `orchestrator.rs:137`).
+- **The WAL holds ids only** (`encode_wal_entry`, `store.rs:52`), and replay already reads each
+  id's current row from `data_<index>` rather than re-enacting the log. That is the shape a
+  catch-up stream needs. But entries are deleted as soon as Tantivy has committed them
+  (`checkpoint_committed`, `store.rs:2353`).
+- **Kademlia stores three record kinds** — peer to node UUID, node metadata, one record per shard
+  — all with `Quorum::One` (`swarm/behaviour.rs:149`, `:213`, `:252`), in a `MemoryStore` that a
+  restart empties. The snapshot in `metadata.redb` is what carries the map across restarts.
+- **No document carries a version**, and a delete leaves nothing behind.
+
+### The design
+
+**Document versions.** The node that accepts a write stamps it with a hybrid logical clock value —
+wall-clock milliseconds, a counter, and the node id as the tie-break — kept in the `data_<index>`
+row. A delete writes a marker with its version to a separate `tomb_<index>` table, so scans of
+`data_` never see one. A copy applies a put or a delete only if its version is newer than the one
+it holds. Then two nodes writing the same id converge, a replica that missed writes converges on
+catch-up, and nothing has to be promoted. A delete marker is dropped once every replica has
+confirmed it. A peer whose clock is further off than `max_clock_skew_ms` is refused at join and
+reported in health while connected.
+
+**The change stream.** The WAL is kept, per index, until every replica has confirmed it, rather
+than until Tantivy commits; each node keeps a cursor per peer, the sequence the peer last
+confirmed. Catching a peer up is: for every id in the WAL past its cursor, send the current row
+or the delete marker. Order does not matter and a resend is harmless, because the version decides.
+A node sends every change past the cursor, including ones it received from that peer: the version
+check makes an echo a no-op, and nothing then depends on remembering where a write came from.
+Retention is bounded; a peer that falls further behind than the bound is resynced by V4.
+
+**The copy operation** ([V4](#v4--the-copy-operation-one-index-from-one-node-to-another-with-catch-up)).
+Copy one index, optionally one key range, from node A to node B: note A's highest WAL sequence S;
+read `data_<index>` in batches, each in its own short read transaction, so the writer is never
+held and redb is not pinned for the length of the copy; B writes each batch through its bulk path;
+then catch up from S. Anything that changed during the copy has a sequence past S, so the catch-up
+covers it. A resync copies into a fresh index on B and swaps it in, so documents B holds that A
+deleted beyond the retained WAL do not survive.
+
+**Writes.** The node that takes a write stamps the version and sends it to every replica of the
+key's shard at once, applying it locally in parallel if it holds one. `[cluster] write_ack`:
+
+| Setting | The client is answered when | A write survives |
+|---|---|---|
+| `all_available` (default) | every reachable replica has it durably; at least one | the loss of any one node, when both were up |
+| `local` | the node that took it has it durably; replicas follow | a process crash; not the loss of that node's disk before it shipped |
+
+A replica that does not answer is marked behind, not waited for: the write is answered and the
+replica caught up from its cursor. A write is refused only when no replica of its shard can be
+reached. The answer names how many replicas have it.
+
+**Reads.** A search goes to one replica of each shard — the local one when there is one.
+`[cluster] read_preference` chooses between `local`, which runs the whole search on the receiving
+node when it holds every shard, and `spread`, which splits the shards between replicas for the
+lowest latency of one search at low concurrency. A get by id reads the local copy when there is one.
+
+**The modes**, as an operator chooses them:
+
+| Mode | Configured as | Each document on | Survives a lost node | For |
+|---|---|---|---|---|
+| Single node | clustering off | the node | by its hardware: RAID, disks moved to another machine | development, small deployments |
+| Partitioned cluster | `replication_factor = 1` (default) | one node | by its hardware, as above; until then its documents are unavailable, reported, not lost | capacity beyond one node, systems that are not critical |
+| Replicated cluster | `replication_factor` 2 or more, below the node count | that many nodes | yes, up to the factor less one | capacity and HA |
+| Mirror | `replication_factor` equal to the node count — two nodes and `2` | every node | yes; either node serves everything | HA on two machines; read capacity |
+
+Moving, draining and rebalancing (V10) serve the partitioned and replicated modes alike; the
+mirror has nothing to rebalance.
+
+**The mirror** ([V5](#v5--the-mirror-two-nodes-every-document-on-both)): a cluster whose
+replication factor equals its node count, each node holding every document. Placement needs no
+decisions — each node routes a document to its own shards by its id — which is why it comes first
+and needs none of V6–V8. What crosses between the two: document changes with their versions and
+delete markers (the change stream), schema records as newest-version records, index creation and
+drops, and the managed key and tenant files R2 writes — so a key minted on either node works on
+both, which is R3 for two nodes ahead of the general broadcast. Either node fills the other by V4
+when the mirror is formed or a resync is needed. Health reports the mirror's state: in sync,
+behind by N changes, resyncing, peer down. When V8 exists the mirror's placement is the trivial
+case of it, and a third node turns it into a replicated cluster.
+
+On two nodes, against one node and against today's two-node cluster, where each node holds half:
+
+| | One node | Two nodes today | Two-node mirror |
+|---|---|---|---|
+| A node lost | everything down | half the data unreachable, and on its disk only | nothing lost; the other node serves everything |
+| Write latency | local commit | local, or one network hop to the owner | the slower of the local commit and the peer's, plus the round trip; both commit in parallel |
+| Write capacity | one node | about two nodes | about one node: each node indexes every document |
+| Search latency | local | the slower half plus a network hop and a merge across nodes | local, no hop and no cross-node merge; `spread` brings back the split |
+| Search capacity at saturation | one node | about two nodes | about two nodes: either node answers any search |
+| Disk | 1× | 1× | 2× |
+
+The read gain is the hop and the merge removed, and reads that survive a node: the CPU a search
+needs is the same, so capacity at saturation is still two nodes' worth.
+
+**Partitions.** In a mirror both sides keep taking writes. When they reconnect each catches the
+other up from its cursor, and for an id written on both sides the newer version wins. An update
+made on the losing side for that id is lost, and the release notes say so. Learned fields are
+added on both sides and merge as a union; a field learned on both sides with two types keeps the
+newer schema version's type, and documents whose value it cannot hold are reported as they are
+today. A delete by query runs where it is received, deletes the ids it matched with versions, and
+sends the delete markers, so its result no longer depends on what each shard happened to hold.
+
+**Metadata: three kinds of record** ([V6](#v6--metadata-records-on-a-majority-of-voters),
+[V7](#v7--compare-and-set-on-one-key-and-the-voter-list)):
+
+| Record | Kind | Written by |
+|---|---|---|
+| Node address and UUID, node health | hint, Kademlia `Quorum::One`, as today | the node itself |
+| Shard placement, `{version, replicas}` | newest version, on a majority of voters | the holder of the topology lock |
+| Index schema | newest version, on a majority | the schema round |
+| Tenant and key files | newest version, on a majority | the node that took the change (R3) |
+| The voter list, and tombstones of removed nodes | compare-and-set | any node, through the compare-and-set |
+| The topology lock: the operation in progress, with an expiry | compare-and-set | the operation's initiator |
+
+The quorum is over an **explicit list of voters**, sent directly over the peer pool with the O2
+deadlines — not over Kademlia's closest peers, which shift as nodes join, so a write and a later
+read could reach majorities that do not overlap. A newest-version record is written to a majority;
+each voter keeps it only if its version is newer; a read takes the newest from a majority and
+writes it back to the voters that were behind. The compare-and-set is a single-key Paxos with no
+leader and no log (as CASPaxos describes): two rounds to a majority, the acceptor state in
+`metadata.redb`. A joining node does not vote until the compare-and-set admits it, one voter at a
+time. Records are kept in `metadata.redb`, so a restart does not depend on the snapshot to know them.
+
+| Voters | Metadata changes | Data |
+|---|---|---|
+| 1 | decided locally, as today | unaffected |
+| 2 (mirror) | schema and keys by newest version on either node; topology needs both, or an operator's force, or a witness | never blocked by the peer |
+| 2 + witness | majority of three; the witness is a node with no data, voting only | never blocked by the peer |
+| 3 or more | majority | served on the last known placement while a quorum is lost |
+
+With the quorum lost, metadata changes answer `503`; reads and writes go on.
+
+**Placement and fencing** ([V8](#v8--shards-belong-to-the-cluster-placement-on-a-version-checked-at-the-replica)).
+Shards belong to the cluster, each with `{version, replicas}`; a node that joins brings no shards
+and is given some. Every write carries the placement version its sender used, and a replica
+refuses an older one, so a node with a stale map learns it on its next write rather than on a
+timer. During a move a shard is written on its old and new replicas both, and the old one is
+dropped only once the new one is Active. Replica states: Initializing, Catching up, Active, Behind,
+Dead.
+
+**Convergence check.** `GET /_admin/index/{index}/digest` — per shard, a hash over (id, version)
+in key order, and over the delete markers. Two replicas with the same digest hold the same
+documents. The cluster suite compares digests after every phase; an operator can too.
+
+### Open questions
+
+Each with the proposed answer, to be settled as the items are built:
+
+1. **WAL retention bound.** Id-only entries are about 50 bytes; at 10,000 writes a second a day is
+   about 43 GB. Proposed: a size bound (default 1 GB per shard) and an age bound, whichever comes
+   first, then resync. Alternative: keep one entry per id past the oldest cursor, so retention
+   costs the ids changed rather than the writes made.
+2. **Clock skew.** Proposed `max_clock_skew_ms = 500`, measured on the existing ping.
+3. **Schema on a partitioned mirror.** Proposed as above: learned fields merge, an explicit
+   `PUT /_config` is a newest-version record, and a change that needs a rebuild waits for the peer.
+   To be checked against the two-phase schema round, which asks every node today.
+4. **Schema creation by majority** in clusters of three or more, rather than every node: a node
+   that missed a schema fetches it before it accepts a write for that index.
+5. **The witness**: a mode of the same binary (`[node] role = "witness"`), or a separate small
+   process.
+6. **Clients across two nodes**: a list of endpoints in the SDK and CLI, or a load balancer in front
+   of the health endpoint, or both.
+7. **Changing `replication_factor` on a running cluster.** Partitioned to mirror on two nodes:
+   each node fills the other by V4 with the documents only it holds, then the factor applies.
+   Mirror to partitioned: each node drops the documents whose key the ring gives the other. Proposed
+   for the first version: the factor is changed by an operation, not by editing the file and
+   restarting, and the operation reports progress; until it exists, the factor is fixed when the
+   cluster is formed.
+8. **The transport between the nodes.** Proposed, now that the mirror is configured as a cluster:
+   the cluster's peer layer with the PSK and the O2 deadlines, one transport for every mode.
+   Alternative, kept from the second pass: HTTP(S) with a key holding a new `mirror` capability,
+   which passes proxies and firewalls and keeps replication independent of libp2p. The change
+   stream's format is the same over either.
+9. **Active-active, or active-standby too.** Proposed: active-active by default, and
+   `[network.cluster] accept_writes = false` on one node of a mirror for an active-standby pair,
+   which refuses writes with `503` (or forwards them to the peer), so no write is ever lost to a
+   conflict; the standby still serves reads and takes over when an operator, or a load balancer,
+   sends writes to it.
+
+### Validation
+
+`scripts/validate/cluster.sh` gains a phase per item, each ending in a digest comparison: a
+mirror node killed during writes, with no acknowledged write lost; a partition with both sides
+writing the same ids, converging to one digest; an outage longer than the retention bound,
+resynced; a clock skewed past the bound, refused; two topology operations started at once, one
+refused by the lock; a node removed while its shards have replicas, nothing lost.
+
+### Items
+
+Phase 1 — the mirror, V2 to V5 — needs of the cluster stability work only OB26's bootstrap and a
+schema round that works with a peer down. The rest is phase 2, a robust partitioned cluster,
+before V6: V13 and V1 below, and what is filed where it already is: [N11](#n11--one-way-to-reach-a-peer),
+the cluster items of [N17](#n17--smaller-items-filed-so-they-are-not-lost) (the snapshot persisted
+out of order, the shard checksum's `DefaultHasher`, the peer tasks outside the cancellation token,
+leaving the cluster before shutdown's Phase 3) and [O4](#o4--the-request-budget-crosses-the-wire).
+
+### V1 — A node that brings new shards cannot join a cluster that holds data
+
+📋 **Planned.** Read from the code 2026-11-08, to be reproduced first. A node started with an
+empty data directory creates `num_shards_init` shards and registers them
+(`RegisterLocalShards`, `orchestrator.rs:4863`); their tokens take over part of every index's key
+space, and no document moves. A later write of an existing id lands on the new shard while the old
+copy stays where it was: a search returns both, and a delete routed by the id misses the old one.
+**Change:** a node whose shards would take key ranges from a cluster holding documents is refused
+with the reason, until V8 lets it join with none.
+
+### V2 — Document versions and delete markers
+
+📋 **Planned.** The hybrid clock, the version in `data_<index>`, `tomb_<index>`, and the
+newest-wins check on every apply. A storage format change: an upgrade note, and rows written before
+it read as version 0.
+
+### V3 — The WAL kept until replicas confirm it, and the change stream
+
+📋 **Planned.** Needs V2. A cursor per peer, retention as open question 1 settles it, and the stream
+of current rows and delete markers past a cursor.
+
+### V4 — The copy operation: one index from one node to another, with catch-up
+
+📋 **Planned.** Needs V3. Batched reads in short transactions, the target's bulk path, catch-up from
+S, an optional key range, and copy-and-swap for a resync. The same operation is V9's replica fill,
+V10's move, V11's reindex and V12's split.
+
+### V5 — The mirror: two nodes, every document on both
+
+📋 **Planned — phase 1 of HA.** Needs V2–V4, and OB26's bootstrap and the schema round made to
+work with a peer down; not V1, not V6–V8. `replication_factor` in `[network.cluster]`, with the
+mirror as the first value above 1 that is accepted (a factor equal to the node count); the write
+sent to the peer with `write_ack` (open question 8 for the transport); local reads; catch-up on
+reconnect; partitions as above; schema records, index creation and drops, and the managed key and
+tenant files kept on both; `accept_writes` for an active-standby pair; the mirror's state in
+health; the digest; endpoints for clients (open question 6); and forming a mirror from today's
+two-node cluster (open question 7).
+
+### V6 — Metadata records on a majority of voters
+
+📋 **Planned.** Records in `metadata.redb`, the voter list, newest-version writes and reads with
+repair, sent over the peer pool. Kademlia keeps the hints. OB26 is rebuilt on it: bootstrap ends
+when a quorum is reachable, or at the first peer in a mirror, or at a deadline.
+
+### V7 — Compare-and-set on one key, and the voter list
+
+📋 **Planned.** Needs V6. The single-key Paxos, admitting and removing voters one at a time, the
+modes by voter count, the topology lock with its expiry, and the witness. OB27's `forget` is a
+compare-and-set on the voter list with a tombstone.
+
+### V8 — Shards belong to the cluster; placement on a version, checked at the replica
+
+📋 **Planned.** Needs V6 and V7. Absorbs O3 and N15's shard-map item: placement records replace
+the shard-map merge, the five sync mechanisms and the 10 s pull. `num_shards_init` becomes the
+cluster's shard count; an existing deployment's shards are placed where they are.
+
+### V9 — Replication with fewer copies than nodes
+
+📋 **Planned.** Needs V5 and V8. A replication factor below the node count: replica sets per shard,
+writes forwarded to the replicas of the key's shard, catch-up, and a digest exchange between
+replicas as the backstop for a lost cursor.
+
+### V10 — Move, drain and rebalance
+
+📋 **Planned.** Needs V4 and V8 — not V9: a partitioned cluster needs it as much as a replicated
+one. Move a shard (copy, write to both, drop the old), drain a node before removing it, and
+rebalance by shard count and size after a node joins — each under the topology lock, one at a
+time. In a replicated cluster a move is a replica added and one dropped.
+
+### V11 — Online reindex, and index aliases
+
+📋 **Planned.** Needs V4. D1 built on the copy operation: a shadow index under the new schema, filled
+and caught up, then swapped in through an alias that switches atomically. Closes the `409` on a
+populated index's rebuild-needing schema change, and the two gaps D1 names.
+
+### V12 — Splitting a shard
+
+📋 **Planned.** Needs V10. A shard's key ranges divided by V4 with a key range, so a cluster can have
+more shards than it started with.
+
+### V13 — A node whose disks move to another machine rejoins as itself
+
+📋 **Planned — phase 2.** The recovery a partitioned cluster relies on when its HA is in the
+hardware: a machine fails, its disks (or its data directory, restored whole) are put in another
+machine with another address, and the node comes back as itself. Read from the code 2026-11-09,
+not yet run: the identity is the data directory (`node_identity.json` beside the shards), the node
+dials its `seed_nodes` and the peers learn its new address on that connection, while every peer's
+node registry still holds the old one (`PersistedNodeInfo.address`, `cluster_state.rs:94`) and its
+own `seed_nodes` may list it. **Change:** a `cluster.sh` phase that moves a node's data directory
+to a container with another address and checks it rejoins with its shards, every write and search
+answering as before, and the old address dropped from the registry; fix what it finds; DEPLOYMENT
+describes the procedure, beside the existing "restore it whole" rule.
+
+### Iteration log
+
+- **2026-11-08 — first version.** From a comparison with Qdrant (current docs and source) and a
+  reading of our storage and swarm code. Taken from Qdrant: metadata-only agreement with the data
+  path outside it, explicit replica states, catch-up by the missed operations, alias swap for a
+  reindex. Not taken: a Raft log; filling a replica with index files. The two-node mirror was set
+  as a requirement in the same discussion.
+- **2026-11-08 — second pass: the mirror is phase 1, and not a cluster.** Because replication is
+  by document, a mirror needs no shared shards: two single nodes and a link. That takes the
+  cluster machinery and its open items (OB26, OB27, O3, V1, V6–V8) off the path to HA, and gives
+  two nodes R3 over the link. The order became four phases (decision 10); the link's transport and
+  an active-standby option were added as open questions 8 and 9.
+- **2026-11-09 — third pass: a cluster is partitioned or replicated.** Replication is a choice, not
+  where every cluster ends up: `replication_factor = 1` keeps today's partitioned cluster as a
+  first-class mode, for systems that are not critical and for HA in the hardware (RAID, disks moved
+  to a healthy machine — V13). The mirror is configured as a cluster again, a factor equal to the
+  node count, keeping the second pass's independence from placement; OB26 and the schema round
+  move into phase 1 for it. Phase 2 became a robust partitioned cluster, and V10 no longer needs
+  V9. The unit keeps the name shard; the modes are named instead (decision 7). Open question 7
+  became changing the factor on a running cluster, and question 8 now proposes the peer layer.
 
 ---
 
