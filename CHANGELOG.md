@@ -82,8 +82,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matches nothing — on `search_index`, or on every index of `search_across_indexes`, each against
   its own schema — checks each plain value or `IN` set on a field matched as a whole value as written
   (a `string` field, or a `text` one under `raw`) alone, at most three counts side by side, and
-  every one that matches nothing on its own is named in `_warning` — a value with that set
-  written out (`authors: IN ["austen, jane" "Austen, jane" "Austen, Jane" "AUSTEN, JANE"]`;
+  every one that matches nothing on its own is named in `_warning`, several sharing one
+  explanation — a value with that set written out (`authors: IN ["austen, jane" "Austen, jane" "Austen, Jane" "AUSTEN, JANE"]`;
   a value with no letters, such as an id, and a set, the retry already made, get no retry,
   only where the field's values are written),
   in place of the general advice about `AND` and phrases, which pointed elsewhere; without such a

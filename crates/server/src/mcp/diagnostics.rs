@@ -290,6 +290,61 @@ pub(super) fn string_case_advice(clause: &WholeValueClause) -> String {
     )
 }
 
+/// The advice for every whole-value clause that matched nothing on its own: one clause gets
+/// [`string_case_advice`]; several share one explanation, then each its retry, so an agent that
+/// wrote three values in the wrong case reads why once and fixes all three in one round.
+pub(super) fn whole_value_advice(clauses: &[&WholeValueClause]) -> Option<String> {
+    match clauses {
+        [] => None,
+        [clause] => Some(string_case_advice(clause)),
+        _ => {
+            let named = clauses
+                .iter()
+                .map(|clause| format!("`{}`", clause.text))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut retries = Vec::new();
+            let mut spent = Vec::new();
+            for clause in clauses {
+                let spellings = spellings(&clause.values[0]);
+                if clause.set || spellings.len() < 2 {
+                    spent.push(format!("`{}`", clause.text));
+                } else {
+                    let set = spellings
+                        .iter()
+                        .map(|spelling| format!("\"{spelling}\""))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    retries.push(format!("`{}: IN [{set}]`", clause.field));
+                }
+            }
+            let mut advice = format!(
+                "Each of {named} alone matches nothing. These fields match only a whole value, \
+                 as the data writes it — case, diacritics and punctuation included — so a value \
+                 in another case, or a part of one, finds nothing."
+            );
+            if !retries.is_empty() {
+                advice.push_str(&format!(
+                    " If the values came from the question, retry once with each one's spellings \
+                     in one set: {}.",
+                    retries.join(", ")
+                ));
+            }
+            if !spent.is_empty() {
+                advice.push_str(&format!(
+                    " No other spelling is left to try for {}.",
+                    spent.join(", ")
+                ));
+            }
+            advice.push_str(
+                " Where that finds nothing, read how the values are written: in each field's \
+                 description, or from a few hits with `limit 5` and the fields in `fields`.",
+            );
+            Some(advice)
+        }
+    }
+}
+
 /// The query as the general zero-result advice should read it: each whole-value clause
 /// replaced by `field:value`, since its quotes enclose a value rather than a phrase, and advice
 /// about phrases would point at the wrong thing.
@@ -1246,6 +1301,18 @@ mod field_suggestion_tests {
         let advice = super::string_case_advice(&id[0]);
         assert!(!advice.contains("IN ["), "{advice}");
         assert!(advice.contains("a part of one"), "{advice}");
+        // Several clauses share one explanation, then each its retry or none.
+        let advice = super::whole_value_advice(&[&found[0], &found[1], &found[2]]).unwrap();
+        assert_eq!(advice.matches("whole value").count(), 1, "{advice}");
+        assert!(
+            advice.contains(r#"`unit_type: IN ["Book" "book" "BOOK"]`"#),
+            "{advice}"
+        );
+        assert!(
+            advice.contains(r#"left to try for `unit_type: IN ["a b" C]`"#),
+            "{advice}"
+        );
+        assert!(super::whole_value_advice(&[]).is_none());
         // The quotes of a string value or set are not a phrase to the general advice.
         let stripped = super::without_string_value_quotes(
             r#"authors:"austen, jane" AND title:pride AND unit_type: IN ["a b" C]"#,

@@ -3329,8 +3329,17 @@ async fn an_empty_result_names_the_whole_value_clause_that_emptied_it() {
         .await;
     let text = warning(&result);
     assert!(
-        text.contains("`authors:\"austen, jane\"` alone") && text.contains("`code:pr-1` alone"),
+        text.contains("Each of `authors:\"austen, jane\"`, `code:pr-1` alone matches nothing"),
         "{result}"
+    );
+    assert!(
+        text.contains(r#"`code: IN ["pr-1" "Pr-1" "PR-1"]`"#),
+        "{result}"
+    );
+    assert_eq!(
+        text.matches("whole value").count(),
+        1,
+        "explained once: {result}"
     );
 
     // A set none of whose values is written so — the retry already made — points at how the
