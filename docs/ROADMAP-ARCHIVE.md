@@ -1344,7 +1344,7 @@ index and an admin key.
 
 ### M5 — Per-index capability subtraction
 
-✅ **Done 2026-09-25.** [C1](../ROADMAP.md#c1--per-index-role-overrides) promoted, and its own entry already
+✅ **Done 2026-09-25.** C1 (Phase 14 Stage C3) promoted, and its own entry already
 named the reason: *risk if unfixed: multi-tenant isolation*.
 
 `index_overrides = { audit = "reader" }` on a key stanza: on the named index the key holds that
@@ -6749,7 +6749,7 @@ HTTP search. Nothing has shipped with the old names.
   log collector is for; the last would need a threat model where the node itself is
   untrusted, which is not the one this stage was written against
 
-**C3 — Per-Index Role Overrides** 📋 Planned — the only stage still open; it lives in [ROADMAP.md, C1](../ROADMAP.md#c1--per-index-role-overrides).
+**C3 — Per-Index Role Overrides** ✅ Done 2026-09-25 as [M5](#m5--per-index-capability-subtraction) (closed in ROADMAP.md 2026-11-09).
 
 ### TLS Inventory (verified 2026-08-07)
 

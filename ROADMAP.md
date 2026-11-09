@@ -61,7 +61,7 @@ on one.
 | 11.5 — Jemalloc memory management | ✅ Done | — |
 | 12 — MCP server integration | ◐ Partial | Streaming, semantic routing, the documentation pass, and compliance tests and benchmarks |
 | 13 — Thread-per-core & memory operations | ◐ Partial | Stage 2f.2 (CPU arenas) and 2f.3 (per-arena jemalloc stats) — both with the evidence against 2f.2 |
-| 14 — Security hardening | ◐ Partial | Stage C3 only (per-index role overrides); complexity caps deferred. Posture items C3–C8 all closed, C8 by M3 on 2026-09-20 |
+| 14 — Security hardening | ◐ Partial | Complexity caps (C2), deferred. Stage C3, per-index role overrides, was built as M5 on 2026-09-25 and closed here on 2026-11-09. Posture items C3–C8 all closed, C8 by M3 on 2026-09-20 |
 | 15 — HA: reindex, replication, migration | 📋 Planned | All three stages, designed and built as [V](#v-cluster-ha--replication-the-two-node-mirror-and-elasticity--planned): D1 is V11, D2 is V5 and V9, D3 is V10 and V12 |
 | 16 — Boot & OOM recovery at scale | ◐ Partial | Stage 3's deeper warming options, and the measurement on the reporting node — now with `quick_repair` on and off; E5 (a cap on open indexes) done by M1, E6 (redb's crash repair) done 2026-10-15, E1 (Stage 4.2) overtaken by F9 |
 | 17 — Record deletion | ✅ Done | — |
@@ -228,6 +228,43 @@ Taken at the 0.3.9 prep. Checked against `git log 55fd6a7..ef4a991` and the tree
 
 ---
 
+## The 0.3.10 scope, 2026-11-09
+
+Agreed after [V. Cluster HA](#v-cluster-ha--replication-the-two-node-mirror-and-elasticity--planned) was filed: 0.3.10 carries
+smaller work and the groundwork that makes 0.4.0's cluster and replication work safer, with no
+change to the storage format. 0.4.0 carries V's phase 1, the mirror, and its incompatibility is
+confined to clusters ([V2](#v2--document-versions-and-delete-markers)'s decision).
+
+- **Already built, in `[Unreleased]`:** U1 and U2, the CJK analyzers; the stale document count;
+  the startup shard count.
+- **Features:** [F11](#f11--the-disk-a-delete-frees-was-never-returned)'s automatic reclaim of deleted
+  documents behind a setting, and min and max ([K1](#k1--min-and-max-in-the-engine)–[K3](#k3--the-surface)).
+- **Required:** the three libp2p advisory exceptions in `deny.toml` expire 2026-12-31 — renewed,
+  or retired by a kameo release on libp2p 0.57; and the dependency updates left for after the
+  0.3.9 cut (`toml_writer`, `serde-saphyr`).
+- **Cluster groundwork, serving partitioned clusters now:**
+  [V1](#v1--a-node-that-brings-new-shards-cannot-join-a-cluster-that-holds-data) (reproduce, then refuse),
+  [OB26](#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap) with
+  [N12](#n12--dead-surface-and-the-comments-that-no-longer-match)'s coordinator dead surface,
+  [V13](#v13--a-node-whose-disks-move-to-another-machine-rejoins-as-itself), the cluster items of
+  [N17](#n17--smaller-items-filed-so-they-are-not-lost) (the snapshot persisted out of order, the
+  checksum's `DefaultHasher`, the peer tasks outside the cancellation token), and
+  [O4](#o4--the-request-budget-crosses-the-wire).
+- **Small correctness and security fixes from N17:** a streamed search logs the caller's query at
+  `info!` and carries no audited query; a request refused with 429 or 403 is audited as `allowed`;
+  a plain index listing churns the open-index cap; the two reported client items (`007` read as a
+  number, the format sniff cut inside a multibyte character), confirmed first. The second-signal
+  "force" item is rechecked first: `main.rs` now exits on a second signal.
+- **A safety net for 0.4.0:** [E4](#e4--two-compatibility-paths-with-no-end-to-end-test) — an index
+  and a WAL tail written by 0.3.x, checked in as fixtures, so 0.4.0 proves it opens them.
+- **Corrected the same day:** [C1](docs/ROADMAP-ARCHIVE.md#m5--per-index-capability-subtraction), per-index role
+  overrides, listed as Phase 14's open stage, was built as M5 on 2026-09-25 (`index_overrides`)
+  and never closed here.
+- **Not in 0.3.10:** N11, which opens V's phase 2, and V2–V5 and R3, which are 0.4.0. CH3 and P5
+  stand as filed.
+
+---
+
 # Active work
 
 ## The order of work
@@ -247,7 +284,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [A7](docs/ROADMAP-ARCHIVE.md#a7--a-short-page-and-a-stale-count-say-nothing-about-why) | A short page and a stale count say nothing about why | 12 | 2026-08-27 | ✅ |
 | [B1](#b1--2f2--cpu-arenas-for-write--read--merge) | 2f.2 — CPU arenas for write / read / merge | 13 | 2026-08-08 | 📋 |
 | [B2](#b2--2f3--per-arena-jemalloc-stats) | 2f.3 — per-arena jemalloc stats | 13 | 2026-08-08 | 📋 |
-| [C1](#c1--per-index-role-overrides) | Per-index role overrides | 14 | 2026-07-30 | 📋 |
+| [C1](docs/ROADMAP-ARCHIVE.md#m5--per-index-capability-subtraction) | Per-index role overrides — built as M5 on 2026-09-25 (`index_overrides`), closed here 2026-11-09 | 14 | 2026-07-30 | ✅ |
 | [C2](#c2--query-complexity-caps) | Query complexity caps | 14 | 2026-08-10 | 💭 |
 | [C3](docs/ROADMAP-ARCHIVE.md#c3--fail-closed-on-unauthenticated-internal) … [C6](docs/ROADMAP-ARCHIVE.md#c6--redact-the-cluster-psk-in-debug) | Posture hardening: four items from the 2026-09-01 review — C3 and C4 done | 14 | 2026-09-01 | ◐ |
 | [C7](docs/ROADMAP-ARCHIVE.md#c7--a-500-printed-the-nodes-internal-error-text) | A `500` printed the node's internal error text | 14 | 2026-09-01 | ✅ |
@@ -556,24 +593,11 @@ for the two purge control names.
 ## C. Phase 14 — Security Hardening ◐ Partial
 
 A1–A5, B1–B3, C1 and C2 are done and verified by `scripts/validate/` — see
-[Phase 14 — what landed](docs/ROADMAP-ARCHIVE.md#phase-14--security-hardening). C3 is the only stage
-still open, and it shrank because B1 absorbed index scoping.
+[Phase 14 — what landed](docs/ROADMAP-ARCHIVE.md#phase-14--security-hardening). Stage C3, per-index role
+overrides, was built as [M5](docs/ROADMAP-ARCHIVE.md#m5--per-index-capability-subtraction) on 2026-09-25; its entry here was
+not closed then, and was on 2026-11-09. What remains is C2, deferred.
 
-### C1 — Per-index role overrides
-
-📋 **Planned** · Phase 14 Stage C3 · ~2 days (was ~5+) · impact Medium · risk if unfixed:
-multi-tenant isolation. The only security stage left, and it matters only for multi-tenant
-deployments.
-
-- Most of what this stage originally described is B1's scoping mechanism, which now applies to
-  every role. What remains is *overrides*: a key with `role = "writer"` granted read-only on a
-  named sensitive index — per-index capability **subtraction** rather than a second allow-list
-- Enforced at B1's ingress chokepoint, **not** at the `RouterActor` boundary as first
-  sketched — that boundary is also driven by cluster peers over kameo, where no API key exists
-  (see the trust boundary note in B1)
-- Depends on B1's capability model and route classification table
-- Verified 2026-08-26: `auth.rs` carries `allowed_indexes` (B1's allow-list) and nothing that
-  subtracts from it
+- ✅ [**C1 — Per-index role overrides**](docs/ROADMAP-ARCHIVE.md#m5--per-index-capability-subtraction) — `index_overrides` on a key stanza, built as M5
 
 ### C2 — Query complexity caps
 
@@ -3288,8 +3312,18 @@ with the reason, until V8 lets it join with none.
 ### V2 — Document versions and delete markers
 
 📋 **Planned.** The hybrid clock, the version in `data_<index>`, `tomb_<index>`, and the
-newest-wins check on every apply. A storage format change: an upgrade note, and rows written before
-it read as version 0.
+newest-wins check on every apply.
+
+**Decided 2026-11-09: versions and delete markers are written only when `replication_factor` is
+above 1.** A single node and a partitioned cluster keep writing today's rows byte for byte, so
+upgrading one needs no migration and costs no bytes per document. This is possible because a
+`data_<index>` row is JSON (`StoredDoc`, `schema.rs:2318`) read without `deny_unknown_fields`: the
+version is an optional field, a row without one reads as version 0, and an older build reading a
+newer row ignores it; delete markers live in `tomb_<index>`, which an older build never opens.
+When a cluster becomes replicated, its existing rows are version 0 — older than any write after
+the change, which is the order they should have. 0.4.0's incompatibility is therefore confined
+to clusters — the peer protocol, the cluster records in `metadata.redb` and shard ownership —
+which upgrade by a full restart rather than node by node; a single node upgrades in place.
 
 ### V3 — The WAL kept until replicas confirm it, and the change stream
 
