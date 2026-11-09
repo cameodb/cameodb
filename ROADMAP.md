@@ -239,9 +239,12 @@ confined to clusters ([V2](#v2--document-versions-and-delete-markers)'s decision
   the startup shard count.
 - **Features:** [F11](docs/ROADMAP-ARCHIVE.md#f11--the-disk-a-delete-frees-was-never-returned)'s automatic reclaim of deleted
   documents behind a setting, and min and max ([K1](docs/ROADMAP-ARCHIVE.md#k1--min-and-max-in-the-engine)–[K3](docs/ROADMAP-ARCHIVE.md#k3--the-surface)).
-- **Required:** the three libp2p advisory exceptions in `deny.toml` expire 2026-12-31 — renewed,
-  or retired by a kameo release on libp2p 0.57; and the dependency updates left for after the
-  0.3.9 cut (`toml_writer`, `serde-saphyr`).
+- **Required:** ✅ the three libp2p advisory exceptions in `deny.toml` expired 2026-12-31 —
+  renewed, or retired by a kameo release on libp2p 0.57; and the dependency updates left for after
+  the 0.3.9 cut (`toml_writer`, `serde-saphyr`) (**done 2026-11-09**: kameo 0.22.2 is still the
+  latest, so the exceptions are renewed to review-by 2027-03-31; `serde-saphyr` 2.0.0 → 2.1.1,
+  `toml` 1.2.0 → 1.2.1 with `serde_spanned` and `toml_datetime`, `toml_writer` already at its
+  latest 1.2.0).
 - **Cluster groundwork, serving partitioned clusters now:**
   [V1](#v1--a-node-that-brings-new-shards-cannot-join-a-cluster-that-holds-data) (reproduce, then refuse),
   [OB26](#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap) with
@@ -279,7 +282,7 @@ K2's merge and the refusal fix (`a2244ea`) their first multi-node check.
 | 6 ✅ | [V1](#v1--a-node-that-brings-new-shards-cannot-join-a-cluster-that-holds-data): reproduce, then refuse — the refusal built 2026-11-09; its `cluster.sh` phase reproduces V1 on an older image and checks the refusal on this one | On the bootstrap step 5 leaves |
 | 7 ✅ | [O4](docs/ROADMAP-ARCHIVE.md#o4--the-request-budget-crosses-the-wire) — done 2026-11-09 | The field is optional on the wire, so mixed versions still work |
 | 8 ✅ | [V13](#v13--a-node-whose-disks-move-to-another-machine-rejoins-as-itself): a `cluster.sh` phase and a DEPLOYMENT procedure — both written 2026-11-09; what the phase finds is fixed after the run | Exercises everything above |
-| — | The `deny.toml` exceptions and the deferred dependency updates | Any time before 2026-12-31 |
+| — ✅ | The `deny.toml` exceptions and the deferred dependency updates — done 2026-11-09 | Any time before 2026-12-31 |
 
 ---
 
