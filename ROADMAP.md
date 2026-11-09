@@ -7,13 +7,13 @@ code comments) is a heading in this file or in the archive. The archive is not d
 measurements and the rejected options are what stop a settled question being reopened, and
 several entries exist precisely to say *do not build this again*.
 
-**Last reconciled against the code: 2026-11-04, at 0.3.8 plus the unreleased 0.3.9 work (`ef4a991`).**
-The pass is recorded under [Reconciliation, 2026-11-04](#reconciliation-2026-11-04), after
-[2026-11-02](#reconciliation-2026-11-02): every open item was checked against the commits since the
+**Last reconciled against the code: 2026-11-09, at 0.3.9 plus the unreleased 0.3.10 work (`e192087`).**
+The pass is recorded under [Reconciliation, 2026-11-09](#reconciliation-2026-11-09), after
+[2026-11-04](#reconciliation-2026-11-04): every open item was checked against the commits since the
 last reconciliation, and none had been closed unrecorded.
 Earlier passes stay recorded where they were made —
-[2026-08-26](#reconciliation-2026-08-26), [2026-09-01](#reconciliation-2026-09-01) and
-[2026-10-15](#reconciliation-2026-10-15), the last of which corrected Phase 16's premise about redb,
+[2026-08-26](#reconciliation-2026-08-26), [2026-09-01](#reconciliation-2026-09-01),
+[2026-10-15](#reconciliation-2026-10-15) and [2026-11-02](#reconciliation-2026-11-02), the last of which corrected Phase 16's premise about redb,
 closed [E6](docs/ROADMAP-ARCHIVE.md#e6--a-crash-restart-repaired-every-shards-redb-file) and filed OB25 and OB26.
 The reviews that filed whole groups are
 [L. Post-0.3.4 review](docs/ROADMAP-ARCHIVE.md#l-post-034-review--preparing-the-next-cycle--done) (archived),
@@ -24,10 +24,11 @@ Features agreed after each release are filed as
 [Q. Post-0.3.8 features](docs/ROADMAP-ARCHIVE.md#q-post-038-features--done) (archived),
 [R. Key and tenant provisioning](#r-key-and-tenant-provisioning--partial) and
 [S. Delete by query](docs/ROADMAP-ARCHIVE.md#s-delete-by-query--done) (archived) and
-[T. OAuth for MCP clients](docs/ROADMAP-ARCHIVE.md#t-oauth-for-mcp-clients--done) (archived); Q, R, S
-and T are built and wait in `[Unreleased]` for 0.3.9.
-[U. Post-0.3.9 features](docs/ROADMAP-ARCHIVE.md#u-post-039-features--done) (archived), opened 2026-11-06 with U1 and U2, is built and waits in `[Unreleased]`.
-[V. Cluster HA](#v-cluster-ha--replication-the-two-node-mirror-and-elasticity--planned), opened 2026-11-08, is the design for replication, the two-node mirror and elasticity, and the order of the cluster work.
+[T. OAuth for MCP clients](docs/ROADMAP-ARCHIVE.md#t-oauth-for-mcp-clients--done) (archived); Q, S
+and T, and R's R1 and R2, were released in 0.3.9 on 2026-11-05.
+[U. Post-0.3.9 features](docs/ROADMAP-ARCHIVE.md#u-post-039-features--done) (archived), opened 2026-11-06 with U1 and U2, with U3 added 2026-11-09, is built and waits in `[Unreleased]` for 0.3.10.
+[V. Cluster HA](#v-cluster-ha--replication-the-two-node-mirror-and-elasticity--partial), opened 2026-11-08, is the design for replication, the two-node mirror and elasticity, and the order of the cluster work; V1 and V13 are done, in 0.3.10.
+What 0.3.10 carries is set under [The 0.3.10 scope](#the-0310-scope-2026-11-09).
 
 ## How to read this file
 
@@ -62,7 +63,7 @@ on one.
 | 12 — MCP server integration | ◐ Partial | Streaming, semantic routing, the documentation pass, and compliance tests and benchmarks; A8 (what a field tells an agent about matching it) and A9 (one retry over a value's spellings) done 2026-11-09, in 0.3.10; A10 and A11 (a field's values, a list flag) deferred, descriptions carry both |
 | 13 — Thread-per-core & memory operations | ◐ Partial | Stage 2f.2 (CPU arenas) and 2f.3 (per-arena jemalloc stats) — both with the evidence against 2f.2 |
 | 14 — Security hardening | ◐ Partial | Complexity caps (C2), deferred. Stage C3, per-index role overrides, was built as M5 on 2026-09-25 and closed here on 2026-11-09. Posture items C3–C8 all closed, C8 by M3 on 2026-09-20 |
-| 15 — HA: reindex, replication, migration | 📋 Planned | All three stages, designed and built as [V](#v-cluster-ha--replication-the-two-node-mirror-and-elasticity--planned): D1 is V11, D2 is V5 and V9, D3 is V10 and V12 |
+| 15 — HA: reindex, replication, migration | 📋 Planned | All three stages, designed and built as [V](#v-cluster-ha--replication-the-two-node-mirror-and-elasticity--partial): D1 is V11, D2 is V5 and V9, D3 is V10 and V12 |
 | 16 — Boot & OOM recovery at scale | ◐ Partial | Stage 3's deeper warming options, and the measurement on the reporting node — now with `quick_repair` on and off; E5 (a cap on open indexes) done by M1, E6 (redb's crash repair) done 2026-10-15, E1 (Stage 4.2) overtaken by F9 |
 | 17 — Record deletion | ✅ Done | — |
 | 18 — Field types: Facet and JSON | ◐ Partial | J2 and J3 — a json field behaves exactly like a text one. J1 (facet writable) and OB1 (the `fast` three-state prerequisite) are done. No migration for what remains |
@@ -70,15 +71,15 @@ on one.
 | Code health — reviewed at 0.3.1, extended 2026-09-01 | ◐ Partial | Twelve items; CH1, CH8–CH12 done, CH2's server half absorbed by the split, CH2's storage half closed out by L12 |
 | L — Post-0.3.4 review: the refactor cycle | ✅ Done | All twenty closed — four defects, six security remainder items, three decompositions, six simplifications, and the retrospective (L20, run 2026-09-19) |
 | M — The 0.3.5 goal set: multi-tenant exposure | ✅ Done, released in 0.3.5 on 2026-09-28 | M0 closed; M1, M2, M3, M4, M5 and M7 done — the blocker is cleared, the surface is metered, and tenants are bounded and isolated per index. No feature build remains; M8 closed with the prefix floor and default-field cap, the clause cap deferred. M6 done: the open-loop arms show goodput degrading rather than collapsing on the bulk, single-write and read lanes, after fixing the two defects its arms found — [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) and [OB15](docs/ROADMAP-ARCHIVE.md#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput), and its confirmation run on 2026-09-27 found OB22 costs a single node nothing measurable |
-| N — Pre-0.3.6 whole-code review | ◐ Partial | N1–N10 and N10a done 2026-10-07/08, in 0.3.6: a `HEAD` authorization gap, batched writes that never learn a field, a peer's 400 answered as 503, node identity replaced silently, query rewrites by substring, three client errors, the first shard's memory budget, streaming broadcast, a storage shutdown race, flattened storage errors, a search of a missing index answering 200. Left, planned and not release blockers: N11–N17 — one way to reach a peer, dead surface, `run_change`, typed boundaries, single owners, the orchestrator split |
+| N — Pre-0.3.6 whole-code review | ◐ Partial | N1–N10 and N10a done 2026-10-07/08, in 0.3.6: a `HEAD` authorization gap, batched writes that never learn a field, a peer's 400 answered as 503, node identity replaced silently, query rewrites by substring, three client errors, the first shard's memory budget, streaming broadcast, a storage shutdown race, flattened storage errors, a search of a missing index answering 200. Left, planned and not release blockers: N11–N17 — one way to reach a peer, dead surface, `run_change`, typed boundaries, single owners, the orchestrator split. Done of them 2026-11-09, in 0.3.10: N12's coordinator dead surface (with OB26), and N17's shutdown, snapshot, checksum, peer-task, audit, streamed-search, index-listing and two client items |
 | O — Post-0.3.6 review: the next-iteration base | ◐ Partial | O1 (the `wal_sync=false` durability barrier) and O2 (deadlines on every remote ask) done 2026-10-15; O4 (the request budget on the wire) 2026-11-09. Left: O3, shard-map merges on a per-owner epoch (the prerequisite N15 does not name, and since 2026-10-18 the one [OB27](#ob27--a-replaced-node-never-leaves-the-cluster)'s `forget` needs). O5 folds Rust-surface items into N16/N17; O6 reconciles the architecture doc |
 | P — Post-0.3.7 features | ◐ Partial | P1, a cap on how many elements of each array a search hit carries — a node default, a node maximum, and `array N` per request — done 2026-10-19. P2, one declaration of an index's default fields — `searched_by_default` dropped, the `--id` reload keeps the list — done 2026-10-20. P3, a schema read is a schema write — `PUT` takes a `GET`, which now reports every property the thumbprint covers — done 2026-10-21. P4, ip fields queried the way addresses are — CIDR, bare addresses, IPv4-bounded ranges, a fast ip sort — done 2026-10-21. P6, a cut array leads with the elements the query matched — `_matched_elements`, on by default — done 2026-11-02. Left: P5, native json fields — paths, typed values and ranges, planned |
-| Q — Post-0.3.8 features | ✅ Done, unreleased (0.3.9) | Q1, ghost fields — a column filled from another field of the stored body, for every document or under an `in` / `not_in` condition, never stored — done 2026-10-27. Q2, the Croatian analyzers read Serbian Cyrillic — done 2026-10-27. The `pt_stem`, `it_stem` and `es`/`fr`/`pt`/`de` `_stem_fold` analyzers of the same days are in the changelog, not filed here |
-| R — Key and tenant provisioning | ◐ Partial, R1 and R2 unreleased (0.3.9) | R1 and R2 done 2026-11-01, single node: included key and tenant files reloaded on change, live tenant quotas and scopes, `allowed_indexes` prefixes; a provisioner minting and revoking keys through `/_keys` (no tenant) and `/_tenants`, changing a key's indexes in place with `PATCH /_keys/{key_id}`, and granting only within its own `allowed_indexes`; client, SDK and a live suite, validated on Linux under systemd and across a restart. Left: R3, every change broadcast to every node, deferred until cluster support is decided — until then a change applies on the node that received it |
-| S — Delete by query | ✅ Done, unreleased (0.3.9) | S1, `POST /api/{index}/delete` — exact clauses, refused past `max_docs` unless confirmed — done 2026-11-02 |
-| T — OAuth for MCP clients | ✅ Done, unreleased (0.3.9) | T1, the node as the OAuth 2.1 authorization server for `/mcp` — discovery, dynamic client registration, an approval page taking the key the user holds, PKCE, refresh; stateless, tokens read-only and ended by revoking the key — done 2026-11-03 |
+| Q — Post-0.3.8 features | ✅ Done, released in 0.3.9 on 2026-11-05 | Q1, ghost fields — a column filled from another field of the stored body, for every document or under an `in` / `not_in` condition, never stored — done 2026-10-27. Q2, the Croatian analyzers read Serbian Cyrillic — done 2026-10-27. The `pt_stem`, `it_stem` and `es`/`fr`/`pt`/`de` `_stem_fold` analyzers of the same days are in the changelog, not filed here |
+| R — Key and tenant provisioning | ◐ Partial, R1 and R2 released in 0.3.9 on 2026-11-05 | R1 and R2 done 2026-11-01, single node: included key and tenant files reloaded on change, live tenant quotas and scopes, `allowed_indexes` prefixes; a provisioner minting and revoking keys through `/_keys` (no tenant) and `/_tenants`, changing a key's indexes in place with `PATCH /_keys/{key_id}`, and granting only within its own `allowed_indexes`; client, SDK and a live suite, validated on Linux under systemd and across a restart. Left: R3, every change broadcast to every node, deferred until cluster support is decided — until then a change applies on the node that received it |
+| S — Delete by query | ✅ Done, released in 0.3.9 on 2026-11-05 | S1, `POST /api/{index}/delete` — exact clauses, refused past `max_docs` unless confirmed — done 2026-11-02 |
+| T — OAuth for MCP clients | ✅ Done, released in 0.3.9 on 2026-11-05 | T1, the node as the OAuth 2.1 authorization server for `/mcp` — discovery, dynamic client registration, an approval page taking the key the user holds, PKCE, refresh; stateless, tokens read-only and ended by revoking the key — done 2026-11-03 |
 | V — Cluster HA | ◐ Partial | V1–V13, opened 2026-11-08; V1 (a node bringing new shards refused) and V13 (a node moved to another machine) done 2026-11-09, with OB26, O4 and N17's cluster items, in 0.3.10. A cluster is partitioned (`replication_factor = 1`, today's behaviour, for systems that are not critical or whose HA is in the hardware) or replicated; two nodes are partitioned or a mirror. Phase 1, HA: the mirror — document versions, the change stream, the copy operation (V2–V5), with the schema round working with a peer down (OB26's bootstrap is done); no shard placement needed. Phase 2, a robust partitioned cluster: N11, then cluster metadata on a quorum of voters with a single-key compare-and-set, no Raft log, and shards owned by the cluster (V6–V8). Phase 3: move, drain, rebalance (V10) and replication with fewer copies than nodes (V9). Phase 4: online reindex and splitting (V11, V12) |
-| U — Post-0.3.9 features | ✅ Done, unreleased | U3, `raw_fold` — a whole value matched in any case, diacritics folded — done 2026-11-09, in 0.3.10. U1, CJK analyzers — `cjk` (characters and character pairs, so Chinese, Japanese and Korean are searchable by word) and `cjk_fold` (traditional Chinese folded to simplified first, so a query in either script finds both) — done 2026-11-06. U2, Japanese and Korean folds — `cjk_ja_fold` (old-style kanji to new) and `cjk_ko_fold` (Hanja to Hangul, with the initial-sound rule) — done 2026-11-06 |
+| U — Post-0.3.9 features | ✅ Done, unreleased (0.3.10) | U3, `raw_fold` — a whole value matched in any case, diacritics folded — done 2026-11-09, in 0.3.10. U1, CJK analyzers — `cjk` (characters and character pairs, so Chinese, Japanese and Korean are searchable by word) and `cjk_fold` (traditional Chinese folded to simplified first, so a query in either script finds both) — done 2026-11-06. U2, Japanese and Korean folds — `cjk_ja_fold` (old-style kanji to new) and `cjk_ko_fold` (Hanja to Hangul, with the initial-sound rule) — done 2026-11-06 |
 
 ## Reconciliation, 2026-08-26
 
@@ -226,11 +227,36 @@ Taken at the 0.3.9 prep. Checked against `git log 55fd6a7..ef4a991` and the tree
 - **Nothing else moved:** N11–N17, O3–O6, OB26, F11's automatic merge, CH3, P5, J2, J3 and K1–K3
   stand as filed.
 
+## Reconciliation, 2026-11-09
+
+Taken at the 0.3.10 prep. Checked against `git log ef4a991..e192087` and the tree.
+
+- **0.3.9 shipped on 2026-11-05** (`3e36143`), with the Windows fixes of its two native runs
+  (`2377ff6`, `65a78b2`, `2de8f17`, `0e36b72`, `21a6b43`); OB30's Windows check is in its
+  record. The header, the intro and the Q, R, S and T rows said they still waited for it.
+- **Closed since 2026-11-04, all recorded:** U1 (`d39d17f`), U2 (`17328c1`), U3 (`77e2e44`);
+  F11's automatic reclaim (`70b8d43`); K1–K3 (`39ec6a6`); E4 (`573ff51`); OB26 with N12's
+  coordinator dead surface (`e15a1a1`); V1 (`f46a946`); O4 (`352432d`); V13 (`e053091`); A8
+  (`64e23ac`) and A9 (`530af04` to `e192087`); C1, closed as built by M5. N17's items fixed in
+  place, each marked ✅: the second signal (`6445574`), the snapshot order, the checksum and the
+  peer tasks (`95b03fe`), the audit of a 429 or 403 and the streamed search's query (`498b42a`),
+  the index listing (`00ff9fb`), and the client's `007` and cut sample (`c2c6de3`).
+- **Fixes with no item:** the node's shard count at startup (`963bfcd`), the cached sizes a reader
+  reload kept (`25a1a4e`), a cluster answering the receiving node's refusal rather than a partial
+  200 (`a2244ea`), the coordinator holding the shard stores weakly (`70b1dfd`), and `sort field
+  asc` searched as words (`795ea5d`); each is in the changelog.
+- **Corrected in this pass:** V's heading said 📋 Planned with V1 and V13 done; it is ◐. U3's row
+  had been spliced into the 0.3.10 order table's step 6; it is back in the status table, and the
+  delivered list names U1–U3.
+- **Nothing else moved:** N11, the rest of N12–N17, O3, O5, O6, OB27's `forget`, CH3, P5, J2,
+  J3, A10, A11, R3 and V2–V12 stand as filed. O6 still waits on O3: ARCHITECTURE.md's "no
+  background polling" is as filed.
+
 ---
 
 ## The 0.3.10 scope, 2026-11-09
 
-Agreed after [V. Cluster HA](#v-cluster-ha--replication-the-two-node-mirror-and-elasticity--planned) was filed: 0.3.10 carries
+Agreed after [V. Cluster HA](#v-cluster-ha--replication-the-two-node-mirror-and-elasticity--partial) was filed: 0.3.10 carries
 smaller work and the groundwork that makes 0.4.0's cluster and replication work safer, with no
 change to the storage format. 0.4.0 carries V's phase 1, the mirror, and its incompatibility is
 confined to clusters ([V2](#v2--document-versions-and-delete-markers)'s decision).
@@ -282,8 +308,7 @@ K2's merge and the refusal fix (`a2244ea`) their first multi-node check.
 | 3 ✅ | [E4](docs/ROADMAP-ARCHIVE.md#e4--two-compatibility-paths-with-no-end-to-end-test)'s fixtures — 0.3.0 and 0.3.9, done 2026-11-09 | Before any 0.4.0 storage work, so they are written by a real 0.3.x build |
 | 4 ✅ | [N17](#n17--smaller-items-filed-so-they-are-not-lost)'s cluster bugs: the snapshot persisted out of order, the checksum's `DefaultHasher` → xxh3, the peer tasks outside the cancellation token — all three fixed 2026-11-09 | Small real bugs under everything after them |
 | 5 ✅ | [OB26](docs/ROADMAP-ARCHIVE.md#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap) with [N12](#n12--dead-surface-and-the-comments-that-no-longer-match)'s coordinator dead surface — done 2026-11-09 | About a day, mostly deletion; the join path step 6 changes |
-| 6 ✅ | [U3](docs/ROADMAP-ARCHIVE.md#u3--raw_fold-a-whole-value-matched-in-any-case) | `raw_fold` — a whole value matched in any case, diacritics folded; done 2026-11-09 | — | 2026-11-09 | ✅ |
-| [V1](docs/ROADMAP-ARCHIVE.md#v1--a-node-that-brings-new-shards-cannot-join-a-cluster-that-holds-data): reproduce, then refuse — done 2026-11-09, reproduced on a 0.3.9 image | On the bootstrap step 5 leaves |
+| 6 ✅ | [V1](docs/ROADMAP-ARCHIVE.md#v1--a-node-that-brings-new-shards-cannot-join-a-cluster-that-holds-data): reproduce, then refuse — done 2026-11-09, reproduced on a 0.3.9 image | On the bootstrap step 5 leaves |
 | 7 ✅ | [O4](docs/ROADMAP-ARCHIVE.md#o4--the-request-budget-crosses-the-wire) — done 2026-11-09 | The field is optional on the wire, so mixed versions still work |
 | 8 ✅ | [V13](docs/ROADMAP-ARCHIVE.md#v13--a-node-whose-disks-move-to-another-machine-rejoins-as-itself): a `cluster.sh` phase and a DEPLOYMENT procedure — done 2026-11-09 | Exercises everything above |
 | — ✅ | The `deny.toml` exceptions and the deferred dependency updates — done 2026-11-09 | Any time before 2026-12-31 |
@@ -391,6 +416,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [T1](docs/ROADMAP-ARCHIVE.md#t1--oauth-for-mcp-clients) | OAuth for MCP clients — browser-based and desktop MCP clients connect with the OAuth flow the MCP specification defines; the user approves once with their existing key, and the token they get is that key's authority, read only — done 2026-11-03 | — | 2026-11-03 | ✅ |
 | [U1](docs/ROADMAP-ARCHIVE.md#u1--cjk-analyzers-chinese-japanese-and-korean-searchable-by-word) | CJK analyzers — `cjk` indexes each Chinese, Japanese or Korean character alone and paired with the next, at one position, so a character, a word or a clause matches exactly; `cjk_fold` folds traditional Chinese to simplified first (a 12 KB table of 2,974 pairs derived from OpenCC's character list, with reviewed overrides), so either script finds both. done 2026-11-06 | — | 2026-11-06 | ✅ |
 | [U2](docs/ROADMAP-ARCHIVE.md#u2--japanese-and-korean-folds-old-style-kanji-and-hanja) | Japanese and Korean folds — `cjk_ja_fold` maps old-style kanji to the new forms (淸吉 finds 清吉; OpenCC and Unihan `kJapaneseNewVariant`, 470 pairs plus reviewed overrides), `cjk_ko_fold` reads Hanja as Hangul (家族 finds 가족; Unihan `kHangul`, the initial-sound rule on each run's first character). done 2026-11-06 | — | 2026-11-06 | ✅ |
+| [U3](docs/ROADMAP-ARCHIVE.md#u3--raw_fold-a-whole-value-matched-in-any-case) | `raw_fold` — a whole value matched in any case, diacritics folded. done 2026-11-09 | — | 2026-11-09 | ✅ |
 | [V1](docs/ROADMAP-ARCHIVE.md#v1--a-node-that-brings-new-shards-cannot-join-a-cluster-that-holds-data) | A node that brings new shards cannot join a cluster that holds data — its tokens take key ranges and no document moves; refused until V8 — refused since 2026-11-09, reproduced on 0.3.9 first | 15 | 2026-11-08 | ✅ |
 | [V2](#v2--document-versions-and-delete-markers) | Document versions and delete markers — a hybrid clock per write, newest wins; a storage format change | 15 | 2026-11-08 | 📋 |
 | [V3](#v3--the-wal-kept-until-replicas-confirm-it-and-the-change-stream) | The WAL kept until replicas confirm it, and the change stream | 15 | 2026-11-08 | 📋 |
@@ -697,7 +723,7 @@ nothing from D2 and D3, and D1 has a documented workaround — declare fields up
 
 Stages are provisional and not yet ordered beyond their dependencies.
 
-**Designed 2026-11-08 as [V. Cluster HA](#v-cluster-ha--replication-the-two-node-mirror-and-elasticity--planned)**, which is where the order and the decisions now
+**Designed 2026-11-08 as [V. Cluster HA](#v-cluster-ha--replication-the-two-node-mirror-and-elasticity--partial)**, which is where the order and the decisions now
 live: D1 is built as V11, D2 as V5 (the two-node mirror) and V9, D3 as V10 and V12. The
 dependency of D2 on D1 below no longer holds — a replica is filled by V4's copy operation, which
 writes documents through the target's own write path, so no reindex is needed first.
@@ -2875,7 +2901,7 @@ U1 and U2, the CJK analyzers, and U3, `raw_fold`, are done; see
 
 ---
 
-## V. Cluster HA — replication, the two-node mirror and elasticity 📋 Planned
+## V. Cluster HA — replication, the two-node mirror and elasticity ◐ Partial
 
 Opened 2026-11-08, scoped against the code at `25a1a4e`. A cluster is partitioned, as today, or
 replicated: a replicated cluster that loses a node keeps its data and keeps serving it, and two
@@ -3267,7 +3293,7 @@ was delivered, its stub stands above in its place; these groups were delivered w
 - ✅ [**S. Delete by query**](docs/ROADMAP-ARCHIVE.md#s-delete-by-query--done) — S1
 - ✅ [**T. OAuth for MCP clients**](docs/ROADMAP-ARCHIVE.md#t-oauth-for-mcp-clients--done) — T1
 - ✅ [**K. Phase 19 — Field metrics: min and max**](docs/ROADMAP-ARCHIVE.md#k-phase-19--field-metrics-min-and-max--done) — K1–K3
-- ✅ [**U. Post-0.3.9 features**](docs/ROADMAP-ARCHIVE.md#u-post-039-features--done) — U1–U2
+- ✅ [**U. Post-0.3.9 features**](docs/ROADMAP-ARCHIVE.md#u-post-039-features--done) — U1–U3
 
 The archive also holds the original write-up of every delivered phase, the measurements, and the settled decisions:
 what the affinity flags cost, what the audit trail costs, the non-goals recorded so they are not re-litigated, and the

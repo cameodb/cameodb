@@ -110,6 +110,12 @@ These are accepted, not fixed. They belong in release notes as much as here.
 - **Delete by query has no version check.** It deletes what matched at each shard's last
   commit: a document written since is not deleted, and one updated since is deleted by its id
   even if it no longer matches.
+- **A cluster keeps one copy of each document, and cannot grow once it holds an index.** Each
+  shard lives on one node, so a node lost with its disks takes its shards' documents with it;
+  back up each node's data directories. A node the cluster has never known is refused while an
+  index exists (documents do not move between nodes yet), and a node that is gone for good stays
+  on every ring and in health: a cluster grows, or replaces a node's disks, only before its first
+  index. A node whose disks move to another machine rejoins as itself.
 - **Cluster peers are trusted by the PSK, not by API keys.** `allowed_indexes` is enforced at
   the HTTP/MCP ingress, where identity exists; it is not a defense against a compromised
   cluster member.
@@ -118,7 +124,9 @@ These are accepted, not fixed. They belong in release notes as much as here.
   `[security.audit] enabled = false` a node keeps no record of who read what. Turned on, it
   is a file the node writes — nothing signs or chains the records, so ship it off the node if
   it needs to survive the node.
-- **Three transitive advisories are ignored** (`deny.toml`), all via libp2p 0.56.0.
+- **Three transitive advisories are ignored** (`deny.toml`), all via libp2p 0.56.0, which
+  kameo 0.22.2 pins: RUSTSEC-2026-0118, RUSTSEC-2026-0119 and RUSTSEC-2024-0436, review-by
+  2027-03-31.
 
 ---
 
@@ -151,6 +159,27 @@ Signed off by:
 ## History
 
 <!-- Newest first. Append a filled-in template per release. -->
+
+## v0.3.10 — in progress
+
+Prepared on 2026-11-09 at `e192087`; not yet cut. Scope and state: ROADMAP, "The 0.3.10 scope"
+and "Reconciliation, 2026-11-09". Done so far, on the host (macOS) tree:
+
+- `scripts/validate/deps.sh`: PASS, 10/10 (fmt, clippy, audit, deny; the three advisory
+  exceptions renewed to review-by 2027-03-31, still via kameo 0.22.2 pinning libp2p 0.56; rustc
+  1.99.0 in the tree and both Dockerfiles).
+- `check-config --allow-unauthenticated`: OK on the root example, `crates/server/cameodb.toml` and
+  `crates/server/windows/cameodb.toml`.
+- `scripts/validate/cluster.sh`: 56/56 on an image built fresh on 2026-11-09, before the MCP and
+  `raw_fold` commits (`64e23ac` onward), which touch no cluster path; the *peer down*,
+  *newcomer* and *moved disks* phases among them, and min and max merged across nodes.
+- MCP and storage changes checked on live indexes (19.7M and 7.2M rows) after each rebuild: the
+  `describe_index` keys, every tokenizer's matching rule, and the zero-hit advice.
+- Dependencies: `serde-saphyr` 2.1.1, `toml` 1.2.1.
+
+Open: the version bump, `cargo test --workspace` in full, `scripts/validate/all.sh` on the
+release build, a `cluster.sh` run at the release commit, the Windows run, build, sign, publish,
+and the 0.3.10 compatibility fixture.
 
 ## v0.3.9 — 2026-11-05
 

@@ -2173,7 +2173,7 @@ second open. Both pass on this build. The fixtures' README says how to add one f
 fixture is never rewritten to make a test pass.
 
 The scope was widened from the two legacy paths to "0.3.x data opens" when 0.4.0 took the
-storage changes of [V. Cluster HA](../ROADMAP.md#v-cluster-ha--replication-the-two-node-mirror-and-elasticity--planned):
+storage changes of [V. Cluster HA](../ROADMAP.md#v-cluster-ha--replication-the-two-node-mirror-and-elasticity--partial):
 the 0.3.9 fixture is what lets 0.4.0 prove it still opens what 0.3.x wrote.
 
 ### E5 — A cap on open index writers
@@ -6214,7 +6214,7 @@ is for exact matching, on a ghost of it.
 
 ## V. Cluster HA — delivered items
 
-The introduction to this group and its open items are in [ROADMAP.md](../ROADMAP.md), under [V. Cluster HA](../ROADMAP.md#v-cluster-ha--replication-the-two-node-mirror-and-elasticity--planned).
+The introduction to this group and its open items are in [ROADMAP.md](../ROADMAP.md), under [V. Cluster HA](../ROADMAP.md#v-cluster-ha--replication-the-two-node-mirror-and-elasticity--partial).
 
 ### V1 — A node that brings new shards cannot join a cluster that holds data
 

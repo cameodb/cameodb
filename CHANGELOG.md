@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+**Upgrading from 0.3.9.** No config change is needed for a node to start, and every new setting
+is off until set. The storage format is unchanged: 0.3.10 opens 0.3.9's data, and 0.3.9 opens
+what 0.3.10 wrote unless an index declares one of the new tokenizers. Four things change what an
+existing deployment sees:
+
+- **An index declaring `raw_fold`, `cjk`, `cjk_fold`, `cjk_ja_fold` or `cjk_ko_fold` needs
+  0.3.10.** A 0.3.9 node cannot build them, so it cannot open such an index after a downgrade,
+  and on a cluster a peer still on 0.3.9 refuses the schema with `400`: upgrade every node before
+  declaring one. Existing fields are unchanged.
+- **MCP `describe_index` no longer returns `indexed`, `stored`, `fast` or `index_record_option`.**
+  A client that read them reads `searchable`, `sortable`, `returned` and `tokenizer` instead (see
+  Changed). `GET /api/{index}/_config` still reports the declaration.
+- **A cluster that holds an index refuses a node it has never known.** A node started with an
+  empty data directory is refused and exits with a failing status, where it used to be taken in
+  and leave documents in two places (see Fixed). Grow a cluster before its first index; a node
+  whose disks move to another machine rejoins as itself (DEPLOYMENT, "Moving a node to another
+  machine").
+- **The audit trail records a request refused with `429` or `403` as `denied`**, no longer
+  `allowed`: a consumer counting refusals by `outcome` now sees them.
+
+On a cluster, upgrade the nodes together: until all run 0.3.10, old and new nodes disagree on the
+shard-map checksum and send each other their full maps, which costs only those sends. A 0.3.9
+peer ignores the spent-budget field a forwarded operation now carries.
+
 ### Added
 
 - **`raw_fold` tokenizer: a whole value matched in any case.** `raw` keeps a value whole and keeps
