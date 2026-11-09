@@ -25,13 +25,6 @@ pub enum ClusterState {
     Failed { reason: String },
 }
 
-impl ClusterState {
-    /// Check if the cluster is healthy (Active state)
-    pub fn is_healthy(&self) -> bool {
-        matches!(self, ClusterState::Active { .. })
-    }
-}
-
 impl Default for ClusterState {
     fn default() -> Self {
         Self::Failed {

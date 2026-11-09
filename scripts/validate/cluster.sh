@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Cluster validation: three nodes in Docker, and the properties only a real cluster has.
 #
+#   peer down   two of three nodes, the third never started, hold each other's shards within
+#               seconds: a node that is down does not hold the exchange up (OB26)
 #   formation   nodes started together find each other and agree on one ring; a node
 #               started before its seeds joins once they are up
 #   storm       new-index writes and index deletes on every node at once leave every node
@@ -37,6 +39,7 @@ PORTS=("$PORT_BASE" "$((PORT_BASE + 1))" "$((PORT_BASE + 2))")
 FORM_SECS="${CLUSTER_FORM_SECS:-60}"
 FORM_ROUNDS="${CLUSTER_FORM_ROUNDS:-3}"
 LATE_SEED_SECS=10
+PEER_DOWN_SECS="${CLUSTER_PEER_DOWN_SECS:-8}"
 STORM_SECS="${CLUSTER_STORM_SECS:-60}"
 STORM_WRITERS="${CLUSTER_STORM_WRITERS:-2}"
 STORM_DELETERS="${CLUSTER_STORM_DELETERS:-1}"
@@ -201,6 +204,21 @@ wait_nodes() {
         wait_for_http "http://127.0.0.1:$p/_cluster/health" 60 || return 1
     done
 }
+
+section "a peer down from the start (node3 never started)"
+# Two of three configured nodes, fresh. They trade shard maps the moment they connect, a node
+# down or not. Until 0.3.10 they waited for every configured node first and learned each other's
+# shards only from the 10 s pull, 12.7 and 14.8 s in (OB26). The bound is under the first pull,
+# which fires 10–15 s after start, so only the exchange on connecting can meet it.
+write_compose "$WORK/data-peer-down"
+compose up -d node1 node2 > /dev/null 2>&1
+wait_nodes "${PORTS[0]}" "${PORTS[1]}"
+if ! CLUSTER_NODES="http://127.0.0.1:${PORTS[0]},http://127.0.0.1:${PORTS[1]}" \
+    check_cmd "node1 and node2 hold each other's shards with node3 down, before any pull" \
+    probe converge "$PEER_DOWN_SECS"; then
+    collect_logs peer-down
+fi
+compose down -t 5 > /dev/null 2>&1
 
 section "formation ($FORM_ROUNDS rounds, all three nodes started together)"
 # Several rounds, because what goes wrong here is a race: on a fresh start the nodes exchange

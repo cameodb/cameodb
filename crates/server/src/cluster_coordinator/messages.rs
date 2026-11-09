@@ -6,8 +6,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::cluster_state::PersistedClusterConfig;
-use crate::distributed::NodeInfo;
 use cluster::ConsistentRing;
 
 /// Message to subscribe to topology (ring) updates.
@@ -66,12 +64,6 @@ pub struct PeerDiscovered {
 #[derive(Debug, Clone)]
 pub struct PeerLost {
     pub node_id: Uuid,
-}
-
-/// Message to route a shard operation (stub for future remote actor support).
-#[derive(Debug, Clone)]
-pub struct RouteShard {
-    pub shard_id: Uuid,
 }
 
 /// Metadata describing a shard and its owning node.
@@ -158,20 +150,6 @@ fn known_peer_connected() -> bool {
     true
 }
 
-/// Message when node metadata is discovered via DHT.
-#[derive(Debug, Clone)]
-pub struct PeerNodeMetadataDiscovered {
-    pub node_uuid: String,
-    pub node_name: String,
-    pub shard_count: u32,
-    pub generation: u64,
-    pub checksum: u64,
-    pub address: Option<String>,
-    pub status: String,
-    pub total_storage_bytes: u64,
-    pub total_document_count: u64,
-}
-
 /// Message to set the local orchestrator reference
 #[derive(Debug, Clone)]
 pub struct SetLocalOrchestrator {
@@ -198,13 +176,6 @@ pub struct DeleteTargets {
     pub local_orchestrator: Option<kameo::actor::ActorRef<crate::node::NodeOrchestrator>>,
     pub peers: Vec<KnownPeer>,
     pub pool: Option<std::sync::Arc<crate::remote_peer_pool::RemotePeerPool>>,
-}
-
-/// Message when a single shard is discovered via DHT.
-#[derive(Debug, Clone)]
-pub struct PeerShardDiscovered {
-    pub node_uuid: String,
-    pub shard: ShardMetadata,
 }
 
 /// Periodic tick: pull every connected peer's shard map and merge it (see
@@ -253,36 +224,6 @@ pub struct ExchangeShardsWithPeer {
     pub generation: u64,
     pub checksum: u64,
     pub shards: HashMap<Uuid, ShardMetadata>,
-}
-
-/// Message to get complete cluster snapshot for persistence
-#[derive(Debug, Clone)]
-pub struct GetClusterSnapshot;
-
-/// Internal message to track push failures for DHT fallback
-#[derive(Debug, Clone)]
-pub struct TrackPushFailure {
-    pub node_id: Uuid,
-}
-
-/// Internal message to reset push failure count on successful push
-#[derive(Debug, Clone)]
-pub struct ResetPushFailure {
-    pub node_id: Uuid,
-}
-
-/// Internal message to mark bootstrap as complete
-#[derive(Debug, Clone)]
-pub struct MarkBootstrapComplete;
-
-/// Snapshot of cluster topology for persistence
-#[derive(Debug, Clone, Reply)]
-#[allow(dead_code)] // Reply struct for GetClusterSnapshot; no external consumer yet
-pub struct ClusterSnapshot {
-    pub config: PersistedClusterConfig,
-    pub shards: HashMap<Uuid, ShardMetadata>,
-    pub nodes: HashMap<Uuid, NodeInfo>,
-    pub ring: ConsistentRing,
 }
 
 // ============================================================================

@@ -44,9 +44,8 @@ To ensure uniform data distribution without coordination:
 * **Ownership:** A key belongs to the first VNode found clockwise on the ring.
 
 ### 2.3. Cluster Discovery
-* **Mechanism:** Kameo + libp2p DHT used primarily during bootstrap to exchange shard metadata snapshots.
-* **Bootstrap:** Nodes dial the configured seed list, publish their shard metadata (UUID, vnode tokens, storage stats), and query peer metadata keys.
-* **Announcement:** Cluster state is exchanged via `PeerShardDiscovered`, `MergeRemoteShards`, and `ClusterStateResponse` messages inside `ClusterCoordinator` rather than a flat node list.
+* **Mechanism:** libp2p for connections and identity — nodes dial the configured seed list, and the Kademlia DHT maps each libp2p peer id to its node UUID — and Kameo actor messages between coordinators for the shard maps.
+* **Exchange:** when a peer connects, and when a node registers its shards, the coordinators push their whole shard map to each other and pull the other's (`MergeRemoteShards`, `GetShardAssignments`, `ClusterStateResponse`), whether or not every expected node is up; a periodic pull every 10 s catches a map missed in between. There is no bootstrap phase to wait out: a node that is down is the steady state a cluster serves in.
 * **Registry:** Each coordinator persists the aggregated shard map + consistent ring locally, replaying it on restart for deterministic routing.
 * **Ring Management:** Local consistent hashing with deterministic token generation; ring updates are broadcast to subscribers (e.g., `NodeOrchestrator`) via actor channels.
 

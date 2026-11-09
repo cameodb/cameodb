@@ -508,7 +508,6 @@ Planned future work includes:
 - Ring snapshot persistence optimization for faster boot (10-40x) on large clusters.
 - Cluster state history tracking for SLA monitoring and failure forensics.
 - Health metrics persistence for capacity planning.
-- `GetClusterSnapshot` query API for operational visibility.
 - Dedicated remote registry/connector module to cache `RemoteActorRef`s.
 - Configurable fallback modes (e.g. local-only when remoting is disabled).
 

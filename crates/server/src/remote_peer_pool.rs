@@ -22,7 +22,7 @@ use kameo::actor::RemoteActorRef;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::RwLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -53,15 +53,11 @@ pub enum ConnectionChannel {
 #[derive(Clone)]
 struct CachedOrchestratorRef {
     remote_ref: RemoteActorRef<NodeOrchestrator>,
-    #[allow(dead_code)] // Reserved for TTL-based expiry
-    cached_at: Instant,
 }
 
 #[derive(Clone)]
 struct CachedCoordinatorRef {
     remote_ref: RemoteActorRef<ClusterCoordinator>,
-    #[allow(dead_code)] // Reserved for TTL-based expiry
-    cached_at: Instant,
 }
 
 // ============================================================================
@@ -232,13 +228,7 @@ impl RemotePeerPool {
         remote_ref: RemoteActorRef<NodeOrchestrator>,
     ) {
         if let Ok(mut map) = self.orchestrator_refs.write() {
-            map.insert(
-                (node_id, channel),
-                CachedOrchestratorRef {
-                    remote_ref,
-                    cached_at: Instant::now(),
-                },
-            );
+            map.insert((node_id, channel), CachedOrchestratorRef { remote_ref });
         }
     }
 
@@ -293,13 +283,7 @@ impl RemotePeerPool {
 
     fn cache_coordinator(&self, node_id: Uuid, remote_ref: RemoteActorRef<ClusterCoordinator>) {
         if let Ok(mut map) = self.coordinator_refs.write() {
-            map.insert(
-                node_id,
-                CachedCoordinatorRef {
-                    remote_ref,
-                    cached_at: Instant::now(),
-                },
-            );
+            map.insert(node_id, CachedCoordinatorRef { remote_ref });
         }
     }
 
@@ -384,6 +368,7 @@ pub enum RemotePeerPoolError {
 mod tests {
     use super::*;
     use crate::node::RemoteVerdict;
+    use std::time::Instant;
 
     fn peer() -> Uuid {
         Uuid::from_u128(7)

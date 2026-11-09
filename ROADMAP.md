@@ -275,7 +275,7 @@ K2's merge and the refusal fix (`a2244ea`) their first multi-node check.
 | 2 ✅ | The audit and logging fixes: the streamed search's query at `info!` and its missing audited query; 429 and 403 audited as `allowed`; a plain index listing churning the open-index cap — all three fixed 2026-11-09 | Small, local, and the first two are security fixes |
 | 3 ✅ | [E4](docs/ROADMAP-ARCHIVE.md#e4--two-compatibility-paths-with-no-end-to-end-test)'s fixtures — 0.3.0 and 0.3.9, done 2026-11-09 | Before any 0.4.0 storage work, so they are written by a real 0.3.x build |
 | 4 ✅ | [N17](#n17--smaller-items-filed-so-they-are-not-lost)'s cluster bugs: the snapshot persisted out of order, the checksum's `DefaultHasher` → xxh3, the peer tasks outside the cancellation token — all three fixed 2026-11-09 | Small real bugs under everything after them |
-| 5 | [OB26](#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap) with [N12](#n12--dead-surface-and-the-comments-that-no-longer-match)'s coordinator dead surface | About a day, mostly deletion; the join path step 6 changes |
+| 5 ✅ | [OB26](#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap) with [N12](#n12--dead-surface-and-the-comments-that-no-longer-match)'s coordinator dead surface — built 2026-11-09; OB26's `cluster.sh` phase runs with steps 4–8 | About a day, mostly deletion; the join path step 6 changes |
 | 6 | [V1](#v1--a-node-that-brings-new-shards-cannot-join-a-cluster-that-holds-data): reproduce, then refuse | On the bootstrap step 5 leaves |
 | 7 | [O4](#o4--the-request-budget-crosses-the-wire) | The field is optional on the wire, so mixed versions still work |
 | 8 | [V13](#v13--a-node-whose-disks-move-to-another-machine-rejoins-as-itself): a `cluster.sh` phase and a DEPLOYMENT procedure | Exercises everything above |
@@ -340,7 +340,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [OB23](docs/ROADMAP-ARCHIVE.md#ob23--recreating-an-index-after-dropping-its-schema-lost-most-of-what-was-written) | **Recreating an index after dropping its schema lost most of what was written** — the drop's record read as a schema, the node re-minted the index from every batch, and a retyped column killed the Tantivy writer, which stayed dead until restart. 1,030 of 16,559 documents landed; now all do, a dying writer is retired and replayed, and the loader counts every failure by its file line | — | 2026-09-27 | ✅ |
 | [OB24](docs/ROADMAP-ARCHIVE.md#ob24--a-and-not-b-and-a-or-not-b-parsed-cleanly-and-answered-wrongly) | **`a AND NOT b` and `a OR NOT b` parsed cleanly and answered wrongly** — a `NOT` arm under `Must`/`Should` matched nothing and nothing reported it; rewritten to `a AND -b` / `a OR (* -b)` before the parser runs | — | 2026-10-05 | ✅ |
 | [OB25](docs/ROADMAP-ARCHIVE.md#ob25--a-search-during-a-restart-answered-short-without-saying-so) | **A search during a restart answered short without saying so** — a rejoining node searched 5 of 9 shards and reported `failed: 0`; on one node, HTTP serves before the replayed tail is committed. Both fixed the same day | — | 2026-10-15 | ✅ |
-| [OB26](#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap) | **A restarted node waits on every expected peer before it leaves bootstrap** — reproduced 2026-10-18: real, and invisible to clients, because the snapshot and any never-restarted peer carry the map. A day, mostly deleting code; with OB27 | — | 2026-10-15 | 📋 |
+| [OB26](#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap) | **A restarted node waits on every expected peer before it leaves bootstrap** — reproduced 2026-10-18: real, and invisible to clients, because the snapshot and any never-restarted peer carry the map. Built 2026-11-09: no bootstrap mode, the exchange runs with any peer down, and the unread DHT shard records are gone; archived after the steps 4–8 cluster run | — | 2026-10-15 | ◐ |
 | [OB27](#ob27--a-replaced-node-never-leaves-the-cluster) | **A replaced node never leaves the cluster** — a node rebuilt with an empty data directory leaves its old identity's shards on every ring for good: writes to their key ranges answer 500, and the new node cannot learn an existing schema (503). The 500 is now a 503 (`888cb27`); `forget` needs O3 | — | 2026-10-18 | ◐ |
 | [OB28](docs/ROADMAP-ARCHIVE.md#ob28--two-range-shapes-were-dropped-without-a-word-or-failed-the-search) | **Two range shapes were dropped without a word or failed the search** — `field:[* TO *]` answered zero unreported, and a range on a json field was a 500; both are now reported dropped clauses, refused with 400 when nothing else is left | — | 2026-10-21 | ✅ |
 | [OB29](docs/ROADMAP-ARCHIVE.md#ob29--what-verifying-ob28-over-mcp-found) | **What verifying OB28 over MCP found** — a query whose every clause was dropped ran as match-all, a json path matched nothing unreported, and `validate_query` called a path an unknown field | — | 2026-10-21 | ✅ |
@@ -1806,8 +1806,22 @@ stays there.
 
 ### OB26 — A restarted node waits on every expected peer before it leaves bootstrap
 
-📋 **Planned, low priority — rebuilt on [V6](#v6--metadata-records-on-a-majority-of-voters)** (2026-11-08): bootstrap ends when a quorum of voters is
-reachable, at the first peer in a two-node mirror, or at a deadline. Read from the code 2026-10-15; reproduced in Docker 2026-10-18 at
+◐ **Built 2026-11-09 (step 5 of [the 0.3.10 order](#the-order-of-the-remaining-work)); archived after the `cluster.sh` run of steps 4–8.**
+
+**What landed.** There is no bootstrap mode left to end. The push and pull of shard maps run on
+every `PeerDiscovered` and every `RegisterLocalShards`, with any peer down; the stability push,
+`bootstrap_complete` and `MarkBootstrapComplete` are gone. Without the gate, the DHT shard path
+had no reader: nothing ever queried the `cameodb-shard-` records, and the `cameodb-node-` query ran
+only from the bootstrap branch and the dead `TrackPushFailure`. Both record kinds, their publish,
+the query, the two swarm events and their coordinator handlers went with it; the DHT keeps the
+peer-id → node-UUID records it is still read for. No deadline was added: with the exchange
+ungated nothing waits on one. `cluster.sh` gains a *peer down* phase: two of three nodes, the
+third never started, must hold each other's shards within 8 s, under the first 10 s pull. What
+[V6](#v6--metadata-records-on-a-majority-of-voters) adds later is the readiness of its own quorum
+records — when a quorum is reachable, at the first peer in a two-node mirror, or at a deadline —
+not a gate on this exchange.
+
+**The finding, as filed.** Read from the code 2026-10-15; reproduced in Docker 2026-10-18 at
 `7696b4a` — the mode is real, and no client sees it. `bootstrap_complete` becomes true in
 `evaluate_and_transition_state` only when no expected node is inactive (`coordinator.rs:510–513`) —
 every node in the snapshot or the configuration, connected. Until then `PeerDiscovered` skips the
@@ -2193,10 +2207,14 @@ delete, the schema change, the sweep and the forwards, and `RemotePeerPool::ask_
   `ShutdownShard` (a handler that duplicates and diverges from `shutdown_all_shards`),
   `WriteRequest.routing_key` (never read) and its "older peer" `serde(default)` and body-id
   fallback, and a `HashMap` in `handle_batch_write` that holds one key.
-- **Coordinator.** `RouteShard` (a deprecated stub), `TrackPushFailure`, `ResetPushFailure` and
+- **Coordinator.** ✅ `RouteShard` (a deprecated stub), `TrackPushFailure`, `ResetPushFailure` and
   `push_failure_count`, `MarkBootstrapComplete`, `GetClusterSnapshot` and `ClusterSnapshot`
-  (`#[allow(dead_code)]`), the empty loop in `sync_expected_nodes`, `decide_route`'s unused
-  `operation_type`, `existing_shard_ids` computed for one debug line, `CachedCoordinatorRef.cached_at`.
+  (`#[allow(dead_code)]`), the empty loop in `sync_expected_nodes`, `existing_shard_ids` computed
+  for one debug line, `CachedCoordinatorRef.cached_at` (**deleted 2026-11-09** with OB26, each
+  confirmed to have no sender; `existing_shard_ids` went with the DHT metadata handler, and
+  `CachedOrchestratorRef.cached_at` and the unused `ClusterState::is_healthy` with them). Kept:
+  `decide_route`'s `operation_type`, unused today and threaded from every handler — replicated
+  reads in 0.4.0 route a read and a write differently, and that is where it is decided.
 - **Storage.** No callers: `commit_writer`, `apply_batch_and_maybe_commit`,
   `reset_operations_counter_to`, `get_index_field_names`, `IndexStats`. Tests only:
   `apply_write_and_maybe_commit`, `promote_field_to_indexed`, `get_non_indexed_fields`,
@@ -2300,8 +2318,8 @@ as two extensions (`Caller` and `Authz`) where one extractor would do.
   before; the refusal keys differ (`document N:` and `{id}:`); `forward_write` fails when
   `items_written` is missing, `forward_delete` defaults it to 0. **Change:** `partition_by_owner`
   and `forward_share`.
-- **Shard map sync** — absorbed by [V8](#v8--shards-belong-to-the-cluster-placement-on-a-version-checked-at-the-replica) (2026-11-08), on V6's quorum records. Five mechanisms: the DHT publish at bootstrap, the stability push
-  (`coordinator.rs:538–583`), `RegisterLocalShards` into `ExchangeShardsWithPeer` into a query
+- **Shard map sync** — absorbed by [V8](#v8--shards-belong-to-the-cluster-placement-on-a-version-checked-at-the-replica) (2026-11-08), on V6's quorum records. Five mechanisms, three since OB26 removed the DHT publish at bootstrap and the stability push
+  (2026-11-09): `RegisterLocalShards` into `ExchangeShardsWithPeer` into a query
   and a push and a fallback push (`:806–857`, `:2261–2320`), the `PeerDiscovered` push and pull
   with a hand-rolled 5× backoff (`:1417–1510`), and the periodic `SyncShardMaps` pull (`:2379`).
   **Change:** one exchange, run on the events that change a shard map — a peer connecting
@@ -2487,7 +2505,8 @@ arrived last":
   `NodeOrchestrator::shard_metadata` is the only producer and hard-codes them — so the checksum is
   stable and the push's "identical, skip" does skip. Still three definitions of what changed: the
   checksum, the merge's routing-only test (`:2104`) and `PeerShardDiscovered`'s count test
-  (`:1860`), and the first and third start meaning something the day counts are filled in.
+  (`:1860`; gone 2026-11-09 with the DHT read side, OB26), and the first starts meaning something
+  the day counts are filled in.
 - The periodic pull that papers over the first is O(N²) full-map transfers every 10 s, and it
   bypasses the short-circuit: it sends checksum 0, so every pull is a full merge — observed
   2026-10-18, every node merging every peer's whole map each tick.
@@ -2497,7 +2516,7 @@ on any change to its shards, persisted in the snapshot; the wire map becomes
 `HashMap<NodeId, { epoch, shards }>`; a merge replaces an owner's entry only when
 `incoming.epoch > known.epoch` (the per-endpoint version, ~100 lines). The checksum then
 hashes the epoch vector — routing data only — in `xxh3` per N17, cached and invalidated on
-generation change; `PeerShardDiscovered` stops bumping generation on counts. **This amends
+generation change. **This amends
 N15:** its "one exchange on events" is safe only once a stale map cannot win, so N15's
 shard-map-sync item runs after this; and the residual anti-entropy N15 calls a "rare safety
 net" becomes digest-first — exchange epoch vectors, pull only newer owners — at a
@@ -3180,8 +3199,9 @@ two-node cluster (open question 7).
 ### V6 — Metadata records on a majority of voters
 
 📋 **Planned.** Records in `metadata.redb`, the voter list, newest-version writes and reads with
-repair, sent over the peer pool. Kademlia keeps the hints. OB26 is rebuilt on it: bootstrap ends
-when a quorum is reachable, or at the first peer in a mirror, or at a deadline.
+repair, sent over the peer pool. Kademlia keeps the hints. Its records are ready when a quorum is
+reachable, or at the first peer in a mirror, or at a deadline; the shard-map exchange no longer
+waits on any bootstrap (OB26, 2026-11-09).
 
 ### V7 — Compare-and-set on one key, and the voter list
 

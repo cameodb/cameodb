@@ -117,6 +117,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exchange. It is now xxh3 over a fixed layout. Upgrade note: during a rolling upgrade from an
   earlier 0.3.x, the old and new nodes disagree on it until all are upgraded, which costs only
   those full-map sends.
+- **Cluster nodes trade shard maps as soon as they connect, with a node down.** A node exchanged
+  its shard map with a peer only once every configured node was connected, so with one node down
+  — a fresh cluster missing a node, or a restart while one was stopped — the others learned each
+  other's shards only from the 10-second pull, 12–15 s in. The exchange now runs on every
+  connection and every shard registration. The shard records nodes published to the DHT, which no
+  node read any more, are no longer written; the DHT still maps peer ids to node ids.
 - **Shutdown ends every task a node has waiting on a peer.** The shard-map sync, the schema sweep,
   the sweep after a peer connects and the exchange after shards are registered ran outside the
   cancellation that ends peer tasks before the swarm stops, so one still waiting on a peer at that
