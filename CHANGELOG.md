@@ -123,6 +123,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   other's shards only from the 10-second pull, 12–15 s in. The exchange now runs on every
   connection and every shard registration. The shard records nodes published to the DHT, which no
   node read any more, are no longer written; the DHT still maps peer ids to node ids.
+- **A node with new shards is refused by a cluster that holds an index.** A node the cluster had
+  never known — started with an empty data directory — brought shards whose tokens took key
+  ranges from every index, while no document moved: a later write of an existing id landed on the
+  new node and left the old copy behind, so a search returned both and a delete by id missed one.
+  The members now leave such a node's shards out of their ring and tell it why; the node, holding
+  no documents, shuts down with that reason and a failing exit status. A node restarted on its own
+  data directory is never refused, nor is any node while no index exists.
 - **Shutdown ends every task a node has waiting on a peer.** The shard-map sync, the schema sweep,
   the sweep after a peer connects and the exchange after shards are registered ran outside the
   cancellation that ends peer tasks before the swarm stops, so one still waiting on a peer at that

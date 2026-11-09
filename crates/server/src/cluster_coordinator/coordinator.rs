@@ -57,6 +57,12 @@ pub struct ClusterCoordinator {
     /// [`ClusterCoordinator::persist_snapshot`].
     pub(crate) snapshot_writer: Option<tokio::sync::watch::Sender<Option<Arc<PendingSnapshot>>>>,
 
+    /// This node's shard stores, set with the local orchestrator: read to decide a join.
+    pub(crate) local_stores: Vec<Arc<storage::HybridStore>>,
+    /// Nodes whose shards this node refused to take into its ring (V1). Kept out of the node
+    /// registry, and told once.
+    pub(crate) refused_nodes: std::collections::HashSet<Uuid>,
+
     /// Shared pool of cached RemoteActorRef handles for avoiding repeated lookups
     pub(crate) remote_peer_pool: Option<Arc<RemotePeerPool>>,
 }
@@ -115,6 +121,8 @@ impl ClusterCoordinator {
             last_queued_generation: 0,
             snapshot_writer: None,
             remote_peer_pool: None,
+            local_stores: Vec::new(),
+            refused_nodes: std::collections::HashSet::new(),
         }
     }
 
@@ -249,6 +257,8 @@ impl ClusterCoordinator {
             last_queued_generation: generation,
             snapshot_writer: None,
             remote_peer_pool: None,
+            local_stores: Vec::new(),
+            refused_nodes: std::collections::HashSet::new(),
         }
     }
 
@@ -498,8 +508,12 @@ impl ClusterCoordinator {
                 });
         }
 
-        // 4. Sync from peer_nodes (active connections)
+        // 4. Sync from peer_nodes (active connections), less the nodes this one refused (V1):
+        // counted, one would keep the cluster degraded once it has gone.
         for (node_id, peer_info) in &self.cluster.peer_nodes {
+            if self.refused_nodes.contains(node_id) {
+                continue;
+            }
             self.expected_nodes
                 .entry(*node_id)
                 .and_modify(|n| {
@@ -774,6 +788,91 @@ impl ClusterCoordinator {
             .peer_nodes
             .get(node_id)
             .is_some_and(|peer| peer.status == NodeStatus::Disconnected)
+    }
+
+    /// The first live index this node holds a schema for. Schemas are the same on every member,
+    /// so every member gives the same answer, which keeps their rings alike when they refuse a
+    /// node — where a document count would differ from node to node.
+    fn live_index(&self) -> Option<String> {
+        let records = self.local_stores.first()?.schema_records().ok()?;
+        records
+            .into_iter()
+            .find(|record| !record.dropped)
+            .map(|record| record.index)
+    }
+
+    /// Whether any of this node's indexes holds a document. Unreadable counts as yes: the
+    /// answer decides whether this node stops, and a node that cannot tell keeps running.
+    pub(crate) fn holds_documents(&self) -> bool {
+        // From the stored rows, not the search index: a write that is durable but not yet
+        // committed to search is a document all the same.
+        self.local_stores.iter().any(|store| {
+            store.schema_records().map_or(true, |records| {
+                records
+                    .iter()
+                    .any(|record| store.document_count(&record.index).map_or(true, |n| n > 0))
+            })
+        })
+    }
+
+    /// Take out of `shards` those of every node this one has never known, when the cluster
+    /// holds an index, and tell each such node once (ROADMAP V1). A node this one knows — a
+    /// member restarting with its shards, its own snapshot's — is never refused, and nothing is
+    /// refused while no index exists, so a fresh cluster forms as before.
+    ///
+    /// Returns whether `sender` is one of the refused.
+    pub(crate) fn refuse_unknown_owners(
+        &mut self,
+        sender: Uuid,
+        shards: &mut HashMap<Uuid, ShardMetadata>,
+    ) -> bool {
+        let local = self.cluster.local_node_id;
+        let unknown: std::collections::HashSet<Uuid> = shards
+            .values()
+            .map(|meta| meta.node_id)
+            .filter(|owner| {
+                *owner != local
+                    && !self
+                        .shard_assignments
+                        .values()
+                        .any(|known| known.node_id == *owner)
+            })
+            .collect();
+        if unknown.is_empty() {
+            return false;
+        }
+        let Some(index) = self.live_index() else {
+            return false;
+        };
+        shards.retain(|_, meta| !unknown.contains(&meta.node_id));
+        for owner in &unknown {
+            self.expected_nodes.remove(owner);
+            if !self.refused_nodes.insert(*owner) {
+                debug!(node = %owner, "ClusterCoordinator: shards of a refused node left out again");
+                continue;
+            }
+            let reason = format!(
+                "node {local} did not take the shards of node {owner} into its ring: the \
+                 cluster holds index '{index}', and a node that brings shards the cluster has \
+                 never known would take key ranges from it while no document moves, so a later \
+                 write of an existing id would leave the old copy behind. Start the node on the \
+                 data directory it had in this cluster, or start a new cluster for it."
+            );
+            error!(node = %owner, index = %index, "ClusterCoordinator: refused a node that brings new shards (V1)");
+            let refusal = JoinRefused { by: local, reason };
+            let pool = self.remote_peer_pool.clone();
+            let owner = *owner;
+            self.spawn_peer_task(async move {
+                let told = converse_with_coordinator(pool.as_ref(), owner, |remote| async move {
+                    remote.tell(&refusal).send().map_err(|e| e.to_string())
+                })
+                .await;
+                if let Err(e) = told {
+                    warn!(node = %owner, error = %e, "ClusterCoordinator: could not tell a refused node");
+                }
+            });
+        }
+        unknown.contains(&sender)
     }
 
     fn node_address(&self, node_id: &Uuid) -> Option<String> {
@@ -1273,6 +1372,40 @@ impl Message<SetLocalOrchestrator> for ClusterCoordinator {
     ) -> Self::Reply {
         info!("ClusterCoordinator: received local orchestrator reference");
         self.local_orchestrator = Some(msg.orchestrator);
+        self.local_stores = msg.stores;
+    }
+}
+
+/// Signalled when a member refused this node's shards and this node holds no documents: the
+/// node shuts down as on a stop signal, and exits with [`JOIN_REFUSAL`] as its error.
+pub static JOIN_REFUSED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+/// Why the cluster refused this node: the first reason a member gave.
+pub static JOIN_REFUSAL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+#[remote_message("cameo.coordinator.join_refused")]
+impl Message<JoinRefused> for ClusterCoordinator {
+    type Reply = ();
+
+    /// A newcomer stops: it holds no documents, so stopping costs nothing, and serving would
+    /// write into key ranges the cluster does not route to it. A node that holds documents is
+    /// not a newcomer — two clusters met — so it keeps running, and refuses theirs in turn.
+    async fn handle(
+        &mut self,
+        msg: JoinRefused,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        if self.holds_documents() {
+            error!(
+                by = %msg.by,
+                reason = %msg.reason,
+                "ClusterCoordinator: a node refused this node's shards; this node holds documents of its own, so it keeps running"
+            );
+            return;
+        }
+        error!(by = %msg.by, reason = %msg.reason, "ClusterCoordinator: the cluster refused this node's shards; shutting down");
+        if JOIN_REFUSAL.set(msg.reason).is_ok() {
+            JOIN_REFUSED.notify_one();
+        }
     }
 }
 
@@ -1516,7 +1649,7 @@ impl Message<MergeRemoteShards> for ClusterCoordinator {
     ) -> Self::Reply {
         let node_id = msg.node_id;
         let node_name = msg.node_name;
-        let actual_shards = msg.shards;
+        let mut actual_shards = msg.shards;
         let remote_generation = msg.generation;
         let remote_checksum = msg.shard_checksum;
 
@@ -1534,6 +1667,11 @@ impl Message<MergeRemoteShards> for ClusterCoordinator {
                 local_checksum,
                 "ClusterCoordinator: skipping merge - data identical, synced generations"
             );
+            return;
+        }
+
+        // Shards of a node this cluster never knew are left out while it holds an index (V1).
+        if self.refuse_unknown_owners(node_id, &mut actual_shards) {
             return;
         }
 

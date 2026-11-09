@@ -276,7 +276,7 @@ K2's merge and the refusal fix (`a2244ea`) their first multi-node check.
 | 3 ✅ | [E4](docs/ROADMAP-ARCHIVE.md#e4--two-compatibility-paths-with-no-end-to-end-test)'s fixtures — 0.3.0 and 0.3.9, done 2026-11-09 | Before any 0.4.0 storage work, so they are written by a real 0.3.x build |
 | 4 ✅ | [N17](#n17--smaller-items-filed-so-they-are-not-lost)'s cluster bugs: the snapshot persisted out of order, the checksum's `DefaultHasher` → xxh3, the peer tasks outside the cancellation token — all three fixed 2026-11-09 | Small real bugs under everything after them |
 | 5 ✅ | [OB26](#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap) with [N12](#n12--dead-surface-and-the-comments-that-no-longer-match)'s coordinator dead surface — built 2026-11-09; OB26's `cluster.sh` phase runs with steps 4–8 | About a day, mostly deletion; the join path step 6 changes |
-| 6 | [V1](#v1--a-node-that-brings-new-shards-cannot-join-a-cluster-that-holds-data): reproduce, then refuse | On the bootstrap step 5 leaves |
+| 6 ✅ | [V1](#v1--a-node-that-brings-new-shards-cannot-join-a-cluster-that-holds-data): reproduce, then refuse — the refusal built 2026-11-09; its `cluster.sh` phase reproduces V1 on an older image and checks the refusal on this one | On the bootstrap step 5 leaves |
 | 7 | [O4](#o4--the-request-budget-crosses-the-wire) | The field is optional on the wire, so mixed versions still work |
 | 8 | [V13](#v13--a-node-whose-disks-move-to-another-machine-rejoins-as-itself): a `cluster.sh` phase and a DEPLOYMENT procedure | Exercises everything above |
 | — | The `deny.toml` exceptions and the deferred dependency updates | Any time before 2026-12-31 |
@@ -370,7 +370,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [T1](docs/ROADMAP-ARCHIVE.md#t1--oauth-for-mcp-clients) | OAuth for MCP clients — browser-based and desktop MCP clients connect with the OAuth flow the MCP specification defines; the user approves once with their existing key, and the token they get is that key's authority, read only — done 2026-11-03 | — | 2026-11-03 | ✅ |
 | [U1](docs/ROADMAP-ARCHIVE.md#u1--cjk-analyzers-chinese-japanese-and-korean-searchable-by-word) | CJK analyzers — `cjk` indexes each Chinese, Japanese or Korean character alone and paired with the next, at one position, so a character, a word or a clause matches exactly; `cjk_fold` folds traditional Chinese to simplified first (a 12 KB table of 2,974 pairs derived from OpenCC's character list, with reviewed overrides), so either script finds both. done 2026-11-06 | — | 2026-11-06 | ✅ |
 | [U2](docs/ROADMAP-ARCHIVE.md#u2--japanese-and-korean-folds-old-style-kanji-and-hanja) | Japanese and Korean folds — `cjk_ja_fold` maps old-style kanji to the new forms (淸吉 finds 清吉; OpenCC and Unihan `kJapaneseNewVariant`, 470 pairs plus reviewed overrides), `cjk_ko_fold` reads Hanja as Hangul (家族 finds 가족; Unihan `kHangul`, the initial-sound rule on each run's first character). done 2026-11-06 | — | 2026-11-06 | ✅ |
-| [V1](#v1--a-node-that-brings-new-shards-cannot-join-a-cluster-that-holds-data) | A node that brings new shards cannot join a cluster that holds data — its tokens take key ranges and no document moves; refused until V8 | 15 | 2026-11-08 | 📋 |
+| [V1](#v1--a-node-that-brings-new-shards-cannot-join-a-cluster-that-holds-data) | A node that brings new shards cannot join a cluster that holds data — its tokens take key ranges and no document moves; refused until V8 | 15 | 2026-11-08 | ◐ |
 | [V2](#v2--document-versions-and-delete-markers) | Document versions and delete markers — a hybrid clock per write, newest wins; a storage format change | 15 | 2026-11-08 | 📋 |
 | [V3](#v3--the-wal-kept-until-replicas-confirm-it-and-the-change-stream) | The WAL kept until replicas confirm it, and the change stream | 15 | 2026-11-08 | 📋 |
 | [V4](#v4--the-copy-operation-one-index-from-one-node-to-another-with-catch-up) | The copy operation — one index from one node to another, with catch-up; serves replica fill, move, reindex and split | 15 | 2026-11-08 | 📋 |
@@ -3150,7 +3150,24 @@ leaving the cluster before shutdown's Phase 3) and [O4](#o4--the-request-budget-
 
 ### V1 — A node that brings new shards cannot join a cluster that holds data
 
-📋 **Planned.** Read from the code 2026-11-08, to be reproduced first. A node started with an
+◐ **Refusal built 2026-11-09** (step 6 of [the 0.3.10 order](#the-order-of-the-remaining-work)); archived after the `cluster.sh` run of steps 4–8, which reproduces the
+defect on an older image first. Joining with no shards is V8's.
+
+**What landed.** A member leaves out of its ring the shards of every node it has never known
+(no shard of that owner in its map or its snapshot) while it holds a live index, and tells that
+node once, with the reason (`JoinRefused`). The test is an index, not a document count: schemas
+are the same on every member, so every member decides alike and their rings stay alike, where
+counts differ from node to node. A refused node is kept out of the node registry, so it does not
+leave the cluster degraded once it is gone. The told node stops — through the same graceful
+shutdown as a signal, exiting with the reason — only if it holds no stored document; one that
+does is another cluster's member, keeps running and refuses the others in turn, so two clusters
+that meet never stop each other. With no index, nothing is refused: a fresh cluster grows as
+before. The `cluster.sh` *newcomer* phase: node1 and node2 configured, documents written, node3
+(not in their list) started empty — it must stop with the refusal, and the two keep their ring and
+every document. DEPLOYMENT says it. A node started empty in place of an old one ([OB27](#ob27--a-replaced-node-never-leaves-the-cluster)) is such a
+newcomer, and is refused now rather than joining beside its old identity.
+
+**The finding, as filed.** Read from the code 2026-11-08. A node started with an
 empty data directory creates `num_shards_init` shards and registers them
 (`RegisterLocalShards`, `orchestrator.rs:4863`); their tokens take over part of every index's key
 space, and no document moves. A later write of an existing id lands on the new shard while the old

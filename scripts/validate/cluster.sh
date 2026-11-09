@@ -3,6 +3,9 @@
 #
 #   peer down   two of three nodes, the third never started, hold each other's shards within
 #               seconds: a node that is down does not hold the exchange up (OB26)
+#   newcomer    node1 and node2 configured and holding documents, node3 started empty is
+#               refused: it stops with the reason, and the two keep their ring and every
+#               document (V1)
 #   formation   nodes started together find each other and agree on one ring; a node
 #               started before its seeds joins once they are up
 #   storm       new-index writes and index deletes on every node at once leave every node
@@ -163,6 +166,7 @@ esac
 write_compose() {
     local data="$1" n
     mkdir -p "$data/node1" "$data/node2" "$data/node3"
+    local members="${CLUSTER_MEMBERS:-node1:9580,node2:9580,node3:9580}"
     chmod -R 777 "$data"
     {
         echo "services:"
@@ -182,7 +186,7 @@ write_compose() {
       - CAMEODB_CLUSTER_BIND_ADDRESS=node$n
       - CAMEODB_CLUSTER_PORT=9580
       - CAMEODB_SEED_NODES=node1:9580,node2:9580
-      - CAMEODB_CLUSTER_NODES=node1:9580,node2:9580,node3:9580
+      - CAMEODB_CLUSTER_NODES=$members
       - CAMEODB_CLUSTER_PSK=$PSK
 $(for kv in ${CLUSTER_NODE_ENV:-}; do printf '      - %s\n' "$kv"; done)
     ports:
@@ -218,6 +222,39 @@ if ! CLUSTER_NODES="http://127.0.0.1:${PORTS[0]},http://127.0.0.1:${PORTS[1]}" \
     probe converge "$PEER_DOWN_SECS"; then
     collect_logs peer-down
 fi
+compose down -t 5 > /dev/null 2>&1
+
+section "a newcomer while the cluster holds data (node3 started empty after writes)"
+# node1 and node2 are the configured members; node3, not in their list, is started empty once
+# they hold documents. It brings shards they never knew. Taken in, their tokens would own key
+# ranges whose documents stay where they are: a later write of an existing id lands on node3
+# and the old copy stays behind (V1). The members leave node3's shards out and tell it; node3,
+# holding no documents, stops with the reason, and the two members answer as before. On a
+# build without the refusal this phase reproduces V1: node3 joins and the ring takes it in.
+TWO="http://127.0.0.1:${PORTS[0]},http://127.0.0.1:${PORTS[1]}"
+CLUSTER_MEMBERS="node1:9580,node2:9580" write_compose "$WORK/data-newcomer"
+compose up -d node1 node2 > /dev/null 2>&1
+wait_nodes "${PORTS[0]}" "${PORTS[1]}"
+CLUSTER_NODES="$TWO" check_cmd "the two configured members form" probe converge "$FORM_SECS"
+CLUSTER_NODES="$TWO" check_cmd "documents written to the two-node cluster" \
+    probe seed newcomer "$SURVIVORS"
+compose up -d node3 > /dev/null 2>&1
+stopped=""
+for _ in $(seq 1 30); do
+    state="$(run_bounded 10 docker inspect -f '{{.State.Running}} {{.State.ExitCode}}' "$PROJECT-node3" 2>/dev/null)"
+    if [ "${state%% *}" = "false" ]; then stopped="$state"; break; fi
+    sleep 1
+done
+if [ -n "$stopped" ] && [ "${stopped##* }" != "0" ] \
+    && run_bounded 10 docker logs "$PROJECT-node3" 2>&1 | grep -q "refused by the cluster"; then
+    pass "node3 stopped with the refusal (exit ${stopped##* })"
+else
+    fail "node3 stopped with the refusal" "state '${stopped:-running}' after 30s"
+    collect_logs newcomer
+fi
+CLUSTER_NODES="$TWO" check_cmd "the members' ring is their own shards alone" probe converge 10
+CLUSTER_NODES="$TWO" check_cmd "every document still found through both members" \
+    probe count newcomer "$SURVIVORS"
 compose down -t 5 > /dev/null 2>&1
 
 section "formation ($FORM_ROUNDS rounds, all three nodes started together)"

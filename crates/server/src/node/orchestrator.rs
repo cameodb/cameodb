@@ -5024,6 +5024,15 @@ impl NodeOrchestrator {
         self.shards.len()
     }
 
+    /// This node's shard stores, for the coordinator to read what the node holds without
+    /// asking this actor from inside its own handler.
+    pub(crate) fn shard_stores(&self) -> Vec<Arc<HybridStore>> {
+        self.shards
+            .values()
+            .filter_map(|shard| shard.store.clone())
+            .collect()
+    }
+
     /// A handle to this node's writer-thread liveness, for the health endpoint to read. Taken
     /// before the orchestrator is moved into its actor, so health can probe it without a message.
     pub(crate) fn writer_liveness(&self) -> Arc<WriterLiveness> {

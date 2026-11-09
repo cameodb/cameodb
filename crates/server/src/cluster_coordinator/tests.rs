@@ -495,4 +495,136 @@ mod tests {
             "an older snapshot committed after the latest"
         );
     }
+
+    /// A store under `dir`, holding index `docs` with `count` documents.
+    fn store_with_index(dir: &std::path::Path, count: u32) -> std::sync::Arc<storage::HybridStore> {
+        let store = storage::HybridStore::new(
+            storage::StorageConfig {
+                shard_path: dir.to_path_buf(),
+                ..storage::StorageConfig::default()
+            },
+            1,
+        )
+        .unwrap();
+        store
+            .store_schema_and_cache("docs", &storage::IndexSchema::default())
+            .unwrap();
+        for n in 0..count {
+            store
+                .apply_write(
+                    "docs",
+                    storage::WalOp::Put {
+                        id: format!("d{n}"),
+                        json_blob: Some(serde_json::json!({ "n": n })),
+                    },
+                )
+                .unwrap();
+        }
+        std::sync::Arc::new(store)
+    }
+
+    fn shard_of(owner: Uuid, token: u64) -> (Uuid, ShardMetadata) {
+        let shard_id = Uuid::new_v4();
+        (
+            shard_id,
+            ShardMetadata {
+                shard_id,
+                node_id: owner,
+                vnode_tokens: vec![token],
+                storage_bytes: 0,
+                document_count: 0,
+            },
+        )
+    }
+
+    fn merge_from(node_id: Uuid, shards: HashMap<Uuid, ShardMetadata>) -> MergeRemoteShards {
+        MergeRemoteShards {
+            node_id,
+            node_name: "peer".to_string(),
+            shards,
+            generation: 1,
+            shard_checksum: 1,
+        }
+    }
+
+    /// V1: a node the cluster never knew brings shards while the cluster holds an index. Taken
+    /// in, its tokens would own key ranges whose documents stay where they are. It is left out
+    /// of the ring and the node registry, and a known member's shards in the same push are not.
+    #[tokio::test]
+    async fn a_node_that_brings_new_shards_is_refused_while_an_index_exists() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cc = ClusterCoordinator::new(make_cluster());
+        cc.local_stores = vec![store_with_index(dir.path(), 0)];
+        let member = Uuid::new_v4();
+        let (member_shard, member_meta) = shard_of(member, 10);
+        cc.shard_assignments
+            .insert(member_shard, member_meta.clone());
+        cc.rebuild_ring();
+
+        let newcomer = Uuid::new_v4();
+        let (new_shard, new_meta) = shard_of(newcomer, 20);
+        let actor = <ClusterCoordinator as kameo::actor::Spawn>::spawn(cc);
+        actor
+            .tell(merge_from(
+                member,
+                HashMap::from([(member_shard, member_meta), (new_shard, new_meta.clone())]),
+            ))
+            .await
+            .unwrap();
+        actor
+            .tell(merge_from(newcomer, HashMap::from([(new_shard, new_meta)])))
+            .await
+            .unwrap();
+
+        let assignments = actor.ask(GetShardAssignments).await.unwrap();
+        assert!(assignments.contains_key(&member_shard));
+        assert!(
+            !assignments.contains_key(&new_shard),
+            "the newcomer's shard took key ranges"
+        );
+        let peers = actor.ask(GetKnownPeers).await.unwrap();
+        assert!(
+            peers.iter().all(|peer| peer.node_id != newcomer),
+            "the refused node is not counted as a member"
+        );
+    }
+
+    /// With no index there is nothing to take ranges from: a fresh cluster forms as before.
+    #[tokio::test]
+    async fn a_node_that_brings_new_shards_joins_while_no_index_exists() {
+        let mut cc = ClusterCoordinator::new(make_cluster());
+        let newcomer = Uuid::new_v4();
+        let (new_shard, new_meta) = shard_of(newcomer, 20);
+        let mut shards = HashMap::from([(new_shard, new_meta)]);
+        assert!(!cc.refuse_unknown_owners(newcomer, &mut shards));
+        assert_eq!(shards.len(), 1);
+        assert!(cc.refused_nodes.is_empty());
+    }
+
+    /// A member restarting with its shards is known by them, index or not.
+    #[tokio::test]
+    async fn a_known_member_is_never_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cc = ClusterCoordinator::new(make_cluster());
+        cc.local_stores = vec![store_with_index(dir.path(), 3)];
+        let member = Uuid::new_v4();
+        let (shard, meta) = shard_of(member, 10);
+        cc.shard_assignments.insert(shard, meta.clone());
+        let mut shards = HashMap::from([(shard, meta)]);
+        assert!(!cc.refuse_unknown_owners(member, &mut shards));
+        assert_eq!(shards.len(), 1);
+    }
+
+    /// The refused node stops only when it holds no documents; a node with data of its own is
+    /// another cluster's member and keeps running.
+    #[test]
+    fn only_a_node_without_documents_counts_as_a_newcomer() {
+        let empty = tempfile::TempDir::new().unwrap();
+        let full = tempfile::TempDir::new().unwrap();
+        let mut cc = ClusterCoordinator::new(make_cluster());
+        cc.local_stores = vec![store_with_index(empty.path(), 0)];
+        assert!(!cc.holds_documents());
+        cc.local_stores.push(store_with_index(full.path(), 2));
+        assert!(cc.holds_documents());
+    }
 }

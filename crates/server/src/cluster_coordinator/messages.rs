@@ -151,9 +151,25 @@ fn known_peer_connected() -> bool {
 }
 
 /// Message to set the local orchestrator reference
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SetLocalOrchestrator {
     pub orchestrator: kameo::actor::ActorRef<crate::node::NodeOrchestrator>,
+    /// This node's shard stores: what the coordinator reads to decide a join (see
+    /// [`JoinRefused`]) without asking the orchestrator from inside its own handler.
+    pub stores: Vec<std::sync::Arc<storage::HybridStore>>,
+}
+
+/// A member refused to take the receiver's shards into its ring: the cluster holds an index,
+/// and a node that brings shards the cluster has never known would take key ranges from it
+/// while no document moves — a later write of an existing id would land on the new shard and
+/// leave the old copy where it was (ROADMAP V1). Sent once per member and refused node.
+///
+/// The receiver stops only if it holds no documents of its own: a node that does is not a
+/// newcomer but another cluster's member, and refuses the sender's shards in turn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinRefused {
+    pub by: Uuid,
+    pub reason: String,
 }
 
 /// An index deletion across all nodes: what [`delete_index_cluster`](super::delete_index_cluster)

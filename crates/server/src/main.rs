@@ -671,6 +671,8 @@ async fn run(args: Vec<String>) -> Result<()> {
     // Taken before the actor is consumed by `spawn`: the router gates the mailbox lane against
     // the estimate the orchestrator writes, so both ends must hold the same handle.
     let mailbox_lane = orchestrator.mailbox_lane();
+    // Read before the orchestrator moves into its actor: the coordinator decides a join from them.
+    let shard_stores = orchestrator.shard_stores();
     let orchestrator_ref = NodeOrchestrator::spawn(orchestrator);
     let remote_name = orchestrator_remote_name(&node_id);
 
@@ -678,6 +680,7 @@ async fn run(args: Vec<String>) -> Result<()> {
     let _ = coordinator_actor
         .ask(crate::cluster_coordinator::SetLocalOrchestrator {
             orchestrator: orchestrator_ref.clone(),
+            stores: shard_stores,
         })
         .await;
 
@@ -1083,6 +1086,9 @@ async fn run(args: Vec<String>) -> Result<()> {
             _ = sigterm.recv() => {
                 tracing::info!("Received SIGTERM (systemctl stop), shutting down...")
             }
+            _ = crate::cluster_coordinator::JOIN_REFUSED.notified() => {
+                tracing::error!("The cluster refused this node's shards, shutting down...")
+            }
         }
         async move {
             tokio::select! {
@@ -1115,6 +1121,9 @@ async fn run(args: Vec<String>) -> Result<()> {
             // the service manager instead.
             _ = service::STOP.notified() => {
                 tracing::info!("Windows asked the service to stop, shutting down...")
+            }
+            _ = crate::cluster_coordinator::JOIN_REFUSED.notified() => {
+                tracing::error!("The cluster refused this node's shards, shutting down...")
             }
         }
         async move {
@@ -1249,5 +1258,10 @@ async fn run(args: Vec<String>) -> Result<()> {
         elapsed_ms = shutdown_start.elapsed().as_millis(),
         "Shutdown complete - process exiting cleanly"
     );
+    // A node the cluster refused ends with the reason, and a failing status, so a supervisor
+    // shows why it stopped rather than restarting it as if it had been asked to.
+    if let Some(reason) = crate::cluster_coordinator::JOIN_REFUSAL.get() {
+        anyhow::bail!("this node was refused by the cluster: {reason}");
+    }
     Ok(())
 }
