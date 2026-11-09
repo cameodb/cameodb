@@ -610,6 +610,13 @@ pub const TOKENIZER_RULES: &[(&str, &str)] = &[
          word or a part of the value matches nothing. Quote a value holding a space.",
     ),
     (
+        "raw_fold",
+        "The whole value is one term, matched in any case and with or without diacritics: \
+         `rjesenje` finds `RJEŠENJE`, `\"hrvatski sabor\"` finds `Hrvatski sabor`. Spaces and \
+         punctuation still count, and a word or a part of the value matches nothing. Quote a \
+         value holding a space.",
+    ),
+    (
         "whitespace",
         "Split at spaces only; case and punctuation are kept, so `Word,` and `word` are \
          different terms.",

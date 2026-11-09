@@ -68,8 +68,9 @@ most of that:
   unqualified term searches, which is exactly what a first-pass agent query is.
 - **Pick types for the operators you want used.** A numeric or date field sorts only with
   its `fast` column; a `text` field is matched by word under its tokenizer, where a `string`
-  field matches its whole value in the case it is written — so a `string` field whose values
-  vary in case, or that a reader will search by one word of, is better as `text`;
+  field matches its whole value in the case it is written — so a field of names or codes whose
+  case varies in the data is better as `text` with `raw_fold` (the whole value, in any case),
+  and one a reader will search by a word of is better as `text` under a word tokenizer;
   `indexed: false` keeps a payload field returned in hits but out of queries.
   `describe_index` reports each field's `type`, `tokenizer`, whether it is `searchable`,
   `sortable` and `returned`, a `query_hint` per type naming its operators and a

@@ -78,7 +78,7 @@ on one.
 | S — Delete by query | ✅ Done, unreleased (0.3.9) | S1, `POST /api/{index}/delete` — exact clauses, refused past `max_docs` unless confirmed — done 2026-11-02 |
 | T — OAuth for MCP clients | ✅ Done, unreleased (0.3.9) | T1, the node as the OAuth 2.1 authorization server for `/mcp` — discovery, dynamic client registration, an approval page taking the key the user holds, PKCE, refresh; stateless, tokens read-only and ended by revoking the key — done 2026-11-03 |
 | V — Cluster HA | ◐ Partial | V1–V13, opened 2026-11-08; V1 (a node bringing new shards refused) and V13 (a node moved to another machine) done 2026-11-09, with OB26, O4 and N17's cluster items, in 0.3.10. A cluster is partitioned (`replication_factor = 1`, today's behaviour, for systems that are not critical or whose HA is in the hardware) or replicated; two nodes are partitioned or a mirror. Phase 1, HA: the mirror — document versions, the change stream, the copy operation (V2–V5), with the schema round working with a peer down (OB26's bootstrap is done); no shard placement needed. Phase 2, a robust partitioned cluster: N11, then cluster metadata on a quorum of voters with a single-key compare-and-set, no Raft log, and shards owned by the cluster (V6–V8). Phase 3: move, drain, rebalance (V10) and replication with fewer copies than nodes (V9). Phase 4: online reindex and splitting (V11, V12) |
-| U — Post-0.3.9 features | ◐ Partial | U3, `raw_fold` — a whole value matched in any case, diacritics folded — planned for 0.3.10. U1, CJK analyzers — `cjk` (characters and character pairs, so Chinese, Japanese and Korean are searchable by word) and `cjk_fold` (traditional Chinese folded to simplified first, so a query in either script finds both) — done 2026-11-06. U2, Japanese and Korean folds — `cjk_ja_fold` (old-style kanji to new) and `cjk_ko_fold` (Hanja to Hangul, with the initial-sound rule) — done 2026-11-06 |
+| U — Post-0.3.9 features | ✅ Done, unreleased | U3, `raw_fold` — a whole value matched in any case, diacritics folded — done 2026-11-09, in 0.3.10. U1, CJK analyzers — `cjk` (characters and character pairs, so Chinese, Japanese and Korean are searchable by word) and `cjk_fold` (traditional Chinese folded to simplified first, so a query in either script finds both) — done 2026-11-06. U2, Japanese and Korean folds — `cjk_ja_fold` (old-style kanji to new) and `cjk_ko_fold` (Hanja to Hangul, with the initial-sound rule) — done 2026-11-06 |
 
 ## Reconciliation, 2026-08-26
 
@@ -264,8 +264,8 @@ confined to clusters ([V2](#v2--document-versions-and-delete-markers)'s decision
   overrides, listed as Phase 14's open stage, was built as M5 on 2026-09-25 (`index_overrides`)
   and never closed here.
 - **Added the same day, agent guidance:** [A8](docs/ROADMAP-ARCHIVE.md#a8--what-a-field-tells-an-agent-about-matching-it)
-  (done), then [U3](#u3--raw_fold-a-whole-value-matched-in-any-case), `raw_fold`, the groundwork for
-  better-organised indexes; [A9](#a9--a-string-clause-that-matches-nothing-names-the-spelling-that-exists)
+  and [U3](docs/ROADMAP-ARCHIVE.md#u3--raw_fold-a-whole-value-matched-in-any-case), `raw_fold`, the groundwork for
+  better-organised indexes, both done; [A9](#a9--a-string-clause-that-matches-nothing-names-the-spelling-that-exists)
   if it fits. Schema changes and reindexing of existing indexes are the last resort, not part of this.
 - **Not in 0.3.10:** N11, which opens V's phase 2, and V2–V5 and R3, which are 0.4.0. CH3 and P5
   stand as filed.
@@ -283,7 +283,7 @@ K2's merge and the refusal fix (`a2244ea`) their first multi-node check.
 | 3 ✅ | [E4](docs/ROADMAP-ARCHIVE.md#e4--two-compatibility-paths-with-no-end-to-end-test)'s fixtures — 0.3.0 and 0.3.9, done 2026-11-09 | Before any 0.4.0 storage work, so they are written by a real 0.3.x build |
 | 4 ✅ | [N17](#n17--smaller-items-filed-so-they-are-not-lost)'s cluster bugs: the snapshot persisted out of order, the checksum's `DefaultHasher` → xxh3, the peer tasks outside the cancellation token — all three fixed 2026-11-09 | Small real bugs under everything after them |
 | 5 ✅ | [OB26](docs/ROADMAP-ARCHIVE.md#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap) with [N12](#n12--dead-surface-and-the-comments-that-no-longer-match)'s coordinator dead surface — done 2026-11-09 | About a day, mostly deletion; the join path step 6 changes |
-| 6 ✅ | [U3](#u3--raw_fold-a-whole-value-matched-in-any-case) | `raw_fold` — a whole value matched in any case, diacritics folded | — | 2026-11-09 | 📋 |
+| 6 ✅ | [U3](docs/ROADMAP-ARCHIVE.md#u3--raw_fold-a-whole-value-matched-in-any-case) | `raw_fold` — a whole value matched in any case, diacritics folded; done 2026-11-09 | — | 2026-11-09 | ✅ |
 | [V1](docs/ROADMAP-ARCHIVE.md#v1--a-node-that-brings-new-shards-cannot-join-a-cluster-that-holds-data): reproduce, then refuse — done 2026-11-09, reproduced on a 0.3.9 image | On the bootstrap step 5 leaves |
 | 7 ✅ | [O4](docs/ROADMAP-ARCHIVE.md#o4--the-request-budget-crosses-the-wire) — done 2026-11-09 | The field is optional on the wire, so mixed versions still work |
 | 8 ✅ | [V13](docs/ROADMAP-ARCHIVE.md#v13--a-node-whose-disks-move-to-another-machine-rejoins-as-itself): a `cluster.sh` phase and a DEPLOYMENT procedure — done 2026-11-09 | Exercises everything above |
@@ -529,8 +529,7 @@ nothing depends on it and nothing blocks it.
 
 ### A9 — A string clause that matches nothing names the spelling that exists
 
-📋 **Planned**, next after [U3](#u3--raw_fold-a-whole-value-matched-in-any-case) or before it — neither
-needs the other. A `string` clause that matches nothing is most often a value in another case:
+📋 **Planned.** A `string` clause that matches nothing is most often a value in another case:
 `authors:"austen, jane"` against `Austen, Jane`. The node can tell cheaply: look the lowercase,
 uppercase and capitalised spellings of the term up in the term dictionary (three lookups per
 clause, no scan) and, where one exists, say so — in `validate_query`'s analysis and as a `_warning`
@@ -2870,28 +2869,12 @@ what a cluster does; a `CHANGELOG.md` entry.
 
 ---
 
-## U. Post-0.3.9 features ◐ Partial
+## U. Post-0.3.9 features ✅ Done
 
-U1 and U2, the CJK analyzers, are done; see
+U1 and U2, the CJK analyzers, and U3, `raw_fold`, are done; see
 [U. Post-0.3.9 features](docs/ROADMAP-ARCHIVE.md#u-post-039-features--done).
 
-### U3 — `raw_fold`: a whole value matched in any case
-
-📋 **Planned**, next in 0.3.10, as the groundwork for better-organised indexes. Every analyzer that
-lowercases also splits into words, and `raw`, the one that keeps a value whole, keeps its case — so a
-field of names, codes or labels has to choose between exact-but-case-sensitive (`string`) and
-any-case-but-by-word (`text`). Values whose case varies within one field are common in real data: a
-gazette's body names mix `Vlada Republike Hrvatske` and `PREDSJEDNICA REPUBLIKE HRVATSKE`, its
-document types are `RJEŠENJE` where a reader types `rjesenje`, a CELEX number is `32013R1303`.
-
-`raw_fold` keeps the whole value as one term, lowercased and diacritics folded, declared on a `text`
-field (a `string` field builds `raw` whatever it declares). Hits still return the value as written,
-from the document store. To check in the build: that a query's value, a prefix, range bounds and an
-`IN` set all pass through the field's tokenizer, so `doc_type:rjesenje`, `doc_type:rje*` and
-`passed_by_label:"hrvatski sabor"` match; what a fast column on such a field sorts by; a matching
-rule for [A8](docs/ROADMAP-ARCHIVE.md#a8--what-a-field-tells-an-agent-about-matching-it)'s `tokenizer_hints`.
-A new name, so no existing field changes: an index uses it by declaring it, which for a field that
-already holds data is a reindex.
+- ✅ [**U3 — `raw_fold`: a whole value matched in any case**](docs/ROADMAP-ARCHIVE.md#u3--raw_fold-a-whole-value-matched-in-any-case)
 
 ---
 

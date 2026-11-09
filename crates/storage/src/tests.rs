@@ -1502,6 +1502,103 @@ mod tests {
         assert_eq!(hits("text_plain:županije"), 1);
     }
 
+    /// `raw_fold`, end to end: every query form that names a value — the value itself, quoted, a
+    /// prefix, a range, an `IN` set — meets the stored value in any case and with or without
+    /// diacritics, and still only the whole value; the hit returns it as written.
+    #[test]
+    fn raw_fold_matches_a_whole_value_in_any_case() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = single_shard_store(&temp_dir);
+        let index = "gazette";
+        let mut schema: IndexSchema = serde_json::from_value(serde_json::json!({
+            "fields": {
+                "passed_by": {"field_type": "text", "indexed": true, "tokenizer": "raw_fold"},
+                "doc_type": {"field_type": "text", "indexed": true, "tokenizer": "raw_fold"},
+                "eu_acts": {"field_type": "text", "indexed": true, "tokenizer": "raw_fold"},
+                "doc_type_exact": {"field_type": "string", "indexed": true},
+                "doc_type_fold": {"field_type": "text", "indexed": true, "tokenizer": "raw_fold",
+                                  "ghost": {"source": "doc_type_exact"}}
+            }
+        }))
+        .unwrap();
+        schema.normalize_after_deserialization();
+        schema.validate_tokenizers().unwrap();
+        // One term, so no positions to keep.
+        assert_eq!(
+            schema.fields["doc_type"].index_record_option.as_deref(),
+            Some("Basic")
+        );
+        store.store_schema_and_cache(index, &schema).unwrap();
+
+        for (id, passed_by, doc_type, eu_acts) in [
+            (
+                "a1",
+                "PREDSJEDNICA REPUBLIKE HRVATSKE",
+                "RJEŠENJE",
+                vec!["32013R1303"],
+            ),
+            (
+                "a2",
+                "Hrvatski sabor",
+                "ZAKON",
+                vec!["32009L0065", "32013R1303"],
+            ),
+            ("a3", "Vlada Republike Hrvatske", "UREDBA", vec![]),
+        ] {
+            store
+                .apply_write(
+                    index,
+                    WalOp::Put {
+                        id: id.to_string(),
+                        json_blob: Some(serde_json::json!({
+                            "passed_by": passed_by,
+                            "doc_type": doc_type,
+                            "doc_type_exact": doc_type,
+                            "eu_acts": eu_acts,
+                        })),
+                    },
+                )
+                .unwrap();
+        }
+        store.commit_index(index).unwrap();
+
+        let hits = |query: &str| {
+            store
+                .search_documents(index, query, 10, None)
+                .unwrap()
+                .total_hits
+        };
+        // The value in another case, and without its diacritics.
+        assert_eq!(hits("doc_type:rjesenje"), 1);
+        assert_eq!(hits("doc_type:Rješenje"), 1);
+        assert_eq!(hits(r#"passed_by:"hrvatski sabor""#), 1);
+        assert_eq!(hits(r#"passed_by:"predsjednica republike hrvatske""#), 1);
+        assert_eq!(hits("eu_acts:32013r1303"), 2);
+        // Still the whole value: a word of it matches nothing.
+        assert_eq!(hits("passed_by:sabor"), 0);
+        assert_eq!(hits(r#"passed_by:"republike hrvatske""#), 0);
+        // A prefix, a range and a set are folded the same way.
+        assert_eq!(hits("passed_by:hrv*"), 1);
+        assert_eq!(hits("passed_by:VLADA*"), 1);
+        assert_eq!(hits("doc_type:[rjesenje TO zakon]"), 3);
+        assert_eq!(hits("doc_type: IN [zakon uredba]"), 2);
+        // The `string` field beside it keeps the case it was written in.
+        assert_eq!(hits("doc_type_exact:rjesenje"), 0);
+        assert_eq!(hits("doc_type_exact:RJEŠENJE"), 1);
+        // A ghost of a `string` field under `raw_fold`: the exact field kept, a folded one beside.
+        assert_eq!(hits("doc_type_fold:rjesenje"), 1);
+
+        // The hit carries the value as written, not as indexed.
+        let result = store
+            .search_documents(index, "doc_type:rjesenje", 10, None)
+            .unwrap();
+        assert_eq!(
+            result.hits[0].1["doc_type"], "RJEŠENJE",
+            "{:?}",
+            result.hits
+        );
+    }
+
     /// A traversal index name must not create or remove anything outside the
     /// shard. This exercises the real write and delete paths rather than the
     /// validator in isolation, because the earlier canonicalize-based guard

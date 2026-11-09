@@ -864,6 +864,7 @@ exactly as the documents were. Omitted, it is `default`.
 |---|---|
 | `default` | Splits on anything not a letter or digit, lowercases. Matches the forms written |
 | `raw` | The whole value as one term; exact match only |
+| `raw_fold` | The whole value as one term, lowercased and with diacritics removed, so `rjesenje` finds `RJEŠENJE` and `"hrvatski sabor"` finds `Hrvatski sabor`, and a word or part of the value still finds nothing. For names, codes and labels whose case varies in the data; hits return the value as written. Its postings default to `Basic`: one term has no positions |
 | `whitespace` | Splits on whitespace only; no lowercasing |
 | `en_stem` · `de_stem` · `fr_stem` · `es_stem` | `default`, then the language's Snowball stemmer, so `concejales` finds `concejal` |
 | `it_stem` | `default`, then the Italian Snowball stemmer with the forms it leaves apart brought together, so `regolamenti` finds `regolamento`, `anni` finds `anno`, `italiane` finds `italiano` and `scrittrice` finds `scrittore` |
@@ -1151,7 +1152,7 @@ The per-field keys:
 | `returned_as` | Present on `id` alone, and only on an index that has a shadow field: names the field hits carry the identifier under instead, since no hit on such an index carries an `id` |
 | `stored` | Kept in the search index as well as the document store |
 | `tokenizer` | On an indexed `text` or `string` field: how its values become terms, the default it took when none was declared — `default` for `text`, `raw` for `string` |
-| `index_record_option` | On an indexed `text` or `string` field: what its postings keep — `Basic`, `WithFreqs` or `WithFreqsAndPositions`. `WithFreqsAndPositions` for `text` unless declared otherwise, `Basic` for `string`. A field without positions matches no phrase; the CLI loader writes its category columns as `text` with `raw` and `Basic` |
+| `index_record_option` | On an indexed `text` or `string` field: what its postings keep — `Basic`, `WithFreqs` or `WithFreqsAndPositions`. `WithFreqsAndPositions` for `text` unless declared otherwise, `Basic` for `string` and for a `text` field under `raw_fold`. A field without positions matches no phrase; the CLI loader writes its category columns as `text` with `raw` and `Basic` |
 | `learned` | Present, and `true`, on a field added by a write rather than declared: not indexed, and its type widens to take each new value rather than refusing it |
 | `ghost` | Present on a ghost field, as declared: the `source` its column is filled from, and the `when` condition, if any, on which documents feed it. Searched, never returned — see [Ghost fields](#createupdate-index-schema) |
 | `default_search` | Whether a term with no field in front of it searches this field. With `default_fields` declared: the declared fields the built index can search. Without: every field it can search as indexed text, string or json, other than `id` and a shadow, by name. Either way the first `max_default_fields` of them. Computed on each read, never stored |

@@ -1981,7 +1981,7 @@ Left as their own items: telling the agent which spelling exists when a string c
 nothing ([A9](../ROADMAP.md#a9--a-string-clause-that-matches-nothing-names-the-spelling-that-exists)), a field's top values
 ([A10](../ROADMAP.md#a10--the-values-a-string-field-holds)), a list flag
 ([A11](../ROADMAP.md#a11--a-field-declared-a-list)), and a whole-value tokenizer that ignores case
-([U3](../ROADMAP.md#u3--raw_fold-a-whole-value-matched-in-any-case)).
+([U3](#u3--raw_fold-a-whole-value-matched-in-any-case)).
 
 ## C. Phase 14 — Security Hardening — delivered items
 
@@ -6157,6 +6157,29 @@ analyzer is rebuilt by reloading it.
 
 **Consumer.** The Gutenberg case: `text_ja` moves to `cjk_ja_fold`, and Korean gets its own
 `text_ko` on `cjk_ko_fold` once a Korean-language book is in its collection.
+
+### U3 — `raw_fold`: a whole value matched in any case
+
+✅ **Done** 2026-11-09, in 0.3.10, found with
+[A8](#a8--what-a-field-tells-an-agent-about-matching-it). Every analyzer that lowercases also
+split into words, and `raw`, the one that kept a value whole, kept its case — so a field of names,
+codes or labels chose between exact-but-case-sensitive (`string`) and any-case-but-by-word
+(`text`). Case varies within one field in real data: a gazette's body names mix `Vlada Republike
+Hrvatske` and `PREDSJEDNICA REPUBLIKE HRVATSKE`, its document types are `RJEŠENJE` where a reader
+types `rjesenje`, a CELEX number is `32013R1303`.
+
+**What landed.** `raw_fold`: tantivy's `RawTokenizer`, then `LowerCaser` and `AsciiFoldingFilter`,
+uncapped like `raw`, declared on a `text` field (a `string` field builds `raw` whatever it
+declares). Its postings default to `Basic`, as a `string` field's do: one term has no positions,
+and a quoted value is one term, not a phrase. Nothing on the query side needed changing — tantivy
+analyses a range's bounds and an `IN` set's values with the field's analyzer, and the prefix
+rewrite already ran its term through it — so `doc_type:rjesenje`, `passed_by:hrv*`,
+`doc_type:[rjesenje TO zakon]` and `doc_type: IN [zakon uredba]` all fold, a word of the value
+still matches nothing, and the hit returns the value as written. A fast column on such a field
+holds the untokenized value, so a sort orders by the value as written. Its matching rule is in
+`TOKENIZER_RULES`, so `describe_index` explains it. A new name: no existing field changes. A field that
+holds data takes it with a reindex, declared on the field itself or, keeping a `string` field as it
+is for exact matching, on a ghost of it.
 
 ## V. Cluster HA — delivered items
 

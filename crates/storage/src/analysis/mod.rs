@@ -17,8 +17,8 @@ mod portuguese;
 
 use tantivy::Index;
 use tantivy::tokenizer::{
-    AsciiFoldingFilter, Language, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer,
-    TextAnalyzer,
+    AsciiFoldingFilter, Language, LowerCaser, RawTokenizer, RemoveLongFilter, SimpleTokenizer,
+    Stemmer, TextAnalyzer,
 };
 
 pub(crate) use accents::SuffixAccents;
@@ -50,6 +50,7 @@ pub(crate) const MAX_INDEXED_TOKEN_LEN: usize = 128;
 pub const TOKENIZERS: &[&str] = &[
     "default",
     "raw",
+    "raw_fold",
     "whitespace",
     "en_stem",
     "cjk",
@@ -109,6 +110,21 @@ pub(crate) fn register_tokenizers(index: &Index) {
     };
 
     manager.register("default", lowercased().build());
+
+    // The whole value as one term, as `raw` keeps it, lowercased and with diacritics folded: a
+    // field of names, codes or labels whose case varies in the data (`Vlada Republike Hrvatske`
+    // beside `PREDSJEDNICA REPUBLIKE HRVATSKE`) matched exactly, but in any case and with or
+    // without diacritics (`rjesenje` finds `RJEŠENJE`). Uncapped, like `raw`: a value is one term
+    // whatever its length, and dropping a long one would make it unfindable rather than shorter.
+    // A query's value, a prefix, range bounds and an `IN` set all pass through the field's
+    // analyzer, so each is folded the same way; hits return the value as written, from redb.
+    manager.register(
+        "raw_fold",
+        TextAnalyzer::builder(RawTokenizer::default())
+            .filter(LowerCaser)
+            .filter(AsciiFoldingFilter)
+            .build(),
+    );
     for &(name, language) in TANTIVY_STEMMED {
         manager.register(name, lowercased().filter(Stemmer::new(language)).build());
     }
@@ -564,6 +580,31 @@ mod tests {
         }
     }
 
+    /// `raw_fold` keeps the value whole and meets it in any case, with or without diacritics.
+    #[test]
+    fn raw_fold_is_one_term_in_any_case() {
+        assert_eq!(
+            analyze("raw_fold", "PREDSJEDNICA Republike Hrvatske"),
+            vec!["predsjednica republike hrvatske".to_string()]
+        );
+        assert_eq!(
+            analyze("raw_fold", "RJEŠENJE"),
+            analyze("raw_fold", "rjesenje")
+        );
+        assert_eq!(
+            analyze("raw_fold", "32013R1303"),
+            vec!["32013r1303".to_string()]
+        );
+        // Punctuation is part of the value, as under `raw`.
+        assert_eq!(
+            analyze("raw_fold", "Austen, Jane"),
+            vec!["austen, jane".to_string()]
+        );
+        // No cap: a value is one term whatever its length.
+        let long = "x".repeat(MAX_INDEXED_TOKEN_LEN * 2);
+        assert_eq!(analyze("raw_fold", &long), vec![long.clone()]);
+    }
+
     /// Every tokenizing analyzer keeps a token of exactly the cap, not only the two that
     /// existed when the cap was introduced.
     #[test]
@@ -572,7 +613,7 @@ mod tests {
         let over = "0".repeat(MAX_INDEXED_TOKEN_LEN + 1);
         for name in TOKENIZERS
             .iter()
-            .filter(|name| !matches!(**name, "raw" | "whitespace"))
+            .filter(|name| !matches!(**name, "raw" | "raw_fold" | "whitespace"))
         {
             assert_eq!(analyze(name, &digest), vec![digest.clone()], "{name}");
             assert!(analyze(name, &over).is_empty(), "{name}");

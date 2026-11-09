@@ -1429,9 +1429,16 @@ impl IndexSchema {
                     if field_def.tokenizer.is_none() {
                         field_def.tokenizer = Some("default".to_string());
                     }
-                    // Set default index record option if not specified
+                    // Set default index record option if not specified. A `raw_fold` value is
+                    // one term, so it has no positions to keep and a phrase over it is a term:
+                    // `Basic`, as a `string` field has.
                     if field_def.index_record_option.is_none() {
-                        field_def.index_record_option = Some("WithFreqsAndPositions".to_string());
+                        field_def.index_record_option =
+                            Some(if field_def.tokenizer.as_deref() == Some("raw_fold") {
+                                "Basic".to_string()
+                            } else {
+                                "WithFreqsAndPositions".to_string()
+                            });
                     }
                 }
                 TantivyFieldType::String => {

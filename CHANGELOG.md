@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`raw_fold` tokenizer: a whole value matched in any case.** `raw` keeps a value whole and keeps
+  its case, and every analyzer that lowercases also splits into words, so a field of names, codes or
+  labels whose case varies in the data had no exact match a reader could hit: `Vlada Republike
+  Hrvatske` beside `PREDSJEDNICA REPUBLIKE HRVATSKE`, `RJEŠENJE` where a reader types `rjesenje`.
+  `raw_fold` keeps the value as one term, lowercased and with diacritics removed, on a `text` field;
+  a value, a quoted value, a prefix, range bounds and an `IN` set are folded the same way, and hits
+  return the value as written. Its postings default to `Basic`. A new name: no existing field
+  changes, and a field that already holds data takes it by reindexing.
 - **`cjk` and `cjk_fold` tokenizers: Chinese, Japanese and Korean searchable by word.** Every
   analyzer so far made one term of a whole clause between two punctuation marks, so only a query
   for exactly that clause matched (on a sample of classical Chinese books, `道` found 11% of the

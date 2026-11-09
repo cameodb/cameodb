@@ -529,6 +529,7 @@ schema, and the table below, which is generated and checked against the tables b
 | Tokenizer | Matching |
 |---|---|
 | `raw` | The whole value is one term, matched exactly: case, spaces and punctuation count, and a word or a part of the value matches nothing. Quote a value holding a space. |
+| `raw_fold` | The whole value is one term, matched in any case and with or without diacritics: `rjesenje` finds `RJEŠENJE`, `"hrvatski sabor"` finds `Hrvatski sabor`. Spaces and punctuation still count, and a word or a part of the value matches nothing. Quote a value holding a space. |
 | `whitespace` | Split at spaces only; case and punctuation are kept, so `Word,` and `word` are different terms. |
 | `default` | Words, in any case; punctuation splits them. No stemming, and diacritics are kept: `run` does not find `running`, `cafe` does not find `café`. |
 | `en_stem` | Words in any case, English stemmed: `running` finds `runs`. |
