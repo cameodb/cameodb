@@ -256,6 +256,7 @@ pub(super) fn search_index(
             .router
             .route_and_handle(
                 ClientOp::Search {
+                    spent_ms: None,
                     index: index.index,
                     query: cleaned_query,
                     limit: Some(window.limit),
@@ -398,6 +399,7 @@ pub(super) fn search_across_indexes(
                         .router
                         .route_and_handle_keeping_sort_keys(
                             ClientOp::Search {
+                                spent_ms: None,
                                 index: index.clone(),
                                 query: cleaned_query,
                                 limit: Some(window.fetch_count()),

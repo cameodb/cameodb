@@ -117,6 +117,7 @@ impl RouterActor {
         refresh: bool,
     ) -> Result<DeleteTally, OrchestratorError> {
         let op = ClientOp::DeleteByQuery {
+            spent_ms: None,
             index: index.to_string(),
             query: query.to_string(),
             mode,

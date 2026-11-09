@@ -4598,6 +4598,32 @@ timeout over lookup-and-ask. **Change:** route all three through it. The hand-ro
 backoff inside `PeerDiscovered` goes when N15 folds that handler into the one exchange —
 the retry belongs to the exchange, not to the event handler.
 
+### O4 — The request budget crosses the wire
+
+✅ **Done 2026-11-09** (step 7 of [the 0.3.10 order](../ROADMAP.md#the-order-of-the-remaining-work)).
+The six ops a node forwards — `Search`, `Write`, `BulkWrite`, `Delete`, `BulkDelete`,
+`DeleteByQuery` — carry `spent_ms`, `#[serde(default)]`, so a peer on either side of the change
+reads the other. It is how much of the request's budget was spent when the op left: stamped in
+the router's `try_remote` on every attempt (so a retry tells the owner how much less is left), in
+`forward_later` when it is called, and on the bulk shares as they are built — wherever the
+request's `REQUEST_STARTED_AT` scope is in reach; an op sent outside one carries `None`. Elapsed
+rather than the remaining budget the item first named: each node judges against its own
+`request_timeout_secs`, and with equal timeouts the two are the same. On the peer,
+`peer_op_clock` starts the clock that far back: an op already past `read_budget` is refused at
+the door with `ReadDeadlineExpired` (`503`), and the rest run inside that scope on the peer lane
+and on the mailbox, so the read pool's deadline and the search deadline measure the client's
+budget, not a fresh one. API_REFERENCE says that a forwarded share refused this way may leave the
+rest of a bulk request applied, and that a retry is safe because writes and deletes are keyed by
+id. Tests: the field's absence and round trip, the stamp inside and outside a request, the
+refusal and the clock, and a forwarded read refused at the pool on its request's deadline. Not
+covered: an op that reaches the actor after a worker handed it back carries no scope there, so a
+forward made from the actor carries `None`, as before.
+
+**The finding, as filed.** F7 shedding measures `REQUEST_STARTED_AT`, a task-local: a forwarded
+`ClientOp` starts a fresh clock on the peer, which then runs work for a client the first hop
+already abandoned — and the router's retry in `handle_remote` spends the peer's writer time
+again.
+
 ## P. Post-0.3.7 features — delivered items
 
 The introduction to this group and its open items are in [ROADMAP.md](../ROADMAP.md), under [P. Post-0.3.7 features](../ROADMAP.md#p-post-037-features--partial).

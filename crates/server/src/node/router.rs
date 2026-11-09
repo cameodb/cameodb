@@ -134,6 +134,7 @@ pub(super) fn widen_broadcast_op(op: ClientOp, window: SearchWindow) -> ClientOp
             metrics,
             ..
         } => ClientOp::Search {
+            spent_ms: None,
             index,
             query,
             limit: Some(window.fetch_count()),
@@ -1727,7 +1728,10 @@ impl RouterActor {
         // that restarted, which answers "actor not running" until the peer's departure is
         // noticed. Drop the peer's refs so the next call looks it up afresh. Not on this
         // router's own timers: those fire on a slow answer as readily as on a lost one.
-        let answer = remote_answer(remote.ask(op).await);
+        // Stamped per attempt, so a retry tells the peer how much less time is left (O4).
+        let mut op = op.clone();
+        op.stamp_spent();
+        let answer = remote_answer(remote.ask(&op).await);
         if let Err(never_arrived) = &answer
             && !matches!(never_arrived, OrchestratorError::Remote { .. })
         {

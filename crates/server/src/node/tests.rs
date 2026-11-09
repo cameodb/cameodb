@@ -590,6 +590,7 @@ fn a_search_without_an_array_limit_reads_as_whole_arrays_and_one_with_it_keeps_i
     ));
 
     let op = ClientOp::Search {
+        spent_ms: None,
         index: "i".to_string(),
         query: "*".to_string(),
         limit: Some(10),
@@ -870,6 +871,7 @@ async fn an_op_the_engine_declines_comes_back_whole() {
 
     let outcome = engine
         .execute(ClientOp::BulkWrite {
+            spent_ms: None,
             index: "books".to_string(),
             docs: vec![DocPayload {
                 id: "b1".to_string(),
@@ -952,6 +954,7 @@ type TestOp = std::pin::Pin<Box<dyn std::future::Future<Output = WorkerOutcome> 
 
 fn placeholder_op() -> Box<ClientOp> {
     Box::new(ClientOp::Write {
+        spent_ms: None,
         index: "bench".to_string(),
         id: "d1".to_string(),
         routing_key: None,
@@ -1097,6 +1100,7 @@ fn the_unkeyed_rung_keeps_the_derivation_that_places_shards() {
 #[test]
 fn a_bulk_delete_without_a_hop_marker_reads_as_a_first_hop() {
     let op = ClientOp::BulkDelete {
+        spent_ms: None,
         index: "books".to_string(),
         docs: vec![],
         forwarded: true,
@@ -2250,6 +2254,7 @@ fn an_ordinary_forward_carries_no_schema_at_all() {
     }
 
     let forward = ClientOp::BulkWrite {
+        spent_ms: None,
         index: "books".to_string(),
         docs: vec![DocPayload {
             id: "b1".to_string(),
@@ -2295,6 +2300,7 @@ fn a_resend_attaches_the_body_the_peer_asked_for() {
     );
 
     let forwarded = ClientOp::Write {
+        spent_ms: None,
         index: "books".to_string(),
         id: "b1".to_string(),
         routing_key: None,
@@ -2333,6 +2339,7 @@ fn a_resend_attaches_the_body_the_peer_asked_for() {
     assert!(
         with_schema_body(
             &ClientOp::Delete {
+                spent_ms: None,
                 index: "books".to_string(),
                 id: "b1".to_string(),
                 routing_key: None,
@@ -2795,6 +2802,7 @@ fn a_paged_merge_returns_the_right_slice_of_the_full_order() {
 #[test]
 fn a_fan_out_reads_the_page_off_the_operation() {
     let search = |limit: Option<usize>, offset: Option<usize>| ClientOp::Search {
+        spent_ms: None,
         index: "books".to_string(),
         query: "rust".to_string(),
         limit,
@@ -3818,6 +3826,7 @@ async fn clustered_orchestrator(dir: &std::path::Path) -> NodeOrchestrator {
 
 fn first_write(index: &str) -> ClientOp {
     ClientOp::Write {
+        spent_ms: None,
         index: index.to_string(),
         id: "d1".to_string(),
         routing_key: None,
@@ -3942,6 +3951,7 @@ async fn only_a_clustered_first_write_canvasses_outside_the_mailbox() {
         Some("books".to_string())
     );
     let bulk = ClientOp::BulkWrite {
+        spent_ms: None,
         index: "books".to_string(),
         docs: Vec::new(),
         forwarded: false,
@@ -4006,6 +4016,7 @@ async fn a_forward_runs_off_the_mailbox() {
     let orchestrator = clustered_orchestrator(dir.path()).await;
     let target = Uuid::new_v4();
     let delete = |forwarded| ClientOp::Delete {
+        spent_ms: None,
         index: "books".to_string(),
         id: "d1".to_string(),
         routing_key: None,
@@ -4038,6 +4049,7 @@ fn only_what_a_worker_can_serve_leaves_the_mailbox() {
     for op in [
         first_write("books"),
         ClientOp::BulkWrite {
+            spent_ms: None,
             index: index(),
             docs: Vec::new(),
             forwarded: true,
@@ -4045,11 +4057,13 @@ fn only_what_a_worker_can_serve_leaves_the_mailbox() {
             tenant: None,
         },
         ClientOp::BulkDelete {
+            spent_ms: None,
             index: index(),
             docs: Vec::new(),
             forwarded: true,
         },
         ClientOp::Search {
+            spent_ms: None,
             index: index(),
             query: "*".to_string(),
             limit: None,
@@ -4373,4 +4387,111 @@ fn a_broadcast_merges_each_nodes_metrics_into_one() {
         stats.metrics,
         Some(json!({"min": {"rank": -7}, "max": {"seen": "2026-03-01T00:00:00Z"}}))
     );
+}
+
+/// An op from a peer that predates `spent_ms` carries none, and starts its clock on arrival; one
+/// that carries it keeps it across the wire. Through `serde_json`, which has kameo's
+/// missing-field rule — see `an_op_without_the_forwarded_flag_reads_as_a_first_hop`.
+#[test]
+fn an_op_without_spent_ms_reads_as_none_and_one_with_it_keeps_it() {
+    let old: ClientOp = serde_json::from_str(
+        r#"{"Write":{"index":"i","id":"d1","routing_key":null,"doc":{"t":1},"forwarded":true}}"#,
+    )
+    .expect("a Write from a peer that does not send `spent_ms`");
+    assert_eq!(old.spent_ms(), None);
+
+    let sent = ClientOp::Delete {
+        index: "i".to_string(),
+        id: "d1".to_string(),
+        routing_key: None,
+        forwarded: true,
+        spent_ms: Some(840),
+    };
+    let wire = serde_json::to_string(&sent).unwrap();
+    let read: ClientOp = serde_json::from_str(&wire).unwrap();
+    assert_eq!(read.spent_ms(), Some(840));
+}
+
+/// An op sent inside a request carries what that request has spent; one sent outside any —
+/// an internal call, with no client waiting — carries nothing (O4).
+#[tokio::test]
+async fn an_op_sent_from_a_request_carries_what_it_has_spent() {
+    let op = || ClientOp::Delete {
+        index: "i".to_string(),
+        id: "d1".to_string(),
+        routing_key: None,
+        forwarded: true,
+        spent_ms: None,
+    };
+    let started = Instant::now() - Duration::from_millis(300);
+    let stamped = REQUEST_STARTED_AT
+        .scope(started, async {
+            let mut op = op();
+            op.stamp_spent();
+            op
+        })
+        .await;
+    assert!(
+        stamped.spent_ms().is_some_and(|ms| ms >= 300),
+        "{:?}",
+        stamped.spent_ms()
+    );
+
+    let mut internal = op();
+    internal.stamp_spent();
+    assert_eq!(internal.spent_ms(), None);
+}
+
+/// The peer's side (O4): an op arriving with its budget already spent is refused before it
+/// runs, as the worker pool's dequeue check refuses a stale job; one with budget left counts
+/// as having arrived when its request did; one with no `spent_ms` arrives now.
+#[test]
+fn a_peers_op_is_judged_against_its_requests_budget() {
+    let budget = Some(Duration::from_millis(1_000));
+    match peer_op_clock(Some(1_500), budget) {
+        Err(OrchestratorError::ReadDeadlineExpired {
+            waited_ms,
+            budget_ms,
+        }) => {
+            assert!(waited_ms >= 1_500, "{waited_ms}");
+            assert_eq!(budget_ms, 1_000);
+        }
+        other => panic!("expected the spent op refused, got {other:?}"),
+    }
+
+    let arrived = peer_op_clock(Some(400), budget).expect("budget left");
+    assert!(arrived.elapsed() >= Duration::from_millis(400));
+
+    let fresh = peer_op_clock(None, budget).expect("no spent_ms");
+    assert!(fresh.elapsed() < Duration::from_millis(100));
+
+    assert!(
+        peer_op_clock(Some(60_000), None).is_ok(),
+        "no budget, nothing refused"
+    );
+}
+
+/// And the clock the peer starts reaches its read pool: a search whose request had spent most
+/// of its budget on the first node is refused at the pool once the wait there uses the rest.
+#[test]
+fn a_forwarded_reads_deadline_is_its_requests_deadline() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let arrived = peer_op_clock(Some(90), Some(Duration::from_millis(100))).expect("in budget");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let read: Result<(), OrchestratorError> = REQUEST_STARTED_AT
+            .scope(
+                arrived,
+                dispatch_read_pool(None, None, Some(Duration::from_millis(100)), || {}),
+            )
+            .await;
+        assert!(
+            matches!(read, Err(OrchestratorError::ReadDeadlineExpired { .. })),
+            "a read on a fresh clock would have run: {read:?}"
+        );
+    });
 }

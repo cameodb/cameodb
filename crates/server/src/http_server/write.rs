@@ -120,6 +120,7 @@ pub(super) async fn write_handler(
     let effective_routing_key = routing_key.or_else(|| Some(id.clone()));
 
     let client_op = ClientOp::Write {
+        spent_ms: None,
         index,
         id,
         routing_key: effective_routing_key.clone(),
@@ -185,6 +186,7 @@ pub(super) async fn delete_document_handler(
     let effective_routing_key = routing_key.clone().or_else(|| Some(id.clone()));
 
     let client_op = ClientOp::Delete {
+        spent_ms: None,
         index,
         id,
         routing_key,
@@ -225,6 +227,7 @@ pub(super) async fn bulk_delete_handler(
     check_write_rate(&state, &caller_of(caller), docs.len())?;
 
     let client_op = ClientOp::BulkDelete {
+        spent_ms: None,
         index,
         docs,
         // A request off the wire is the first hop.
@@ -258,6 +261,7 @@ pub(super) async fn bulk_write_handler(
     let tenant = tenant_of(authz);
 
     let client_op = ClientOp::BulkWrite {
+        spent_ms: None,
         index,
         docs,
         // A request off the wire is the first hop, and decides its own schema.
@@ -714,6 +718,7 @@ pub(super) async fn flush_write_batch(
     tenant: Option<&str>,
 ) -> Result<JsonValue, crate::node::OrchestratorError> {
     let client_op = ClientOp::BulkWrite {
+        spent_ms: None,
         index: index.to_string(),
         docs,
         forwarded: false,

@@ -743,6 +743,7 @@ impl BulkCtx<'_> {
         // against it says so, and the resend below carries the body. Nothing about the schema
         // travels on a forward that does not need it.
         let op = ClientOp::BulkWrite {
+            spent_ms: crate::node::request_spent_ms(),
             index: index.to_string(),
             docs,
             forwarded: true,
@@ -818,6 +819,7 @@ impl BulkCtx<'_> {
         let ids: Vec<String> = docs.iter().map(|doc| doc.id().to_string()).collect();
 
         let op = ClientOp::BulkDelete {
+            spent_ms: crate::node::request_spent_ms(),
             index: index.to_string(),
             docs,
             // One hop. If the peer cannot place these either, it says so per id rather than
@@ -2752,6 +2754,7 @@ impl OrchestratorEngine {
     pub(super) async fn execute(&self, op: ClientOp) -> WorkerOutcome {
         match op {
             ClientOp::Write {
+                spent_ms,
                 index,
                 id,
                 routing_key,
@@ -2766,6 +2769,7 @@ impl OrchestratorEngine {
                     routing_key,
                     doc,
                 }) => WorkerOutcome::UseActor(Box::new(ClientOp::Write {
+                    spent_ms,
                     index,
                     id,
                     routing_key,
@@ -2781,6 +2785,7 @@ impl OrchestratorEngine {
                 Err(err) => WorkerOutcome::Done(Err(err)),
             },
             ClientOp::Search {
+                spent_ms: _,
                 index,
                 query,
                 limit,
@@ -2809,6 +2814,7 @@ impl OrchestratorEngine {
                 .await,
             ),
             ClientOp::Delete {
+                spent_ms,
                 index,
                 id,
                 routing_key,
@@ -2817,6 +2823,7 @@ impl OrchestratorEngine {
                 Ok(DeleteOutcome::Done(value)) => WorkerOutcome::Done(Ok(value)),
                 Ok(DeleteOutcome::NeedsActor { id, routing_key }) => {
                     WorkerOutcome::UseActor(Box::new(ClientOp::Delete {
+                        spent_ms,
                         index,
                         id,
                         routing_key,
@@ -2826,6 +2833,7 @@ impl OrchestratorEngine {
                 Err(err) => WorkerOutcome::Done(Err(err)),
             },
             ClientOp::BulkWrite {
+                spent_ms,
                 index,
                 docs,
                 forwarded,
@@ -2835,6 +2843,7 @@ impl OrchestratorEngine {
                 Ok(BulkOutcome::Done(value)) => WorkerOutcome::Done(Ok(value)),
                 Ok(BulkOutcome::NeedsActor { docs }) => {
                     WorkerOutcome::UseActor(Box::new(ClientOp::BulkWrite {
+                        spent_ms,
                         index,
                         docs,
                         // Whichever hop this is, handing the op to the actor is not another one —
@@ -2850,11 +2859,13 @@ impl OrchestratorEngine {
             // A delete carries no document, so no delete can ever need a schema written —
             // there is no slow path to defer to, and this always answers.
             ClientOp::BulkDelete {
+                spent_ms: _,
                 index,
                 docs,
                 forwarded,
             } => WorkerOutcome::Done(self.engine_bulk_delete(&index, docs, forwarded).await),
             ClientOp::DeleteByQuery {
+                spent_ms: _,
                 index,
                 query,
                 mode,
@@ -5067,6 +5078,7 @@ impl NodeOrchestrator {
         Answer::Now(match op.normalized() {
             ClientOp::Stream { .. } => unreachable!("normalized to a search above"),
             ClientOp::Search {
+                spent_ms: _,
                 index,
                 query,
                 limit,
@@ -5095,6 +5107,7 @@ impl NodeOrchestrator {
                 .await
             }
             ClientOp::Write {
+                spent_ms: _,
                 index,
                 id,
                 routing_key,
@@ -5118,6 +5131,7 @@ impl NodeOrchestrator {
                     .into();
             }
             ClientOp::BulkWrite {
+                spent_ms: _,
                 index,
                 docs,
                 forwarded,
@@ -5137,6 +5151,7 @@ impl NodeOrchestrator {
                     .into();
             }
             ClientOp::Delete {
+                spent_ms: _,
                 index,
                 id,
                 routing_key,
@@ -5148,12 +5163,14 @@ impl NodeOrchestrator {
                     .into();
             }
             ClientOp::BulkDelete {
+                spent_ms: _,
                 index,
                 docs,
                 forwarded,
             } => return self.orch_bulk_delete(&index, docs, forwarded).await.into(),
             // Off the mailbox: a delete of many documents waits on every shard's writer.
             ClientOp::DeleteByQuery {
+                spent_ms: _,
                 index,
                 query,
                 mode,
@@ -5402,6 +5419,7 @@ impl NodeOrchestrator {
                         target,
                         forwarded,
                         ClientOp::Write {
+                            spent_ms: None,
                             index: index.to_string(),
                             id,
                             routing_key: effective_routing_key,
@@ -5477,6 +5495,7 @@ impl NodeOrchestrator {
                 target,
                 forwarded,
                 ClientOp::Write {
+                    spent_ms: None,
                     index: index.to_string(),
                     id,
                     routing_key: effective_routing_key,
@@ -5529,6 +5548,7 @@ impl NodeOrchestrator {
                 target,
                 forwarded,
                 ClientOp::Delete {
+                    spent_ms: None,
                     index: index.to_string(),
                     id,
                     routing_key: Some(effective),
@@ -5610,6 +5630,10 @@ impl NodeOrchestrator {
                  settled"
             )))));
         }
+        // Stamped now, inside the request's scope when there is one: the future runs later, in a
+        // task of its own that the scope does not reach (O4).
+        let mut op = op;
+        op.stamp_spent();
         let coordinator = self.coordinator.clone();
         let pool = self.remote_peer_pool.clone();
         Answer::Later(Box::pin(async move {
@@ -6737,6 +6761,18 @@ impl Message<ClientOp> for NodeOrchestrator {
     /// shares both were waiting for.
     async fn handle(&mut self, msg: ClientOp, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         let msg = msg.normalized();
+        // The request clock starts as far back as the sender had spent of it (ROADMAP O4), so
+        // every deadline check below judges this op against the deadline its client is waiting
+        // on. One that arrives with that budget gone is refused here: it would be run for a
+        // client the first node has already answered. An op from a peer that sends no
+        // `spent_ms` starts its clock now, as every peer op did before.
+        let arrived = match peer_op_clock(msg.spent_ms(), self.read_budget) {
+            Ok(arrived) => arrived,
+            Err(spent) => {
+                debug!(error = %spent, "a peer's op arrived with its request's budget spent; refused");
+                return ctx.reply(Err(spent));
+            }
+        };
         if worker_eligible(&msg)
             && let (Some(engine), Some(lane)) = (self.engine.clone(), self.peer_lane.clone())
         {
@@ -6746,7 +6782,7 @@ impl Message<ClientOp> for NodeOrchestrator {
             if let Ok(permit) = lane.try_acquire_owned() {
                 let (delegated, reply) = ctx.reply_sender();
                 let orchestrator = ctx.actor_ref().downgrade();
-                tokio::spawn(async move {
+                tokio::spawn(REQUEST_STARTED_AT.scope(arrived, async move {
                     let result = match engine.execute(msg).await {
                         WorkerOutcome::Done(result) => result,
                         WorkerOutcome::UseActor(op) => {
@@ -6757,13 +6793,38 @@ impl Message<ClientOp> for NodeOrchestrator {
                     if let Some(reply) = reply {
                         reply.send(result);
                     }
-                });
+                }));
                 return delegated;
             }
             debug!("peer lane full; serving a peer's op on the mailbox");
         }
-        self.run_on_actor(msg, ctx).await
+        REQUEST_STARTED_AT
+            .scope(arrived, self.run_on_actor(msg, ctx))
+            .await
     }
+}
+
+/// When a peer's op counts as having arrived (ROADMAP O4): `spent_ms` before now, so the
+/// deadline checks it meets here measure the budget its client is still waiting on. Refused, as
+/// the worker pool's dequeue check refuses, when that is already more than `budget`. No
+/// `spent_ms` — a peer that predates it, or an op sent outside any request — arrives now.
+pub(crate) fn peer_op_clock(
+    spent_ms: Option<u64>,
+    budget: Option<Duration>,
+) -> Result<Instant, OrchestratorError> {
+    let arrived = spent_ms
+        .and_then(|spent| Instant::now().checked_sub(Duration::from_millis(spent)))
+        .unwrap_or_else(Instant::now);
+    if let Some(budget) = budget {
+        let waited = arrived.elapsed();
+        if waited > budget {
+            return Err(OrchestratorError::ReadDeadlineExpired {
+                waited_ms: waited.as_millis() as u64,
+                budget_ms: budget.as_millis() as u64,
+            });
+        }
+    }
+    Ok(arrived)
 }
 
 /// Run an op on the actor itself: this node's own requests that a worker handed back or could
@@ -7045,6 +7106,7 @@ impl Message<MintAfterCanvass> for NodeOrchestrator {
 
         let result = match op {
             ClientOp::Write {
+                spent_ms: _,
                 index,
                 id,
                 routing_key,
@@ -7066,6 +7128,7 @@ impl Message<MintAfterCanvass> for NodeOrchestrator {
                 .await
                 .into(),
             ClientOp::BulkWrite {
+                spent_ms: _,
                 index,
                 docs,
                 forwarded,

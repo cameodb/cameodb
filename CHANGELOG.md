@@ -130,6 +130,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The members now leave such a node's shards out of their ring and tell it why; the node, holding
   no documents, shuts down with that reason and a failing exit status. A node restarted on its own
   data directory is never refused, nor is any node while no index exists.
+- **A cluster node no longer runs work for a request whose time is already up.** An operation
+  forwarded to the node that owns it started a fresh clock there, so the owner ran a search or a
+  write for a client the first node had already answered with a timeout, and a retried forward
+  spent the owner's writer time again. A forwarded operation now carries how much of its request's
+  time is spent, the owner refuses it with `503` when none is left, and its deadline checks run on
+  the request's clock. Older peers neither send nor need the field.
 - **Shutdown ends every task a node has waiting on a peer.** The shard-map sync, the schema sweep,
   the sweep after a peer connects and the exchange after shards are registered ran outside the
   cancellation that ends peer tasks before the swarm stops, so one still waiting on a peer at that

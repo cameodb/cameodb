@@ -187,6 +187,15 @@ pub(crate) fn request_started_at() -> Instant {
         .unwrap_or_else(|_| Instant::now())
 }
 
+/// How much of the current request's budget is spent, in milliseconds: what an op sent to a
+/// peer carries as `spent_ms` (ROADMAP O4). `None` outside a request's scope — an internal call
+/// has no client waiting — and the peer starts its clock on arrival.
+pub(crate) fn request_spent_ms() -> Option<u64> {
+    REQUEST_STARTED_AT
+        .try_with(|started| started.elapsed().as_millis() as u64)
+        .ok()
+}
+
 // ============================================================================
 // Remote Actor Naming Constants
 // ============================================================================
@@ -1239,6 +1248,14 @@ pub enum ClientOp {
         /// metrics, and nothing else changes.
         #[serde(default)]
         metrics: Option<storage::MetricsSpec>,
+        /// How much of its request's time budget was already spent when a peer sent this op
+        /// (ROADMAP O4). The receiving node starts its request clock that far back, so its
+        /// deadline checks judge the op against the budget the client is still waiting on, not a
+        /// fresh one. `None` on an op that did not come from a peer, or from a peer on a build
+        /// that predates the field: the clock starts on arrival, as before. The same on every
+        /// forwarded variant.
+        #[serde(default)]
+        spent_ms: Option<u64>,
     },
     /// The search an earlier build sent for a streamed request: the first `limit` hits, no
     /// offset. Never built here — the stream route builds a `Search` — and kept on the wire only
@@ -1286,6 +1303,9 @@ pub enum ClientOp {
         /// Defaulted, so an op from an older peer stamps nothing.
         #[serde(default)]
         tenant: Option<String>,
+        /// See [`ClientOp::Search::spent_ms`].
+        #[serde(default)]
+        spent_ms: Option<u64>,
     },
     /// Bulk write operation to insert/update multiple documents
     BulkWrite {
@@ -1326,6 +1346,9 @@ pub enum ClientOp {
         /// [`ClientOp::Write::tenant`].
         #[serde(default)]
         tenant: Option<String>,
+        /// See [`ClientOp::Search::spent_ms`].
+        #[serde(default)]
+        spent_ms: Option<u64>,
     },
     /// Remove many documents by key, in one request.
     ///
@@ -1342,6 +1365,9 @@ pub enum ClientOp {
         mode: DeleteMode,
         /// Commit each shard that deleted something, so search reflects the delete at once.
         refresh: bool,
+        /// See [`ClientOp::Search::spent_ms`].
+        #[serde(default)]
+        spent_ms: Option<u64>,
     },
     BulkDelete {
         index: String,
@@ -1358,6 +1384,9 @@ pub enum ClientOp {
         /// hop, which is what it is.
         #[serde(default)]
         forwarded: bool,
+        /// See [`ClientOp::Search::spent_ms`].
+        #[serde(default)]
+        spent_ms: Option<u64>,
     },
     /// Remove one document by its key.
     ///
@@ -1376,6 +1405,9 @@ pub enum ClientOp {
         /// forward it again. See [`NodeOrchestrator::forward_op_to_owner`].
         #[serde(default)]
         forwarded: bool,
+        /// See [`ClientOp::Search::spent_ms`].
+        #[serde(default)]
+        spent_ms: Option<u64>,
     },
     /// Phase one of `PUT /_config`: what storing `schema` here would ask of this node, without
     /// storing it — answered as a [`SchemaReadiness`].
@@ -1477,6 +1509,38 @@ pub enum ClientOp {
 }
 
 impl ClientOp {
+    /// How much of its request's budget the sending peer had spent: see
+    /// [`ClientOp::Search::spent_ms`]. `None` on every op that does not carry it.
+    pub(crate) fn spent_ms(&self) -> Option<u64> {
+        match self {
+            Self::Search { spent_ms, .. }
+            | Self::Write { spent_ms, .. }
+            | Self::BulkWrite { spent_ms, .. }
+            | Self::DeleteByQuery { spent_ms, .. }
+            | Self::BulkDelete { spent_ms, .. }
+            | Self::Delete { spent_ms, .. } => *spent_ms,
+            _ => None,
+        }
+    }
+
+    /// Stamp the current request's spent budget on an op about to go to a peer (ROADMAP O4), so
+    /// the peer judges it against the client's deadline. Leaves the op as it is outside a
+    /// request's scope, and on an op that does not carry the field.
+    pub(crate) fn stamp_spent(&mut self) {
+        let Some(spent) = request_spent_ms() else {
+            return;
+        };
+        match self {
+            Self::Search { spent_ms, .. }
+            | Self::Write { spent_ms, .. }
+            | Self::BulkWrite { spent_ms, .. }
+            | Self::DeleteByQuery { spent_ms, .. }
+            | Self::BulkDelete { spent_ms, .. }
+            | Self::Delete { spent_ms, .. } => *spent_ms = Some(spent),
+            _ => {}
+        }
+    }
+
     /// The op as a node acts on it: a [`ClientOp::Stream`] is the `Search` it names — the same
     /// window from the front of every source's order — and everything else is itself. Applied
     /// where an op enters a node, the router for this node's requests and the orchestrator's
@@ -1491,6 +1555,7 @@ impl ClientOp {
                 fields,
                 sort,
             } => ClientOp::Search {
+                spent_ms: None,
                 index,
                 query,
                 limit,

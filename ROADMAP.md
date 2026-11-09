@@ -71,7 +71,7 @@ on one.
 | L — Post-0.3.4 review: the refactor cycle | ✅ Done | All twenty closed — four defects, six security remainder items, three decompositions, six simplifications, and the retrospective (L20, run 2026-09-19) |
 | M — The 0.3.5 goal set: multi-tenant exposure | ✅ Done, released in 0.3.5 on 2026-09-28 | M0 closed; M1, M2, M3, M4, M5 and M7 done — the blocker is cleared, the surface is metered, and tenants are bounded and isolated per index. No feature build remains; M8 closed with the prefix floor and default-field cap, the clause cap deferred. M6 done: the open-loop arms show goodput degrading rather than collapsing on the bulk, single-write and read lanes, after fixing the two defects its arms found — [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) and [OB15](docs/ROADMAP-ARCHIVE.md#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput), and its confirmation run on 2026-09-27 found OB22 costs a single node nothing measurable |
 | N — Pre-0.3.6 whole-code review | ◐ Partial | N1–N10 and N10a done 2026-10-07/08, in 0.3.6: a `HEAD` authorization gap, batched writes that never learn a field, a peer's 400 answered as 503, node identity replaced silently, query rewrites by substring, three client errors, the first shard's memory budget, streaming broadcast, a storage shutdown race, flattened storage errors, a search of a missing index answering 200. Left, planned and not release blockers: N11–N17 — one way to reach a peer, dead surface, `run_change`, typed boundaries, single owners, the orchestrator split |
-| O — Post-0.3.6 review: the next-iteration base | ◐ Partial | O1 (the `wal_sync=false` durability barrier) and O2 (deadlines on every remote ask) done 2026-10-15. Left: O3, shard-map merges on a per-owner epoch (the prerequisite N15 does not name, and since 2026-10-18 the one [OB27](#ob27--a-replaced-node-never-leaves-the-cluster)'s `forget` needs), and O4, the request budget on the wire. O5 folds Rust-surface items into N16/N17; O6 reconciles the architecture doc |
+| O — Post-0.3.6 review: the next-iteration base | ◐ Partial | O1 (the `wal_sync=false` durability barrier) and O2 (deadlines on every remote ask) done 2026-10-15; O4 (the request budget on the wire) 2026-11-09. Left: O3, shard-map merges on a per-owner epoch (the prerequisite N15 does not name, and since 2026-10-18 the one [OB27](#ob27--a-replaced-node-never-leaves-the-cluster)'s `forget` needs). O5 folds Rust-surface items into N16/N17; O6 reconciles the architecture doc |
 | P — Post-0.3.7 features | ◐ Partial | P1, a cap on how many elements of each array a search hit carries — a node default, a node maximum, and `array N` per request — done 2026-10-19. P2, one declaration of an index's default fields — `searched_by_default` dropped, the `--id` reload keeps the list — done 2026-10-20. P3, a schema read is a schema write — `PUT` takes a `GET`, which now reports every property the thumbprint covers — done 2026-10-21. P4, ip fields queried the way addresses are — CIDR, bare addresses, IPv4-bounded ranges, a fast ip sort — done 2026-10-21. P6, a cut array leads with the elements the query matched — `_matched_elements`, on by default — done 2026-11-02. Left: P5, native json fields — paths, typed values and ranges, planned |
 | Q — Post-0.3.8 features | ✅ Done, unreleased (0.3.9) | Q1, ghost fields — a column filled from another field of the stored body, for every document or under an `in` / `not_in` condition, never stored — done 2026-10-27. Q2, the Croatian analyzers read Serbian Cyrillic — done 2026-10-27. The `pt_stem`, `it_stem` and `es`/`fr`/`pt`/`de` `_stem_fold` analyzers of the same days are in the changelog, not filed here |
 | R — Key and tenant provisioning | ◐ Partial, R1 and R2 unreleased (0.3.9) | R1 and R2 done 2026-11-01, single node: included key and tenant files reloaded on change, live tenant quotas and scopes, `allowed_indexes` prefixes; a provisioner minting and revoking keys through `/_keys` (no tenant) and `/_tenants`, changing a key's indexes in place with `PATCH /_keys/{key_id}`, and granting only within its own `allowed_indexes`; client, SDK and a live suite, validated on Linux under systemd and across a restart. Left: R3, every change broadcast to every node, deferred until cluster support is decided — until then a change applies on the node that received it |
@@ -249,7 +249,7 @@ confined to clusters ([V2](#v2--document-versions-and-delete-markers)'s decision
   [V13](#v13--a-node-whose-disks-move-to-another-machine-rejoins-as-itself), the cluster items of
   [N17](#n17--smaller-items-filed-so-they-are-not-lost) (the snapshot persisted out of order, the
   checksum's `DefaultHasher`, the peer tasks outside the cancellation token), and
-  [O4](#o4--the-request-budget-crosses-the-wire).
+  [O4](docs/ROADMAP-ARCHIVE.md#o4--the-request-budget-crosses-the-wire).
 - **Small correctness and security fixes from N17:** a streamed search logs the caller's query at
   `info!` and carries no audited query; a request refused with 429 or 403 is audited as `allowed`;
   a plain index listing churns the open-index cap; the two reported client items (`007` read as a
@@ -277,7 +277,7 @@ K2's merge and the refusal fix (`a2244ea`) their first multi-node check.
 | 4 ✅ | [N17](#n17--smaller-items-filed-so-they-are-not-lost)'s cluster bugs: the snapshot persisted out of order, the checksum's `DefaultHasher` → xxh3, the peer tasks outside the cancellation token — all three fixed 2026-11-09 | Small real bugs under everything after them |
 | 5 ✅ | [OB26](#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap) with [N12](#n12--dead-surface-and-the-comments-that-no-longer-match)'s coordinator dead surface — built 2026-11-09; OB26's `cluster.sh` phase runs with steps 4–8 | About a day, mostly deletion; the join path step 6 changes |
 | 6 ✅ | [V1](#v1--a-node-that-brings-new-shards-cannot-join-a-cluster-that-holds-data): reproduce, then refuse — the refusal built 2026-11-09; its `cluster.sh` phase reproduces V1 on an older image and checks the refusal on this one | On the bootstrap step 5 leaves |
-| 7 | [O4](#o4--the-request-budget-crosses-the-wire) | The field is optional on the wire, so mixed versions still work |
+| 7 ✅ | [O4](docs/ROADMAP-ARCHIVE.md#o4--the-request-budget-crosses-the-wire) — done 2026-11-09 | The field is optional on the wire, so mixed versions still work |
 | 8 | [V13](#v13--a-node-whose-disks-move-to-another-machine-rejoins-as-itself): a `cluster.sh` phase and a DEPLOYMENT procedure | Exercises everything above |
 | — | The `deny.toml` exceptions and the deferred dependency updates | Any time before 2026-12-31 |
 
@@ -2480,6 +2480,7 @@ O6 last, reconciling the architecture document after the code it describes has m
 
 - ✅ [**O1 — A durability barrier makes `wal_sync = false` safe**](docs/ROADMAP-ARCHIVE.md#o1--a-durability-barrier-makes-wal_sync--false-safe)
 - ✅ [**O2 — Every remote conversation runs under a deadline**](docs/ROADMAP-ARCHIVE.md#o2--every-remote-conversation-runs-under-a-deadline)
+- ✅ [**O4 — The request budget crosses the wire**](docs/ROADMAP-ARCHIVE.md#o4--the-request-budget-crosses-the-wire)
 
 ### O3 — Shard maps merge on a version, not on recency
 
@@ -2521,17 +2522,6 @@ N15:** its "one exchange on events" is safe only once a stale map cannot win, so
 shard-map-sync item runs after this; and the residual anti-entropy N15 calls a "rare safety
 net" becomes digest-first — exchange epoch vectors, pull only newer owners — at a
 minutes-long interval rather than a 10 s full-map pull.
-
-### O4 — The request budget crosses the wire
-
-**Planned.**
-
-F7 shedding measures `REQUEST_STARTED_AT`, a task-local: a forwarded `ClientOp` starts a
-fresh clock on the peer, which then runs work for a client the first hop already abandoned —
-and the router's retry in `handle_remote` spends the peer's writer time again. **Change:**
-carry `remaining_budget_ms` on forwarded ops and let the peer lane shed on it; document in
-API_REFERENCE that a remote write answered 503 may have been applied — retry is safe because
-puts and deletes are keyed by id.
 
 ### O5 — The Rust surface, folded into N16 and N17
 
@@ -3146,7 +3136,7 @@ schema round that works with a peer down. The rest is phase 2, a robust partitio
 before V6: V13 and V1 below, and what is filed where it already is: [N11](#n11--one-way-to-reach-a-peer),
 the cluster items of [N17](#n17--smaller-items-filed-so-they-are-not-lost) (the snapshot persisted
 out of order, the shard checksum's `DefaultHasher`, the peer tasks outside the cancellation token,
-leaving the cluster before shutdown's Phase 3) and [O4](#o4--the-request-budget-crosses-the-wire).
+leaving the cluster before shutdown's Phase 3) and [O4](docs/ROADMAP-ARCHIVE.md#o4--the-request-budget-crosses-the-wire).
 
 ### V1 — A node that brings new shards cannot join a cluster that holds data
 
