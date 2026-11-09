@@ -126,67 +126,155 @@ pub(super) fn spellings(value: &str) -> Vec<String> {
     out
 }
 
-/// The `field:value` clauses of a query that name a `string` field with a plain value: the ones
-/// a value in another case leaves empty. A range, a set, a prefix and a boost are left out —
-/// each says something about the value the retry would have to keep.
-pub(super) fn string_value_clauses(query: &str, fields: &[FieldInfo]) -> Vec<(String, String)> {
-    let mut found = Vec::new();
+/// A clause on a field matched as a whole value as written: `field:value`, `field:"a value"`
+/// or `field: IN [a "b c"]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct WholeValueClause {
+    pub field: String,
+    /// The clause exactly as the query writes it: what is counted alone, and what the general
+    /// advice reads without its quotes.
+    pub text: String,
+    /// The value, or the values of the set.
+    pub values: Vec<String>,
+    pub set: bool,
+}
+
+/// The values of an `IN [...]` set as written, quoted or bare, and the byte length of the set
+/// from its `[` to its `]`; `None` when the set does not close.
+fn set_values(set: &str) -> Option<(Vec<String>, usize)> {
+    let mut values = Vec::new();
+    let mut chars = set.char_indices().skip(1).peekable();
+    while let Some((at, ch)) = chars.next() {
+        match ch {
+            ']' => return Some((values, at + 1)),
+            '"' => {
+                let mut value = String::new();
+                loop {
+                    match chars.next()? {
+                        (_, '"') => break,
+                        (_, '\\') => value.push(chars.next()?.1),
+                        (_, other) => value.push(other),
+                    }
+                }
+                values.push(value);
+            }
+            _ if ch.is_whitespace() => {}
+            _ => {
+                let mut value = ch.to_string();
+                while let Some(&(_, next)) = chars.peek() {
+                    if next.is_whitespace() || next == ']' {
+                        break;
+                    }
+                    value.push(next);
+                    chars.next();
+                }
+                values.push(value);
+            }
+        }
+    }
+    None
+}
+
+/// The clauses of a query that name a field matched as a whole value as written — a `string`
+/// field, or a `text` one under `raw` — with a plain value or an `IN` set: the ones a value in
+/// another case, or written another way, leaves empty. A range, a prefix and a boost are left
+/// out — each says something about the value a retry would have to keep.
+pub(super) fn string_value_clauses(query: &str, fields: &[FieldInfo]) -> Vec<WholeValueClause> {
+    let mut found: Vec<WholeValueClause> = Vec::new();
     for reference in storage::field_references(query) {
-        let is_string = fields
+        if !fields
             .iter()
-            .any(|f| f.name == reference.name && f.matches_whole_value_as_written());
-        let Some(rest) = query[reference.span.end..].strip_prefix(':') else {
-            continue;
-        };
-        if !is_string {
+            .any(|f| f.name == reference.name && f.matches_whole_value_as_written())
+        {
             continue;
         }
-        let value = if let Some(quoted) = rest.strip_prefix('"') {
-            match quoted.find('"') {
-                Some(end) => &quoted[..end],
-                None => continue,
-            }
+        let after_name = reference.span.end;
+        let Some(rest) = query[after_name..].strip_prefix(':') else {
+            continue;
+        };
+        let (values, len, set) = if let Some(set) = rest
+            .trim_start()
+            .strip_prefix("IN")
+            .map(str::trim_start)
+            .filter(|set| set.starts_with('['))
+        {
+            let Some((values, set_len)) = set_values(set) else {
+                continue;
+            };
+            let offset = rest.len() - set.len();
+            (values, offset + set_len, true)
+        } else if let Some(quoted) = rest.strip_prefix('"') {
+            let Some(end) = quoted.find('"') else {
+                continue;
+            };
+            (vec![quoted[..end].to_string()], end + 2, false)
         } else {
             let end = rest
                 .find(|ch: char| ch.is_whitespace() || ch == ')')
                 .unwrap_or(rest.len());
-            &rest[..end]
+            (vec![rest[..end].to_string()], end, false)
         };
-        if value.is_empty()
-            || value.contains(['*', '^', '\\'])
-            || value.starts_with(['[', '{', '<', '>', '(', '='])
+        if values.is_empty()
+            || values.iter().any(|value| {
+                value.is_empty()
+                    || (!set
+                        && (value.contains(['*', '^', '\\'])
+                            || value.starts_with(['[', '{', '<', '>', '(', '='])))
+            })
         {
             continue;
         }
-        let clause = (reference.name.to_string(), value.to_string());
-        if !found.contains(&clause) {
+        let clause = WholeValueClause {
+            field: reference.name.to_string(),
+            text: query[reference.span.start..after_name + 1 + len].to_string(),
+            values,
+            set,
+        };
+        if !found.iter().any(|seen| seen.text == clause.text) {
             found.push(clause);
         }
     }
     found
 }
 
-/// What to try when a `string` clause matched nothing on its own: the one retry that covers a
-/// value written in another case, spelled out for that clause.
+const READ_THE_VALUES: &str = "Read how the values are written: in the field's description, or \
+                               from a few hits with `limit 5` and the field in `fields`.";
+
+/// What to try when a whole-value clause matched nothing on its own, spelled out for that
+/// clause: for a value, the one retry over its spellings; for a set, or a value with no other
+/// spelling, where the values are written.
 ///
 /// A `string` field matches its whole value in the case the data writes it, so
 /// `authors:"austen, jane"` finds nothing where the data holds `Austen, Jane` — and the general
 /// zero-result advice (drop an `AND`, unquote a phrase) sends the caller the wrong way. The
 /// caller has checked the clause alone matches nothing, so the advice never blames a clause that
 /// was right while another one emptied the result.
-pub(super) fn string_case_advice(field: &str, value: &str) -> String {
-    let spellings = spellings(value);
+pub(super) fn string_case_advice(clause: &WholeValueClause) -> String {
+    let WholeValueClause {
+        field,
+        text,
+        values,
+        set,
+    } = clause;
     let opening = format!(
-        "`{field}:\"{value}\"` alone matches nothing. '{field}' matches only a whole value, as \
-         the data writes it, so"
+        "`{text}` alone matches nothing. '{field}' matches only a whole value, as the data \
+         writes it"
     );
-    let read = "read how the values are written: in the field's description, or from a few hits \
-                with `limit 5` and the field in `fields`.";
+    if *set {
+        // The retry already ran, or the caller wrote the set: no spelling is left to try.
+        return format!(
+            "{opening} — case, diacritics and punctuation included — and no value of this set is \
+             written so. {READ_THE_VALUES}"
+        );
+    }
+    let value = &values[0];
+    let spellings = spellings(value);
     // A value with no letters has one spelling, so a retry over its spellings would send the
     // same clause again: what is left is a part of a value, or a value written another way.
     if spellings.len() < 2 {
         return format!(
-            "{opening} a part of one, or one written another way, finds nothing: {read}"
+            "{opening}, so a part of one, or one written another way, finds nothing. \
+             {READ_THE_VALUES}"
         );
     }
     let set = spellings
@@ -195,19 +283,20 @@ pub(super) fn string_case_advice(field: &str, value: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     format!(
-        "{opening} a value in another case, or a part of one, finds nothing. If \"{value}\" came \
-         from the question, retry once with its spellings in one set — `{field}: IN [{set}]` — \
-         and if that finds nothing too, {read}"
+        "{opening}, so a value in another case, or a part of one, finds nothing. If \"{value}\" \
+         came from the question, retry once with its spellings in one set — `{field}: IN [{set}]` \
+         — and if that finds nothing too, read how the values are written: in the field's \
+         description, or from a few hits with `limit 5` and the field in `fields`."
     )
 }
 
-/// The query as the general zero-result advice should read it: the quotes around `string`
-/// values removed, since they enclose a value rather than a phrase, and advice about phrases
-/// would point at the wrong thing.
-pub(super) fn without_string_value_quotes(query: &str, clauses: &[(String, String)]) -> String {
+/// The query as the general zero-result advice should read it: each whole-value clause
+/// replaced by `field:value`, since its quotes enclose a value rather than a phrase, and advice
+/// about phrases would point at the wrong thing.
+pub(super) fn without_string_value_quotes(query: &str, clauses: &[WholeValueClause]) -> String {
     let mut out = query.to_string();
-    for (field, value) in clauses {
-        out = out.replace(&format!("{field}:\"{value}\""), &format!("{field}:value"));
+    for clause in clauses {
+        out = out.replace(&clause.text, &format!("{}:value", clause.field));
     }
     out
 }
@@ -1087,14 +1176,15 @@ mod field_suggestion_tests {
         let mut sha = info("sha1", "string");
         sha.is_shadow = true;
         let fields = vec![code, folded, sha];
+        let found = super::string_value_clauses("code:ABC AND label:Abc AND sha1:FF", &fields);
         assert_eq!(
-            super::string_value_clauses("code:ABC AND label:Abc AND sha1:FF", &fields),
-            [("code".to_string(), "ABC".to_string())]
+            found.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
+            ["code:ABC"]
         );
     }
 
-    /// The clauses the retry is for: plain values on string fields, not a text clause, a range,
-    /// a prefix or a set.
+    /// The clauses the retry is for: plain values and `IN` sets on string fields, not a text
+    /// clause, a range or a prefix.
     #[test]
     fn the_string_clauses_of_a_query_are_found() {
         let fields = vec![
@@ -1103,14 +1193,27 @@ mod field_suggestion_tests {
             info("title", "text"),
             info("year", "i64"),
         ];
+        let found = super::string_value_clauses(
+            r#"authors:"austen, jane" AND title:pride AND unit_type:Book AND unit_type: IN ["a b" C]"#,
+            &fields,
+        );
         assert_eq!(
-            super::string_value_clauses(
-                r#"authors:"austen, jane" AND title:pride AND unit_type:Book"#,
-                &fields
-            ),
+            found
+                .iter()
+                .map(|c| (c.text.as_str(), c.values.clone(), c.set))
+                .collect::<Vec<_>>(),
             [
-                ("authors".to_string(), "austen, jane".to_string()),
-                ("unit_type".to_string(), "Book".to_string())
+                (
+                    r#"authors:"austen, jane""#,
+                    vec!["austen, jane".to_string()],
+                    false
+                ),
+                ("unit_type:Book", vec!["Book".to_string()], false),
+                (
+                    r#"unit_type: IN ["a b" C]"#,
+                    vec!["a b".to_string(), "C".to_string()],
+                    true
+                ),
             ]
         );
         for query in [
@@ -1118,7 +1221,7 @@ mod field_suggestion_tests {
             "year:1813",
             "authors:Aus*",
             r#"authors:["a" TO "b"]"#,
-            r#"authors: IN ["a" "b"]"#,
+            r#"authors: IN ["a" "b""#,
         ] {
             assert!(
                 super::string_value_clauses(query, &fields).is_empty(),
@@ -1126,22 +1229,27 @@ mod field_suggestion_tests {
             );
         }
 
-        let advice = super::string_case_advice("authors", "austen, jane");
+        let advice = super::string_case_advice(&found[0]);
         assert!(
             advice.contains(
                 r#"`authors: IN ["austen, jane" "Austen, jane" "Austen, Jane" "AUSTEN, JANE"]`"#
             ),
             "{advice}"
         );
+        // A set is the retry already made: no spellings are offered again.
+        let advice = super::string_case_advice(&found[2]);
+        assert!(advice.contains("no value of this set"), "{advice}");
+        assert!(!advice.contains("retry"), "{advice}");
         // A value with no letters has no other spelling to retry.
-        let advice = super::string_case_advice("id", "1212_0004");
+        let fields = vec![info("id", "string")];
+        let id = super::string_value_clauses("id:1212_0004", &fields);
+        let advice = super::string_case_advice(&id[0]);
         assert!(!advice.contains("IN ["), "{advice}");
         assert!(advice.contains("a part of one"), "{advice}");
-        // The quotes of a string value are not a phrase to the general advice.
-        let clauses = vec![("authors".to_string(), "austen, jane".to_string())];
+        // The quotes of a string value or set are not a phrase to the general advice.
         let stripped = super::without_string_value_quotes(
-            r#"authors:"austen, jane" AND title:pride"#,
-            &clauses,
+            r#"authors:"austen, jane" AND title:pride AND unit_type: IN ["a b" C]"#,
+            &found,
         );
         assert!(!stripped.contains('"'), "{stripped}");
     }

@@ -3320,6 +3320,34 @@ async fn an_empty_result_names_the_whole_value_clause_that_emptied_it() {
         "a quoted value is not a phrase: {result}"
     );
 
+    // Two wrong clauses are both named, so one round fixes both.
+    let (_, result) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "books_a", "query": "authors:\"austen, jane\" AND code:pr-1"}),
+        )
+        .await;
+    let text = warning(&result);
+    assert!(
+        text.contains("`authors:\"austen, jane\"` alone") && text.contains("`code:pr-1` alone"),
+        "{result}"
+    );
+
+    // A set none of whose values is written so — the retry already made — points at how the
+    // values are written, not at another retry, and its quotes are no phrase.
+    let (_, result) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "books_a", "query": "authors: IN [\"austen\" \"Austen\"] AND title:pride"}),
+        )
+        .await;
+    let text = warning(&result);
+    assert!(text.contains("no value of this set"), "{result}");
+    assert!(
+        !text.contains("phrase") && !text.contains("retry"),
+        "{result}"
+    );
+
     // Across indexes: each index that answered is explained against its own schema.
     let (_, result) = node
         .call_tool(

@@ -2006,10 +2006,11 @@ skill; the index-describe skill writes values exactly as stored, a small closed 
 probe is not built: with descriptions written from the data and the retry costing one request,
 naming the one spelling that exists would answer a question the agent no longer has to ask. What
 the node does instead is cheaper: a search that matches nothing reads the schema, counts each
-plain clause on a whole-value field (`string`, or `text` under `raw`) alone, and the first that
-matches nothing on its own gets the retry written out in `_warning` —
-`authors: IN ["austen, jane" "Austen, jane" "Austen, Jane" "AUSTEN, JANE"]` — in place of the
-general advice; `search_across_indexes` does the same per index. Checking the standard examples against the live index the same day found `sort seq asc`,
+plain value or `IN` set on a whole-value field (`string`, or `text` under `raw`) alone, at most
+three, and every one that matches nothing on its own is named in `_warning`, a value with its retry
+written out — `authors: IN ["austen, jane" "Austen, jane" "Austen, Jane" "AUSTEN, JANE"]` — and
+a set, or a value with no letters, with where the values are written; in place of the general
+advice; `search_across_indexes` does the same per index. Checking the standard examples against the live index the same day found `sort seq asc`,
 the descriptions' recipe for reading a record in order, searched as three ORed words; the spaced
 order is now a sort.
 

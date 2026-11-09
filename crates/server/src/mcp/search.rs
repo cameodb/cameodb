@@ -7,9 +7,10 @@ use cameodb_mcp::{McpIndexSearchRequest, McpSearchBounds, ToolError};
 
 use crate::cluster_coordinator::OperationType;
 use crate::mcp::diagnostics::{
-    approximate_sort_note, names_a_missing_field, narrowed_default_fields_note, paged_past_the_end,
-    refuse_if_clauses_discarded, short_page_note, string_case_advice, string_value_clauses,
-    tool_error, with_field_suggestions, without_string_value_quotes, zero_results_advice,
+    WholeValueClause, approximate_sort_note, names_a_missing_field, narrowed_default_fields_note,
+    paged_past_the_end, refuse_if_clauses_discarded, short_page_note, string_case_advice,
+    string_value_clauses, tool_error, with_field_suggestions, without_string_value_quotes,
+    zero_results_advice,
 };
 use crate::mcp::schema::{extract_field_info, index_schema};
 use crate::node::{
@@ -229,15 +230,15 @@ fn annotate_search_response(
     }
 }
 
-/// Whether `field:"value"` alone matches nothing on `index`: a count, no hits fetched.
-async fn clause_matches_nothing(state: &AppState, index: &str, field: &str, value: &str) -> bool {
+/// Whether `clause` alone matches nothing on `index`: a count, no hits fetched.
+async fn clause_matches_nothing(state: &AppState, index: &str, clause: &str) -> bool {
     let result = state
         .router
         .route_and_handle(
             ClientOp::Search {
                 spent_ms: None,
                 index: index.to_string(),
-                query: format!("{field}:\"{value}\""),
+                query: clause.to_string(),
                 limit: Some(0),
                 offset: Some(0),
                 fields: None,
@@ -257,28 +258,37 @@ async fn clause_matches_nothing(state: &AppState, index: &str, field: &str, valu
         == Some(0)
 }
 
-/// Why a search that matched nothing may have: a whole-value clause written in another case.
+/// Why a search that matched nothing may have: a whole-value clause written in another case, or
+/// another way.
 ///
 /// Read only on the zero-hit path, so a search that found something pays nothing. The index's
 /// schema says which clauses name a field matched as a whole value as written — a `string`
-/// field, or a `text` one under `raw` — and each such clause, at most three, is counted alone:
-/// the first that matches nothing on its own gets its one-request retry, and a clause that was
-/// right beside a wrong one is never blamed. Also returns the clauses, so the caller can unquote
-/// their values for the general advice, which would otherwise read a quoted value as a phrase.
+/// field, or a `text` one under `raw` — and each such clause, at most three, is counted alone,
+/// the counts side by side: every one that matches nothing on its own is named with what to try,
+/// so two clauses written in the wrong case cost one round, and a clause that was right beside a
+/// wrong one is never blamed. Also returns the clauses, so the caller can unquote their values
+/// for the general advice, which would otherwise read a quoted value as a phrase.
 async fn whole_value_retry(
     state: &AppState,
     index: &str,
     query: &str,
-) -> (Vec<(String, String)>, Option<String>) {
+) -> (Vec<WholeValueClause>, Vec<String>) {
     let fields = extract_field_info(&index_schema(state, index).await);
     let clauses = string_value_clauses(query, &fields);
-    for (field, value) in clauses.iter().take(3) {
-        if clause_matches_nothing(state, index, field, value).await {
-            let note = string_case_advice(field, value);
-            return (clauses, Some(note));
-        }
-    }
-    (clauses, None)
+    let empty = futures::future::join_all(
+        clauses
+            .iter()
+            .take(3)
+            .map(|clause| clause_matches_nothing(state, index, &clause.text)),
+    )
+    .await;
+    let notes = clauses
+        .iter()
+        .zip(empty)
+        .filter(|(_, empty)| *empty)
+        .map(|(clause, _)| string_case_advice(clause))
+        .collect();
+    (clauses, notes)
 }
 
 pub(super) fn search_index(
@@ -344,18 +354,18 @@ pub(super) fn search_index(
                     .unwrap_or(0);
 
                 let (unquoted, why_empty) = if total_hits == 0 {
-                    let (clauses, note) =
+                    let (clauses, notes) =
                         whole_value_retry(&state, &index_name, &cleaned_for_advice).await;
-                    (without_string_value_quotes(&query, &clauses), note)
+                    (without_string_value_quotes(&query, &clauses), notes)
                 } else {
-                    (query.clone(), None)
+                    (query.clone(), Vec::new())
                 };
                 annotate_search_response(
                     &mut response,
                     &unquoted,
                     window,
                     total_hits as usize,
-                    why_empty.into_iter().collect(),
+                    why_empty,
                 );
                 cap_response_bytes(&mut response, state.max_response_bytes);
                 Ok(response)
@@ -669,12 +679,14 @@ pub(super) fn search_across_indexes(
         let mut why_empty = Vec::new();
         if total_hits == 0 {
             for index_name in answered.iter().take(5) {
-                let (clauses, note) =
+                let (clauses, notes) =
                     whole_value_retry(&state, index_name, &cleaned_for_advice).await;
                 all_clauses.extend(clauses);
-                if let Some(note) = note {
-                    why_empty.push(format!("Index '{index_name}': {note}"));
-                }
+                why_empty.extend(
+                    notes
+                        .into_iter()
+                        .map(|note| format!("Index '{index_name}': {note}")),
+                );
             }
         }
         let advice_query = without_string_value_quotes(&query, &all_clauses);
