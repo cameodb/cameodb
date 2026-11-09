@@ -79,10 +79,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tell an agent how to read a field's description and how to learn a field's values before
   filtering on them: a value in the case the description's examples show first, and a value from
   the question that finds nothing retried once with its spellings in one `IN` set. A search that
-  matches nothing checks each plain `string` clause alone, with one count, and the first that
-  matches nothing on its own gets that set written out in `_warning` (`authors: IN ["austen, jane" "Austen, jane" "Austen, Jane" "AUSTEN, JANE"]`),
-  ahead of the general advice about `AND`, which no longer reads a quoted string value as a
-  phrase; `describe_index` gives every field its keys
+  matches nothing — on `search_index`, or on every index of `search_across_indexes`, each against
+  its own schema — checks each plain clause on a field matched as a whole value as written (a
+  `string` field, or a `text` one under `raw`) alone, with one count, and the first that matches
+  nothing on its own gets that set written out in `_warning` (`authors: IN ["austen, jane" "Austen, jane" "Austen, Jane" "AUSTEN, JANE"]`),
+  in place of the general advice about `AND` and phrases, which pointed elsewhere; without such a
+  clause the general advice stays, and no longer reads a quoted value as a phrase; `describe_index` gives every field its keys
   in one order.
 
 ### Fixed

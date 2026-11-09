@@ -87,6 +87,20 @@ impl FieldInfo {
     pub(super) fn is_queryable(&self) -> bool {
         self.searchable || self.is_shadow
     }
+
+    /// Whether a value must be written exactly as the data writes it — case, spaces and
+    /// punctuation — and whole: a `string` field, or a `text` field under `raw`. Decided by how
+    /// the field matches, not by its type, so a field declared either way gets the same help.
+    /// A shadow field is the identifier, answered by key, and is left out.
+    pub(super) fn matches_whole_value_as_written(&self) -> bool {
+        !self.is_shadow
+            && self.searchable
+            && match self.field_type.as_str() {
+                "string" | "exact" => true,
+                "text" => self.tokenizer.as_deref() == Some("raw"),
+                _ => false,
+            }
+    }
 }
 
 pub(super) fn extract_field_info(value: &JsonValue) -> Vec<FieldInfo> {

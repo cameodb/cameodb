@@ -3234,3 +3234,105 @@ max_array_limit = 200
         );
     }
 }
+
+/// A search that matches nothing because a whole-value field was written in another case says
+/// which clause, with the one-request retry for it — on one index and across several — and
+/// blames no clause that matches on its own.
+#[tokio::test]
+async fn an_empty_result_names_the_whole_value_clause_that_emptied_it() {
+    let node = TestNode::start().await;
+    for index in ["books_a", "books_b"] {
+        let status = http()
+            .put(format!("{}/api/{index}/_config", node.url))
+            .json(&json!({
+                "fields": {
+                    "title": {"field_type": "text", "indexed": true},
+                    "authors": {"field_type": "string", "indexed": true},
+                    // Matched as written, like a string field, though declared text.
+                    "code": {"field_type": "text", "indexed": true, "tokenizer": "raw"},
+                }
+            }))
+            .send()
+            .await
+            .expect("create config")
+            .status();
+        assert!(status.is_success(), "creating '{index}' failed: {status}");
+        let status = http()
+            .put(format!("{}/api/{index}/document", node.url))
+            .json(&json!({
+                "id": "1",
+                "doc": {"title": "record of Pride and Prejudice", "authors": ["Austen, Jane"], "code": "PR-1"}
+            }))
+            .send()
+            .await
+            .expect("write")
+            .status();
+        assert!(status.is_success(), "seeding '{index}' failed: {status}");
+        node.await_searchable(index, 1).await;
+    }
+
+    let warning =
+        |result: &serde_json::Value| result["_warning"].as_str().unwrap_or("").to_string();
+
+    // One index: the wrong-case clause is named with its retry, and the general advice is not
+    // added beside it.
+    let (_, result) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "books_a", "query": "authors:\"austen, jane\" AND title:pride"}),
+        )
+        .await;
+    let text = warning(&result);
+    assert!(
+        text.contains(
+            r#"`authors: IN ["austen, jane" "Austen, jane" "Austen, Jane" "AUSTEN, JANE"]`"#
+        ),
+        "{result}"
+    );
+    assert!(
+        !text.contains("phrase") && !text.contains("Try `OR`"),
+        "{result}"
+    );
+
+    // A text field under `raw`, count-only.
+    let (_, result) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "books_a", "query": "code:pr-1", "limit": 0}),
+        )
+        .await;
+    assert!(
+        warning(&result).contains(r#"`code: IN ["pr-1" "Pr-1" "PR-1"]`"#),
+        "{result}"
+    );
+
+    // A right whole-value clause beside a wrong text clause is not blamed.
+    let (_, result) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "books_a", "query": "authors:\"Austen, Jane\" AND title:xyzzy"}),
+        )
+        .await;
+    let text = warning(&result);
+    assert!(!text.contains("alone matches nothing"), "{result}");
+    assert!(
+        !text.contains("phrase"),
+        "a quoted value is not a phrase: {result}"
+    );
+
+    // Across indexes: each index that answered is explained against its own schema.
+    let (_, result) = node
+        .call_tool(
+            "search_across_indexes",
+            json!({
+                "query": "authors:\"austen, jane\"",
+                "indexes": [{"index": "books_a"}, {"index": "books_b"}],
+            }),
+        )
+        .await;
+    let text = warning(&result);
+    assert!(
+        text.contains("Index 'books_a'") && text.contains("Index 'books_b'"),
+        "{result}"
+    );
+}

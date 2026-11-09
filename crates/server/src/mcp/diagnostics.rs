@@ -134,7 +134,7 @@ pub(super) fn string_value_clauses(query: &str, fields: &[FieldInfo]) -> Vec<(St
     for reference in storage::field_references(query) {
         let is_string = fields
             .iter()
-            .any(|f| f.name == reference.name && f.field_type == "string" && !f.is_shadow);
+            .any(|f| f.name == reference.name && f.matches_whole_value_as_written());
         let Some(rest) = query[reference.span.end..].strip_prefix(':') else {
             continue;
         };
@@ -181,9 +181,8 @@ pub(super) fn string_case_advice(field: &str, value: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     format!(
-        "`{field}:\"{value}\"` alone matches nothing. '{field}' is a string field: it matches \
-         only a whole value as the data writes it, so a value in another case, or a part of \
-         one, finds nothing. If \"{value}\" came from the question, retry once with its \
+        "`{field}:\"{value}\"` alone matches nothing. '{field}' matches only a whole value, as \
+         the data writes it, so a value in another case, or a part of one, finds nothing. If \"{value}\" came from the question, retry once with its \
          spellings in one set — `{field}: IN [{set}]` — and if that finds nothing too, read how \
          the values are written: in the field's description, or from a few hits with `limit 5` \
          and the field in `fields`."
@@ -1062,6 +1061,23 @@ mod field_suggestion_tests {
         assert_eq!(
             super::spellings("rješenje"),
             ["rješenje", "Rješenje", "RJEŠENJE"]
+        );
+    }
+
+    /// Decided by how a field matches, not its type: a `text` field under `raw` is as
+    /// case-sensitive as a `string` one; one under any other tokenizer, or a shadow, is not.
+    #[test]
+    fn a_text_field_under_raw_takes_the_retry_too() {
+        let mut code = info("code", "text");
+        code.tokenizer = Some("raw".to_string());
+        let mut folded = info("label", "text");
+        folded.tokenizer = Some("raw_fold".to_string());
+        let mut sha = info("sha1", "string");
+        sha.is_shadow = true;
+        let fields = vec![code, folded, sha];
+        assert_eq!(
+            super::string_value_clauses("code:ABC AND label:Abc AND sha1:FF", &fields),
+            [("code".to_string(), "ABC".to_string())]
         );
     }
 

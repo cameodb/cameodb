@@ -162,6 +162,7 @@ fn annotate_search_response(
     query: &str,
     window: SearchWindow,
     total_hits: usize,
+    why_empty: Vec<String>,
 ) {
     let hits_returned = response
         .get("hits_returned")
@@ -175,6 +176,9 @@ fn annotate_search_response(
         // same shape, and only one of them is the query's fault.
         match paged_past_the_end(window.offset, total_hits) {
             Some(note) => notes.push(note),
+            // A clause found to match nothing on its own is the reason, count-only included, and
+            // the general advice (try `OR`, unquote a phrase) beside it would point elsewhere.
+            None if !why_empty.is_empty() => notes.extend(why_empty),
             // `limit 0` is count-only and returns no hits on purpose, so it is not explained.
             None if window.limit > 0 => notes.extend(zero_results_advice(query)),
             None => {}
@@ -253,17 +257,28 @@ async fn clause_matches_nothing(state: &AppState, index: &str, field: &str, valu
         == Some(0)
 }
 
-/// Put a note at the front of `_warning`, ahead of what is there: the more specific reason
-/// leads.
-fn add_warning(response: &mut JsonValue, note: String) {
-    let Some(obj) = response.as_object_mut() else {
-        return;
-    };
-    let joined = match obj.get("_warning").and_then(|w| w.as_str()) {
-        Some(existing) => format!("{note} {existing}"),
-        None => note,
-    };
-    obj.insert("_warning".to_string(), JsonValue::String(joined));
+/// Why a search that matched nothing may have: a whole-value clause written in another case.
+///
+/// Read only on the zero-hit path, so a search that found something pays nothing. The index's
+/// schema says which clauses name a field matched as a whole value as written — a `string`
+/// field, or a `text` one under `raw` — and each such clause, at most three, is counted alone:
+/// the first that matches nothing on its own gets its one-request retry, and a clause that was
+/// right beside a wrong one is never blamed. Also returns the clauses, so the caller can unquote
+/// their values for the general advice, which would otherwise read a quoted value as a phrase.
+async fn whole_value_retry(
+    state: &AppState,
+    index: &str,
+    query: &str,
+) -> (Vec<(String, String)>, Option<String>) {
+    let fields = extract_field_info(&index_schema(state, index).await);
+    let clauses = string_value_clauses(query, &fields);
+    for (field, value) in clauses.iter().take(3) {
+        if clause_matches_nothing(state, index, field, value).await {
+            let note = string_case_advice(field, value);
+            return (clauses, Some(note));
+        }
+    }
+    (clauses, None)
 }
 
 pub(super) fn search_index(
@@ -328,29 +343,20 @@ pub(super) fn search_index(
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
 
-                // Nothing matched, count-only included: a `string` clause written in another
-                // case is the commonest reason, and only the schema can say a clause is one.
-                // Read on this path alone, so a search that found something pays nothing.
-                let string_clauses = if total_hits == 0 {
-                    let fields = extract_field_info(&index_schema(&state, &index_name).await);
-                    string_value_clauses(&cleaned_for_advice, &fields)
+                let (unquoted, why_empty) = if total_hits == 0 {
+                    let (clauses, note) =
+                        whole_value_retry(&state, &index_name, &cleaned_for_advice).await;
+                    (without_string_value_quotes(&query, &clauses), note)
                 } else {
-                    Vec::new()
+                    (query.clone(), None)
                 };
                 annotate_search_response(
                     &mut response,
-                    &without_string_value_quotes(&query, &string_clauses),
+                    &unquoted,
                     window,
                     total_hits as usize,
+                    why_empty.into_iter().collect(),
                 );
-                // Each clause checked alone, one count each, so the advice names the clause that
-                // emptied the result and never one that was right while another was not.
-                for (field, value) in string_clauses.iter().take(3) {
-                    if clause_matches_nothing(&state, &index_name, field, value).await {
-                        add_warning(&mut response, string_case_advice(field, value));
-                        break;
-                    }
-                }
                 cap_response_bytes(&mut response, state.max_response_bytes);
                 Ok(response)
             }
@@ -396,6 +402,7 @@ pub(super) fn search_across_indexes(
         // Preprocess query to extract return/limit/offset/sort modifiers (same as HTTP server)
         let inline = parse_query_keywords(&query);
         let cleaned_query = inline.query;
+        let cleaned_for_advice = cleaned_query.clone();
         let parsed_fields = inline.fields;
         let parsed_sort = inline.sort;
 
@@ -490,6 +497,8 @@ pub(super) fn search_across_indexes(
         // answer one query differently on each run.
         let mut blocks: Vec<(usize, Vec<JsonValue>)> = Vec::new();
         let mut total_hits = 0u64;
+        // The indexes that answered, for explaining an empty result per index.
+        let mut answered: Vec<String> = Vec::new();
         // What could not be reached, named so the caller can tell which part of its request
         // is missing from the answer. An index that fails does not sink the ones that
         // answered: partial results with an explicit account of the gap are actionable,
@@ -544,6 +553,7 @@ pub(super) fn search_across_indexes(
                 .unwrap_or(0);
 
             total_hits += index_hits;
+            answered.push(index_name.clone());
             // One index sorting approximately makes the merged order approximate, since these
             // hits are merged with the rest and the sample they came from is not the whole of
             // what matched there.
@@ -652,7 +662,29 @@ pub(super) fn search_across_indexes(
             );
         }
 
-        annotate_search_response(&mut response, &query, window, total_hits as usize);
+        // Nothing matched anywhere: each index that answered is asked the single-index question
+        // against its own schema, since one field can be a whole-value field in one index and
+        // text in another. Named per index, at most five, in the order they answered.
+        let mut all_clauses = Vec::new();
+        let mut why_empty = Vec::new();
+        if total_hits == 0 {
+            for index_name in answered.iter().take(5) {
+                let (clauses, note) =
+                    whole_value_retry(&state, index_name, &cleaned_for_advice).await;
+                all_clauses.extend(clauses);
+                if let Some(note) = note {
+                    why_empty.push(format!("Index '{index_name}': {note}"));
+                }
+            }
+        }
+        let advice_query = without_string_value_quotes(&query, &all_clauses);
+        annotate_search_response(
+            &mut response,
+            &advice_query,
+            window,
+            total_hits as usize,
+            why_empty,
+        );
 
         cap_response_bytes(&mut response, state.max_response_bytes);
         Ok(response)
