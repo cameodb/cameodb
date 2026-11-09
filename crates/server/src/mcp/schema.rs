@@ -147,6 +147,21 @@ pub(super) fn extract_field_names(value: &JsonValue) -> Vec<String> {
 /// four, since that is the shape a schema is written back in.
 const DECLARATION_KEYS: &[&str] = &["indexed", "stored", "fast", "index_record_option"];
 
+/// The order a described field's keys come in; any key not named follows, as it came.
+const FIELD_KEY_ORDER: &[&str] = &[
+    "name",
+    "type",
+    "tokenizer",
+    "description",
+    "searchable",
+    "sortable",
+    "returned",
+    "default_search",
+    "shadow",
+    "ghost",
+    "returned_as",
+];
+
 /// Turn an index's schema block into the entry `describe_index` returns: the block as
 /// `GET /_config` reports it, each field described by what a query can do with it rather than
 /// by what its schema declares, with one `query_hint` per field type present and one
@@ -166,12 +181,25 @@ pub(super) fn enrich_index_entry(mut entry: JsonValue) -> JsonValue {
     let field_infos = extract_field_info(&entry);
 
     if let Some(fields) = entry.get_mut("fields").and_then(JsonValue::as_array_mut) {
-        for field in fields.iter_mut().filter_map(JsonValue::as_object_mut) {
+        for field in fields.iter_mut() {
+            let Some(mut source) = field.as_object().cloned() else {
+                continue;
+            };
             for key in DECLARATION_KEYS {
-                field.remove(*key);
+                source.remove(*key);
             }
-            let returned = !field.contains_key("ghost");
-            field.insert("returned".to_string(), JsonValue::Bool(returned));
+            let returned = !source.contains_key("ghost");
+            source.insert("returned".to_string(), JsonValue::Bool(returned));
+            // One key order on every field — what it is, what it holds, what a query can do with
+            // it — so forty fields read as a table rather than forty differently shuffled objects.
+            let mut ordered = serde_json::Map::new();
+            for key in FIELD_KEY_ORDER {
+                if let Some(value) = source.remove(*key) {
+                    ordered.insert(key.to_string(), value);
+                }
+            }
+            ordered.extend(source);
+            *field = JsonValue::Object(ordered);
         }
     }
 
@@ -355,6 +383,34 @@ mod tests {
             field("authors")["shadow"],
             false,
             "false is an answer, so it stays"
+        );
+        // Every field's keys in one order.
+        let keys = |f: &JsonValue| f.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        assert_eq!(
+            keys(field("year")),
+            [
+                "name",
+                "type",
+                "searchable",
+                "sortable",
+                "returned",
+                "default_search",
+                "shadow"
+            ]
+        );
+        assert_eq!(
+            keys(field("text_hr")),
+            [
+                "name",
+                "type",
+                "tokenizer",
+                "searchable",
+                "sortable",
+                "returned",
+                "default_search",
+                "shadow",
+                "ghost"
+            ]
         );
 
         let tokenizers: Vec<&str> = described["tokenizer_hints"]

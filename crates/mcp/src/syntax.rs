@@ -300,7 +300,7 @@ pub const OPERATORS: &[Operator] = &[
         examples: &[
             "status: IN [active pending]",
             "year: IN [2023 2024]",
-            "author: IN [\"Austen, Jane\" \"AUSTEN, JANE\"]",
+            "label: IN [\"Austen, Jane\" \"AUSTEN, JANE\"]",
         ],
         types: &[
             TYPE_TEXT,
@@ -444,7 +444,7 @@ pub const RULES: &[&str] = &[
      often lists its values, and the case its examples are written in is the case to try first \
      (`ZAKON`, `Hrvatski sabor`). When a string value written from the question finds nothing, \
      retry once with its spellings in one set — as given, lowercase, first letter capitalised, \
-     each word capitalised, uppercase: `author: IN [\"austen, jane\" \"Austen, jane\" \
+     each word capitalised, uppercase: `label: IN [\"austen, jane\" \"Austen, jane\" \
      \"Austen, Jane\" \"AUSTEN, JANE\"]` — one request rather than one per spelling. A \
      description saying `list` means the field holds several values: a clause matches when any \
      one of them does, and hits carry an array. For a numeric or date field, `metrics` with \
@@ -536,7 +536,7 @@ pub const INLINE_MODIFIERS: &[(&str, &str, &str)] = &[
     ),
     (
         "sort field:desc",
-        "Order by a field. See the sorting rules.",
+        "Order by a field; `sort field desc` is the same. See the sorting rules.",
         "title:rust sort year:desc",
     ),
     (
@@ -563,7 +563,7 @@ pub const MODIFIER_RULES: &[&str] = &[
      query, with query text left in front of it. Anything else is searched for, so `find tax \
      return forms` is four terms and `* limit 10` is how to ask for a bare limit.",
     "A field list needs a comma between names, a limit or an array needs a number, `matches` \
-     needs `on` or `off`, and a sort order must be exactly `asc` or `desc`. A clause that does not parse stays in the query rather than being \
+     needs `on` or `off`, and a sort order must be exactly `asc` or `desc`, after a colon or a space. A clause that does not parse stays in the query rather than being \
      applied in part.",
     "A modifier naming a field the index does not have is reported as a dropped clause, since a \
      projection would otherwise return documents with no fields.",
@@ -581,7 +581,7 @@ pub const FIELD_TYPES: &[(&str, &str)] = &[
         TYPE_STRING,
         "The whole value is one term, matched exactly: case, spaces and punctuation count, and \
          a word or a part of the value matches nothing. Quote a value holding a space or \
-         punctuation — `author:\"Austen, Jane\"` — and copy it as the data writes it.",
+         punctuation — `label:\"Austen, Jane\"` — and copy it as the data writes it.",
     ),
     (TYPE_I64, "Signed 64-bit integer."),
     (TYPE_U64, "Unsigned 64-bit integer."),

@@ -78,9 +78,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   holds `Austen, Jane`, and nothing said so. The session instructions and the orchestrator skill
   tell an agent how to read a field's description and how to learn a field's values before
   filtering on them: a value in the case the description's examples show first, and a value from
-  the question that finds nothing retried once with its spellings in one `IN` set.
+  the question that finds nothing retried once with its spellings in one `IN` set. A search that
+  matches nothing through a `string` clause now says so in its `_warning`, with that set written
+  out for the clause (`authors: IN ["austen, jane" "Austen, jane" "Austen, Jane" "AUSTEN, JANE"]`),
+  ahead of the general advice about `AND` and phrases; `describe_index` gives every field its keys
+  in one order.
 
 ### Fixed
+
+- **`sort seq asc` sorted nothing.** Only `sort seq:asc` was a sort; with a space the three words
+  were searched for, ORed, so `book_id:1342 sort seq asc` — the recipe schema descriptions give
+  for reading a record in order — returned a million rows of a 19.7M-row index by relevance, with
+  no warning. `sort field asc` and `sort field desc` are now the same as the colon form, on HTTP
+  and MCP; `sort by date` stays query text.
 
 - **On a cluster, a search the index cannot answer is refused, not answered as a partial page.** An
   unsortable sort, or a query whose every clause was dropped, is decided by each node against the

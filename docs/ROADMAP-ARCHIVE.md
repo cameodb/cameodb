@@ -1994,7 +1994,7 @@ settled instead on the agent doing what that would have told it, in one request:
   its examples use before anything is retried.
 - **One retry, every spelling in one set.** A value taken from the question that finds nothing is
   retried once as an `IN` set — as given, lowercase, first letter capitalised, each word
-  capitalised, uppercase: `author: IN ["austen, jane" "Austen, jane" "Austen, Jane" "AUSTEN,
+  capitalised, uppercase: `authors: IN ["austen, jane" "Austen, jane" "Austen, Jane" "AUSTEN,
   JANE"]`. On the 19.7M-row book index that finds the 24 books `"austen, jane"` alone missed, in
   one call; the `OR` of the same clauses does too.
 - **`list` in a description** is read as several values per row: any one matching makes a hit,
@@ -2003,8 +2003,14 @@ settled instead on the agent doing what that would have told it, in one request:
 In the syntax rule on learning a field's values, the session instructions and the orchestrator
 skill; the index-describe skill writes values exactly as stored, a small closed set whole, and
 `list` on every multi-valued field. The `IN` operator's examples show a quoted value. The engine
-probe is not built: with descriptions written from the data and the retry costing one request, it
-would answer a question the agent no longer has to ask.
+probe is not built: with descriptions written from the data and the retry costing one request,
+naming the one spelling that exists would answer a question the agent no longer has to ask. What
+the node does instead is cheaper: a search that matches nothing reads the schema, and a `string`
+clause in it gets the retry written out in `_warning` —
+`authors: IN ["austen, jane" "Austen, jane" "Austen, Jane" "AUSTEN, JANE"]` — ahead of the general
+advice. Checking the standard examples against the live index the same day found `sort seq asc`,
+the descriptions' recipe for reading a record in order, searched as three ORed words; the spaced
+order is now a sort.
 
 ## C. Phase 14 — Security Hardening — delivered items
 

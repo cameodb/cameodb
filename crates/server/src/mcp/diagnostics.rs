@@ -94,6 +94,101 @@ pub(super) fn zero_results_advice(query: &str) -> Option<String> {
     (!reasons.is_empty()).then(|| reasons.join(" "))
 }
 
+/// A value's spellings in the order a retry tries them: as given, lowercase, first letter
+/// capitalised, each word capitalised, uppercase — each once.
+pub(super) fn spellings(value: &str) -> Vec<String> {
+    fn capitalise(word: &str) -> String {
+        let mut done = false;
+        word.chars()
+            .flat_map(|ch| {
+                if !done && ch.is_alphabetic() {
+                    done = true;
+                    ch.to_uppercase().collect::<Vec<_>>()
+                } else {
+                    vec![ch]
+                }
+            })
+            .collect()
+    }
+    let lower = value.to_lowercase();
+    let first = capitalise(&lower);
+    let each = lower
+        .split(' ')
+        .map(capitalise)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut out: Vec<String> = Vec::new();
+    for spelling in [value.to_string(), lower, first, each, value.to_uppercase()] {
+        if !out.contains(&spelling) {
+            out.push(spelling);
+        }
+    }
+    out
+}
+
+/// The `field:value` clauses of a query that name a `string` field with a plain value: the ones
+/// a value in another case leaves empty. A range, a set, a prefix and a boost are left out —
+/// each says something about the value the retry would have to keep.
+fn string_value_clauses(query: &str, fields: &[FieldInfo]) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    for reference in storage::field_references(query) {
+        let is_string = fields
+            .iter()
+            .any(|f| f.name == reference.name && f.field_type == "string" && !f.is_shadow);
+        let Some(rest) = query[reference.span.end..].strip_prefix(':') else {
+            continue;
+        };
+        if !is_string {
+            continue;
+        }
+        let value = if let Some(quoted) = rest.strip_prefix('"') {
+            match quoted.find('"') {
+                Some(end) => &quoted[..end],
+                None => continue,
+            }
+        } else {
+            let end = rest
+                .find(|ch: char| ch.is_whitespace() || ch == ')')
+                .unwrap_or(rest.len());
+            &rest[..end]
+        };
+        if value.is_empty()
+            || value.contains(['*', '^', '\\'])
+            || value.starts_with(['[', '{', '<', '>', '(', '='])
+        {
+            continue;
+        }
+        let clause = (reference.name.to_string(), value.to_string());
+        if !found.contains(&clause) {
+            found.push(clause);
+        }
+    }
+    found
+}
+
+/// What to try when a query naming a `string` field matched nothing: the one retry that covers
+/// a value written in another case, spelled out for the clause it applies to.
+///
+/// A `string` field matches its whole value in the case the data writes it, so
+/// `authors:"austen, jane"` finds nothing where the data holds `Austen, Jane` — and the general
+/// zero-result advice (drop an `AND`, unquote a phrase) sends the caller the wrong way. Written
+/// for the first such clause only, since the retry is one request whichever clause was off.
+pub(super) fn string_case_advice(query: &str, fields: &[FieldInfo]) -> Option<String> {
+    let text = parse_query_keywords(query).query;
+    let (field, value) = string_value_clauses(&text, fields).into_iter().next()?;
+    let set = spellings(&value)
+        .iter()
+        .map(|spelling| format!("\"{spelling}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(format!(
+        "'{field}' is a string field: it matches only a whole value, in the case the data \
+         writes it. If \"{value}\" came from the question rather than from the data, retry once \
+         with its spellings in one set — `{field}: IN [{set}]` — or take the value as the \
+         field's description or a hit writes it."
+    ))
+}
+
 /// Why an empty page came back from a query that matched, or `None` when it did not page past
 /// the end.
 ///
@@ -522,7 +617,10 @@ pub(super) fn analyze_query(query_text: &str, field_infos: &[FieldInfo]) -> Json
                 });
                 // How the value in the query meets the field's terms — case, stemming,
                 // diacritics — which the type's hint cannot say, since it is the tokenizer's.
+                // Not on a `string` field: it is always `raw`, and its type's hint opens with
+                // that rule already.
                 if !info.is_shadow
+                    && info.field_type != "string"
                     && let Some(rule) = cameodb_mcp::syntax::tokenizer_rule(
                         &info.field_type,
                         info.tokenizer.as_deref(),
@@ -929,6 +1027,65 @@ mod field_suggestion_tests {
             .collect()
     }
 
+    #[test]
+    fn a_value_s_spellings_are_each_tried_once() {
+        assert_eq!(
+            super::spellings("austen, jane"),
+            [
+                "austen, jane",
+                "Austen, jane",
+                "Austen, Jane",
+                "AUSTEN, JANE"
+            ]
+        );
+        assert_eq!(
+            super::spellings("HRVATSKI SABOR"),
+            [
+                "HRVATSKI SABOR",
+                "hrvatski sabor",
+                "Hrvatski sabor",
+                "Hrvatski Sabor"
+            ]
+        );
+        assert_eq!(
+            super::spellings("rješenje"),
+            ["rješenje", "Rješenje", "RJEŠENJE"]
+        );
+    }
+
+    /// A string clause that matched nothing gets the retry spelled out for it; a text clause,
+    /// a range and a prefix do not.
+    #[test]
+    fn a_string_clause_gets_its_retry_spelled_out() {
+        let fields = vec![
+            info("authors", "string"),
+            info("title", "text"),
+            info("year", "i64"),
+        ];
+        let advice =
+            super::string_case_advice(r#"authors:"austen, jane" AND title:pride limit 5"#, &fields)
+                .expect("a string clause");
+        assert!(
+            advice.contains(
+                r#"`authors: IN ["austen, jane" "Austen, jane" "Austen, Jane" "AUSTEN, JANE"]`"#
+            ),
+            "{advice}"
+        );
+        let advice = super::string_case_advice("unit_type:Book", &[info("unit_type", "string")])
+            .expect("a bare value");
+        assert!(advice.contains(r#""book""#), "{advice}");
+
+        for query in [
+            "title:pride",
+            "year:1813",
+            "authors:Aus*",
+            r#"authors:["a" TO "b"]"#,
+            r#"authors: IN ["a" "b"]"#,
+        ] {
+            assert_eq!(super::string_case_advice(query, &fields), None, "{query}");
+        }
+    }
+
     /// A field the query names comes back with how its values are matched: a string field
     /// matches its whole value in its own case, which is the commonest reason a query that
     /// parses finds nothing, and the type's operator list cannot say it.
@@ -949,8 +1106,12 @@ mod field_suggestion_tests {
                 .and_then(|h| h["matching"].as_str())
                 .map(str::to_string)
         };
+        // A string field's rule is its type's hint, said once.
+        assert_eq!(matching("authors"), None, "{analysis}");
         assert!(
-            matching("authors").is_some_and(|m| m.contains("case")),
+            analysis["hints"]["string"]
+                .as_str()
+                .is_some_and(|h| h.contains("case")),
             "{analysis}"
         );
         assert!(

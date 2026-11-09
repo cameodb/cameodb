@@ -122,8 +122,27 @@ fn parse_modifier_run(tokens: &[&str]) -> Option<QueryModifiers> {
                 idx += 2;
             }
             "sort" if run.sort.is_none() => {
-                run.sort = Some(parse_sort_spec(tokens.get(idx + 1)?)?);
+                let spec_token = tokens.get(idx + 1)?;
+                let mut spec = parse_sort_spec(spec_token)?;
                 idx += 2;
+                // `sort seq asc` as well as `sort seq:asc`: the spaced order is how the recipes
+                // in schema descriptions are written and how a reader writes it back, and read
+                // as words it turned a sorted read of a record into an OR of three terms over the
+                // whole index. Only after a field with no order of its own, and only `asc` or
+                // `desc`, so `sort by date` stays query text.
+                if !spec_token.contains(':')
+                    && let Some(order) = tokens.get(idx).and_then(|token| {
+                        match token.to_ascii_lowercase().as_str() {
+                            "asc" => Some(SortOrder::Asc),
+                            "desc" => Some(SortOrder::Desc),
+                            _ => None,
+                        }
+                    })
+                {
+                    spec.order = order;
+                    idx += 1;
+                }
+                run.sort = Some(spec);
             }
             "return" if run.fields.is_none() => {
                 // The field list runs to the next keyword, since only a keyword can end it.
@@ -598,6 +617,28 @@ mod tests {
             fields,
             Some(vec!["title".to_string(), "author".to_string()])
         );
+    }
+
+    /// The spaced order, as schema descriptions write their recipes: `book_id:1342 sort seq asc`
+    /// was three ORed words over 19.7M rows, a million hits by relevance.
+    #[test]
+    fn a_sort_order_may_follow_the_field_after_a_space() {
+        let m = parse_query_keywords("book_id:1342 sort seq asc");
+        assert_eq!(m.query, "book_id:1342");
+        assert_eq!(
+            m.sort,
+            Some(SortSpec {
+                field: "seq".to_string(),
+                order: SortOrder::Asc,
+            })
+        );
+        let m = parse_query_keywords("title:rust sort year DESC limit 5");
+        assert_eq!(m.query, "title:rust");
+        assert_eq!(m.limit, Some(5));
+        assert_eq!(m.sort.map(|s| s.order), Some(SortOrder::Desc));
+        // Not after an order already given, and not a word that is not an order.
+        assert_no_modifiers("title:rust sort year:desc asc");
+        assert_no_modifiers("title:rust sort by date");
     }
 
     #[test]

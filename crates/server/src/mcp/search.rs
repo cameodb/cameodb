@@ -8,10 +8,10 @@ use cameodb_mcp::{McpIndexSearchRequest, McpSearchBounds, ToolError};
 use crate::cluster_coordinator::OperationType;
 use crate::mcp::diagnostics::{
     approximate_sort_note, names_a_missing_field, narrowed_default_fields_note, paged_past_the_end,
-    refuse_if_clauses_discarded, short_page_note, tool_error, with_field_suggestions,
-    zero_results_advice,
+    refuse_if_clauses_discarded, short_page_note, string_case_advice, tool_error,
+    with_field_suggestions, zero_results_advice,
 };
-use crate::mcp::schema::extract_field_info;
+use crate::mcp::schema::{extract_field_info, index_schema};
 use crate::node::{
     APPROXIMATE_SORT_FIELD, ClientOp, NARROWED_DEFAULT_FIELDS, SearchWindow, order_hit_blocks,
 };
@@ -225,6 +225,19 @@ fn annotate_search_response(
     }
 }
 
+/// Put a note at the front of `_warning`, ahead of what is there: the more specific reason
+/// leads.
+fn add_warning(response: &mut JsonValue, note: String) {
+    let Some(obj) = response.as_object_mut() else {
+        return;
+    };
+    let joined = match obj.get("_warning").and_then(|w| w.as_str()) {
+        Some(existing) => format!("{note} {existing}"),
+        None => note,
+    };
+    obj.insert("_warning".to_string(), JsonValue::String(joined));
+}
+
 pub(super) fn search_index(
     state: AppState,
     index: McpIndexSearchRequest,
@@ -287,6 +300,15 @@ pub(super) fn search_index(
                     .unwrap_or(0);
 
                 annotate_search_response(&mut response, &query, window, total_hits as usize);
+                // Nothing matched, count-only included: a `string` clause written in another
+                // case is the commonest reason, and only the schema can say a clause is one.
+                // Read on this path alone, so a search that found something pays nothing.
+                if total_hits == 0 {
+                    let fields = extract_field_info(&index_schema(&state, &index_name).await);
+                    if let Some(advice) = string_case_advice(&query, &fields) {
+                        add_warning(&mut response, advice);
+                    }
+                }
                 cap_response_bytes(&mut response, state.max_response_bytes);
                 Ok(response)
             }
