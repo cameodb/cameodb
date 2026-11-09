@@ -274,7 +274,7 @@ K2's merge and the refusal fix (`a2244ea`) their first multi-node check.
 | 1 ✅ | Rechecks: the second-signal "force" item; the client's `007` read as a number; the format sniff cut inside a multibyte character — all three confirmed and fixed 2026-11-09 | Each either closes or becomes a confirmed bug, which sizes step 2 |
 | 2 ✅ | The audit and logging fixes: the streamed search's query at `info!` and its missing audited query; 429 and 403 audited as `allowed`; a plain index listing churning the open-index cap — all three fixed 2026-11-09 | Small, local, and the first two are security fixes |
 | 3 ✅ | [E4](docs/ROADMAP-ARCHIVE.md#e4--two-compatibility-paths-with-no-end-to-end-test)'s fixtures — 0.3.0 and 0.3.9, done 2026-11-09 | Before any 0.4.0 storage work, so they are written by a real 0.3.x build |
-| 4 | [N17](#n17--smaller-items-filed-so-they-are-not-lost)'s cluster bugs: the snapshot persisted out of order, the checksum's `DefaultHasher` → xxh3, the peer tasks outside the cancellation token | Small real bugs under everything after them |
+| 4 ✅ | [N17](#n17--smaller-items-filed-so-they-are-not-lost)'s cluster bugs: the snapshot persisted out of order, the checksum's `DefaultHasher` → xxh3, the peer tasks outside the cancellation token — all three fixed 2026-11-09 | Small real bugs under everything after them |
 | 5 | [OB26](#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap) with [N12](#n12--dead-surface-and-the-comments-that-no-longer-match)'s coordinator dead surface | About a day, mostly deletion; the join path step 6 changes |
 | 6 | [V1](#v1--a-node-that-brings-new-shards-cannot-join-a-cluster-that-holds-data): reproduce, then refuse | On the bootstrap step 5 leaves |
 | 7 | [O4](#o4--the-request-budget-crosses-the-wire) | The field is optional on the wire, so mixed versions still work |
@@ -2313,7 +2313,7 @@ as two extensions (`Caller` and `Authz`) where one extractor would do.
   replaced by the event that should have: a node that finds a connected peer's shards missing
   from its ring asks that peer, as the canvass already does for a schema. Kept, if at all, only
   as a rare safety net, not the mechanism. The architecture prefers event-triggered coordination
-  to ticking pull or push tasks (2026-10-07); the 30 s schema sweep (`spawn_schema_sweep`, N13)
+  to ticking pull or push tasks (2026-10-07); the 30 s schema sweep (`sweep_schemas_every`, N13)
   is held to the same rule.
 - **Smaller owners.** The ring is built from shards twice by forging a `NodeIdentity`
   (`coordinator.rs:222`, `:883`, `orchestrator.rs:5001`): `ConsistentRing::insert(id, &tokens)`;
@@ -2362,17 +2362,20 @@ it should, or a defect with a small reach.
   emergency checks between phases could not fire, since the phase caps sum to 100 s under a 120 s
   limit. **Fixed 2026-11-09:** a watchdog started with the shutdown exits on a second signal or
   at 120 s, and the inline checks and `SHUTDOWN_IN_PROGRESS` are gone; verified on a node held in
-  Phase 2 by an open request (exit 1, one second after the second SIGINT). Still open: the
-  post-connect sweep, the periodic sweep, the shard-map timer and
-  `RegisterLocalShards` run as plain `task::spawn` outside the `peer_tasks` cancellation token that
-  `spawn_peer_task` exists for (`coordinator.rs:911`, `:1366`, `:2339`, `:2363`, `:837`).
-  **Change:** leave the cluster before Phase 3 (the watchdog is done).
-- **Persistence.** `persist_snapshot` (`coordinator.rs:414`) is an unordered `spawn_blocking` per
-  call and sets `last_persisted_generation` before success, so an older snapshot can commit after
-  a newer one: one persister task on a `watch`, as topology already does. The shard checksum
-  (`:293`) uses `DefaultHasher`, whose output is not stable across Rust releases, and is compared
-  across nodes, so a mixed-build cluster always sees a difference: use `xxh3`, already a
-  dependency. `GetStatus` mutates state and logs at `info!` on every call (`:1241`).
+  Phase 2 by an open request (exit 1, one second after the second SIGINT). ✅ The post-connect
+  sweep, the periodic sweep, the shard-map timer and the exchange after `RegisterLocalShards` ran
+  as plain `task::spawn` outside the `peer_tasks` cancellation token that `spawn_peer_task` exists
+  for (**fixed 2026-11-09**: all four are peer tasks; the two timers start from a
+  `StartPeriodicSync` message, so the coordinator owns them). Still open, **change:** leave the
+  cluster before Phase 3.
+- **Persistence.** ✅ `persist_snapshot` was an unordered `spawn_blocking` per call and set
+  `last_persisted_generation` before success, so an older snapshot could commit after a newer one
+  (**fixed 2026-11-09**: one writer task on a `watch` takes the latest in turn; a test of 200
+  generations caught the old path leaving 199 on disk over 201). ✅ The shard checksum used
+  `DefaultHasher`, whose output is not stable across Rust releases, and is compared across nodes,
+  so a mixed-build cluster always saw a difference (**fixed 2026-11-09**: xxh3 over a fixed
+  layout, pinned by a test). Still open: `GetStatus` mutates state and logs at `info!` on every
+  call (`:1241`).
 - **Swarm.** The event forwarder is a 160-line closure inside `InitSwarm` over an unbounded
   channel with one `ask` per event (`swarm/mod.rs:597`, `coordinator.rs:998–1160`): extract
   `forward_swarm_events`, use `tell`, bound or coalesce. The yamux and swarm config are copied in

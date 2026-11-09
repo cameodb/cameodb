@@ -208,9 +208,14 @@ pub struct PeerShardDiscovered {
 }
 
 /// Periodic tick: pull every connected peer's shard map and merge it (see
-/// `spawn_shard_map_sync`). Local only; never crosses the wire.
+/// `StartPeriodicSync`). Local only; never crosses the wire.
 #[derive(Debug, Clone)]
 pub struct SyncShardMaps;
+
+/// Start a clustered node's timers — the shard-map sync and the schema sweep — as peer tasks,
+/// so shutdown ends them with the rest. Local only; sent once, after the swarm is up.
+#[derive(Debug, Clone)]
+pub struct StartPeriodicSync;
 
 /// Message to merge remote shard assignments into local coordinator.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -425,4 +425,74 @@ mod tests {
         assert!(!asked.load(std::sync::atomic::Ordering::SeqCst));
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
+
+    /// The shard checksum is compared across nodes, so a given map has to give the same number
+    /// on every build. Pinned: if this changes, nodes on the old and new build disagree on
+    /// every comparison until all are upgraded — change it only knowing that.
+    #[test]
+    fn the_shard_checksum_is_the_same_on_every_build() {
+        let mut cc = ClusterCoordinator::new(make_cluster());
+        assert_eq!(
+            cc.calculate_shard_checksum(),
+            0x2d06800538d394c2,
+            "the empty map"
+        );
+        for (shard, owner, docs) in [(2u128, 9u128, 40u64), (1, 8, 30)] {
+            let shard_id = Uuid::from_u128(shard);
+            cc.shard_assignments.insert(
+                shard_id,
+                ShardMetadata {
+                    shard_id,
+                    node_id: Uuid::from_u128(owner),
+                    vnode_tokens: vec![docs, docs * 7, u64::MAX - docs],
+                    storage_bytes: docs * 1024,
+                    document_count: docs,
+                },
+            );
+        }
+        assert_eq!(
+            cc.calculate_shard_checksum(),
+            0x75905e9f38fafcda,
+            "two shards"
+        );
+    }
+
+    /// Snapshots are written one at a time, latest last: a burst of changes leaves the newest
+    /// on disk, and it stays there. Written by a task each, an older one could commit after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_snapshot_on_disk_is_the_latest_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (store, _) =
+            crate::cluster_state::ClusterStateStore::open_for_startup(dir.path(), false).unwrap();
+        let store = std::sync::Arc::new(store);
+        let mut cc = ClusterCoordinator::new(make_cluster());
+        cc.set_state_store(std::sync::Arc::clone(&store));
+        for _ in 0..200 {
+            cc.generation += 1;
+            cc.persist_snapshot();
+        }
+        let latest = cc.generation;
+
+        let on_disk = || {
+            store
+                .load_persisted_cluster()
+                .unwrap()
+                .map(|topology| topology.config.generation)
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while on_disk() != Some(latest) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never reached {latest}: {:?}",
+                on_disk()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            on_disk(),
+            Some(latest),
+            "an older snapshot committed after the latest"
+        );
+    }
 }

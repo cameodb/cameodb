@@ -731,8 +731,12 @@ async fn run(args: Vec<String>) -> Result<()> {
         } else {
             tracing::info!(name = %coordinator_remote_name, "Registered coordinator for remote access");
         }
-        crate::cluster_coordinator::spawn_shard_map_sync(&coordinator_actor, node_id);
-        crate::cluster_coordinator::spawn_schema_sweep(&coordinator_actor, node_id);
+        if let Err(e) = coordinator_actor
+            .tell(crate::cluster_coordinator::StartPeriodicSync)
+            .await
+        {
+            tracing::warn!(error = %e, "Failed to start the shard-map sync and schema sweep");
+        }
     } else if !cluster_enabled {
         tracing::info!("Cluster disabled, skipping coordinator remote registration");
     } else {

@@ -107,6 +107,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`client data load`: a JSON Lines file is no longer read as one JSON document when the 64 KiB
   sample ends inside a multibyte character.** The sample failed as UTF-8 as a whole, which skipped
   the JSON Lines check; the cut character is now left out of the sample.
+- **A cluster node's saved topology is the latest one.** Each change to the cluster wrote its
+  snapshot to `metadata.redb` from a task of its own, so two close together could commit in either
+  order, and the node could restart on the older ring and assignments. One writer now takes them in
+  turn, the latest last.
+- **Nodes built apart agree on whether their shard maps match.** The checksum two nodes compare
+  came from Rust's `DefaultHasher`, whose output can change from one Rust release to the next, so
+  nodes built with different toolchains never matched and sent each other their full map at every
+  exchange. It is now xxh3 over a fixed layout. Upgrade note: during a rolling upgrade from an
+  earlier 0.3.x, the old and new nodes disagree on it until all are upgraded, which costs only
+  those full-map sends.
+- **Shutdown ends every task a node has waiting on a peer.** The shard-map sync, the schema sweep,
+  the sweep after a peer connects and the exchange after shards are registered ran outside the
+  cancellation that ends peer tasks before the swarm stops, so one still waiting on a peer at that
+  moment could panic inside the actor library.
 
 ## [0.3.9] - 2026-11-05
 

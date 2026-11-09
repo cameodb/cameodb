@@ -4,7 +4,7 @@
 use super::*;
 
 use anyhow::Result;
-use kameo::actor::{ActorRef, RemoteActorRef};
+use kameo::actor::{RemoteActorRef, WeakActorRef};
 use kameo::message::{Context, Message};
 use kameo::{Actor, RemoteActor, remote_message};
 use serde_json::Value as JsonValue;
@@ -53,8 +53,12 @@ pub struct ClusterCoordinator {
     // DHT Bootstrap tracking - DHT is used only during bootstrap, then push-only
     pub(crate) bootstrap_complete: bool,
 
-    // Track last persisted generation to avoid redundant snapshots
-    pub(crate) last_persisted_generation: u64,
+    /// The generation last handed to the snapshot writer, so an unchanged one is not written
+    /// again.
+    pub(crate) last_queued_generation: u64,
+    /// Feeds the one task that writes snapshots, started with the first one: see
+    /// [`ClusterCoordinator::persist_snapshot`].
+    pub(crate) snapshot_writer: Option<tokio::sync::watch::Sender<Option<Arc<PendingSnapshot>>>>,
 
     // Track push failures per peer for DHT fallback recovery
     pub(crate) push_failure_count: HashMap<Uuid, u32>,
@@ -118,7 +122,8 @@ impl ClusterCoordinator {
             topology_subscribers: Vec::new(),
             peer_tasks: tokio_util::sync::CancellationToken::new(),
             bootstrap_complete: false,
-            last_persisted_generation: 0,
+            last_queued_generation: 0,
+            snapshot_writer: None,
             push_failure_count: HashMap::new(),
             last_seen_state: HashMap::new(),
             remote_peer_pool: None,
@@ -254,7 +259,8 @@ impl ClusterCoordinator {
             topology_subscribers: Vec::new(),
             peer_tasks: tokio_util::sync::CancellationToken::new(),
             bootstrap_complete: false, // Will be set after initial DHT queries complete
-            last_persisted_generation: generation,
+            last_queued_generation: generation,
+            snapshot_writer: None,
             push_failure_count: HashMap::new(),
             last_seen_state: HashMap::new(),
             remote_peer_pool: None,
@@ -289,33 +295,28 @@ impl ClusterCoordinator {
         }
     }
 
-    /// Calculate checksum of all shard metadata for quick comparison
-    fn calculate_shard_checksum(&self) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-
-        // Sort shard IDs for consistent hashing
+    /// A checksum of the shard map, compared with a peer's to decide whether to send it.
+    ///
+    /// Compared across nodes, so it must come out the same on every build: xxh3 over a fixed
+    /// byte layout, not `DefaultHasher`, whose output may change with the Rust release and made
+    /// two nodes built apart disagree on every comparison. Shards in id order; per shard its id,
+    /// owner, document count, bytes, then the token count and its vnode tokens.
+    pub(crate) fn calculate_shard_checksum(&self) -> u64 {
+        let mut hasher = xxhash_rust::xxh3::Xxh3::new();
         let mut shard_ids: Vec<_> = self.shard_assignments.keys().collect();
         shard_ids.sort();
-
         for shard_id in shard_ids {
-            if let Some(meta) = self.shard_assignments.get(shard_id) {
-                // Hash the key components that determine shard state
-                shard_id.hash(&mut hasher);
-                meta.node_id.hash(&mut hasher);
-                meta.document_count.hash(&mut hasher);
-                meta.storage_bytes.hash(&mut hasher);
-
-                // Hash vnode tokens for routing consistency
-                for token in &meta.vnode_tokens {
-                    token.hash(&mut hasher);
-                }
+            let meta = &self.shard_assignments[shard_id];
+            hasher.update(shard_id.as_bytes());
+            hasher.update(meta.node_id.as_bytes());
+            hasher.update(&meta.document_count.to_le_bytes());
+            hasher.update(&meta.storage_bytes.to_le_bytes());
+            hasher.update(&(meta.vnode_tokens.len() as u64).to_le_bytes());
+            for token in &meta.vnode_tokens {
+                hasher.update(&token.to_le_bytes());
             }
         }
-
-        hasher.finish()
+        hasher.digest()
     }
 
     /// Update local generation to match higher remote generation when data is identical
@@ -393,52 +394,38 @@ impl ClusterCoordinator {
         exchanged.ok_or_else(|| "Remote coordinator not found".to_string())
     }
 
-    /// Persist current cluster state snapshot to disk (event-driven)
-    /// Only persists when generation changes to avoid redundant writes
-    fn persist_snapshot(&mut self) {
-        // Skip if generation hasn't changed since last persist
-        if self.generation == self.last_persisted_generation {
+    /// Hand the current cluster state to the snapshot writer, when its generation changed.
+    ///
+    /// One task writes every snapshot, in turn, and takes only the latest: a snapshot queued
+    /// while another is being written replaces any still waiting. A blocking task per call, as
+    /// before, let two writes race, so an older snapshot could commit after a newer one and the
+    /// node restart on the older topology. A write that fails is logged; the next change writes
+    /// the whole state again.
+    pub(crate) fn persist_snapshot(&mut self) {
+        if self.generation == self.last_queued_generation {
             return;
         }
-
-        if let Some(state_store) = &self.state_store {
-            // Use current state for persistence
-            let nodes_to_persist = self.expected_nodes.clone();
-            let ring = self.ring.clone();
-            let state_store = state_store.clone();
-            let generation = self.generation;
-            let shard_assignments = self.shard_assignments.clone();
-            let cluster_name = self.cluster.cluster_config.cluster_name.clone();
-
-            // 4. Offload blocking I/O to thread pool
-            task::spawn_blocking(move || {
-                let config = PersistedClusterConfig {
-                    expected_nodes: nodes_to_persist.len(),
-                    generation,
-                    last_stable_at: Some(current_timestamp()), // Coordinator calls this when stable
-                    cluster_name: cluster_name.clone(),
-                };
-
-                if let Err(e) = state_store.persist_cluster_snapshot(
-                    &config,
-                    &shard_assignments,
-                    &nodes_to_persist,
-                    &ring,
-                ) {
-                    error!(error = %e, "Failed to persist cluster snapshot");
-                } else {
-                    info!(
-                        generation,
-                        shards = shard_assignments.len(),
-                        nodes = nodes_to_persist.len(),
-                        "Cluster snapshot persisted"
-                    );
-                }
-            });
-
-            // Update last persisted generation after successful dispatch
-            self.last_persisted_generation = self.generation;
-        }
+        let Some(state_store) = &self.state_store else {
+            return;
+        };
+        let snapshot = Arc::new(PendingSnapshot {
+            config: PersistedClusterConfig {
+                expected_nodes: self.expected_nodes.len(),
+                generation: self.generation,
+                last_stable_at: Some(current_timestamp()),
+                cluster_name: self.cluster.cluster_config.cluster_name.clone(),
+            },
+            shards: self.shard_assignments.clone(),
+            nodes: self.expected_nodes.clone(),
+            ring: self.ring.clone(),
+        });
+        let writer = self.snapshot_writer.get_or_insert_with(|| {
+            let (tx, rx) = tokio::sync::watch::channel(None);
+            task::spawn(write_snapshots(Arc::clone(state_store), rx));
+            tx
+        });
+        writer.send_replace(Some(snapshot));
+        self.last_queued_generation = self.generation;
     }
 
     /// Evaluate cluster state and transition if needed (reactive, message-driven)
@@ -824,7 +811,7 @@ impl Message<RegisterLocalShards> for ClusterCoordinator {
                     let peer_generation = local_generation;
                     let peer_checksum = local_checksum;
 
-                    task::spawn(async move {
+                    self.spawn_peer_task(async move {
                         match self_weak_clone.upgrade() {
                             Some(self_ref) => {
                                 // Send a message to perform intelligent exchange
@@ -1353,7 +1340,7 @@ impl Message<PeerDiscovered> for ClusterCoordinator {
         // compare schema records once its orchestrator is reachable. The timer catches a peer
         // that is not by then.
         let weak = ctx.actor_ref().downgrade();
-        task::spawn(async move {
+        self.spawn_peer_task(async move {
             tokio::time::sleep(SCHEMA_SWEEP_AFTER_CONNECT).await;
             if let Some(coordinator) = weak.upgrade() {
                 super::sweep_schemas(&coordinator).await;
@@ -2334,49 +2321,106 @@ const SCHEMA_SWEEP_AFTER_CONNECT: std::time::Duration = std::time::Duration::fro
 /// How often each node compares its schema records with its peers' — see `sweep_schemas`.
 const SCHEMA_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Start the periodic schema sweep for a clustered node: phase-shifted by node id as the
-/// shard-map sync is. The task ends with the coordinator.
-pub fn spawn_schema_sweep(coordinator: &ActorRef<ClusterCoordinator>, node_id: Uuid) {
-    let weak = coordinator.downgrade();
-    let phase = std::time::Duration::from_millis(u64::from(node_id.as_bytes()[1]) * 40);
-    task::spawn(async move {
-        let start = tokio::time::Instant::now() + SCHEMA_SWEEP_INTERVAL + phase;
-        let mut ticks = tokio::time::interval_at(start, SCHEMA_SWEEP_INTERVAL);
-        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            ticks.tick().await;
-            let Some(coordinator) = weak.upgrade() else {
-                break;
-            };
-            super::sweep_schemas(&coordinator).await;
-        }
-    });
+impl Message<StartPeriodicSync> for ClusterCoordinator {
+    type Reply = ();
+
+    /// Start a clustered node's two timers: the shard-map sync and the schema sweep. Each is a
+    /// peer task, ended by `ShutdownSwarm` with the rest, since either can be waiting on a peer
+    /// when the swarm stops. Nodes are phase-shifted by their id, so nodes started together do
+    /// not tick in the same instant.
+    async fn handle(
+        &mut self,
+        _msg: StartPeriodicSync,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let id = *self.cluster.local_node_id.as_bytes();
+        self.spawn_peer_task(sync_shard_maps_every(
+            ctx.actor_ref().downgrade(),
+            std::time::Duration::from_millis(u64::from(id[0]) * 20),
+        ));
+        self.spawn_peer_task(sweep_schemas_every(
+            ctx.actor_ref().downgrade(),
+            std::time::Duration::from_millis(u64::from(id[1]) * 40),
+        ));
+    }
 }
 
-/// Start the periodic shard-map sync for a clustered node.
+/// The periodic schema sweep. Ends with the coordinator.
+async fn sweep_schemas_every(weak: WeakActorRef<ClusterCoordinator>, phase: std::time::Duration) {
+    let start = tokio::time::Instant::now() + SCHEMA_SWEEP_INTERVAL + phase;
+    let mut ticks = tokio::time::interval_at(start, SCHEMA_SWEEP_INTERVAL);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticks.tick().await;
+        let Some(coordinator) = weak.upgrade() else {
+            break;
+        };
+        super::sweep_schemas(&coordinator).await;
+    }
+}
+
+/// The periodic shard-map sync.
 ///
 /// Shard maps otherwise move only when a node's own shards change, and a fresh cluster trades
 /// them in one burst of tens of milliseconds, so a map missed in that burst stayed missed (OB20).
 /// Each tick pulls every connected peer's map and merges it; a map that matches costs one ask per
-/// peer and changes nothing. Nodes are phase-shifted by their id, so three nodes started together
-/// do not pull from each other in the same instant. The task ends with the coordinator.
-pub fn spawn_shard_map_sync(coordinator: &ActorRef<ClusterCoordinator>, node_id: Uuid) {
-    let weak = coordinator.downgrade();
-    let phase = std::time::Duration::from_millis(u64::from(node_id.as_bytes()[0]) * 20);
-    task::spawn(async move {
-        let start = tokio::time::Instant::now() + SHARD_MAP_SYNC_INTERVAL + phase;
-        let mut ticks = tokio::time::interval_at(start, SHARD_MAP_SYNC_INTERVAL);
-        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            ticks.tick().await;
-            let Some(coordinator) = weak.upgrade() else {
-                break;
-            };
-            if coordinator.tell(SyncShardMaps).await.is_err() {
-                break;
-            }
+/// peer and changes nothing. Ends with the coordinator.
+async fn sync_shard_maps_every(weak: WeakActorRef<ClusterCoordinator>, phase: std::time::Duration) {
+    let start = tokio::time::Instant::now() + SHARD_MAP_SYNC_INTERVAL + phase;
+    let mut ticks = tokio::time::interval_at(start, SHARD_MAP_SYNC_INTERVAL);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticks.tick().await;
+        let Some(coordinator) = weak.upgrade() else {
+            break;
+        };
+        if coordinator.tell(SyncShardMaps).await.is_err() {
+            break;
         }
-    });
+    }
+}
+
+/// A cluster snapshot waiting for the writer: what `persist_snapshot` read of the coordinator.
+pub(crate) struct PendingSnapshot {
+    config: PersistedClusterConfig,
+    shards: HashMap<Uuid, ShardMetadata>,
+    nodes: HashMap<Uuid, NodeInfo>,
+    ring: ConsistentRing,
+}
+
+/// The snapshot writer: one write at a time, always of the latest snapshot queued. Ends when
+/// the coordinator is gone, after writing one it queued last.
+async fn write_snapshots(
+    store: Arc<ClusterStateStore>,
+    mut pending: tokio::sync::watch::Receiver<Option<Arc<PendingSnapshot>>>,
+) {
+    while pending.changed().await.is_ok() {
+        let Some(snapshot) = pending.borrow_and_update().clone() else {
+            continue;
+        };
+        let store = Arc::clone(&store);
+        let written = task::spawn_blocking(move || {
+            store
+                .persist_cluster_snapshot(
+                    &snapshot.config,
+                    &snapshot.shards,
+                    &snapshot.nodes,
+                    &snapshot.ring,
+                )
+                .map(|()| snapshot)
+        })
+        .await;
+        match written {
+            Ok(Ok(snapshot)) => info!(
+                generation = snapshot.config.generation,
+                shards = snapshot.shards.len(),
+                nodes = snapshot.nodes.len(),
+                "Cluster snapshot persisted"
+            ),
+            Ok(Err(e)) => error!(error = %e, "Failed to persist cluster snapshot"),
+            Err(e) => error!(error = %e, "Cluster snapshot write did not finish"),
+        }
+    }
 }
 
 impl Message<SyncShardMaps> for ClusterCoordinator {
