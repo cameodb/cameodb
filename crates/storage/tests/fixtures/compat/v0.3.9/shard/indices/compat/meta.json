@@ -1,0 +1,173 @@
+{
+  "index_settings": {
+    "docstore_compression": "lz4",
+    "docstore_blocksize": 16384
+  },
+  "segments": [
+    {
+      "segment_id": "b6bbc1ef-c76c-4f66-bd7c-7f5caaf727a5",
+      "max_doc": 6,
+      "deletes": {
+        "num_deleted_docs": 1,
+        "opstamp": 8
+      }
+    }
+  ],
+  "schema": [
+    {
+      "name": "id",
+      "type": "text",
+      "options": {
+        "indexing": {
+          "record": "basic",
+          "fieldnorms": true,
+          "tokenizer": "raw"
+        },
+        "stored": true,
+        "fast": true
+      }
+    },
+    {
+      "name": "title",
+      "type": "text",
+      "options": {
+        "indexing": {
+          "record": "position",
+          "fieldnorms": true,
+          "tokenizer": "default"
+        },
+        "stored": false,
+        "fast": false
+      }
+    },
+    {
+      "name": "body",
+      "type": "text",
+      "options": {
+        "indexing": {
+          "record": "position",
+          "fieldnorms": true,
+          "tokenizer": "default"
+        },
+        "stored": false,
+        "fast": false
+      }
+    },
+    {
+      "name": "addr",
+      "type": "ip_addr",
+      "options": {
+        "fast": false,
+        "stored": false,
+        "indexed": true,
+        "fieldnorms": true
+      }
+    },
+    {
+      "name": "seen",
+      "type": "date",
+      "options": {
+        "indexed": true,
+        "fieldnorms": true,
+        "fast": true,
+        "stored": false,
+        "precision": "seconds"
+      }
+    },
+    {
+      "name": "tags",
+      "type": "text",
+      "options": {
+        "indexing": {
+          "record": "basic",
+          "fieldnorms": true,
+          "tokenizer": "raw"
+        },
+        "stored": false,
+        "fast": false
+      }
+    },
+    {
+      "name": "count",
+      "type": "i64",
+      "options": {
+        "indexed": true,
+        "fieldnorms": true,
+        "fast": true,
+        "stored": false
+      }
+    },
+    {
+      "name": "lang",
+      "type": "text",
+      "options": {
+        "indexing": {
+          "record": "basic",
+          "fieldnorms": true,
+          "tokenizer": "raw"
+        },
+        "stored": false,
+        "fast": false
+      }
+    },
+    {
+      "name": "active",
+      "type": "bool",
+      "options": {
+        "indexed": true,
+        "fieldnorms": true,
+        "fast": false,
+        "stored": false
+      }
+    },
+    {
+      "name": "meta",
+      "type": "json_object",
+      "options": {
+        "stored": false,
+        "indexing": {
+          "record": "position",
+          "fieldnorms": true,
+          "tokenizer": "default"
+        },
+        "fast": false,
+        "expand_dots_enabled": false
+      }
+    },
+    {
+      "name": "score",
+      "type": "f64",
+      "options": {
+        "indexed": true,
+        "fieldnorms": true,
+        "fast": true,
+        "stored": false
+      }
+    },
+    {
+      "name": "body_en",
+      "type": "text",
+      "options": {
+        "indexing": {
+          "record": "position",
+          "fieldnorms": true,
+          "tokenizer": "en_stem"
+        },
+        "stored": false,
+        "fast": false
+      }
+    },
+    {
+      "name": "size",
+      "type": "u64",
+      "options": {
+        "indexed": true,
+        "fieldnorms": true,
+        "fast": true,
+        "stored": false
+      }
+    }
+  ],
+  "opstamp": 8,
+  "payload": "cameodb:wal_seq=7"
+}

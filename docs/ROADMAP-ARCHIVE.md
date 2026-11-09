@@ -2067,6 +2067,42 @@ could spend that budget and deny it to the rest, with no per-address dimension t
 
 The introduction to this group and its open items are in [ROADMAP.md](../ROADMAP.md), under [E. Phase 16 — Boot & OOM Recovery at Scale](../ROADMAP.md#e-phase-16--boot--oom-recovery-at-scale--partial).
 
+### E4 — Two compatibility paths with no end-to-end test
+
+✅ **Done 2026-11-09**, as step 3 of the [0.3.10 order of work](../ROADMAP.md#the-order-of-the-remaining-work).
+Both from Stage 7, and both unbuildable in-repo at the time:
+
+- **An index built by an older build, opened by this one.** The compatibility path was real and
+  exercised in the decoder unit tests, but `create_schema_from_definition` no longer declared
+  `_seq`, so there was no way to *create* a legacy-shaped index to open. Verifying it needed a
+  checked-in fixture index or a build-flag seam.
+- **A legacy WAL tail replaying end to end**, for the same reason. `decode_wal_entry` was unit
+  tested against both formats, and the replay body above it is format-agnostic by construction.
+
+**What landed.** Fixtures, not a seam: a shard written by the release build itself is the only
+evidence of what that build wrote. `crates/storage/tests/fixtures/compat/` holds two, each
+written by its release commit in a worktree, with the generator kept beside it:
+
+- **`v0.3.0`** (`3a952ae`) — the legacy shapes: `_seq` declared in the index, whole-`WalOp` JSON
+  WAL entries, no checkpoint payload. 0.3.0 was released 2026-08-10 and the shapes were retired
+  on 2026-08-19, so a deployment of 0.3.0 can hold them.
+- **`v0.3.9`** (`3e36143`) — the shapes 0.3.x ends on, which 0.4.0 has to keep opening: id-only
+  WAL entries, the checkpoint in the commit payload, a ghost field.
+
+Each is left the way a killed process leaves it: committed documents with one deleted, then a
+tail durable in redb that Tantivy never got — two documents added, one replaced, one deleted —
+and `process::exit`, keeping the writer's lock files and a half-written segment.
+`tests/compat_fixture_test.rs` opens a copy of each as a node starts a shard (`recover_indices`,
+then the commit phase 1 makes) and checks that the tail replayed: every live document stored and
+searchable, the deletes gone, the replaced title the only one left, each field type answering, min
+and max over the fast columns, the ghost field on 0.3.9, and a write after the open surviving a
+second open. Both pass on this build. The fixtures' README says how to add one for a release; a
+fixture is never rewritten to make a test pass.
+
+The scope was widened from the two legacy paths to "0.3.x data opens" when 0.4.0 took the
+storage changes of [V. Cluster HA](../ROADMAP.md#v-cluster-ha--replication-the-two-node-mirror-and-elasticity--planned):
+the 0.3.9 fixture is what lets 0.4.0 prove it still opens what 0.3.x wrote.
+
 ### E5 — A cap on open index writers
 
 ✅ **Done 2026-09-20** by [M1](#m1--bound-resident-memory-against-index-count), which caps

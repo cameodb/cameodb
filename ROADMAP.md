@@ -255,7 +255,7 @@ confined to clusters ([V2](#v2--document-versions-and-delete-markers)'s decision
   a plain index listing churns the open-index cap; the two reported client items (`007` read as a
   number, the format sniff cut inside a multibyte character), confirmed first. The second-signal
   "force" item is rechecked first: `main.rs` now exits on a second signal.
-- **A safety net for 0.4.0:** [E4](#e4--two-compatibility-paths-with-no-end-to-end-test) — an index
+- **A safety net for 0.4.0:** [E4](docs/ROADMAP-ARCHIVE.md#e4--two-compatibility-paths-with-no-end-to-end-test) — an index
   and a WAL tail written by 0.3.x, checked in as fixtures, so 0.4.0 proves it opens them.
 - **Corrected the same day:** [C1](docs/ROADMAP-ARCHIVE.md#m5--per-index-capability-subtraction), per-index role
   overrides, listed as Phase 14's open stage, was built as M5 on 2026-09-25 (`index_overrides`)
@@ -273,7 +273,7 @@ K2's merge and the refusal fix (`a2244ea`) their first multi-node check.
 |---|---|---|
 | 1 ✅ | Rechecks: the second-signal "force" item; the client's `007` read as a number; the format sniff cut inside a multibyte character — all three confirmed and fixed 2026-11-09 | Each either closes or becomes a confirmed bug, which sizes step 2 |
 | 2 ✅ | The audit and logging fixes: the streamed search's query at `info!` and its missing audited query; 429 and 403 audited as `allowed`; a plain index listing churning the open-index cap — all three fixed 2026-11-09 | Small, local, and the first two are security fixes |
-| 3 | [E4](#e4--two-compatibility-paths-with-no-end-to-end-test)'s fixtures | Before any 0.4.0 storage work, so they are written by a real 0.3.x build |
+| 3 ✅ | [E4](docs/ROADMAP-ARCHIVE.md#e4--two-compatibility-paths-with-no-end-to-end-test)'s fixtures — 0.3.0 and 0.3.9, done 2026-11-09 | Before any 0.4.0 storage work, so they are written by a real 0.3.x build |
 | 4 | [N17](#n17--smaller-items-filed-so-they-are-not-lost)'s cluster bugs: the snapshot persisted out of order, the checksum's `DefaultHasher` → xxh3, the peer tasks outside the cancellation token | Small real bugs under everything after them |
 | 5 | [OB26](#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap) with [N12](#n12--dead-surface-and-the-comments-that-no-longer-match)'s coordinator dead surface | About a day, mostly deletion; the join path step 6 changes |
 | 6 | [V1](#v1--a-node-that-brings-new-shards-cannot-join-a-cluster-that-holds-data): reproduce, then refuse | On the bootstrap step 5 leaves |
@@ -312,7 +312,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [E1](#e1--stage-42--a-max-wal-size-commit-trigger) | Stage 4.2 — a max-WAL-size commit trigger — overtaken by F9's commit clock and backstop | 16 | 2026-08-19 | ⏭️ |
 | [E2](#e2--stage-3s-deeper-warming-options) | Stage 3's deeper warming options | 16 | 2026-08-19 | 📋 |
 | [E3](#e3--measure-recovery-on-the-reporting-node) | Measure recovery on the reporting node — with `quick_repair` on and off | 16 | 2026-08-19 | 📋 |
-| [E4](#e4--two-compatibility-paths-with-no-end-to-end-test) | Two compatibility paths with no end-to-end test | 16 | 2026-08-19 | 📋 |
+| [E4](docs/ROADMAP-ARCHIVE.md#e4--two-compatibility-paths-with-no-end-to-end-test) | Two compatibility paths with no end-to-end test — fixtures written by 0.3.0 and 0.3.9, opened by this build | 16 | 2026-08-19 | ✅ |
 | [E6](docs/ROADMAP-ARCHIVE.md#e6--a-crash-restart-repaired-every-shards-redb-file) | **A crash restart repaired every shard's redb file** — up to three passes over each file before the shard opened; `[storage] quick_repair`, on by default, records the allocator state per commit, and a repair is now logged. 1 GB shard: 2.1–2.5 s → 12–18 ms | 16 | 2026-10-15 | ✅ |
 | [F1](#f1--the-cost-of-a-durable-commit-under-read-load) | The cost of a durable commit under read load — deferred: redb has no middle durability level, and building one trades the guarantee this node keeps | — | 2026-08-10 | 💭 |
 | [F2](docs/ROADMAP-ARCHIVE.md#f2--an-open-loop-load-generator) | An open-loop load generator | — | 2026-09-15 | ✅ |
@@ -754,17 +754,7 @@ reporting node, the measurement needs both arms: a crash restart with `quick_rep
 with `false`, read from disk rather than the page cache, and the single-write and bulk throughput
 each setting gives — the second flush per commit is the cost that decides the default there.
 
-### E4 — Two compatibility paths with no end-to-end test
-
-📋 **Planned.** Both from Stage 7, and both unbuildable in-repo as things stand:
-
-- **An index built by an older build, opened by this one.** The compatibility path is real and
-  exercised in the decoder unit tests, but `create_schema_from_definition` no longer declares
-  `_seq`, so there is no longer any way to *create* a legacy-shaped index to open. Verifying it
-  needs a checked-in fixture index or a build-flag seam.
-- **A legacy WAL tail replaying end to end**, for the same reason. `decode_wal_entry` is unit
-  tested against both formats, and the replay body above it is format-agnostic by construction.
-
+- ✅ [**E4 — Two compatibility paths with no end-to-end test**](docs/ROADMAP-ARCHIVE.md#e4--two-compatibility-paths-with-no-end-to-end-test)
 - ✅ [**E5 — A cap on open index writers**](docs/ROADMAP-ARCHIVE.md#e5--a-cap-on-open-index-writers)
 - ✅ [**E6 — A crash restart repaired every shard's redb file**](docs/ROADMAP-ARCHIVE.md#e6--a-crash-restart-repaired-every-shards-redb-file)
 
