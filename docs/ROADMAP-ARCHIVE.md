@@ -2473,6 +2473,84 @@ goodput and zero refusals. Not measured: the single-write path (`Write` *is* wor
 should be covered, and that is an assumption until an arm says so), and whether a retrying client
 deepens any of this.
 
+### F11 — The disk a delete frees was never returned
+
+✅ **Done 2026-11-09.** Raised from the field on 2026-10-16: a node of about 500M records had a large share
+deleted to free disk, and the files kept their size.
+
+**What was measured** (4 shards, 2.2M documents of about 800 B, 75% deleted):
+
+| | After load | After the delete | Reclaimed |
+|---|---|---|---|
+| redb `store.redb`, per shard | 1,028 MB, holding 435 MB | 1,028 MB, unchanged | 310 MB with `compact`, 1.5 s |
+| Tantivy index, per shard | 160 MB | 176 MB, 62% of it deleted | 65 MB with a merge, 1.3 s |
+
+- **redb never returns space while it runs.** A delete frees pages inside the file and later writes
+  reuse them, but only `Database::compact` truncates, and it needs the database to itself. A
+  running node shares every shard's store, so this is offline.
+- **The redb file was 2.3× its data before any delete.** The WAL tables live in the same file and
+  are written and trimmed at every checkpoint, which is the likely cause. Not proven, and worth its
+  own look: it means a node that never deletes still carries that much free space.
+- **Tantivy keeps a deleted document until its segment is merged.** The default `LogMergePolicy`
+  merges similar-sized segments once there are eight, never because of deletes alone
+  (`del_docs_ratio_before_merge` is 1.0), and never a segment above ten million live documents.
+  On a large node, the deleted documents in its biggest segments may never go.
+- **Write speed after the delete was unchanged at this scale,** about 43k docs/s before, after and
+  after reclaiming. The site's slowdown was not reproduced; its data is hundreds of times larger.
+
+**✅ Done:**
+- `cameodb compact [-c <PATH>] [--dry-run]` (`a648898`), with the node stopped: compacts every
+  shard's `store.redb` and `metadata.redb`. `--dry-run` reports what each file would give back.
+- `POST /_admin/index/{index}/merge` (`8647baf`), with the node running: commits, then merges each
+  shard's segments into one on Tantivy's merge threads. It returns at once, and each shard logs
+  `Merge complete`. Writes carried on at full rate during a merge of 850k deleted documents.
+- `cameodb compact --rewrite [--keep]` (`9741dc5`): copies each file into a new one and renames it
+  over the original, after checking the filesystem has room for the copy. Added after a
+  production node of 17 shards of 1.5–1.8 TB, a few percent of its documents deleted, came out
+  of 5–8 h of in-place compaction 0–6% smaller per file. The suspicion was in-place
+  compaction stopping at a large page with no free run below it. Not reproduced: a dense file
+  of mixed 2–72 KB documents with every 20th deleted compacted in place to its allocated size,
+  and a rewrite ends there too, never smaller. The deciding number is that node's `--dry-run`
+  size against its file size, not yet taken.
+
+**✅ Done 2026-11-09: reclaim deleted documents automatically, behind a setting.** Postponed on
+2026-10-16 in favour of the two manual tools above, and built for 0.3.10. Off by default, so a
+node that does not set it merges exactly as it does today. The plan as filed:
+
+- **The shape:** a merge policy wrapping `LogMergePolicy`. It keeps every candidate the default
+  proposes and adds a single-segment merge for any segment whose deleted share is above a
+  threshold, of any size. Rewriting one segment costs in proportion to that segment, which keeps a
+  delete from pulling a whole level into one merge.
+- **Not the built-in knob:** `set_del_docs_ratio_before_merge` alone would merge the whole level
+  around such a segment, and still skips segments above ten million live documents, which are the
+  ones that matter at the site's scale.
+- **Where it plugs in:** the writer is built in `HybridStore::get_or_create_index_locked`
+  (`store.rs`), beside `merge_num_threads`. The setting would follow the same path as
+  `merge_num_threads` and `quick_repair`: `[search]` in the config, the CLI and environment
+  overrides, `NodeConfig`, then `StorageConfig`.
+- **Open questions:** the default threshold (0.3 is a starting point), and whether a rewrite
+  should wait until the node is quiet. Every rewrite needs free disk for the new segment.
+
+**What landed.** `[search] reclaim_deleted_ratio` (default `0`, off; `--reclaim-deleted-ratio`,
+`CAMEODB_RECLAIM_DELETED_RATIO`), refused outside `[0, 1)` — at 1 no segment could pass it, which
+reads as on and is off. Set, each index writer gets `ReclaimDeletesMergePolicy`
+(`storage/src/merge.rs`): the default `LogMergePolicy`'s candidates unchanged, plus a merge of its
+own for every other segment whose deleted share is above the ratio, at any size, and never a
+segment in two candidates. Tantivy asks the policy after every commit and merge, so the commit
+that makes the deletes count starts the rewrites; a rewritten segment has no deletes and is not
+proposed again until new ones pass the ratio. Each rewrite is logged at `info` as `Reclaiming
+deleted documents`. The open questions were settled by the shape: no default threshold — off
+unless set, with 0.3 suggested in CONFIGURATION for bulk deletes — and no wait for a quiet node,
+because the rewrites run on the index's merge threads, which `merge_num_threads` already bounds.
+
+Tests: the policy against built segment metadata — a segment past the ratio rewritten alone and
+one below left, the ratio itself not past it, a segment beyond ten million live documents that the
+default never merges reclaimed, and the default's own merge of eight kept with no segment proposed
+twice; end to end, four segments three quarters deleted rewritten unasked after the commit, to
+less than half their bytes with all 1,000 live documents kept; and a store without the setting
+keeping `LogMergePolicy` and its deletes. Docs: CONFIGURATION (`[search]`), API_REFERENCE beside
+the merge route and delete by query, the example config; `CHANGELOG.md`.
+
 ## G. Code health, reviewed at 0.3.1 — delivered items
 
 The introduction to this group and its open items are in [ROADMAP.md](../ROADMAP.md), under [G. Code health, reviewed at 0.3.1](../ROADMAP.md#g-code-health-reviewed-at-031).
@@ -4909,7 +4987,7 @@ cannot be written into. `rebuild_changes` then knows three cases:
 A changed tokenizer or type on a ghost stays a conflict refused with `409`, as on any built column:
 a query would be analysed differently from the terms the column holds.
 
-The old copies are disk only. Two ways to take them back: write the documents again, or have the offline `cameodb compact --rewrite` ([F11](../ROADMAP.md#f11--the-disk-a-delete-frees-was-never-returned))
+The old copies are disk only. Two ways to take them back: write the documents again, or have the offline `cameodb compact --rewrite` ([F11](#f11--the-disk-a-delete-frees-was-never-returned))
 drop ghost names from the bodies it rewrites. Case 3, and any wish to make cases 1 and 2 hold for
 old rows too, is [D1](../ROADMAP.md#d1--reindex): the condition reads only what redb holds, so rebuilding a shard
 from its documents under the new schema fills the ghosts exactly as the writes would have, and D1

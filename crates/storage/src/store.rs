@@ -1899,6 +1899,14 @@ impl HybridStore {
             .num_merge_threads(num_merge_threads)
             .build();
         let mut writer = open_writer_past_a_close(&tantivy_index, writer_options)?;
+        // At `0` the writer keeps Tantivy's default policy, so a node that does not set it merges
+        // exactly as before.
+        if self.config.reclaim_deleted_ratio > 0.0 {
+            writer.set_merge_policy(Box::new(crate::merge::ReclaimDeletesMergePolicy::new(
+                index,
+                self.config.reclaim_deleted_ratio,
+            )));
+        }
 
         tracing::info!(
             index = %index,

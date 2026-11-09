@@ -176,6 +176,33 @@ mod tests {
         );
     }
 
+    /// Off unless set, so a node that does not ask merges as it always has; set, it is a share
+    /// strictly between nothing and everything.
+    #[test]
+    fn reclaim_deleted_ratio_is_off_by_default_and_a_share_below_one() {
+        assert_eq!(CameoDbConfig::default().search.reclaim_deleted_ratio, 0.0);
+        let config: CameoDbConfig = toml::from_str(
+            "[search]\n\
+             reclaim_deleted_ratio = 0.3\n",
+        )
+        .expect("partial config");
+        assert_eq!(config.search.reclaim_deleted_ratio, 0.3);
+
+        let mut config = CameoDbConfig::default();
+        for ok in [0.0, 0.3, 0.99] {
+            config.search.reclaim_deleted_ratio = ok;
+            assert!(config.validate().is_ok(), "{ok} is accepted");
+        }
+        for refused in [1.0, 1.5, -0.1, f32::NAN] {
+            config.search.reclaim_deleted_ratio = refused;
+            let error = config.validate().expect_err("refused").to_string();
+            assert!(
+                error.contains("reclaim_deleted_ratio"),
+                "{refused}: {error}"
+            );
+        }
+    }
+
     /// The pre-`[limits]` file every existing deployment still has on disk. It must resolve
     /// to exactly what the grouped spelling resolves to — an upgrade that quietly reverts a
     /// 420MB record ceiling to 64 is a node that starts and then refuses the writes it was

@@ -300,6 +300,9 @@ max_concurrent_remote_searches = 8
 enable_early_termination = true
 commit_interval_ms = 2000
 supervisor_timeout_secs = 3
+# Deleted share past which a segment is rewritten on its own, giving its disk back without
+# `POST /_admin/index/{index}/merge` (0: off, the default; 0.3 is a start for bulk deletes).
+reclaim_deleted_ratio = 0
 default_search_limit = 10
 # Elements kept of each array in a hit when a search names no `array`; a hit that lost elements
 # carries `_truncated_arrays`. At most security.limits.max_array_limit.

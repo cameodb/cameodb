@@ -678,6 +678,7 @@ mod tests {
             memory_pressure_threshold_percent: 80,
             indexer_num_threads: 1,
             merge_num_threads: 1,
+            reclaim_deleted_ratio: 0.0,
             default_batch_size: 100_000,
             wal_sync: true,
             quick_repair: true,
@@ -1119,6 +1120,7 @@ mod tests {
             memory_pressure_threshold_percent: 80,
             indexer_num_threads: 1,
             merge_num_threads: 1,
+            reclaim_deleted_ratio: 0.0,
             default_batch_size: 100_000,
             wal_sync: true,
             quick_repair: true,
@@ -1215,6 +1217,7 @@ mod tests {
             memory_pressure_threshold_percent: 80,
             indexer_num_threads: 1,
             merge_num_threads: 1,
+            reclaim_deleted_ratio: 0.0,
             default_batch_size: 100_000,
             wal_sync: true,
             quick_repair: true,
@@ -1308,6 +1311,7 @@ mod tests {
             memory_pressure_threshold_percent: 80,
             indexer_num_threads: 1,
             merge_num_threads: 1,
+            reclaim_deleted_ratio: 0.0,
             default_batch_size: 100_000,
             wal_sync: true,
             quick_repair: true,
@@ -1523,6 +1527,7 @@ mod tests {
             memory_pressure_threshold_percent: 80,
             indexer_num_threads: 1,
             merge_num_threads: 1,
+            reclaim_deleted_ratio: 0.0,
             default_batch_size: 100,
             wal_sync: true,
             quick_repair: true,
@@ -1586,6 +1591,7 @@ mod tests {
             // Thread Configuration
             indexer_num_threads: 1,
             merge_num_threads: 2,
+            reclaim_deleted_ratio: 0.0,
 
             // Other Configuration
             default_batch_size: 1000,
@@ -2727,6 +2733,7 @@ mod commit_interval_tests {
             memory_pressure_threshold_percent: 80,
             indexer_num_threads: 1,
             merge_num_threads: 1,
+            reclaim_deleted_ratio: 0.0,
             default_batch_size: BATCH,
             wal_sync: false,
             quick_repair: true,
@@ -3559,6 +3566,118 @@ mod full_merge {
 
         assert!(store.start_full_merge(INDEX).expect("again").is_none());
         assert!(store.start_full_merge("absent").expect("absent").is_none());
+    }
+
+    /// The committed segments of `INDEX`, as the writer's index records them.
+    fn segment_metas(store: &HybridStore) -> Vec<tantivy::index::SegmentMeta> {
+        let writer = store
+            .writers
+            .get(INDEX)
+            .map(|writer| Arc::clone(writer.value()))
+            .expect("the index is open");
+        let writer = writer.lock().expect("writer");
+        writer.index().searchable_segment_metas().expect("metas")
+    }
+
+    #[test]
+    fn with_reclaim_deleted_ratio_a_commit_rewrites_the_segments_past_it_unasked() {
+        let dir = TempDir::new().expect("temp dir");
+        // The same four segments as `store_after_a_mass_delete`, in a store with the setting on.
+        let store = {
+            let store = HybridStore::new(
+                StorageConfig {
+                    reclaim_deleted_ratio: 0.5,
+                    ..config(&dir)
+                },
+                1,
+            )
+            .expect("open store");
+            store
+                .store_schema_and_cache(INDEX, &IndexSchema::default())
+                .expect("store schema");
+            for segment in 0..4 {
+                let ops = (0..1_000)
+                    .map(|i| WalOp::Put {
+                        id: format!("d{}", segment * 1_000 + i),
+                        json_blob: Some(serde_json::json!({
+                            "title": format!("document {i} of segment {segment}"),
+                            "body": "words that make each document take some room in its segment",
+                        })),
+                    })
+                    .collect();
+                store.apply_batch(INDEX, ops).expect("write");
+                store.commit_index(INDEX).expect("commit");
+            }
+            store
+        };
+        assert_eq!(segment_metas(&store).len(), 4);
+        let bytes_before = store.measure_tantivy_bytes(INDEX).expect("bytes");
+
+        let deletes = (0..4_000)
+            .filter(|n| n % 4 != 0)
+            .map(|n| WalOp::Delete {
+                id: format!("d{n}"),
+            })
+            .collect();
+        store.apply_batch(INDEX, deletes).expect("delete");
+        store.commit_index(INDEX).expect("commit the deletes");
+
+        // Each segment is three quarters deleted, past 0.5: four rewrites, each on its own, on
+        // Tantivy's merge threads. Four segments are below the eight the default policy waits
+        // for, so nothing else would merge them.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let metas = segment_metas(&store);
+            if metas.iter().all(|meta| !meta.has_deletes()) {
+                assert_eq!(
+                    metas.iter().map(|meta| meta.num_docs()).sum::<u32>(),
+                    1_000,
+                    "the live documents are all kept"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the deleted documents were not reclaimed: {metas:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let after = store.finish_merge(INDEX).expect("finish");
+        assert!(
+            after < bytes_before / 2,
+            "three quarters of the documents are gone from disk: {bytes_before} -> {after} bytes"
+        );
+        assert_eq!(
+            store
+                .search_documents(INDEX, "*", 10_000, None)
+                .expect("search")
+                .total_hits,
+            1_000
+        );
+    }
+
+    #[test]
+    fn without_reclaim_deleted_ratio_the_deletes_stay_until_a_merge_is_asked_for() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = store_after_a_mass_delete(&dir);
+        store.commit_index(INDEX).expect("commit the deletes");
+
+        let metas = segment_metas(&store);
+        assert_eq!(
+            metas.len(),
+            4,
+            "the default policy waits for eight segments"
+        );
+        assert!(metas.iter().all(|meta| meta.has_deletes()));
+        let writer = store
+            .writers
+            .get(INDEX)
+            .map(|writer| Arc::clone(writer.value()))
+            .expect("open");
+        let policy = format!("{:?}", writer.lock().expect("writer").get_merge_policy());
+        assert!(policy.contains("LogMergePolicy"), "{policy}");
+        assert!(!policy.contains("ReclaimDeletes"), "{policy}");
     }
 }
 

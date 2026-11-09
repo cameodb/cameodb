@@ -161,6 +161,11 @@ pub(crate) const OVERRIDES: &[Override] = &[
         apply: |c, v| { c.search.commit_interval_ms = v.parse()?; Ok(()) },
     },
     Override {
+        flag: "--reclaim-deleted-ratio", env: "CAMEODB_RECLAIM_DELETED_RATIO", kind: FlagKind::Value,
+        placeholder: "<RATIO>", help: "Deleted share past which a segment is rewritten alone (0: off)",
+        apply: |c, v| { c.search.reclaim_deleted_ratio = v.parse()?; Ok(()) },
+    },
+    Override {
         flag: "--node-label", env: "CAMEODB_NODE_LABEL", kind: FlagKind::Value,
         placeholder: "<NAME>", help: "Human-readable name for this node",
         apply: |c, v| { c.node.label = Some(v.to_string()); Ok(()) },

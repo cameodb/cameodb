@@ -32,6 +32,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   included, are unchanged. The tables are built by `tools/cjk-fold`, which replaces
   `tools/zh-fold` and gives the Chinese table unchanged. Unihan is under the Unicode License v3,
   added as `licenses/LICENSE-UNICODE-3.0`.
+- **`[search] reclaim_deleted_ratio`: the disk deleted documents hold, given back without
+  asking.** A delete marks a document dead in its segment, and the default merging never rewrites
+  a segment because of deletes alone, nor one past ten million live documents — so after a large
+  delete the disk stayed taken until `POST /_admin/index/{index}/merge`. Set between 0 and 1, every
+  segment whose deleted share passes it is rewritten on its own, on the index's merge threads,
+  after the commit that made the deletes count: one segment at a time, so each rewrite costs that
+  segment's live documents and needs free disk for them while it runs. Each is logged as
+  `Reclaiming deleted documents`. Default `0`, off: a node that does not set it merges exactly as
+  before. `--reclaim-deleted-ratio` / `CAMEODB_RECLAIM_DELETED_RATIO`. The documents themselves, in
+  redb, are still returned by `cameodb compact`.
 
 ### Fixed
 

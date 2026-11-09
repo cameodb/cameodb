@@ -283,6 +283,8 @@ pub struct NodeConfig {
     pub indexer_num_threads: usize,
     /// Number of background merge (compaction) threads per IndexWriter (default: 2)
     pub merge_num_threads: usize,
+    /// Deleted share past which a segment is rewritten on its own; 0 is off (`[search]`)
+    pub reclaim_deleted_ratio: f32,
     /// Timeout in seconds for writer thread to drain pending commands during shutdown
     /// Increased from 10s to 30s to handle large coalesced batches
     pub writer_shutdown_timeout_secs: u64,
@@ -365,6 +367,7 @@ impl Default for NodeConfig {
             default_batch_size: 1000,
             indexer_num_threads: 1,
             merge_num_threads: 2,
+            reclaim_deleted_ratio: 0.0,
             writer_shutdown_timeout_secs: 30,
             supervisor_timeout_secs: 3,
             commit_interval_ms: 2000,

@@ -322,7 +322,35 @@ commit_interval_ms = 2000
 # Seconds after an index's last write before it is committed anyway (default: 3): the idle
 # commit, for the writes that end a burst. Keep it at or above commit_interval_ms.
 supervisor_timeout_secs = 3
+
+# The deleted share past which a segment is rewritten on its own, giving back the disk its deleted
+# documents hold (default: 0, off). Between 0 and 1; 0.3 rewrites a segment once more than 30% of
+# its documents are deleted.
+reclaim_deleted_ratio = 0
 ```
+
+**`reclaim_deleted_ratio` — deleted documents given back without asking.** A delete only marks
+a document dead in its segment; the disk comes back when the segment is merged. Off, an index
+merges as it always has: segments of similar size once there are enough of them, never because of
+deletes alone, and never a segment past ten million live documents — so after a large delete the
+disk can stay taken until [`POST /_admin/index/{index}/merge`](API_REFERENCE.md) asks for it. Set
+between 0 and 1, every segment whose deleted documents pass that share of it is also rewritten,
+alone, on the index's merge threads (`merge_num_threads`), after the commit that made the deletes
+count. Writes and searches carry on meanwhile.
+
+- **The cost is one segment at a time:** a rewrite reads and writes that segment's live documents,
+  never the rest of its level, and needs free disk for them while it runs. The whole old segment
+  goes when it ends.
+- **Lower is sooner and busier.** At 0.1 a steady trickle of deletes rewrites the largest segments
+  often, each time for a tenth of their size; at 0.5 a segment holds up to half dead documents
+  before its rewrite. 0.3 is a reasonable start for an index that deletes in bulk, such as a
+  retention prune.
+- **Each rewrite is logged** at `info` as `Reclaiming deleted documents`, with the index, the
+  segment and its deleted and total documents.
+- **This is the index files only.** The documents themselves are held in redb, which never returns
+  deleted space while the node runs; see `cameodb compact` in [DEPLOYMENT.md](DEPLOYMENT.md).
+
+`--reclaim-deleted-ratio` / `CAMEODB_RECLAIM_DELETED_RATIO` set it without editing the file.
 
 ### The MCP endpoint (`[mcp]`)
 

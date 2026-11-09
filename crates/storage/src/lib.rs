@@ -143,6 +143,17 @@ pub struct StorageConfig {
     /// but on memory-constrained nodes with many indices this causes mmap storms.
     /// Default: 1. Scale up on nodes with ample RAM and high write throughput.
     pub merge_num_threads: usize,
+    /// The deleted share above which a segment is rewritten on its own, returning the disk its
+    /// deleted documents hold; `0` leaves merging to Tantivy's default policy alone.
+    ///
+    /// The default policy merges segments of similar size once there are enough of them, and
+    /// never a segment past ten million live documents, so after a large delete the space can
+    /// stay indefinitely. Above `0`, every segment whose deleted documents exceed this share of
+    /// it is also proposed for a merge of its own — one segment at a time, so the cost of each
+    /// is that segment's size, never the level around it. Values from `0` up to, not including,
+    /// `1`; the policy is `ReclaimDeletesMergePolicy` in `merge.rs`.
+    #[serde(default)]
+    pub reclaim_deleted_ratio: f32,
 
     // Other Configuration
     /// Default batch size for smart commit calculations.
@@ -448,6 +459,7 @@ impl Default for StorageConfig {
             // Thread Configuration
             indexer_num_threads: 1,
             merge_num_threads: 2,
+            reclaim_deleted_ratio: 0.0,
 
             // Other Configuration
             default_batch_size: 1000,

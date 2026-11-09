@@ -20,6 +20,7 @@ fn test_storage_engine_basics() {
         // Thread Configuration
         indexer_num_threads: 1,
         merge_num_threads: 2,
+        reclaim_deleted_ratio: 0.0,
 
         // Other Configuration
         default_batch_size: 1000, // 1000 operations default
@@ -124,6 +125,7 @@ fn test_storage_configuration() {
         // Thread Configuration
         indexer_num_threads: 1,
         merge_num_threads: 2,
+        reclaim_deleted_ratio: 0.0,
 
         // Other Configuration
         default_batch_size: 500,

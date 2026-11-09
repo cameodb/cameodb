@@ -26,6 +26,7 @@ fn test_config(shard_path: &std::path::Path) -> StorageConfig {
         memory_pressure_threshold_percent: 80,
         indexer_num_threads: 1,
         merge_num_threads: 1,
+        reclaim_deleted_ratio: 0.0,
         // No commit ever happens unless a test asks for one.
         default_batch_size: 100_000,
         wal_sync: true,

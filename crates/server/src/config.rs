@@ -839,6 +839,17 @@ pub struct SearchConfig {
     #[serde(default = "default_merge_num_threads")]
     pub merge_num_threads: usize,
 
+    /// The deleted share past which a segment is rewritten on its own, returning the disk its
+    /// deleted documents hold (default: 0, off).
+    ///
+    /// Off, an index merges as it always has: segments of similar size once there are enough of
+    /// them, never because of deletes alone, and never a segment past ten million live
+    /// documents — so after a large delete the disk can stay taken until
+    /// `POST /_admin/index/{index}/merge`. Between 0 and 1, every segment whose deleted
+    /// documents pass that share of it is also rewritten, alone, on the merge threads.
+    #[serde(default)]
+    pub reclaim_deleted_ratio: f32,
+
     /// Moved to `[limits] total_memory_limit_mb`. Read from here until 0.4.0.
     #[serde(default)]
     pub total_memory_limit_mb: Option<usize>,
@@ -1572,6 +1583,18 @@ impl CameoDbConfig {
             .into());
         }
 
+        // At 1 or above no segment could ever pass it, which reads as on and is off; a negative
+        // value or NaN means nothing at all.
+        if !(0.0..1.0).contains(&self.search.reclaim_deleted_ratio) {
+            return Err(ConfigError::StorageConfig {
+                message: format!(
+                    "[search] reclaim_deleted_ratio must be at least 0 (off) and below 1, got {}",
+                    self.search.reclaim_deleted_ratio
+                ),
+            }
+            .into());
+        }
+
         // A warning rather than a refusal: either order commits everything eventually. Inverted,
         // the idle commit fires inside every interval and does the batching the interval is for,
         // which costs throughput and is almost certainly not what the operator meant.
@@ -1735,6 +1758,7 @@ impl Default for SearchConfig {
             stream_batch_size: default_stream_batch_size(),
             indexer_num_threads: default_indexer_num_threads(),
             merge_num_threads: default_merge_num_threads(),
+            reclaim_deleted_ratio: 0.0,
             total_memory_limit_mb: None,
         }
     }

@@ -35,6 +35,7 @@ fn config(shard_path: &std::path::Path, wal_sync: bool) -> StorageConfig {
         memory_pressure_threshold_percent: 80,
         indexer_num_threads: 1,
         merge_num_threads: 1,
+        reclaim_deleted_ratio: 0.0,
         default_batch_size: 100_000,
         wal_sync,
         quick_repair: true,

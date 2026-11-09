@@ -4746,6 +4746,7 @@ impl NodeOrchestrator {
             // Thread Configuration
             indexer_num_threads: self.config.indexer_num_threads,
             merge_num_threads: self.config.merge_num_threads,
+            reclaim_deleted_ratio: self.config.reclaim_deleted_ratio,
 
             // Other Configuration
             default_batch_size: self.config.default_batch_size,

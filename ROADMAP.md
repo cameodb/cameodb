@@ -237,7 +237,7 @@ confined to clusters ([V2](#v2--document-versions-and-delete-markers)'s decision
 
 - **Already built, in `[Unreleased]`:** U1 and U2, the CJK analyzers; the stale document count;
   the startup shard count.
-- **Features:** [F11](#f11--the-disk-a-delete-frees-was-never-returned)'s automatic reclaim of deleted
+- **Features:** [F11](docs/ROADMAP-ARCHIVE.md#f11--the-disk-a-delete-frees-was-never-returned)'s automatic reclaim of deleted
   documents behind a setting, and min and max ([K1](#k1--min-and-max-in-the-engine)–[K3](#k3--the-surface)).
 - **Required:** the three libp2p advisory exceptions in `deny.toml` expire 2026-12-31 — renewed,
   or retired by a kameo release on libp2p 0.57; and the dependency updates left for after the
@@ -336,7 +336,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [M0](docs/ROADMAP-ARCHIVE.md#m0--the-architecture-review-and-the-order-of-work) … [M8](docs/ROADMAP-ARCHIVE.md#m8--re-decide-the-query-complexity-caps) | The 0.3.5 goal set — a node exposed on the internet serving several tenants from one process; M0 closed, the M1 blocker cleared, and M2–M8 done; M6's open-loop arms found and fixed [OB14](#ob14--a-timed-out-request-never-leaves-the-worker-pool-and-the-node-degrades-until-it-is-restarted) and [OB15](docs/ROADMAP-ARCHIVE.md#ob15--every-refused-request-was-an-error-line-and-under-write-overload-the-logging-cost-half-the-goodput), and were confirmed on the cut binary 2026-09-27. Released in 0.3.5 on 2026-09-28 | — | 2026-09-27 | ✅ |
 | [N1](docs/ROADMAP-ARCHIVE.md#n1--head-requests-skip-authorization) … [N17](#n17--smaller-items-filed-so-they-are-not-lost) | Pre-0.3.6 whole-code review — ten defects (N1–N10) to close before the cut, then the duplication and structure behind them: one way to reach a peer, dead surface, `run_change`, typed boundaries, single owners, the `orchestrator.rs` split | — | 2026-10-07 | 📋 |
 | [F10](#f10--fast-field-projection-the-pages-fields-answered-from-the-columns) | Fast-field projection — the page's fields answered from the columns, and the fetch phase skipped when they can be; the last layer of the search-economics work opened by the TS5 outage — deferred: the gain over the two-phase search is small for today's workloads, and the design is filed so it can be picked up | — | 2026-10-09 | 💭 |
-| [F11](#f11--the-disk-a-delete-frees-was-never-returned) | The disk a delete frees was never returned — `cameodb compact` and `--rewrite` (redb, offline) and `POST /_admin/index/{index}/merge` (Tantivy, online) done; reclaiming deleted documents automatically, behind a setting, planned | — | 2026-10-16 | ◐ |
+| [F11](docs/ROADMAP-ARCHIVE.md#f11--the-disk-a-delete-frees-was-never-returned) | The disk a delete frees was never returned — `cameodb compact` and `--rewrite` (redb, offline), `POST /_admin/index/{index}/merge` (Tantivy, online), and `[search] reclaim_deleted_ratio` rewriting a segment past a deleted share without asking, done 2026-11-09 | — | 2026-10-16 | ✅ |
 | [P1](docs/ROADMAP-ARCHIVE.md#p1--a-hits-arrays-are-capped-the-way-its-hits-are) | A hit's arrays are capped the way its hits are — `[search] default_array_limit`, `[security.limits] max_array_limit`, `array N` per request; found validating 0.3.7 on the threat-intel dataset, where one field carries a few hundred thousand addresses | — | 2026-10-19 | ✅ |
 | [P2](docs/ROADMAP-ARCHIVE.md#p2--one-declaration-of-an-indexs-default-fields) | One declaration of an index's default fields — `default_fields` is the only list, each field's `default_search` the effective set; `searched_by_default` dropped, and `data load --id` keeps a declared list | — | 2026-10-20 | ✅ |
 | [P3](docs/ROADMAP-ARCHIVE.md#p3--a-schema-read-is-a-schema-write) | A schema read is a schema write — `PUT /_config` takes a `GET /_config` as it is, and the read reports the record option, `learned` and the routing field it lacked, so a saved read restores its index and the thumbprint proves it | — | 2026-10-21 | ✅ |
@@ -1426,66 +1426,7 @@ OB13 reopening on a second mechanism. Filed as
 [F8](docs/ROADMAP-ARCHIVE.md#f8--the-overload-gates-do-not-cover-the-bulk-write-path).
 
 - ✅ [**F8 — The overload gates do not cover the bulk write path**](docs/ROADMAP-ARCHIVE.md#f8--the-overload-gates-do-not-cover-the-bulk-write-path)
-
----
-
-### F11 — The disk a delete frees was never returned
-
-◐ **Partial.** Raised from the field on 2026-10-16: a node of about 500M records had a large share
-deleted to free disk, and the files kept their size.
-
-**What was measured** (4 shards, 2.2M documents of about 800 B, 75% deleted):
-
-| | After load | After the delete | Reclaimed |
-|---|---|---|---|
-| redb `store.redb`, per shard | 1,028 MB, holding 435 MB | 1,028 MB, unchanged | 310 MB with `compact`, 1.5 s |
-| Tantivy index, per shard | 160 MB | 176 MB, 62% of it deleted | 65 MB with a merge, 1.3 s |
-
-- **redb never returns space while it runs.** A delete frees pages inside the file and later writes
-  reuse them, but only `Database::compact` truncates, and it needs the database to itself. A
-  running node shares every shard's store, so this is offline.
-- **The redb file was 2.3× its data before any delete.** The WAL tables live in the same file and
-  are written and trimmed at every checkpoint, which is the likely cause. Not proven, and worth its
-  own look: it means a node that never deletes still carries that much free space.
-- **Tantivy keeps a deleted document until its segment is merged.** The default `LogMergePolicy`
-  merges similar-sized segments once there are eight, never because of deletes alone
-  (`del_docs_ratio_before_merge` is 1.0), and never a segment above ten million live documents.
-  On a large node, the deleted documents in its biggest segments may never go.
-- **Write speed after the delete was unchanged at this scale,** about 43k docs/s before, after and
-  after reclaiming. The site's slowdown was not reproduced; its data is hundreds of times larger.
-
-**✅ Done:**
-- `cameodb compact [-c <PATH>] [--dry-run]` (`a648898`), with the node stopped: compacts every
-  shard's `store.redb` and `metadata.redb`. `--dry-run` reports what each file would give back.
-- `POST /_admin/index/{index}/merge` (`8647baf`), with the node running: commits, then merges each
-  shard's segments into one on Tantivy's merge threads. It returns at once, and each shard logs
-  `Merge complete`. Writes carried on at full rate during a merge of 850k deleted documents.
-- `cameodb compact --rewrite [--keep]` (`9741dc5`): copies each file into a new one and renames it
-  over the original, after checking the filesystem has room for the copy. Added after a
-  production node of 17 shards of 1.5–1.8 TB, a few percent of its documents deleted, came out
-  of 5–8 h of in-place compaction 0–6% smaller per file. The suspicion was in-place
-  compaction stopping at a large page with no free run below it. Not reproduced: a dense file
-  of mixed 2–72 KB documents with every 20th deleted compacted in place to its allocated size,
-  and a rewrite ends there too, never smaller. The deciding number is that node's `--dry-run`
-  size against its file size, not yet taken.
-
-**📋 Planned: reclaim deleted documents automatically, behind a setting.** Postponed on
-2026-10-16 in favour of the two manual tools above. Off by default, so a node that does not set
-it merges exactly as it does today.
-
-- **The shape:** a merge policy wrapping `LogMergePolicy`. It keeps every candidate the default
-  proposes and adds a single-segment merge for any segment whose deleted share is above a
-  threshold, of any size. Rewriting one segment costs in proportion to that segment, which keeps a
-  delete from pulling a whole level into one merge.
-- **Not the built-in knob:** `set_del_docs_ratio_before_merge` alone would merge the whole level
-  around such a segment, and still skips segments above ten million live documents, which are the
-  ones that matter at the site's scale.
-- **Where it plugs in:** the writer is built in `HybridStore::get_or_create_index_locked`
-  (`store.rs`), beside `merge_num_threads`. The setting would follow the same path as
-  `merge_num_threads` and `quick_repair`: `[search]` in the config, the CLI and environment
-  overrides, `NodeConfig`, then `StorageConfig`.
-- **Open questions:** the default threshold (0.3 is a starting point), and whether a rewrite
-  should wait until the node is quiet. Every rewrite needs free disk for the new segment.
+- ✅ [**F11 — The disk a delete frees was never returned**](docs/ROADMAP-ARCHIVE.md#f11--the-disk-a-delete-frees-was-never-returned)
 
 ---
 

@@ -751,7 +751,8 @@ matches more. The error names the clause and why.
   [`write_documents_per_minute`](CONFIGURATION.md#rate-limiting-tool-calls-search-and-writes-securitylimits),
   when that is on. `confirm` skips only the `max_docs` check.
 - **Visibility** as for any delete — see above — or at once with `"refresh": true`. The disk is
-  returned when a merge rewrites the segments (`POST /_admin/index/{index}/merge`).
+  returned when a merge rewrites the segments (`POST /_admin/index/{index}/merge`, or without
+  asking with `[search] reclaim_deleted_ratio`).
 
 ### ⚙️ Index Management
 
@@ -1617,6 +1618,10 @@ of its documents deleted went to 95 MB in about 2.4 s, inserts unaffected meanwh
 
 This is the index files only. The documents themselves are held in redb, which never returns
 deleted space while the node runs; see `cameodb compact` in DEPLOYMENT.md.
+
+To have deleted documents given back without asking, set `[search] reclaim_deleted_ratio`
+([CONFIGURATION.md](CONFIGURATION.md)): every segment whose deleted share passes it is rewritten on its own after
+the commit that made the deletes count.
 
 #### Evict Index Writer
 Evict the index writer from cache for the given index, freeing its memory.

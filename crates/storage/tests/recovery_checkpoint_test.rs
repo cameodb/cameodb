@@ -27,6 +27,7 @@ fn test_config(shard_path: &std::path::Path) -> StorageConfig {
         memory_pressure_threshold_percent: 80,
         indexer_num_threads: 1,
         merge_num_threads: 1,
+        reclaim_deleted_ratio: 0.0,
         // Keep the steady-state commit threshold far above what these tests write, so a
         // commit only ever happens when the test asks for one.
         default_batch_size: 100_000,

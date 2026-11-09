@@ -515,6 +515,7 @@ async fn run(args: Vec<String>) -> Result<()> {
         default_batch_size: cameodb_config.storage.default_batch_size,
         indexer_num_threads: cameodb_config.search.indexer_num_threads,
         merge_num_threads: cameodb_config.search.merge_num_threads,
+        reclaim_deleted_ratio: cameodb_config.search.reclaim_deleted_ratio,
         writer_shutdown_timeout_secs: 30,
         supervisor_timeout_secs: cameodb_config.search.supervisor_timeout_secs,
         commit_interval_ms: cameodb_config.search.commit_interval_ms,
