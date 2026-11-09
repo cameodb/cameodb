@@ -266,17 +266,28 @@ impl IntoResponse for AppError {
         //
         // A 429 is the same bargain made by the rate limiter, which always knows its number:
         // `too_many_requests_in` carries it, and a client that obeys the header is admitted.
-        if status == StatusCode::SERVICE_UNAVAILABLE || status == StatusCode::TOO_MANY_REQUESTS {
+        let mut response = if status == StatusCode::SERVICE_UNAVAILABLE
+            || status == StatusCode::TOO_MANY_REQUESTS
+        {
             let retry_after = self.retry_after_secs.unwrap_or(1).to_string();
-            return (
+            (
                 status,
                 [(axum::http::header::RETRY_AFTER, retry_after)],
                 Json(body),
             )
-                .into_response();
-        }
+                .into_response()
+        } else {
+            (status, Json(body)).into_response()
+        };
 
-        (status, Json(body)).into_response()
+        // A rate limit (429) or a tenant's quota or scope (403) refused a request its key was
+        // allowed to make; the audit record says `denied`, with the reason the caller was given.
+        if status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::FORBIDDEN {
+            response
+                .extensions_mut()
+                .insert(crate::authz::AuditedRefusal(error_msg));
+        }
+        response
     }
 }
 

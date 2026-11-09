@@ -1307,6 +1307,12 @@ misconfiguration and a compromised credential. Refusals of an *unidentified* cal
 counted instead, because their volume is chosen by whoever can reach the port — listing them
 individually would hand a stranger a way to fill the disk.
 
+`outcome` says whether the action happened. A request its key was allowed to make is still
+`denied`, with the caller's `reason`, when `[security.limits]` refused it (`429`) or a tenant's
+quota or scope did (`403`). A write refused for its rate is counted like any write, in a
+`write_stats` total of its own with `outcome: "denied"`, so a key past its allowance shows as
+one line beside the writes that landed rather than a line per refusal.
+
 Points worth knowing:
 
 - **Never on the request path.** Emitting is a timestamp and a non-blocking hand-off; the

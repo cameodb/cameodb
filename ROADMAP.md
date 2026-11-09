@@ -2387,11 +2387,12 @@ it should, or a defect with a small reach.
   channel with one `ask` per event (`swarm/mod.rs:597`, `coordinator.rs:998–1160`): extract
   `forward_swarm_events`, use `tell`, bound or coalesce. The yamux and swarm config are copied in
   the PSK and non-PSK branches (`:446–492`).
-- **Streaming search** logs the caller's query at `info!` (`search.rs:174`) where the plain search
-  deliberately uses `debug!`, and attaches no `AuditedQuery`, so with `record_query_text` on,
-  streamed queries are missing from the audit trail; the rate check, keyword parse and merge are
-  copied between the two handlers. A request the limiter or quota refused (429, 403) is audited as
-  `outcome: "allowed"` (`authz.rs:778`), against `Outcome`'s own doc. `classify` runs up to three
+- **Streaming search** ✅ logged the caller's query at `info!` (`search.rs:174`) where the plain search
+  deliberately uses `debug!`, and attached no `AuditedQuery`, so with `record_query_text` on,
+  streamed queries were missing from the audit trail (**fixed 2026-11-09**). Still open: the rate check, keyword parse and merge are
+  copied between the two handlers. ✅ A request the limiter or quota refused (429, 403) was audited as
+  `outcome: "allowed"` (`authz.rs:778`), against `Outcome`'s own doc (**fixed 2026-11-09**: the
+  handler leaves an `AuditedRefusal` on the response, and the record is `denied`). `classify` runs up to three
   times per request and the same `AuditRecord` is built three times (`authz.rs:737–802`).
 - **Storage.** `gather_index_stats(false)` opens readers through `get_reader` and
   `admit_open_index`, which can close and evict an index, so a plain `ListIndexes` churns the

@@ -8,7 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::cluster_coordinator::OperationType;
 use crate::http_server::caller_of;
@@ -192,10 +192,16 @@ pub(super) async fn search_stream_handler(
     )
     .map_err(AppError::bad_request)?;
 
-    info!(
+    // `debug`, as the plain search logs it: the caller's query text has no place in the log at
+    // the level operators run, and the audit record below is where it is kept when asked for.
+    debug!(
         "Stream request - index: {}, query: {}, limit: {}, fields: {:?}",
         index, cleaned_query, window.limit, final_fields
     );
+    let audited_query = state
+        .audit
+        .records_query_text()
+        .then(|| cleaned_query.clone());
 
     // The first `limit` hits: a stream has no page to take, and the route refuses an offset.
     let client_op = ClientOp::Search {
@@ -229,5 +235,9 @@ pub(super) async fn search_stream_handler(
     // The hits are written after this returns, so the request's concurrency permit has to
     // outlive the handler: see `hold_permit_for_streamed_body`.
     resp.extensions_mut().insert(super::routes::StreamedBody);
+    if let Some(query) = audited_query {
+        resp.extensions_mut()
+            .insert(crate::authz::AuditedQuery(query));
+    }
     Ok(resp)
 }

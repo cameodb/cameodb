@@ -561,6 +561,12 @@ pub(super) async fn write_stream_handler(
             HeaderValue::from_str(&retry_after_secs.to_string())
                 .unwrap_or(HeaderValue::from_static("1")),
         );
+        response
+            .extensions_mut()
+            .insert(crate::authz::AuditedRefusal(format!(
+                "{} {written} items were written before it.",
+                write_rate_message(batch_size)
+            )));
         return Ok(response);
     }
 

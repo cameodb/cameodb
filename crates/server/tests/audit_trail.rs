@@ -599,6 +599,64 @@ async fn query_text_is_kept_only_when_configured() {
     );
 }
 
+/// The streamed search keeps its query as the plain one does, and a search the rate limiter
+/// refuses is recorded as refused. The stream carried no query at all, and a 429 was written
+/// `"outcome": "allowed"` because the key had passed the gate before the limiter said no.
+#[tokio::test]
+async fn a_streamed_query_is_kept_and_a_rate_limited_search_is_denied() {
+    let secret = "streamed_patient_identifier";
+    let node = TestNode::start(
+        "record_query_text = true\n\n\
+         [security.limits]\n\
+         tool_calls_per_minute = 1\n\
+         tool_call_burst = 1",
+    )
+    .await;
+    node.write("docs", "d1").await;
+
+    let streamed = http()
+        .post(format!("{}/api/docs/search/stream", node.url))
+        .bearer_auth(&node.reader_key)
+        .json(&json!({"query": secret, "limit": 5}))
+        .send()
+        .await
+        .expect("stream");
+    assert_eq!(streamed.status().as_u16(), 200);
+    streamed.bytes().await.expect("stream body");
+
+    // The allowance of one is spent: this one is refused.
+    assert_eq!(node.search("docs", "title:t", &node.reader_key).await, 429);
+
+    let trail = node
+        .trail_until(|t| {
+            let http = records_of(t, "http");
+            http.iter().any(|r| r["path"] == "/api/docs/search/stream")
+                && http.iter().any(|r| r["path"] == "/api/docs/search")
+        })
+        .await;
+    let http = records_of(&trail, "http");
+    let stream = http
+        .iter()
+        .find(|r| r["path"] == "/api/docs/search/stream")
+        .unwrap_or_else(|| panic!("the stream should be in the trail, got {trail:#?}"));
+    assert_eq!(stream["query"], secret, "{stream}");
+    assert_eq!(stream["outcome"], "allowed");
+
+    let limited = http
+        .iter()
+        .find(|r| r["path"] == "/api/docs/search")
+        .unwrap_or_else(|| panic!("the refused search should be in the trail, got {trail:#?}"));
+    assert_eq!(limited["status"], 429, "{limited}");
+    assert_eq!(limited["outcome"], "denied", "{limited}");
+    assert!(
+        limited["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("rate limit")),
+        "the reason the caller was given: {limited}"
+    );
+    assert_eq!(limited["label"], "analyst", "still attributed to its key");
+}
+
 /// What the HTTP gate structurally cannot see. From outside, every agent call is
 /// `POST /mcp`; which tool ran and which index it touched exist only inside the dispatcher,
 /// which is the whole reason `record_tool_call` is a hook on the backend rather than another

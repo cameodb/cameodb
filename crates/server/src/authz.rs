@@ -916,8 +916,14 @@ pub async fn authorize(State(gate): State<GateState>, mut req: Request, next: Ne
                             .extensions()
                             .get::<AuditedQuery>()
                             .map(|q| q.0.clone()),
-                    )
-                    .allowed(status);
+                    );
+                // Still rolled up as its route is: a key spending its write allowance is a
+                // flood of 429s, and a rolled bucket is keyed by outcome, so the refusals are
+                // counted apart from the writes that landed.
+                let record = match response.extensions().get::<AuditedRefusal>() {
+                    Some(refusal) => record.denied(status, refusal.0.clone()),
+                    None => record.allowed(status),
+                };
                 match rollup_name(access, true, true) {
                     Some(event) => gate.audit.record_rolled(record.with_event(event)),
                     None => gate.audit.record(record),
@@ -976,6 +982,17 @@ pub async fn authorize(State(gate): State<GateState>, mut req: Request, next: Ne
 /// handler with more to say attaches it here and the single record picks it up.
 #[derive(Clone)]
 pub struct AuditedQuery(pub String);
+
+/// A handler's refusal of an authenticated request, left on the response for the audit record.
+///
+/// The key passed this layer, so the record used to say `allowed` for a request the rate
+/// limiter (429) or a tenant quota or scope (403) then refused — against [`Outcome`]'s own
+/// meaning, whether the action happened. The handler is the only one that knows the request was
+/// refused rather than failed, so it says so here, with the reason the caller was given.
+///
+/// [`Outcome`]: crate::audit::Outcome
+#[derive(Clone)]
+pub struct AuditedRefusal(pub String);
 
 /// Which events are counted rather than listed, and under what name.
 ///

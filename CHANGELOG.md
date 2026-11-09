@@ -86,6 +86,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only a phase hung past its timeout could exceed it, and that phase never returned to be checked.
   A watchdog started with the shutdown now exits with status 1 on a second SIGINT or SIGTERM
   (Ctrl+C, close or shutdown on Windows), or once the shutdown passes 120 s.
+- **The audit trail records a rate-limited or quota-refused request as `denied`.** The key had
+  passed the gate before `[security.limits]` (`429`) or a tenant's quota or scope (`403`)
+  refused the request, and the record said `"outcome": "allowed"`. It now says `denied`, with the
+  reason the caller was given; a refused write is counted in a `write_stats` total of its own.
+- **A streamed search keeps its query out of the log and in the audit trail.** `POST
+  /api/{index}/search/stream` logged the caller's query at `info`, where the plain search logs
+  it at `debug`, and with `record_query_text = true` its audit record carried no query. It now
+  matches the plain search on both.
+
 - **`client data load`: a code column keeps its leading zeros in an index that lacks it.** A CSV
   column the existing index had no field for was read cell by cell, so `007` was sent as the number
   7 while the scan reported the column as text, and the node created an integer field from it. Such
