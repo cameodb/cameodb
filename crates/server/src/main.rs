@@ -5,7 +5,6 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use anyhow::Result;
 use kameo::actor::Spawn;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -50,10 +49,6 @@ use node::{
 use remote_peer_pool::RemotePeerPool;
 use state::AppState;
 
-/// Global shutdown flag to prevent double-shutdown issues.
-/// Set to true when shutdown begins, checked by signal handlers.
-static SHUTDOWN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
-
 /// Maximum time to wait for HTTP server to drain connections.
 const HTTP_DRAIN_TIMEOUT_SECS: u64 = 10;
 
@@ -72,6 +67,37 @@ const READ_RUNTIME_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
 /// Emergency shutdown timeout: forces process exit if total shutdown exceeds this time.
 /// Prevents indefinite hangs from stuck resources.
 const EMERGENCY_SHUTDOWN_TIMEOUT_SECS: u64 = 120;
+
+/// Ends the process once a shutdown has begun and either a second signal arrives or the
+/// shutdown outlasts [`EMERGENCY_SHUTDOWN_TIMEOUT_SECS`].
+///
+/// Both used to be checked inline, and neither could fire: the second signal's check ran only
+/// inside the wait for the first, so "press Ctrl+C again to force" did nothing once a handler
+/// had replaced the default one, and the deadline was checked between phases whose own
+/// timeouts sum to less than it, so a phase that hung outside its timeout hung the process.
+fn spawn_shutdown_watchdog(
+    second_signal: impl std::future::Future<Output = &'static str> + Send + 'static,
+) {
+    tokio::spawn(async move {
+        tokio::select! {
+            signal = second_signal => {
+                tracing::warn!("Second {signal} received, forcing immediate exit");
+                eprintln!("Second {signal} received, forcing immediate exit");
+            }
+            _ = tokio::time::sleep(Duration::from_secs(EMERGENCY_SHUTDOWN_TIMEOUT_SECS)) => {
+                tracing::error!(
+                    "EMERGENCY: Shutdown exceeded {}s - forcing exit",
+                    EMERGENCY_SHUTDOWN_TIMEOUT_SECS
+                );
+                eprintln!(
+                    "Shutdown exceeded {}s - forcing exit",
+                    EMERGENCY_SHUTDOWN_TIMEOUT_SECS
+                );
+            }
+        }
+        std::process::exit(1);
+    });
+}
 
 /// Install the process-level rustls crypto provider.
 ///
@@ -1037,34 +1063,33 @@ async fn run(args: Vec<String>) -> Result<()> {
     #[cfg(windows)]
     service::node_started();
 
-    // Wait for shutdown signal (Ctrl+C or systemctl stop)
+    // Wait for shutdown signal (Ctrl+C or systemctl stop). The listeners outlive the first
+    // signal: the watchdog takes them, so a second one ends the process instead of being
+    // swallowed by a handler nobody polls any more.
     #[cfg(unix)]
-    {
-        use tokio::signal::unix;
-        let mut sigterm_recv = unix::signal(unix::SignalKind::terminate())
+    let second_signal = {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigint = signal(SignalKind::interrupt())
+            .map_err(|e| anyhow::anyhow!("Failed to setup SIGINT handler: {}", e))?;
+        let mut sigterm = signal(SignalKind::terminate())
             .map_err(|e| anyhow::anyhow!("Failed to setup SIGTERM handler: {}", e))?;
-        let sigint_recv = tokio::signal::ctrl_c();
 
         tokio::select! {
-            _ = sigint_recv => {
-                if SHUTDOWN_IN_PROGRESS.swap(true, Ordering::SeqCst) {
-                    tracing::warn!("Second SIGINT received, forcing immediate exit");
-                    std::process::exit(1);
-                }
-                tracing::info!("Received SIGINT (Ctrl+C), shutting down...");
-            }
-            _ = sigterm_recv.recv() => {
-                if SHUTDOWN_IN_PROGRESS.swap(true, Ordering::SeqCst) {
-                    tracing::warn!("Second SIGTERM received, forcing immediate exit");
-                    std::process::exit(1);
-                }
-                tracing::info!("Received SIGTERM (systemctl stop), shutting down...");
+            _ = sigint.recv() => tracing::info!("Received SIGINT (Ctrl+C), shutting down..."),
+            _ = sigterm.recv() => {
+                tracing::info!("Received SIGTERM (systemctl stop), shutting down...")
             }
         }
-    }
+        async move {
+            tokio::select! {
+                _ = sigint.recv() => "SIGINT",
+                _ = sigterm.recv() => "SIGTERM",
+            }
+        }
+    };
 
     #[cfg(windows)]
-    {
+    let second_signal = {
         use tokio::signal::windows;
 
         let mut sigint = windows::ctrl_c()
@@ -1075,43 +1100,35 @@ async fn run(args: Vec<String>) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("Failed to setup CTRL_SHUTDOWN handler: {}", e))?;
 
         tokio::select! {
-            _ = sigint.recv() => {
-                if SHUTDOWN_IN_PROGRESS.swap(true, Ordering::SeqCst) {
-                    tracing::warn!("Second CTRL+C received, forcing immediate exit");
-                    std::process::exit(1);
-                }
-                tracing::info!("Received CTRL+C, shutting down...");
-            }
+            _ = sigint.recv() => tracing::info!("Received CTRL+C, shutting down..."),
             _ = sigclose.recv() => {
-                if SHUTDOWN_IN_PROGRESS.swap(true, Ordering::SeqCst) {
-                    tracing::warn!("Second CTRL_CLOSE received, forcing immediate exit");
-                    std::process::exit(1);
-                }
-                tracing::info!("Received CTRL_CLOSE (console closed), shutting down...");
+                tracing::info!("Received CTRL_CLOSE (console closed), shutting down...")
             }
             _ = sigshutdown.recv() => {
-                if SHUTDOWN_IN_PROGRESS.swap(true, Ordering::SeqCst) {
-                    tracing::warn!("Second CTRL_SHUTDOWN received, forcing immediate exit");
-                    std::process::exit(1);
-                }
-                tracing::info!("Received CTRL_SHUTDOWN (system shutting down), shutting down...");
+                tracing::info!("Received CTRL_SHUTDOWN (system shutting down), shutting down...")
             }
             // A service gets none of the console events above: Windows asks it to stop through
             // the service manager instead.
             _ = service::STOP.notified() => {
-                SHUTDOWN_IN_PROGRESS.store(true, Ordering::SeqCst);
-                tracing::info!("Windows asked the service to stop, shutting down...");
+                tracing::info!("Windows asked the service to stop, shutting down...")
             }
         }
-    }
+        async move {
+            tokio::select! {
+                _ = sigint.recv() => "CTRL+C",
+                _ = sigclose.recv() => "CTRL_CLOSE",
+                _ = sigshutdown.recv() => "CTRL_SHUTDOWN",
+            }
+        }
+    };
     println!("Shutting down gracefully (press Ctrl+C again to force)...");
 
-    // Start emergency shutdown timer
     let shutdown_start = std::time::Instant::now();
     tracing::info!(
         "Starting graceful shutdown (emergency timeout: {}s)",
         EMERGENCY_SHUTDOWN_TIMEOUT_SECS
     );
+    spawn_shutdown_watchdog(second_signal);
 
     // Phase 1: Shutdown MCP sessions (timeout: 5s)
     tracing::info!(
@@ -1129,12 +1146,6 @@ async fn run(args: Vec<String>) -> Result<()> {
             "MCP shutdown timed out after {}s, continuing...",
             MCP_SHUTDOWN_TIMEOUT_SECS
         ),
-    }
-
-    // Emergency timeout check
-    if shutdown_start.elapsed() > Duration::from_secs(EMERGENCY_SHUTDOWN_TIMEOUT_SECS) {
-        tracing::error!("EMERGENCY: Shutdown timeout exceeded after Phase 1 - forcing exit");
-        std::process::exit(1);
     }
 
     // Phase 2: Drain HTTP server (timeout: 10s)
@@ -1155,12 +1166,6 @@ async fn run(args: Vec<String>) -> Result<()> {
         ),
     }
 
-    // Emergency timeout check
-    if shutdown_start.elapsed() > Duration::from_secs(EMERGENCY_SHUTDOWN_TIMEOUT_SECS) {
-        tracing::error!("EMERGENCY: Shutdown timeout exceeded after Phase 2 - forcing exit");
-        std::process::exit(1);
-    }
-
     // Phase 3: Shutdown all shards (timeout: 60s)
     tracing::info!(
         "Phase 3/5: Shutting down all shards (timeout: {}s)...",
@@ -1178,12 +1183,6 @@ async fn run(args: Vec<String>) -> Result<()> {
             "Shard shutdown timed out after {}s - data may not be persisted!",
             SHARD_SHUTDOWN_TIMEOUT_SECS
         ),
-    }
-
-    // Emergency timeout check
-    if shutdown_start.elapsed() > Duration::from_secs(EMERGENCY_SHUTDOWN_TIMEOUT_SECS) {
-        tracing::error!("EMERGENCY: Shutdown timeout exceeded after Phase 3 - forcing exit");
-        std::process::exit(1);
     }
 
     // Phase 4: Shut down the dedicated read thread pool (timeout: 10s).
@@ -1242,20 +1241,8 @@ async fn run(args: Vec<String>) -> Result<()> {
     // open rollup window is every write of the last ten seconds.
     audit_sink.shutdown();
 
-    // Final emergency timeout check
-    let shutdown_elapsed = shutdown_start.elapsed();
-    if shutdown_elapsed > Duration::from_secs(EMERGENCY_SHUTDOWN_TIMEOUT_SECS) {
-        tracing::error!(
-            elapsed_secs = shutdown_elapsed.as_secs(),
-            timeout_secs = EMERGENCY_SHUTDOWN_TIMEOUT_SECS,
-            "EMERGENCY: Shutdown exceeded {}s - forcing exit",
-            EMERGENCY_SHUTDOWN_TIMEOUT_SECS
-        );
-        std::process::exit(1);
-    }
-
     tracing::info!(
-        elapsed_ms = shutdown_elapsed.as_millis(),
+        elapsed_ms = shutdown_start.elapsed().as_millis(),
         "Shutdown complete - process exiting cleanly"
     );
     Ok(())

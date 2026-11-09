@@ -79,6 +79,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   paths)`). CONFIGURATION describes
   `num_shards_init` as the node's shard count, fixed when its data is created, and the two ways to
   change it.
+- **A second Ctrl+C ends a node that is shutting down.** "Press Ctrl+C again to force" did
+  nothing: the node checked for a second signal only while it waited for the first, and with its
+  own handler installed the default one no longer ended the process. The 120-second shutdown
+  limit could not fire either — it was checked between phases whose own timeouts sum to 100 s, so
+  only a phase hung past its timeout could exceed it, and that phase never returned to be checked.
+  A watchdog started with the shutdown now exits with status 1 on a second SIGINT or SIGTERM
+  (Ctrl+C, close or shutdown on Windows), or once the shutdown passes 120 s.
 
 ## [0.3.9] - 2026-11-05
 

@@ -263,6 +263,24 @@ confined to clusters ([V2](#v2--document-versions-and-delete-markers)'s decision
 - **Not in 0.3.10:** N11, which opens V's phase 2, and V2–V5 and R3, which are 0.4.0. CH3 and P5
   stand as filed.
 
+### The order of the remaining work
+
+Set 2026-11-09, cheapest and most certain first. Steps 1–3 are independent of the cluster.
+Steps 4–8 are validated together by a `cluster.sh` run on a freshly built image, which also gives
+K2's merge and the refusal fix (`a2244ea`) their first multi-node check.
+
+| # | Step | Why here |
+|---|---|---|
+| 1 | Rechecks: the second-signal "force" item; the client's `007` read as a number; the format sniff cut inside a multibyte character | Each either closes or becomes a confirmed bug, which sizes step 2 |
+| 2 | The audit and logging fixes: the streamed search's query at `info!` and its missing audited query; 429 and 403 audited as `allowed`; a plain index listing churning the open-index cap | Small, local, and the first two are security fixes |
+| 3 | [E4](#e4--two-compatibility-paths-with-no-end-to-end-test)'s fixtures | Before any 0.4.0 storage work, so they are written by a real 0.3.x build |
+| 4 | [N17](#n17--smaller-items-filed-so-they-are-not-lost)'s cluster bugs: the snapshot persisted out of order, the checksum's `DefaultHasher` → xxh3, the peer tasks outside the cancellation token | Small real bugs under everything after them |
+| 5 | [OB26](#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap) with [N12](#n12--dead-surface-and-the-comments-that-no-longer-match)'s coordinator dead surface | About a day, mostly deletion; the join path step 6 changes |
+| 6 | [V1](#v1--a-node-that-brings-new-shards-cannot-join-a-cluster-that-holds-data): reproduce, then refuse | On the bootstrap step 5 leaves |
+| 7 | [O4](#o4--the-request-budget-crosses-the-wire) | The field is optional on the wire, so mixed versions still work |
+| 8 | [V13](#v13--a-node-whose-disks-move-to-another-machine-rejoins-as-itself): a `cluster.sh` phase and a DEPLOYMENT procedure | Exercises everything above |
+| — | The `deny.toml` exceptions and the deferred dependency updates | Any time before 2026-12-31 |
+
 ---
 
 # Active work
@@ -2349,14 +2367,16 @@ client REPL (which N17 replaces).
 **Planned.** None of these blocks a release; each is a place the next change will cost more than
 it should, or a defect with a small reach.
 
-- **Shutdown.** The second signal's "force" does nothing: `SHUTDOWN_IN_PROGRESS` is checked only
-  inside the first `select!` (`main.rs:877–924`), so "Press Ctrl+C again to force" is false; the
-  emergency checks between phases cannot fire, since the phase caps sum to 100 s under a 120 s
-  limit; and the post-connect sweep, the periodic sweep, the shard-map timer and
+- **Shutdown.** ✅ The second signal's "force" did nothing: `SHUTDOWN_IN_PROGRESS` was checked only
+  inside the first `select!` (`main.rs:877–924`), so "Press Ctrl+C again to force" was false, and the
+  emergency checks between phases could not fire, since the phase caps sum to 100 s under a 120 s
+  limit. **Fixed 2026-11-09:** a watchdog started with the shutdown exits on a second signal or
+  at 120 s, and the inline checks and `SHUTDOWN_IN_PROGRESS` are gone; verified on a node held in
+  Phase 2 by an open request (exit 1, one second after the second SIGINT). Still open: the
+  post-connect sweep, the periodic sweep, the shard-map timer and
   `RegisterLocalShards` run as plain `task::spawn` outside the `peer_tasks` cancellation token that
   `spawn_peer_task` exists for (`coordinator.rs:911`, `:1366`, `:2339`, `:2363`, `:837`).
-  **Change:** a watchdog (second signal or deadline, then `exit`), and leave the cluster before
-  Phase 3.
+  **Change:** leave the cluster before Phase 3 (the watchdog is done).
 - **Persistence.** `persist_snapshot` (`coordinator.rs:414`) is an unordered `spawn_blocking` per
   call and sets `last_persisted_generation` before success, so an older snapshot can commit after
   a newer one: one persister task on a `watch`, as topology already does. The shard checksum
