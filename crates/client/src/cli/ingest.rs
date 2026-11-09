@@ -315,16 +315,25 @@ impl SourceAnalysis {
 
     /// How the load reads each column: the type the index's field declares, the date order the
     /// scan found, and whether its values are lists.
+    ///
+    /// A delimited column the index has no field for is read as the scan typed it. Read by each
+    /// cell's look instead, a code column's `007` went as the number 7 while the scan called the
+    /// column text, and the node learned an integer field from it. A JSON value carries its own
+    /// type, so a JSON key the index lacks is still sent as it is written.
     pub(crate) fn shapes(
         &self,
         field_types: &HashMap<String, TantivyFieldType>,
     ) -> Vec<ColumnShape> {
+        let delimited = self.format == SourceFormat::CsvLike;
         self.profiler
             .columns
             .iter()
             .zip(&self.choices)
             .map(|(column, choice)| {
-                let field_type = field_types.get(&column.name).cloned();
+                let field_type = field_types
+                    .get(&column.name)
+                    .cloned()
+                    .or_else(|| delimited.then(|| choice.field_type.clone()));
                 let dates = match field_type {
                     Some(TantivyFieldType::Date) => choice.dates,
                     _ => DateOrders::default(),
@@ -1134,7 +1143,7 @@ pub(crate) fn detect_source_format_from_bytes(bytes: &[u8]) -> Result<SourceForm
     match first_non_whitespace {
         b'[' => Ok(SourceFormat::JsonArray),
         b'{' => {
-            if let Ok(text) = std::str::from_utf8(bytes) {
+            if let Some(text) = utf8_prefix(bytes) {
                 let mut non_empty_lines =
                     text.lines().map(str::trim).filter(|line| !line.is_empty());
                 if let (Some(first), Some(second)) =
@@ -1158,6 +1167,19 @@ pub(crate) fn detect_source_format_from_bytes(bytes: &[u8]) -> Result<SourceForm
             Ok(SourceFormat::JsonDocument)
         }
         _ => Ok(SourceFormat::CsvLike),
+    }
+}
+
+/// The text of a sniffed prefix, less a character the prefix's end cut in two.
+///
+/// The prefix is a fixed number of bytes, so it can end inside a multibyte character, and the
+/// whole prefix then failed as UTF-8: the JSONL check never ran and a JSON Lines file was read
+/// as one JSON document. Bytes that are not UTF-8 before the end are still no text.
+fn utf8_prefix(bytes: &[u8]) -> Option<&str> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Some(text),
+        Err(e) if e.error_len().is_none() => std::str::from_utf8(&bytes[..e.valid_up_to()]).ok(),
+        Err(_) => None,
     }
 }
 
@@ -2747,7 +2769,8 @@ pub(crate) struct ColumnShape {
 /// instead was how a load went wrong in three ways. `NA` in a count column was sent as text and
 /// the row refused. `20240315` in a date column was sent as a number, which a date field reads
 /// as seconds since 1970 — the row landed in August 1970. And a text column's `007` was sent as
-/// the number 7. A column no field describes is still read by its look, as it always was.
+/// the number 7. A column the index has no field for takes the type the scan gave it
+/// ([`SourceAnalysis::shapes`]); one with no type at all is read by its look.
 ///
 /// A blank cell is no value in every field, a boolean one included: `false` would be a guess.
 pub(crate) fn csv_cell(raw: &str, shape: &ColumnShape) -> JsonValue {

@@ -86,6 +86,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only a phase hung past its timeout could exceed it, and that phase never returned to be checked.
   A watchdog started with the shutdown now exits with status 1 on a second SIGINT or SIGTERM
   (Ctrl+C, close or shutdown on Windows), or once the shutdown passes 120 s.
+- **`client data load`: a code column keeps its leading zeros in an index that lacks it.** A CSV
+  column the existing index had no field for was read cell by cell, so `007` was sent as the number
+  7 while the scan reported the column as text, and the node created an integer field from it. Such
+  a column is now loaded as the scan typed it. A field the index declares still decides, and JSON
+  sources, whose values carry their own type, are unchanged.
+- **`client data load`: a JSON Lines file is no longer read as one JSON document when the 64 KiB
+  sample ends inside a multibyte character.** The sample failed as UTF-8 as a whole, which skipped
+  the JSON Lines check; the cut character is now left out of the sample.
 
 ## [0.3.9] - 2026-11-05
 

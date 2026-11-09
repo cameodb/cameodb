@@ -824,6 +824,49 @@ mod detect_tests {
             .collect()
     }
 
+    /// A column the index has no field for loads as the scan typed it: a code column's `007`
+    /// stays `"007"`, where it went as the number 7 and the node learned an integer field. A
+    /// field the index declares still wins, and a count column is still sent as numbers.
+    #[test]
+    fn a_column_the_index_lacks_loads_as_the_scan_typed_it() {
+        let analysis = analysis("id,code,count\n1,007,3\n2,10115,4\n", None);
+        let cell = |field_types: &HashMap<String, TantivyFieldType>, column, raw| {
+            let shapes = analysis.shapes(field_types);
+            let at = analysis.profiler.index_of(column).expect("column");
+            csv_cell(raw, &shapes[at])
+        };
+
+        let none = HashMap::new();
+        assert_eq!(cell(&none, "code", "007"), json!("007"));
+        assert_eq!(cell(&none, "code", "10115"), json!("10115"));
+        assert_eq!(cell(&none, "count", "3"), json!(3));
+
+        let declared = HashMap::from([("code".to_string(), TantivyFieldType::I64)]);
+        assert_eq!(cell(&declared, "code", "007"), json!(7));
+    }
+
+    /// A sniffed prefix that ends inside a multibyte character is still read as text, so a JSON
+    /// Lines file is not taken for one JSON document because of where 64 KiB fell.
+    #[test]
+    fn a_prefix_cut_inside_a_character_still_detects_json_lines() {
+        let mut text = String::from("{\"name\":\"a\"}\n{\"name\":\"b\"}\n{\"name\":\"");
+        text.push('č');
+        let bytes = text.as_bytes();
+        let cut = &bytes[..bytes.len() - 1];
+        assert!(std::str::from_utf8(cut).is_err(), "the cut splits 'č'");
+        assert_eq!(
+            detect_source_format_from_bytes(cut).expect("format"),
+            SourceFormat::JsonLines
+        );
+        // Bytes that are not UTF-8 before the end are still not text.
+        let mut broken = b"{\"a\":1}\n{\"a\":2}\n".to_vec();
+        broken.splice(3..3, [0xFF]);
+        assert_eq!(
+            detect_source_format_from_bytes(&broken).expect("format"),
+            SourceFormat::JsonDocument
+        );
+    }
+
     /// Strict: a column takes a type only when every value fits it, whatever order they come
     /// in. Evolution typed `abc, 5` and `5, abc` both as integers, and refused the `abc` rows.
     #[test]

@@ -271,7 +271,7 @@ K2's merge and the refusal fix (`a2244ea`) their first multi-node check.
 
 | # | Step | Why here |
 |---|---|---|
-| 1 | Rechecks: the second-signal "force" item; the client's `007` read as a number; the format sniff cut inside a multibyte character | Each either closes or becomes a confirmed bug, which sizes step 2 |
+| 1 ✅ | Rechecks: the second-signal "force" item; the client's `007` read as a number; the format sniff cut inside a multibyte character — all three confirmed and fixed 2026-11-09 | Each either closes or becomes a confirmed bug, which sizes step 2 |
 | 2 | The audit and logging fixes: the streamed search's query at `info!` and its missing audited query; 429 and 403 audited as `allowed`; a plain index listing churning the open-index cap | Small, local, and the first two are security fixes |
 | 3 | [E4](#e4--two-compatibility-paths-with-no-end-to-end-test)'s fixtures | Before any 0.4.0 storage work, so they are written by a real 0.3.x build |
 | 4 | [N17](#n17--smaller-items-filed-so-they-are-not-lost)'s cluster bugs: the snapshot persisted out of order, the checksum's `DefaultHasher` → xxh3, the peer tasks outside the cancellation token | Small real bugs under everything after them |
@@ -2406,12 +2406,14 @@ it should, or a defect with a small reach.
   and the serde reader (`:1512–1640`) — where a blocking `Read` over the response stream would
   serve both and remove about 400 lines. A compressed remote source is downloaded twice, once to
   sniff it (`:1893`) and again to open it; `detect_schema_from_source` loads a JSON document twice
-  (`:2227`); format sniffing runs `from_utf8` on the 64 KiB prefix, so a cut inside a multibyte
-  character skips the JSONL check and the file is read as one JSON document (**reported**);
+  (`:2227`); ✅ format sniffing ran `from_utf8` on the 64 KiB prefix, so a cut inside a multibyte
+  character skipped the JSONL check and the file was read as one JSON document (**fixed
+  2026-11-09**: the cut character is left out of the sample);
   `SourceAnalysis` allows impossible states (format, `Option<data>`, `Option<delimiter>` vary
-  independently, hence the `expect`s in `load_csv`). A column the existing index lacks is read by
-  `parse_csv_cell`, which turns `007` into the number 7 while the profiler calls it text, and the
-  server then creates an `i64` field (**reported**). The REPL re-parses the CLI grammar and has
+  independently, hence the `expect`s in `load_csv`). ✅ A column the existing index lacks was read by
+  `parse_csv_cell`, which turned `007` into the number 7 while the profiler called it text, and the
+  server then created an `i64` field (**fixed 2026-11-09**: a delimited column the index lacks
+  loads as the scan typed it, `SourceAnalysis::shapes`). The REPL re-parses the CLI grammar and has
   drifted from it: no `--limit` or `--offset` on its `search`, `-e` only there, a literal `1..=16`
   against `MAX_PARALLEL`, and `split_whitespace` collapses spacing inside a quoted phrase. **Change:**
   parse the REPL line with `try_parse_from` on a clap enum that wraps `ClientCommand`, with one
