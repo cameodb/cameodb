@@ -8,8 +8,8 @@ use cameodb_mcp::{McpIndexSearchRequest, McpSearchBounds, ToolError};
 use crate::cluster_coordinator::OperationType;
 use crate::mcp::diagnostics::{
     approximate_sort_note, names_a_missing_field, narrowed_default_fields_note, paged_past_the_end,
-    refuse_if_clauses_discarded, short_page_note, string_case_advice, tool_error,
-    with_field_suggestions, zero_results_advice,
+    refuse_if_clauses_discarded, short_page_note, string_case_advice, string_value_clauses,
+    tool_error, with_field_suggestions, without_string_value_quotes, zero_results_advice,
 };
 use crate::mcp::schema::{extract_field_info, index_schema};
 use crate::node::{
@@ -225,6 +225,34 @@ fn annotate_search_response(
     }
 }
 
+/// Whether `field:"value"` alone matches nothing on `index`: a count, no hits fetched.
+async fn clause_matches_nothing(state: &AppState, index: &str, field: &str, value: &str) -> bool {
+    let result = state
+        .router
+        .route_and_handle(
+            ClientOp::Search {
+                spent_ms: None,
+                index: index.to_string(),
+                query: format!("{field}:\"{value}\""),
+                limit: Some(0),
+                offset: Some(0),
+                fields: None,
+                sort: None,
+                array_limit: None,
+                match_elements: false,
+                metrics: None,
+            },
+            None,
+            OperationType::Read,
+        )
+        .await;
+    // A count that could not be read says nothing, so it blames nothing.
+    result
+        .ok()
+        .and_then(|response| response.get("total_hits").and_then(|v| v.as_u64()))
+        == Some(0)
+}
+
 /// Put a note at the front of `_warning`, ahead of what is there: the more specific reason
 /// leads.
 fn add_warning(response: &mut JsonValue, note: String) {
@@ -250,6 +278,7 @@ pub(super) fn search_index(
         // Preprocess query to extract return/limit/offset/sort modifiers (same as HTTP server)
         let inline = parse_query_keywords(&query);
         let cleaned_query = inline.query;
+        let cleaned_for_advice = cleaned_query.clone();
 
         // Merge MCP-provided values with parsed values (MCP takes precedence for limit/fields)
         let window = effective_window(
@@ -299,14 +328,27 @@ pub(super) fn search_index(
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
 
-                annotate_search_response(&mut response, &query, window, total_hits as usize);
                 // Nothing matched, count-only included: a `string` clause written in another
                 // case is the commonest reason, and only the schema can say a clause is one.
                 // Read on this path alone, so a search that found something pays nothing.
-                if total_hits == 0 {
+                let string_clauses = if total_hits == 0 {
                     let fields = extract_field_info(&index_schema(&state, &index_name).await);
-                    if let Some(advice) = string_case_advice(&query, &fields) {
-                        add_warning(&mut response, advice);
+                    string_value_clauses(&cleaned_for_advice, &fields)
+                } else {
+                    Vec::new()
+                };
+                annotate_search_response(
+                    &mut response,
+                    &without_string_value_quotes(&query, &string_clauses),
+                    window,
+                    total_hits as usize,
+                );
+                // Each clause checked alone, one count each, so the advice names the clause that
+                // emptied the result and never one that was right while another was not.
+                for (field, value) in string_clauses.iter().take(3) {
+                    if clause_matches_nothing(&state, &index_name, field, value).await {
+                        add_warning(&mut response, string_case_advice(field, value));
+                        break;
                     }
                 }
                 cap_response_bytes(&mut response, state.max_response_bytes);

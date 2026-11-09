@@ -129,7 +129,7 @@ pub(super) fn spellings(value: &str) -> Vec<String> {
 /// The `field:value` clauses of a query that name a `string` field with a plain value: the ones
 /// a value in another case leaves empty. A range, a set, a prefix and a boost are left out —
 /// each says something about the value the retry would have to keep.
-fn string_value_clauses(query: &str, fields: &[FieldInfo]) -> Vec<(String, String)> {
+pub(super) fn string_value_clauses(query: &str, fields: &[FieldInfo]) -> Vec<(String, String)> {
     let mut found = Vec::new();
     for reference in storage::field_references(query) {
         let is_string = fields
@@ -166,27 +166,39 @@ fn string_value_clauses(query: &str, fields: &[FieldInfo]) -> Vec<(String, Strin
     found
 }
 
-/// What to try when a query naming a `string` field matched nothing: the one retry that covers
-/// a value written in another case, spelled out for the clause it applies to.
+/// What to try when a `string` clause matched nothing on its own: the one retry that covers a
+/// value written in another case, spelled out for that clause.
 ///
 /// A `string` field matches its whole value in the case the data writes it, so
 /// `authors:"austen, jane"` finds nothing where the data holds `Austen, Jane` — and the general
-/// zero-result advice (drop an `AND`, unquote a phrase) sends the caller the wrong way. Written
-/// for the first such clause only, since the retry is one request whichever clause was off.
-pub(super) fn string_case_advice(query: &str, fields: &[FieldInfo]) -> Option<String> {
-    let text = parse_query_keywords(query).query;
-    let (field, value) = string_value_clauses(&text, fields).into_iter().next()?;
-    let set = spellings(&value)
+/// zero-result advice (drop an `AND`, unquote a phrase) sends the caller the wrong way. The
+/// caller has checked the clause alone matches nothing, so the advice never blames a clause that
+/// was right while another one emptied the result.
+pub(super) fn string_case_advice(field: &str, value: &str) -> String {
+    let set = spellings(value)
         .iter()
         .map(|spelling| format!("\"{spelling}\""))
         .collect::<Vec<_>>()
         .join(" ");
-    Some(format!(
-        "'{field}' is a string field: it matches only a whole value, in the case the data \
-         writes it. If \"{value}\" came from the question rather than from the data, retry once \
-         with its spellings in one set — `{field}: IN [{set}]` — or take the value as the \
-         field's description or a hit writes it."
-    ))
+    format!(
+        "`{field}:\"{value}\"` alone matches nothing. '{field}' is a string field: it matches \
+         only a whole value as the data writes it, so a value in another case, or a part of \
+         one, finds nothing. If \"{value}\" came from the question, retry once with its \
+         spellings in one set — `{field}: IN [{set}]` — and if that finds nothing too, read how \
+         the values are written: in the field's description, or from a few hits with `limit 5` \
+         and the field in `fields`."
+    )
+}
+
+/// The query as the general zero-result advice should read it: the quotes around `string`
+/// values removed, since they enclose a value rather than a phrase, and advice about phrases
+/// would point at the wrong thing.
+pub(super) fn without_string_value_quotes(query: &str, clauses: &[(String, String)]) -> String {
+    let mut out = query.to_string();
+    for (field, value) in clauses {
+        out = out.replace(&format!("{field}:\"{value}\""), &format!("{field}:value"));
+    }
+    out
 }
 
 /// Why an empty page came back from a query that matched, or `None` when it did not page past
@@ -1053,28 +1065,26 @@ mod field_suggestion_tests {
         );
     }
 
-    /// A string clause that matched nothing gets the retry spelled out for it; a text clause,
-    /// a range and a prefix do not.
+    /// The clauses the retry is for: plain values on string fields, not a text clause, a range,
+    /// a prefix or a set.
     #[test]
-    fn a_string_clause_gets_its_retry_spelled_out() {
+    fn the_string_clauses_of_a_query_are_found() {
         let fields = vec![
             info("authors", "string"),
+            info("unit_type", "string"),
             info("title", "text"),
             info("year", "i64"),
         ];
-        let advice =
-            super::string_case_advice(r#"authors:"austen, jane" AND title:pride limit 5"#, &fields)
-                .expect("a string clause");
-        assert!(
-            advice.contains(
-                r#"`authors: IN ["austen, jane" "Austen, jane" "Austen, Jane" "AUSTEN, JANE"]`"#
+        assert_eq!(
+            super::string_value_clauses(
+                r#"authors:"austen, jane" AND title:pride AND unit_type:Book"#,
+                &fields
             ),
-            "{advice}"
+            [
+                ("authors".to_string(), "austen, jane".to_string()),
+                ("unit_type".to_string(), "Book".to_string())
+            ]
         );
-        let advice = super::string_case_advice("unit_type:Book", &[info("unit_type", "string")])
-            .expect("a bare value");
-        assert!(advice.contains(r#""book""#), "{advice}");
-
         for query in [
             "title:pride",
             "year:1813",
@@ -1082,8 +1092,26 @@ mod field_suggestion_tests {
             r#"authors:["a" TO "b"]"#,
             r#"authors: IN ["a" "b"]"#,
         ] {
-            assert_eq!(super::string_case_advice(query, &fields), None, "{query}");
+            assert!(
+                super::string_value_clauses(query, &fields).is_empty(),
+                "{query}"
+            );
         }
+
+        let advice = super::string_case_advice("authors", "austen, jane");
+        assert!(
+            advice.contains(
+                r#"`authors: IN ["austen, jane" "Austen, jane" "Austen, Jane" "AUSTEN, JANE"]`"#
+            ),
+            "{advice}"
+        );
+        // The quotes of a string value are not a phrase to the general advice.
+        let clauses = vec![("authors".to_string(), "austen, jane".to_string())];
+        let stripped = super::without_string_value_quotes(
+            r#"authors:"austen, jane" AND title:pride"#,
+            &clauses,
+        );
+        assert!(!stripped.contains('"'), "{stripped}");
     }
 
     /// A field the query names comes back with how its values are matched: a string field
