@@ -18,7 +18,8 @@
 #               an index none holds is a 404 through every node, one just written is found;
 #               a hit's arrays are capped through every node, wherever the document lives
 #   restart     two of three nodes restarted together rejoin, converge and serve, and no
-#               committed document is lost
+#               committed document is lost; min and max over documents on every node are
+#               merged through every node (K2)
 #   frozen peer node3 paused: node1 keeps answering, and after it resumes the ring converges,
 #               every node serves and no document is lost
 #   moved disks node3's data directory started under another hostname comes back as node3:
@@ -260,6 +261,10 @@ fi
 CLUSTER_NODES="$TWO" check_cmd "the members' ring is their own shards alone" probe converge 10
 CLUSTER_NODES="$TWO" check_cmd "every document still found through both members" \
     probe count newcomer "$SURVIVORS"
+# The damage V1 is about: a write of an existing id that the ring now places on node3 lands
+# there, and the old version stays where it was, still found by what it used to say.
+CLUSTER_NODES="$TWO" check_cmd "every document rewritten: the new version found, never the old" \
+    probe rewrite newcomer "$SURVIVORS"
 compose down -t 5 > /dev/null 2>&1
 
 section "formation ($FORM_ROUNDS rounds, all three nodes started together)"
@@ -373,6 +378,7 @@ check_cmd "seed documents written" probe seed survivor "$SURVIVORS"
 # Past the idle commit (3s by default), so every one of them is durable before a restart.
 sleep 6
 check_cmd "seed documents visible from every node" probe count survivor "$SURVIVORS"
+check_cmd "min and max merged across the nodes, through every node" probe metrics survivor "$SURVIVORS"
 for r in $(seq 1 "$ROUNDS"); do
     if ! run_bounded 120 docker restart -t 5 "$PROJECT-node2" "$PROJECT-node3" > /dev/null; then
         fail "round $r: docker restart returned" "docker did not restart the nodes"

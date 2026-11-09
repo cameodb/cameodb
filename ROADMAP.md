@@ -77,7 +77,7 @@ on one.
 | R — Key and tenant provisioning | ◐ Partial, R1 and R2 unreleased (0.3.9) | R1 and R2 done 2026-11-01, single node: included key and tenant files reloaded on change, live tenant quotas and scopes, `allowed_indexes` prefixes; a provisioner minting and revoking keys through `/_keys` (no tenant) and `/_tenants`, changing a key's indexes in place with `PATCH /_keys/{key_id}`, and granting only within its own `allowed_indexes`; client, SDK and a live suite, validated on Linux under systemd and across a restart. Left: R3, every change broadcast to every node, deferred until cluster support is decided — until then a change applies on the node that received it |
 | S — Delete by query | ✅ Done, unreleased (0.3.9) | S1, `POST /api/{index}/delete` — exact clauses, refused past `max_docs` unless confirmed — done 2026-11-02 |
 | T — OAuth for MCP clients | ✅ Done, unreleased (0.3.9) | T1, the node as the OAuth 2.1 authorization server for `/mcp` — discovery, dynamic client registration, an approval page taking the key the user holds, PKCE, refresh; stateless, tokens read-only and ended by revoking the key — done 2026-11-03 |
-| V — Cluster HA | 📋 Planned | V1–V13, opened 2026-11-08. A cluster is partitioned (`replication_factor = 1`, today's behaviour, for systems that are not critical or whose HA is in the hardware) or replicated; two nodes are partitioned or a mirror. Phase 1, HA: the mirror — document versions, the change stream, the copy operation (V2–V5), with OB26 and the schema round working with a peer down; no shard placement needed. Phase 2, a robust partitioned cluster: V1, V13, N11, N17's cluster items, O4, then cluster metadata on a quorum of voters with a single-key compare-and-set, no Raft log, and shards owned by the cluster (V6–V8). Phase 3: move, drain, rebalance (V10) and replication with fewer copies than nodes (V9). Phase 4: online reindex and splitting (V11, V12) |
+| V — Cluster HA | ◐ Partial | V1–V13, opened 2026-11-08; V1 (a node bringing new shards refused) and V13 (a node moved to another machine) done 2026-11-09, with OB26, O4 and N17's cluster items, in 0.3.10. A cluster is partitioned (`replication_factor = 1`, today's behaviour, for systems that are not critical or whose HA is in the hardware) or replicated; two nodes are partitioned or a mirror. Phase 1, HA: the mirror — document versions, the change stream, the copy operation (V2–V5), with the schema round working with a peer down (OB26's bootstrap is done); no shard placement needed. Phase 2, a robust partitioned cluster: N11, then cluster metadata on a quorum of voters with a single-key compare-and-set, no Raft log, and shards owned by the cluster (V6–V8). Phase 3: move, drain, rebalance (V10) and replication with fewer copies than nodes (V9). Phase 4: online reindex and splitting (V11, V12) |
 | U — Post-0.3.9 features | ✅ Done, unreleased | U1, CJK analyzers — `cjk` (characters and character pairs, so Chinese, Japanese and Korean are searchable by word) and `cjk_fold` (traditional Chinese folded to simplified first, so a query in either script finds both) — done 2026-11-06. U2, Japanese and Korean folds — `cjk_ja_fold` (old-style kanji to new) and `cjk_ko_fold` (Hanja to Hangul, with the initial-sound rule) — done 2026-11-06 |
 
 ## Reconciliation, 2026-08-26
@@ -179,7 +179,7 @@ read, on a release build of `dc331cf`: one node with 4 shards and ~2.5 GB of red
 - **Two clustered findings, filed as observed:** a node rejoining answers a search from a partial
   ring as if it were whole ([OB25](docs/ROADMAP-ARCHIVE.md#ob25--a-search-during-a-restart-answered-short-without-saying-so)),
   and a restarted node stays in bootstrap mode while any expected peer is down
-  ([OB26](#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap)).
+  ([OB26](docs/ROADMAP-ARCHIVE.md#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap)).
   Rejoin itself is fast: the killed node was serving 0.5 s after restart and its peers saw the
   full cluster 0.56 s after it, because a killed process's sockets close at once and Identify
   reintegrates it on the new connection.
@@ -246,10 +246,10 @@ confined to clusters ([V2](#v2--document-versions-and-delete-markers)'s decision
   `toml` 1.2.0 → 1.2.1 with `serde_spanned` and `toml_datetime`, `toml_writer` already at its
   latest 1.2.0).
 - **Cluster groundwork, serving partitioned clusters now:**
-  [V1](#v1--a-node-that-brings-new-shards-cannot-join-a-cluster-that-holds-data) (reproduce, then refuse),
-  [OB26](#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap) with
+  [V1](docs/ROADMAP-ARCHIVE.md#v1--a-node-that-brings-new-shards-cannot-join-a-cluster-that-holds-data) (reproduce, then refuse),
+  [OB26](docs/ROADMAP-ARCHIVE.md#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap) with
   [N12](#n12--dead-surface-and-the-comments-that-no-longer-match)'s coordinator dead surface,
-  [V13](#v13--a-node-whose-disks-move-to-another-machine-rejoins-as-itself), the cluster items of
+  [V13](docs/ROADMAP-ARCHIVE.md#v13--a-node-whose-disks-move-to-another-machine-rejoins-as-itself), the cluster items of
   [N17](#n17--smaller-items-filed-so-they-are-not-lost) (the snapshot persisted out of order, the
   checksum's `DefaultHasher`, the peer tasks outside the cancellation token), and
   [O4](docs/ROADMAP-ARCHIVE.md#o4--the-request-budget-crosses-the-wire).
@@ -278,11 +278,21 @@ K2's merge and the refusal fix (`a2244ea`) their first multi-node check.
 | 2 ✅ | The audit and logging fixes: the streamed search's query at `info!` and its missing audited query; 429 and 403 audited as `allowed`; a plain index listing churning the open-index cap — all three fixed 2026-11-09 | Small, local, and the first two are security fixes |
 | 3 ✅ | [E4](docs/ROADMAP-ARCHIVE.md#e4--two-compatibility-paths-with-no-end-to-end-test)'s fixtures — 0.3.0 and 0.3.9, done 2026-11-09 | Before any 0.4.0 storage work, so they are written by a real 0.3.x build |
 | 4 ✅ | [N17](#n17--smaller-items-filed-so-they-are-not-lost)'s cluster bugs: the snapshot persisted out of order, the checksum's `DefaultHasher` → xxh3, the peer tasks outside the cancellation token — all three fixed 2026-11-09 | Small real bugs under everything after them |
-| 5 ✅ | [OB26](#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap) with [N12](#n12--dead-surface-and-the-comments-that-no-longer-match)'s coordinator dead surface — built 2026-11-09; OB26's `cluster.sh` phase runs with steps 4–8 | About a day, mostly deletion; the join path step 6 changes |
-| 6 ✅ | [V1](#v1--a-node-that-brings-new-shards-cannot-join-a-cluster-that-holds-data): reproduce, then refuse — the refusal built 2026-11-09; its `cluster.sh` phase reproduces V1 on an older image and checks the refusal on this one | On the bootstrap step 5 leaves |
+| 5 ✅ | [OB26](docs/ROADMAP-ARCHIVE.md#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap) with [N12](#n12--dead-surface-and-the-comments-that-no-longer-match)'s coordinator dead surface — done 2026-11-09 | About a day, mostly deletion; the join path step 6 changes |
+| 6 ✅ | [V1](docs/ROADMAP-ARCHIVE.md#v1--a-node-that-brings-new-shards-cannot-join-a-cluster-that-holds-data): reproduce, then refuse — done 2026-11-09, reproduced on a 0.3.9 image | On the bootstrap step 5 leaves |
 | 7 ✅ | [O4](docs/ROADMAP-ARCHIVE.md#o4--the-request-budget-crosses-the-wire) — done 2026-11-09 | The field is optional on the wire, so mixed versions still work |
-| 8 ✅ | [V13](#v13--a-node-whose-disks-move-to-another-machine-rejoins-as-itself): a `cluster.sh` phase and a DEPLOYMENT procedure — both written 2026-11-09; what the phase finds is fixed after the run | Exercises everything above |
+| 8 ✅ | [V13](docs/ROADMAP-ARCHIVE.md#v13--a-node-whose-disks-move-to-another-machine-rejoins-as-itself): a `cluster.sh` phase and a DEPLOYMENT procedure — done 2026-11-09 | Exercises everything above |
 | — ✅ | The `deny.toml` exceptions and the deferred dependency updates — done 2026-11-09 | Any time before 2026-12-31 |
+
+**Validated 2026-11-09.** Two full `cluster.sh` runs on images built fresh from HEAD passed 54 of
+54 checks each (a third, with the checks below added, 56 of 56), the new *peer down*, *newcomer* and *moved disks* phases among them. The first
+found one regression of step 6's — the coordinator held the shard stores strongly, so every store
+stayed open past shutdown — fixed in `70b1dfd` and gone from the second run's log. A 0.3.9 image
+built from `3e36143` then ran the *peer down* and *newcomer* phases and failed them as filed: two
+nodes with the third down held only their own 4 shards each after 8 s (OB26), and node3 started
+empty was taken in, the ring grew from 8 shards to 12, and 5 rewritten documents were still found
+in their old version (V1). After the runs the suite gained a min/max check merged across the nodes
+(K2), which the order above expected the run to give and no phase had asked for.
 
 ---
 
@@ -343,7 +353,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [OB23](docs/ROADMAP-ARCHIVE.md#ob23--recreating-an-index-after-dropping-its-schema-lost-most-of-what-was-written) | **Recreating an index after dropping its schema lost most of what was written** — the drop's record read as a schema, the node re-minted the index from every batch, and a retyped column killed the Tantivy writer, which stayed dead until restart. 1,030 of 16,559 documents landed; now all do, a dying writer is retired and replayed, and the loader counts every failure by its file line | — | 2026-09-27 | ✅ |
 | [OB24](docs/ROADMAP-ARCHIVE.md#ob24--a-and-not-b-and-a-or-not-b-parsed-cleanly-and-answered-wrongly) | **`a AND NOT b` and `a OR NOT b` parsed cleanly and answered wrongly** — a `NOT` arm under `Must`/`Should` matched nothing and nothing reported it; rewritten to `a AND -b` / `a OR (* -b)` before the parser runs | — | 2026-10-05 | ✅ |
 | [OB25](docs/ROADMAP-ARCHIVE.md#ob25--a-search-during-a-restart-answered-short-without-saying-so) | **A search during a restart answered short without saying so** — a rejoining node searched 5 of 9 shards and reported `failed: 0`; on one node, HTTP serves before the replayed tail is committed. Both fixed the same day | — | 2026-10-15 | ✅ |
-| [OB26](#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap) | **A restarted node waits on every expected peer before it leaves bootstrap** — reproduced 2026-10-18: real, and invisible to clients, because the snapshot and any never-restarted peer carry the map. Built 2026-11-09: no bootstrap mode, the exchange runs with any peer down, and the unread DHT shard records are gone; archived after the steps 4–8 cluster run | — | 2026-10-15 | ◐ |
+| [OB26](docs/ROADMAP-ARCHIVE.md#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap) | **A restarted node waits on every expected peer before it leaves bootstrap** — reproduced 2026-10-18: real, and invisible to clients, because the snapshot and any never-restarted peer carry the map. Built 2026-11-09: no bootstrap mode, the exchange runs with any peer down, and the unread DHT shard records are gone; validated by `cluster.sh` and reproduced on 0.3.9 | — | 2026-10-15 | ✅ |
 | [OB27](#ob27--a-replaced-node-never-leaves-the-cluster) | **A replaced node never leaves the cluster** — a node rebuilt with an empty data directory leaves its old identity's shards on every ring for good: writes to their key ranges answer 500, and the new node cannot learn an existing schema (503). The 500 is now a 503 (`888cb27`); `forget` needs O3 | — | 2026-10-18 | ◐ |
 | [OB28](docs/ROADMAP-ARCHIVE.md#ob28--two-range-shapes-were-dropped-without-a-word-or-failed-the-search) | **Two range shapes were dropped without a word or failed the search** — `field:[* TO *]` answered zero unreported, and a range on a json field was a 500; both are now reported dropped clauses, refused with 400 when nothing else is left | — | 2026-10-21 | ✅ |
 | [OB29](docs/ROADMAP-ARCHIVE.md#ob29--what-verifying-ob28-over-mcp-found) | **What verifying OB28 over MCP found** — a query whose every clause was dropped ran as match-all, a json path matched nothing unreported, and `validate_query` called a path an unknown field | — | 2026-10-21 | ✅ |
@@ -373,19 +383,19 @@ first written down here, so the chronology stays visible under the cost ordering
 | [T1](docs/ROADMAP-ARCHIVE.md#t1--oauth-for-mcp-clients) | OAuth for MCP clients — browser-based and desktop MCP clients connect with the OAuth flow the MCP specification defines; the user approves once with their existing key, and the token they get is that key's authority, read only — done 2026-11-03 | — | 2026-11-03 | ✅ |
 | [U1](docs/ROADMAP-ARCHIVE.md#u1--cjk-analyzers-chinese-japanese-and-korean-searchable-by-word) | CJK analyzers — `cjk` indexes each Chinese, Japanese or Korean character alone and paired with the next, at one position, so a character, a word or a clause matches exactly; `cjk_fold` folds traditional Chinese to simplified first (a 12 KB table of 2,974 pairs derived from OpenCC's character list, with reviewed overrides), so either script finds both. done 2026-11-06 | — | 2026-11-06 | ✅ |
 | [U2](docs/ROADMAP-ARCHIVE.md#u2--japanese-and-korean-folds-old-style-kanji-and-hanja) | Japanese and Korean folds — `cjk_ja_fold` maps old-style kanji to the new forms (淸吉 finds 清吉; OpenCC and Unihan `kJapaneseNewVariant`, 470 pairs plus reviewed overrides), `cjk_ko_fold` reads Hanja as Hangul (家族 finds 가족; Unihan `kHangul`, the initial-sound rule on each run's first character). done 2026-11-06 | — | 2026-11-06 | ✅ |
-| [V1](#v1--a-node-that-brings-new-shards-cannot-join-a-cluster-that-holds-data) | A node that brings new shards cannot join a cluster that holds data — its tokens take key ranges and no document moves; refused until V8 | 15 | 2026-11-08 | ◐ |
+| [V1](docs/ROADMAP-ARCHIVE.md#v1--a-node-that-brings-new-shards-cannot-join-a-cluster-that-holds-data) | A node that brings new shards cannot join a cluster that holds data — its tokens take key ranges and no document moves; refused until V8 — refused since 2026-11-09, reproduced on 0.3.9 first | 15 | 2026-11-08 | ✅ |
 | [V2](#v2--document-versions-and-delete-markers) | Document versions and delete markers — a hybrid clock per write, newest wins; a storage format change | 15 | 2026-11-08 | 📋 |
 | [V3](#v3--the-wal-kept-until-replicas-confirm-it-and-the-change-stream) | The WAL kept until replicas confirm it, and the change stream | 15 | 2026-11-08 | 📋 |
 | [V4](#v4--the-copy-operation-one-index-from-one-node-to-another-with-catch-up) | The copy operation — one index from one node to another, with catch-up; serves replica fill, move, reindex and split | 15 | 2026-11-08 | 📋 |
 | [V5](#v5--the-mirror-two-nodes-every-document-on-both) | The mirror — phase 1 of HA: a cluster whose `replication_factor` equals its node count, each node holding every document; either serves everything when the other is lost | 15 | 2026-11-08 | 📋 |
-| [V6](#v6--metadata-records-on-a-majority-of-voters) | Metadata records on a majority of voters — OB26 rebuilt on it | 15 | 2026-11-08 | 📋 |
+| [V6](#v6--metadata-records-on-a-majority-of-voters) | Metadata records on a majority of voters — its records' readiness: a quorum reachable, the first peer in a mirror, or a deadline | 15 | 2026-11-08 | 📋 |
 | [V7](#v7--compare-and-set-on-one-key-and-the-voter-list) | Compare-and-set on one key, and the voter list — the topology lock, the witness, OB27's `forget` | 15 | 2026-11-08 | 📋 |
 | [V8](#v8--shards-belong-to-the-cluster-placement-on-a-version-checked-at-the-replica) | Shards belong to the cluster; placement on a version, checked at the replica — absorbs O3 and N15's shard-map item | 15 | 2026-11-08 | 📋 |
 | [V9](#v9--replication-with-fewer-copies-than-nodes) | Replication with fewer copies than nodes | 15 | 2026-11-08 | 📋 |
 | [V10](#v10--move-drain-and-rebalance) | Move, drain and rebalance | 15 | 2026-11-08 | 📋 |
 | [V11](#v11--online-reindex-and-index-aliases) | Online reindex, and index aliases | 15 | 2026-11-08 | 📋 |
 | [V12](#v12--splitting-a-shard) | Splitting a shard | 15 | 2026-11-08 | 📋 |
-| [V13](#v13--a-node-whose-disks-move-to-another-machine-rejoins-as-itself) | A node whose disks move to another machine rejoins as itself — the recovery a partitioned cluster relies on when its HA is in the hardware | 15 | 2026-11-09 | ◐ |
+| [V13](docs/ROADMAP-ARCHIVE.md#v13--a-node-whose-disks-move-to-another-machine-rejoins-as-itself) | A node whose disks move to another machine rejoins as itself — the recovery a partitioned cluster relies on when its HA is in the hardware — rehearsed by `cluster.sh` 2026-11-09, nothing needed fixing | 15 | 2026-11-09 | ✅ |
 
 ---
 
@@ -1806,59 +1816,14 @@ stays there.
 - ✅ [**OB23 — Recreating an index after dropping its schema lost most of what was written**](docs/ROADMAP-ARCHIVE.md#ob23--recreating-an-index-after-dropping-its-schema-lost-most-of-what-was-written)
 - ✅ [**OB24 — `a AND NOT b` and `a OR NOT b` parsed cleanly and answered wrongly**](docs/ROADMAP-ARCHIVE.md#ob24--a-and-not-b-and-a-or-not-b-parsed-cleanly-and-answered-wrongly)
 - ✅ [**OB25 — A search during a restart answered short without saying so**](docs/ROADMAP-ARCHIVE.md#ob25--a-search-during-a-restart-answered-short-without-saying-so)
-
-### OB26 — A restarted node waits on every expected peer before it leaves bootstrap
-
-◐ **Built 2026-11-09 (step 5 of [the 0.3.10 order](#the-order-of-the-remaining-work)); archived after the `cluster.sh` run of steps 4–8.**
-
-**What landed.** There is no bootstrap mode left to end. The push and pull of shard maps run on
-every `PeerDiscovered` and every `RegisterLocalShards`, with any peer down; the stability push,
-`bootstrap_complete` and `MarkBootstrapComplete` are gone. Without the gate, the DHT shard path
-had no reader: nothing ever queried the `cameodb-shard-` records, and the `cameodb-node-` query ran
-only from the bootstrap branch and the dead `TrackPushFailure`. Both record kinds, their publish,
-the query, the two swarm events and their coordinator handlers went with it; the DHT keeps the
-peer-id → node-UUID records it is still read for. No deadline was added: with the exchange
-ungated nothing waits on one. `cluster.sh` gains a *peer down* phase: two of three nodes, the
-third never started, must hold each other's shards within 8 s, under the first 10 s pull. What
-[V6](#v6--metadata-records-on-a-majority-of-voters) adds later is the readiness of its own quorum
-records — when a quorum is reachable, at the first peer in a two-node mirror, or at a deadline —
-not a gate on this exchange.
-
-**The finding, as filed.** Read from the code 2026-10-15; reproduced in Docker 2026-10-18 at
-`7696b4a` — the mode is real, and no client sees it. `bootstrap_complete` becomes true in
-`evaluate_and_transition_state` only when no expected node is inactive (`coordinator.rs:510–513`) —
-every node in the snapshot or the configuration, connected. Until then `PeerDiscovered` skips the
-actor push and pull of shard maps (`:1388`) and so does `RegisterLocalShards` (`:789`), leaving the
-node to the DHT records and the 10 s `SyncShardMaps` pull. A node restarted while any one peer is
-down therefore never leaves that mode, and the event-driven exchange
-[N15](#n15--per-index-state-and-node-state-each-with-one-owner) intends does not run on it.
-`MarkBootstrapComplete`, the override that would end the mode, is a struct with no handler and no
-sender (dead surface, for [N12](#n12--dead-surface-and-the-comments-that-no-longer-match)).
-
-**Measured, three nodes, `cameodb.toml` listing all three:**
-
-| Scenario | Leaves bootstrap | Shard maps | Data |
-|---|---|---|---|
-| Fresh cluster, node3 never started | Neither node | Each other's shards after 12.7 s and 14.8 s, from the 10 s pull. The DHT step fetched node metadata only. Instant once node3 joined (the stability push) | Not reachable: creating an index needs every configured node to answer the schema canvass (503, *only 2 of 3 cluster nodes are connected*) |
-| node3 stopped, node2 restarted | node2 never (`Skipping actor-based shard exchange (discovery phase)`) | Whole at once: the snapshot restored them, and node1, never restarted, pushed and pulled 9 ms after Identify | Whole: node3's ids unavailable and reported (`failed: 1`), none misplaced or duplicated |
-| Whole cluster restarted, node3 down | No node; no exchange runs | Whole at once, from the snapshot | Whole, as above |
-
-So the snapshot carries the map across restarts, and any node that never restarted still pushes on
-Identify. The only delay is the fresh cluster, where nothing can be written anyway. The fix is still
-worth making because it deletes code and makes the exchange the one that actually runs, not because
-a client is waiting on it.
-
-The rule this should follow: bootstrap ends at the first peer connected, or on a deadline — a
-peer that is down is the steady state the cluster has to serve in, not a phase before it. That
-means the actor push and pull run on every `PeerDiscovered` and `RegisterLocalShards`; the
-stability push in `evaluate_and_transition_state` then repeats what `PeerDiscovered` does and goes;
-`MarkBootstrapComplete` goes. Roughly a day with a `cluster.sh` phase for the restart-with-a-peer-down
-case. Today shard sets cannot change during a process's life, so pushing against a partial view
-risks only what the 10 s pull already risks ([O3](#o3--shard-maps-merge-on-a-version-not-on-recency)'s
-narrow live case); it no longer has to wait for O3. Best done together with
-[OB27](#ob27--a-replaced-node-never-leaves-the-cluster), which touches the same count of expected nodes.
+- ✅ [**OB26 — A restarted node waits on every expected peer before it leaves bootstrap**](docs/ROADMAP-ARCHIVE.md#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap)
 
 ### OB27 — A replaced node never leaves the cluster
+
+**Changed 2026-11-09 by [V1](docs/ROADMAP-ARCHIVE.md#v1--a-node-that-brings-new-shards-cannot-join-a-cluster-that-holds-data) and [OB26](docs/ROADMAP-ARCHIVE.md#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap):** the replacement node is refused while the cluster
+holds an index, and stops, so the third bullet below no longer happens and the first's
+"stays in bootstrap" is gone with bootstrap. The old identity still stays on every ring with
+its key ranges, and health still counts it: `forget` is still needed to rebuild a node's disk.
 
 📋 **Planned.** Found 2026-10-18 while reproducing OB26, at `7696b4a`. node3 of three was stopped, its
 data directory emptied, and started again on the same address: a new node identity, and the old
@@ -1866,7 +1831,7 @@ one never returns. From then on, permanently:
 
 - **Every node's ring keeps the old identity's shards** — `cluster_total_shards` 16 for 12 real
   shards — and `total_nodes` reads 4, so health stays yellow and every node restarted afterwards stays
-  in bootstrap ([OB26](#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap)).
+  in bootstrap ([OB26](docs/ROADMAP-ARCHIVE.md#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap)).
 - **The old shards keep their key ranges.** A write whose id hashes there gets
   `500 Write operation cannot be broadcast - routing failed` (9 of 50 ids) — unavailable, and a 500
   where every other unreachable-owner path answers 503.
@@ -2875,7 +2840,7 @@ replicated: a replicated cluster that loses a node keeps its data and keeps serv
 nodes run as a partitioned pair or as a mirror of each other. Either kind grows, shrinks and
 rebalances while it serves, and a partitioned cluster becomes as robust as its hardware lets it. This group is the design for [Phase 15](#d-phase-15--high-availability-reindex-replication--migration--planned):
 D1, D2 and D3 are built as the items below. It absorbs [O3](#o3--shard-maps-merge-on-a-version-not-on-recency)
-and N15's shard-map item, and [OB26](#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap),
+and N15's shard-map item, and [OB26](docs/ROADMAP-ARCHIVE.md#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap),
 [OB27](#ob27--a-replaced-node-never-leaves-the-cluster)'s `forget` and [R3](#r3--changes-reach-every-node)
 are built on it. The design is meant to be iterated: each pass adds to the
 [iteration log](#iteration-log) and settles or adds open questions, so a later change does not
@@ -2912,7 +2877,7 @@ reopen a settled one without saying why.
    choice for a system that is not critical, and for one whose HA is in the hardware: a RAID
    array survives a failed disk, and a failed machine's disks boot in a healthy one, the node
    rejoining as itself because its identity is its data directory
-   ([V13](#v13--a-node-whose-disks-move-to-another-machine-rejoins-as-itself)). Everything built
+   ([V13](docs/ROADMAP-ARCHIVE.md#v13--a-node-whose-disks-move-to-another-machine-rejoins-as-itself)). Everything built
    for the cluster that does not need a second copy — the stability items, the metadata quorum,
    placement, move, drain and rebalance — serves it as well.
 7. **"Shard" keeps its meaning; the modes are named, not the unit.** A shard is already both the
@@ -3141,32 +3106,7 @@ the cluster items of [N17](#n17--smaller-items-filed-so-they-are-not-lost) (the 
 out of order, the shard checksum's `DefaultHasher`, the peer tasks outside the cancellation token,
 leaving the cluster before shutdown's Phase 3) and [O4](docs/ROADMAP-ARCHIVE.md#o4--the-request-budget-crosses-the-wire).
 
-### V1 — A node that brings new shards cannot join a cluster that holds data
-
-◐ **Refusal built 2026-11-09** (step 6 of [the 0.3.10 order](#the-order-of-the-remaining-work)); archived after the `cluster.sh` run of steps 4–8, which reproduces the
-defect on an older image first. Joining with no shards is V8's.
-
-**What landed.** A member leaves out of its ring the shards of every node it has never known
-(no shard of that owner in its map or its snapshot) while it holds a live index, and tells that
-node once, with the reason (`JoinRefused`). The test is an index, not a document count: schemas
-are the same on every member, so every member decides alike and their rings stay alike, where
-counts differ from node to node. A refused node is kept out of the node registry, so it does not
-leave the cluster degraded once it is gone. The told node stops — through the same graceful
-shutdown as a signal, exiting with the reason — only if it holds no stored document; one that
-does is another cluster's member, keeps running and refuses the others in turn, so two clusters
-that meet never stop each other. With no index, nothing is refused: a fresh cluster grows as
-before. The `cluster.sh` *newcomer* phase: node1 and node2 configured, documents written, node3
-(not in their list) started empty — it must stop with the refusal, and the two keep their ring and
-every document. DEPLOYMENT says it. A node started empty in place of an old one ([OB27](#ob27--a-replaced-node-never-leaves-the-cluster)) is such a
-newcomer, and is refused now rather than joining beside its old identity.
-
-**The finding, as filed.** Read from the code 2026-11-08. A node started with an
-empty data directory creates `num_shards_init` shards and registers them
-(`RegisterLocalShards`, `orchestrator.rs:4863`); their tokens take over part of every index's key
-space, and no document moves. A later write of an existing id lands on the new shard while the old
-copy stays where it was: a search returns both, and a delete routed by the id misses the old one.
-**Change:** a node whose shards would take key ranges from a cluster holding documents is refused
-with the reason, until V8 lets it join with none.
+- ✅ [**V1 — A node that brings new shards cannot join a cluster that holds data**](docs/ROADMAP-ARCHIVE.md#v1--a-node-that-brings-new-shards-cannot-join-a-cluster-that-holds-data)
 
 ### V2 — Document versions and delete markers
 
@@ -3249,32 +3189,7 @@ populated index's rebuild-needing schema change, and the two gaps D1 names.
 📋 **Planned.** Needs V10. A shard's key ranges divided by V4 with a key range, so a cluster can have
 more shards than it started with.
 
-### V13 — A node whose disks move to another machine rejoins as itself
-
-◐ **Phase and procedure written 2026-11-09** (step 8 of [the 0.3.10 order](#the-order-of-the-remaining-work)); archived once the `cluster.sh` run passes it, with whatever it finds fixed.
-
-**What landed.** The `cluster.sh` *moved disks* phase stops node3 and starts its data directory
-as `node3b` — another hostname, so another address — while every other node's configuration
-still names node3. It checks the node id is unchanged, the ring converges, every node counts three
-nodes (the probe's new `nodes` command), no committed document is lost, every node writes and
-deletes, and that node1, restarted after the move, finds node3b again. Read from the code
-beforehand: the libp2p key is in the data directory, so the peer id is unchanged; nodes dial their
-seeds and DHT-discovered addresses, never the persisted registry, whose address is updated from the
-connection and persisted with the next generation. So nothing is expected to need fixing; the run
-decides. DEPLOYMENT gains *Moving a node to another machine*: keep the old machine from starting
-it again, bring every data path over whole, change only its own bind addresses, start it, check
-health, tidy the others' `seed_nodes` and `cluster_nodes` at their next restart.
-
-**The item, as filed.** Phase 2. The recovery a partitioned cluster relies on when its HA is in the
-hardware: a machine fails, its disks (or its data directory, restored whole) are put in another
-machine with another address, and the node comes back as itself. Read from the code 2026-11-09,
-not yet run: the identity is the data directory (`node_identity.json` beside the shards), the node
-dials its `seed_nodes` and the peers learn its new address on that connection, while every peer's
-node registry still holds the old one (`PersistedNodeInfo.address`, `cluster_state.rs:94`) and its
-own `seed_nodes` may list it. **Change:** a `cluster.sh` phase that moves a node's data directory
-to a container with another address and checks it rejoins with its shards, every write and search
-answering as before, and the old address dropped from the registry; fix what it finds; DEPLOYMENT
-describes the procedure, beside the existing "restore it whole" rule.
+- ✅ [**V13 — A node whose disks move to another machine rejoins as itself**](docs/ROADMAP-ARCHIVE.md#v13--a-node-whose-disks-move-to-another-machine-rejoins-as-itself)
 
 ### Iteration log
 

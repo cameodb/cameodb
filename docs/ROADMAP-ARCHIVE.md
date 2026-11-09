@@ -3779,6 +3779,61 @@ them defects is that the answer claims to be whole.
   shard reports itself as recovering in `stats` until its recovery commit lands, or that commit
   completes before the shard is registered for routing.
 
+### OB26 — A restarted node waits on every expected peer before it leaves bootstrap
+
+✅ **Done 2026-11-09** (step 5 of [the 0.3.10 order](../ROADMAP.md#the-order-of-the-remaining-work)). **Validated:** the
+*peer down* phase passed on HEAD in two full `cluster.sh` runs (54 of 54 checks each, fresh
+image), node1 and node2 holding each other's shards at once; on a 0.3.9 image built from
+`3e36143` the same phase failed, each node holding only its own 4 shards after 8 s — the defect
+as filed.
+
+**What landed.** There is no bootstrap mode left to end. The push and pull of shard maps run on
+every `PeerDiscovered` and every `RegisterLocalShards`, with any peer down; the stability push,
+`bootstrap_complete` and `MarkBootstrapComplete` are gone. Without the gate, the DHT shard path
+had no reader: nothing ever queried the `cameodb-shard-` records, and the `cameodb-node-` query ran
+only from the bootstrap branch and the dead `TrackPushFailure`. Both record kinds, their publish,
+the query, the two swarm events and their coordinator handlers went with it; the DHT keeps the
+peer-id → node-UUID records it is still read for. No deadline was added: with the exchange
+ungated nothing waits on one. `cluster.sh` gains a *peer down* phase: two of three nodes, the
+third never started, must hold each other's shards within 8 s, under the first 10 s pull. What
+[V6](../ROADMAP.md#v6--metadata-records-on-a-majority-of-voters) adds later is the readiness of its own quorum
+records — when a quorum is reachable, at the first peer in a two-node mirror, or at a deadline —
+not a gate on this exchange.
+
+**The finding, as filed.** Read from the code 2026-10-15; reproduced in Docker 2026-10-18 at
+`7696b4a` — the mode is real, and no client sees it. `bootstrap_complete` becomes true in
+`evaluate_and_transition_state` only when no expected node is inactive (`coordinator.rs:510–513`) —
+every node in the snapshot or the configuration, connected. Until then `PeerDiscovered` skips the
+actor push and pull of shard maps (`:1388`) and so does `RegisterLocalShards` (`:789`), leaving the
+node to the DHT records and the 10 s `SyncShardMaps` pull. A node restarted while any one peer is
+down therefore never leaves that mode, and the event-driven exchange
+[N15](../ROADMAP.md#n15--per-index-state-and-node-state-each-with-one-owner) intends does not run on it.
+`MarkBootstrapComplete`, the override that would end the mode, is a struct with no handler and no
+sender (dead surface, for [N12](../ROADMAP.md#n12--dead-surface-and-the-comments-that-no-longer-match)).
+
+**Measured, three nodes, `cameodb.toml` listing all three:**
+
+| Scenario | Leaves bootstrap | Shard maps | Data |
+|---|---|---|---|
+| Fresh cluster, node3 never started | Neither node | Each other's shards after 12.7 s and 14.8 s, from the 10 s pull. The DHT step fetched node metadata only. Instant once node3 joined (the stability push) | Not reachable: creating an index needs every configured node to answer the schema canvass (503, *only 2 of 3 cluster nodes are connected*) |
+| node3 stopped, node2 restarted | node2 never (`Skipping actor-based shard exchange (discovery phase)`) | Whole at once: the snapshot restored them, and node1, never restarted, pushed and pulled 9 ms after Identify | Whole: node3's ids unavailable and reported (`failed: 1`), none misplaced or duplicated |
+| Whole cluster restarted, node3 down | No node; no exchange runs | Whole at once, from the snapshot | Whole, as above |
+
+So the snapshot carries the map across restarts, and any node that never restarted still pushes on
+Identify. The only delay is the fresh cluster, where nothing can be written anyway. The fix is still
+worth making because it deletes code and makes the exchange the one that actually runs, not because
+a client is waiting on it.
+
+The rule this should follow: bootstrap ends at the first peer connected, or on a deadline — a
+peer that is down is the steady state the cluster has to serve in, not a phase before it. That
+means the actor push and pull run on every `PeerDiscovered` and `RegisterLocalShards`; the
+stability push in `evaluate_and_transition_state` then repeats what `PeerDiscovered` does and goes;
+`MarkBootstrapComplete` goes. Roughly a day with a `cluster.sh` phase for the restart-with-a-peer-down
+case. Today shard sets cannot change during a process's life, so pushing against a partial view
+risks only what the 10 s pull already risks ([O3](../ROADMAP.md#o3--shard-maps-merge-on-a-version-not-on-recency)'s
+narrow live case); it no longer has to wait for O3. Best done together with
+[OB27](../ROADMAP.md#ob27--a-replaced-node-never-leaves-the-cluster), which touches the same count of expected nodes.
+
 ### OB28 — Two range shapes were dropped without a word or failed the search
 
 ✅ **Done 2026-10-21.** Found profiling a test index of legal acts for its descriptions, at `3815886`:
@@ -6060,6 +6115,75 @@ analyzer is rebuilt by reloading it.
 
 **Consumer.** The Gutenberg case: `text_ja` moves to `cjk_ja_fold`, and Korean gets its own
 `text_ko` on `cjk_ko_fold` once a Korean-language book is in its collection.
+
+## V. Cluster HA — delivered items
+
+The introduction to this group and its open items are in [ROADMAP.md](../ROADMAP.md), under [V. Cluster HA](../ROADMAP.md#v-cluster-ha--replication-the-two-node-mirror-and-elasticity--planned).
+
+### V1 — A node that brings new shards cannot join a cluster that holds data
+
+✅ **Done 2026-11-09** (step 6 of [the 0.3.10 order](../ROADMAP.md#the-order-of-the-remaining-work)). Joining
+with no shards is [V8](../ROADMAP.md#v8--shards-belong-to-the-cluster-placement-on-a-version-checked-at-the-replica)'s. **Reproduced, then refused:** on a 0.3.9 image built
+from `3e36143`, the *newcomer* phase showed the defect: node3 joined instead of stopping, the
+members' ring grew from 8 shards to 12, and after every document was rewritten with a new title
+both members found the 30 new versions and still 5 old ones — the old copies of the ids the ring
+now gave node3. On this build the same phase passes in full: node3 stops with the refusal (exit
+1), the ring stays at 8, and no old version is found. The first cluster run also found that the
+coordinator's strong handles on the shard stores kept every store open past shutdown (26
+"Storage still referenced" warnings); it holds them weakly since `70b1dfd`.
+
+**What landed.** A member leaves out of its ring the shards of every node it has never known
+(no shard of that owner in its map or its snapshot) while it holds a live index, and tells that
+node once, with the reason (`JoinRefused`). The test is an index, not a document count: schemas
+are the same on every member, so every member decides alike and their rings stay alike, where
+counts differ from node to node. A refused node is kept out of the node registry, so it does not
+leave the cluster degraded once it is gone. The told node stops — through the same graceful
+shutdown as a signal, exiting with the reason — only if it holds no stored document; one that
+does is another cluster's member, keeps running and refuses the others in turn, so two clusters
+that meet never stop each other. With no index, nothing is refused: a fresh cluster grows as
+before. The `cluster.sh` *newcomer* phase: node1 and node2 configured, documents written, node3
+(not in their list) started empty — it must stop with the refusal, and the two keep their ring and
+every document, and after every document is rewritten with a new title no node finds an old
+version (the probe's `rewrite`, which waits out the commit). DEPLOYMENT says it. A node started empty in place of an old one ([OB27](../ROADMAP.md#ob27--a-replaced-node-never-leaves-the-cluster)) is such a
+newcomer, and is refused now rather than joining beside its old identity.
+
+**The finding, as filed.** Read from the code 2026-11-08. A node started with an
+empty data directory creates `num_shards_init` shards and registers them
+(`RegisterLocalShards`, `orchestrator.rs:4863`); their tokens take over part of every index's key
+space, and no document moves. A later write of an existing id lands on the new shard while the old
+copy stays where it was: a search returns both, and a delete routed by the id misses the old one.
+**Change:** a node whose shards would take key ranges from a cluster holding documents is refused
+with the reason, until V8 lets it join with none.
+
+### V13 — A node whose disks move to another machine rejoins as itself
+
+✅ **Done 2026-11-09** (step 8 of [the 0.3.10 order](../ROADMAP.md#the-order-of-the-remaining-work)). **Validated:** the
+*moved disks* phase passed in both full `cluster.sh` runs: node3b reported node3's id, the ring
+converged at once, every node counted three nodes, all 30 committed documents were found, writes
+and deletes went through every node, and node1, restarted after the move, found node3b again.
+Nothing needed fixing, as the code read beforehand suggested.
+
+**What landed.** The `cluster.sh` *moved disks* phase stops node3 and starts its data directory
+as `node3b` — another hostname, so another address — while every other node's configuration
+still names node3. It checks the node id is unchanged, the ring converges, every node counts three
+nodes (the probe's new `nodes` command), no committed document is lost, every node writes and
+deletes, and that node1, restarted after the move, finds node3b again. Read from the code
+beforehand: the libp2p key is in the data directory, so the peer id is unchanged; nodes dial their
+seeds and DHT-discovered addresses, never the persisted registry, whose address is updated from the
+connection and persisted with the next generation. DEPLOYMENT gains *Moving a node to another machine*: keep the old machine from starting
+it again, bring every data path over whole, change only its own bind addresses, start it, check
+health, tidy the others' `seed_nodes` and `cluster_nodes` at their next restart.
+
+**The item, as filed.** Phase 2. The recovery a partitioned cluster relies on when its HA is in the
+hardware: a machine fails, its disks (or its data directory, restored whole) are put in another
+machine with another address, and the node comes back as itself. Read from the code 2026-11-09,
+not yet run: the identity is the data directory (`node_identity.json` beside the shards), the node
+dials its `seed_nodes` and the peers learn its new address on that connection, while every peer's
+node registry still holds the old one (`PersistedNodeInfo.address`, `cluster_state.rs:94`) and its
+own `seed_nodes` may list it. **Change:** a `cluster.sh` phase that moves a node's data directory
+to a container with another address and checks it rejoins with its shards, every write and search
+answering as before, and the old address dropped from the registry; fix what it finds; DEPLOYMENT
+describes the procedure, beside the existing "restore it whole" rule.
 
 ## Phases 1–9 — Foundations through advanced architecture ✅ Done
 

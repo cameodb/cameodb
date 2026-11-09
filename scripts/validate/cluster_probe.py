@@ -20,6 +20,10 @@ show the evidence. Nodes come from CLUSTER_NODES, a comma-separated list of base
   searches <seconds> <writers> <index>     searches through every node, each a cluster-wide fan-out
   bulkmints <seconds> <writers>            each bulk write creates its own index, through every node
   samemint <rounds> <writers>              every node writes to one new index at the same moment
+  metrics <index> <count>                  min and max of `n` over what `seed` wrote, through every
+                                           node: 0 and count - 1, merged across the nodes
+  rewrite <index> <count>                  the documents `seed` wrote, written again with a new
+                                           title: found new through every node, never old
   missing                                  a missing index is a 404 through every node; one just
                                            written through any node is found through every node
   fault <seconds> <from> <to> <index>      node1's health, searches and writes while a peer is
@@ -411,6 +415,64 @@ def cmd_count(index, count):
     return 0 if ok else 1
 
 
+def cmd_metrics(index, count):
+    """Min and max of `n` over the documents `seed` wrote, asked through every node: the answer
+    merges every node's share, so each node reports 0 and count - 1 whichever shard holds them."""
+    ok = True
+    for node in NODES:
+        status, _, body = call("POST", f"{node}/api/{index}/search",
+                               {"query": "title:survivor", "limit": 0,
+                                "metrics": {"min": ["n"], "max": ["n"]}})
+        metrics = body.get("metrics") if status == 200 and isinstance(body, dict) else None
+        low = (metrics or {}).get("min", {}).get("n")
+        high = (metrics or {}).get("max", {}).get("n")
+        good = low == 0 and high == count - 1
+        ok &= good
+        print(f"  {node}: {status}, min {low}, max {high}" + ("" if good else f"   <-- expected 0 and {count - 1}"))
+    print(f"every node merges min 0 and max {count - 1}" if ok else "a node merged the wrong range")
+    return 0 if ok else 1
+
+
+def cmd_rewrite(index, count):
+    """Write every document `seed` wrote again with a new title, then search through every node:
+    the new version is found for each, and the old one for none. A write of an existing id that
+    the ring places on a shard other than the one holding it leaves the old copy behind (V1).
+    """
+    failed = 0
+    for i in range(count):
+        node = NODES[i % len(NODES)]
+        status, _, _ = call("PUT", f"{node}/api/{index}/document",
+                            {"id": f"d{i}", "doc": {"title": "rewritten", "n": i}})
+        failed += status not in (200, 201)
+    if failed:
+        print(f"{failed} of {count} rewrites refused")
+        return 1
+    # A write is searchable at the index's next commit, a few seconds away, so wait for it. An old
+    # copy left on a shard the ring no longer routes the id to is never overwritten, and stays.
+    def seen(node):
+        found = {}
+        for title in ("rewritten", "survivor"):
+            status, _, body = call("POST", f"{node}/api/{index}/search",
+                                   {"query": f"title:{title}", "limit": 1})
+            found[title] = body.get("total_hits") if status == 200 and isinstance(body, dict) else None
+        return found
+
+    deadline = time.time() + 15
+    while True:
+        views = {node: seen(node) for node in NODES}
+        ok = all(v["rewritten"] == count and v["survivor"] == 0 for v in views.values())
+        if ok or time.time() >= deadline:
+            break
+        time.sleep(1)
+    for node, found in views.items():
+        good = found["rewritten"] == count and found["survivor"] == 0
+        print(f"  {node}: {found['rewritten']} rewritten, {found['survivor']} old copies still found"
+              + ("" if good else "   <-- stale"))
+    print(f"every node finds the {count} rewritten and no old copy" if ok
+          else "an old copy outlived its rewrite")
+    return 0 if ok else 1
+
+
 def cmd_missing():
     """A search is a 404 only when no node holds the index: never created, or deleted with its
     schema. One written a moment ago through another node is found, however many nodes have not
@@ -777,6 +839,10 @@ def main():
         return cmd_bulkmints(int(args[0]), int(args[1]))
     if cmd == "samemint":
         return cmd_samemint(int(args[0]), int(args[1]))
+    if cmd == "metrics":
+        return cmd_metrics(args[0], int(args[1]))
+    if cmd == "rewrite":
+        return cmd_rewrite(args[0], int(args[1]))
     if cmd == "missing":
         return cmd_missing()
     if cmd == "fault":
