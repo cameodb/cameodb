@@ -272,7 +272,7 @@ K2's merge and the refusal fix (`a2244ea`) their first multi-node check.
 | # | Step | Why here |
 |---|---|---|
 | 1 ✅ | Rechecks: the second-signal "force" item; the client's `007` read as a number; the format sniff cut inside a multibyte character — all three confirmed and fixed 2026-11-09 | Each either closes or becomes a confirmed bug, which sizes step 2 |
-| 2 | The audit and logging fixes: the streamed search's query at `info!` and its missing audited query; 429 and 403 audited as `allowed`; a plain index listing churning the open-index cap | Small, local, and the first two are security fixes |
+| 2 ✅ | The audit and logging fixes: the streamed search's query at `info!` and its missing audited query; 429 and 403 audited as `allowed`; a plain index listing churning the open-index cap — all three fixed 2026-11-09 | Small, local, and the first two are security fixes |
 | 3 | [E4](#e4--two-compatibility-paths-with-no-end-to-end-test)'s fixtures | Before any 0.4.0 storage work, so they are written by a real 0.3.x build |
 | 4 | [N17](#n17--smaller-items-filed-so-they-are-not-lost)'s cluster bugs: the snapshot persisted out of order, the checksum's `DefaultHasher` → xxh3, the peer tasks outside the cancellation token | Small real bugs under everything after them |
 | 5 | [OB26](#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap) with [N12](#n12--dead-surface-and-the-comments-that-no-longer-match)'s coordinator dead surface | About a day, mostly deletion; the join path step 6 changes |
@@ -2394,9 +2394,10 @@ it should, or a defect with a small reach.
   `outcome: "allowed"` (`authz.rs:778`), against `Outcome`'s own doc (**fixed 2026-11-09**: the
   handler leaves an `AuditedRefusal` on the response, and the record is `denied`). `classify` runs up to three
   times per request and the same `AuditRecord` is built three times (`authz.rs:737–802`).
-- **Storage.** `gather_index_stats(false)` opens readers through `get_reader` and
-  `admit_open_index`, which can close and evict an index, so a plain `ListIndexes` churns the
-  open-index cap (`search.rs:250`): use `document_count()`; `searchable_fields` and
+- **Storage.** ✅ `gather_index_stats(false)` opened readers through `get_reader` and
+  `admit_open_index`, which can close and evict an index, so a plain `ListIndexes` churned the
+  open-index cap (`search.rs:250`) (**fixed 2026-11-09**: `listed_document_count` reads a cached
+  reader or, for a closed index, the redb data table). Still open: `searchable_fields` and
   `sortable_fields` open each index from disk on every call (`:1219`, `:1254`): one
   `built_schema(index)` that prefers the cached reader or writer. `derive_index_schema_from_tantivy`
   decides String against Text by `is_stored && !is_indexed` (`store.rs:1537`), which never matches

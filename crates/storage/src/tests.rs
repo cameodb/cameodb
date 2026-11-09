@@ -4028,3 +4028,71 @@ mod ghost_field_tests {
         );
     }
 }
+
+/// What a listing costs the open set: nothing. Every admission and every use stamps
+/// `open_tick`, so a listing that opened a closed index — evicting one in use, which the next
+/// listed name then reopened — moved it, however the open set looked afterwards.
+#[cfg(test)]
+mod listing_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use tempfile::TempDir;
+
+    fn config(temp_dir: &TempDir) -> StorageConfig {
+        StorageConfig {
+            max_open_indexes: 2,
+            shard_path: temp_dir.path().to_path_buf(),
+            indexer_memory_budget: 16 * 1024 * 1024,
+            indexer_memory_min_mb: 16,
+            indexer_memory_max_mb: 64,
+            total_memory_limit_bytes: 1024 * 1024 * 1024,
+            memory_pressure_threshold_percent: 80,
+            indexer_num_threads: 1,
+            merge_num_threads: 1,
+            reclaim_deleted_ratio: 0.0,
+            default_batch_size: 1000,
+            wal_sync: false,
+            quick_repair: true,
+            commit_interval_ms: 0,
+            query: Default::default(),
+        }
+    }
+
+    fn write(store: &HybridStore, index: &str, id: &str) {
+        store
+            .apply_write(
+                index,
+                WalOp::Put {
+                    id: id.to_string(),
+                    json_blob: Some(serde_json::json!({"id": id, "title": "listed"})),
+                },
+            )
+            .expect("write");
+        store.commit_index(index).expect("commit");
+    }
+
+    #[test]
+    fn a_listing_neither_opens_nor_stamps_an_index() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = HybridStore::new(config(&temp_dir), 1).expect("store");
+        write(&store, "closed", "a");
+        write(&store, "closed", "b");
+        for hot in ["hot-1", "hot-2"] {
+            write(&store, hot, "a");
+            // Searched, as an index in use is: its reader is cached.
+            store.get_reader(hot).expect("reader");
+        }
+        assert!(!store.is_index_open("closed"));
+
+        let tick = store.open_tick.load(Ordering::Relaxed);
+        let stats = store.gather_index_stats(false).expect("stats");
+        assert_eq!(stats.per_index["closed"].document_count, 2);
+        assert_eq!(stats.per_index["hot-1"].document_count, 1);
+        assert_eq!(
+            store.open_tick.load(Ordering::Relaxed),
+            tick,
+            "the listing admitted or stamped an index"
+        );
+        assert!(!store.is_index_open("closed"));
+    }
+}

@@ -276,3 +276,56 @@ fn a_write_that_loses_a_race_with_a_close_reopens_the_index() {
         failures.first()
     );
 }
+
+/// Listing the indexes opens none of them.
+///
+/// The listing counted each index's documents through a reader, and a reader for a closed index
+/// is an admission: under the cap, one `GET /_indexes` evicted the indexes in use to open every
+/// one it listed. A closed index is now counted from redb, which its close committed, so the
+/// count is the one it would report open, deletes included.
+#[test]
+fn listing_the_indexes_opens_none_of_them() {
+    let dir = TempDir::new().unwrap();
+    let store = HybridStore::new(capped_config(dir.path(), 2), 1).expect("store");
+
+    write_one(&store, "closed", "doc-1");
+    write_one(&store, "closed", "doc-2");
+    write_one(&store, "closed", "doc-3");
+    store
+        .apply_write(
+            "closed",
+            WalOp::Delete {
+                id: "doc-2".to_string(),
+            },
+        )
+        .expect("delete");
+    store.commit_index("closed").expect("commit");
+    let open_count =
+        store.gather_index_stats(false).expect("stats").per_index["closed"].document_count;
+    assert_eq!(open_count, 2, "three written, one deleted");
+
+    for hot in ["hot-1", "hot-2"] {
+        write_one(&store, hot, "doc-1");
+        store.commit_index(hot).expect("commit");
+    }
+    assert!(
+        !store.is_index_open("closed"),
+        "two newer indexes evicted it"
+    );
+
+    let stats = store.gather_index_stats(false).expect("stats");
+    assert_eq!(
+        stats.per_index["closed"].document_count, open_count,
+        "a closed index reports the count it had open"
+    );
+    assert_eq!(stats.per_index["hot-1"].document_count, 1);
+    assert_eq!(stats.per_index["hot-2"].document_count, 1);
+    assert!(
+        !store.is_index_open("closed"),
+        "the listing must not reopen a closed index"
+    );
+    assert!(
+        store.is_index_open("hot-1") && store.is_index_open("hot-2"),
+        "and so must not evict the indexes in use"
+    );
+}

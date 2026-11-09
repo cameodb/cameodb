@@ -94,7 +94,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   /api/{index}/search/stream` logged the caller's query at `info`, where the plain search logs
   it at `debug`, and with `record_query_text = true` its audit record carried no query. It now
   matches the plain search on both.
-
+- **Listing indexes no longer opens them.** `GET /_indexes` counted each index's documents
+  through a reader, and opening one for a closed index is an admission to the open set: under
+  `max_open_indexes`, one listing closed the indexes in use to open each one it listed, then
+  closed those again. A closed index is now counted from its stored documents, the count it
+  reports open.
 - **`client data load`: a code column keeps its leading zeros in an index that lacks it.** A CSV
   column the existing index had no field for was read cell by cell, so `007` was sent as the number
   7 while the scan reported the column as text, and the node created an integer field from it. Such

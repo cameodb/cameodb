@@ -1848,6 +1848,39 @@ impl HybridStore {
         Ok((doc_count, raw_bytes))
     }
 
+    /// The document count an index listing reports, without opening the index.
+    ///
+    /// The listing used [`Self::get_document_count_from_tantivy`], which opens a reader for an
+    /// index that is not open and so admits it to the open set: under `max_open_indexes`, one
+    /// `GET /_indexes` closed and reopened every index the shard held, evicting the ones in use
+    /// for ones nobody had asked for. Now:
+    ///
+    /// - a cached reader answers, read without stamping the index as used;
+    /// - an index open only for writing opens its reader, which admits nothing new, so the count
+    ///   still follows its commits;
+    /// - a closed index answers from its redb data table. Closing commits it, so that is the
+    ///   count it would report open — and on a restart before its WAL tail is replayed it is the
+    ///   truer one, since redb already holds those documents.
+    pub(crate) fn listed_document_count(
+        &self,
+        index_name: &str,
+        read_txn: &redb::ReadTransaction,
+    ) -> Result<u64, StoreError> {
+        if let Some(reader) = self.readers.get(index_name) {
+            return Ok(reader.value().searcher().num_docs());
+        }
+        if self.open_indexes.contains_key(index_name) {
+            return self.get_document_count_from_tantivy(index_name);
+        }
+        let data_table_name = format!("data_{}", index_name);
+        let data_table_def = TableDefinition::<&str, &[u8]>::new(&data_table_name);
+        match read_txn.open_table(data_table_def) {
+            Ok(table) => Ok(table.len()?),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(0),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     /// Get document count from Tantivy index (O(1) operation).
     /// This is faster than querying redb when we don't need size calculation.
     pub(crate) fn get_document_count_from_tantivy(
@@ -1946,9 +1979,7 @@ impl HybridStore {
                 // When calculating data size, get count from redb for consistency
                 self.measure_redb_stats_with_txn(idx_name, read_txn)?
             } else {
-                // When skipping data size, use Tantivy count (faster, no redb access)
-                let doc_count = self.get_document_count_from_tantivy(idx_name)?;
-                (doc_count, 0)
+                (self.listed_document_count(idx_name, read_txn)?, 0)
             };
 
             per_index_stats.push((idx_name.clone(), tantivy_bytes, doc_count, raw_redb_bytes));
