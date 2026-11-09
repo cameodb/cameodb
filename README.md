@@ -1,20 +1,38 @@
 <div align="center">
   <h1>CameoDB</h1>
-  <p><strong>A high-performance, distributed hybrid-search database built in Rust.</strong></p>
-  
+  <p><strong>The Search Database Engine for AI</strong></p>
+  <p>The intelligence layer between your data and your AI.</p>
+
   [![Rust](https://img.shields.io/badge/rust-1.85%2B-blue.svg)](https://www.rust-lang.org)
   [![License](https://img.shields.io/badge/license-Apache--2.0_%2F_MIT_%2F_FSL--1.1-green.svg)](LICENSE)
 </div>
 
 ## ✨ What is CameoDB?
 
-CameoDB is a decentralized, leaderless database that combines the durability of an ACID-compliant Key-Value store (`redb`) with the power of a full-text inverted index engine (`tantivy`). 
+### A Unified Architecture for AI
 
-By leveraging the **Kameo** actor framework and **Tokio**'s async runtime, CameoDB provides blazingly fast full-text search across distributed nodes—without the overhead of a central master.
+CameoDB fuses an ACID key-value store, a document model, and a full-text search engine into a single Rust binary. Agents query over MCP for grounded answers: no separate system to sync, no pipeline to keep alive, no guessing.
+
+### One write path, one source of truth
+
+[`redb`](https://www.redb.org) for key-value durability, a flexible document model, and [`tantivy`](https://github.com/quickwit-oss/tantivy) for full-text search, behind one write path in one process. A document is readable by ID the moment the write returns and searchable after the next commit, and `redb` carries every write safely through a restart.
+
+### Native Field Projection for Lean AI Context
+
+Stop paying tokens for fields the model never needed. CameoDB projects inside the engine, on the shard that holds the document, so only the fields you request are serialized and sent, and a peer never ships the coordinator what it would discard. Smaller responses cost less to move and keep your LLM context window focused.
+
+### Each Value Stored Once
+
+CameoDB writes a value once, not once per feature that reads it. A document's key is stored as the key and is not repeated in its body, and a [ghost field](docs/API_REFERENCE.md) searches one stored text through as many analyzers as it needs instead of keeping a copy per stemmed column. The document body and its search index are both kept; what the engine avoids is multiplying copies of the same text, which matters most for long, multilingual fields.
+
+Built on the **Kameo** actor framework and **Tokio**, CameoDB is also decentralized and leaderless: full-text search runs across distributed nodes without the overhead of a central master.
 
 ## 🚀 Key Features
 
-* **Hybrid Storage Architecture:** Every shard is an atomic unit containing both a KV store (for data/WAL) and an inverted index (for full-text search).
+* **Unified Storage Architecture:** Every shard is an atomic unit containing both a KV store (for data/WAL) and an inverted index (for full-text search), written through one path, so a document is readable by ID when the write returns and searchable after the next commit.
+* **Built for Agents (MCP):** A Model Context Protocol surface an agent searches through, scoped per key, with every tool checked against the capability and index it needs. See the [MCP Server](docs/MCP.md) guide.
+* **Lean Context by Design:** Field projection on the shard that holds the document, and hits sized for their reader (below), so a response carries what the model asked for and nothing it has to pay tokens to skip.
+* **Each Value Stored Once:** A document's key is not repeated in its body, and ghost fields (below) search one stored text through as many analyzers as needed without storing it again, so a multilingual text is kept once rather than once per stemmed column.
 * **Decentralized Topology:** Zero master nodes. Utilizes Consistent Hashing and a custom Kademlia DHT behavior for seamless peer discovery and routing.
 * **Supervised Smart Commits:** Intelligently batches writes with micro-second precision to optimize throughput while maintaining strict crash durability.
 * **Tiered Cache Sizing:** Dynamically budgets memory across active shards based on system RAM to ensure steady-state operational safety.
@@ -23,7 +41,7 @@ By leveraging the **Kameo** actor framework and **Tokio**'s async runtime, Cameo
 * **Language-Aware Search:** Each text field names its analyzer, so a query for one form of a word finds the others: Snowball stemmers for English, Italian, German, French, Spanish and Portuguese (Italian and Portuguese with steps of our own that bring together the plurals and feminines Snowball leaves apart, `it_stem` and `pt_stem`; each but English also accent-insensitive, as `<lang>_stem_fold`, with `de_stem_fold` reading `ae`/`oe`/`ue` as umlauts), and a Croatian dictionary lemmatizer of our own (`hr_stem`, and `hr_stem_fold` for queries typed without diacritics), built from a CC0 corpus of 3 billion words, which reads Serbian Cyrillic as Latin. See [Tokenizers](docs/API_REFERENCE.md) and [tools/hr-lexicon](tools/hr-lexicon/README.md).
 * **Ghost Fields:** One stored text, searched through as many analyzers as it needs. A ghost field is a search column filled from another field — for every document, or for those whose language field says `en` — and never stored, so a multilingual text is kept once rather than once per stemmed column.
 * **Hits Sized for Their Reader:** One field of a threat-intelligence record can hold hundreds of thousands of addresses, so each array in a hit is capped (1000 elements by default) and the hit says what it lost in `_truncated_arrays`. A cut array leads with the elements the query matched, their stored positions in `_matched_elements`, so the evidence for a hit is in the hit however long the field.
-* **Consistent Hybrid Recovery:** Guarantees data consistency during startup by automatically recovering and syncing uncommitted records from the ACID datastore (KV) into the search index.
+* **Consistent Crash Recovery:** Guarantees data consistency during startup by automatically recovering and syncing uncommitted records from the ACID datastore (KV) into the search index.
 * **Graceful Shutdowns:** Multi-phase process ensuring zero WAL replay on clean reboots.
 * **Contained Faults:** A panic fails one request rather than the process — caught at the read pool, the per-index write guard, the request handler and index warming. A writer thread that dies is respawned over the same store, and `/_cluster/health` turns red for a node whose data path has stopped serving (a dead or wedged writer, a wedged read pool) even while the cluster still calls itself green.
 * **Production Memory Management:** Jemalloc allocator with per-CPU arenas, background purge threads, and runtime admin endpoints for memory diagnostics and manual intervention.
@@ -232,8 +250,8 @@ Dive deeper into CameoDB's architecture and APIs:
 - 📦 **[Building & Packaging](docs/BUILDING.md)**: Instructions for compiling cross-platform binaries and generating RPM/DEB packages.
 - 💻 **[Development Setup](docs/DEVELOPMENT.md)**: Getting a clean macOS or Linux machine ready to build, test and validate CameoDB.
 - 🚢 **[Deployment](docs/DEPLOYMENT.md)**: Running CameoDB as a service, in containers, and as a cluster.
-- � **[MCP Server](docs/MCP.md)**: Enabling, securing and feeding the Model Context Protocol surface an agent searches through.
-- �🧭 **[Architecture Decisions](docs/ADR.md)**: Why the system is shaped the way it is.
+- 🤖 **[MCP Server](docs/MCP.md)**: Enabling, securing and feeding the Model Context Protocol surface an agent searches through.
+- 🧭 **[Architecture Decisions](docs/ADR.md)**: Why the system is shaped the way it is.
 - 🧪 **[Scripts](scripts/README.md)**: Build, setup, validation and testing scripts, and what each one checks.
 - 📊 **[Data Ingestion Examples](examples/README.md)**: Sample python scripts and datasets (TED Talks, Book Summaries) to try out right away.
 
