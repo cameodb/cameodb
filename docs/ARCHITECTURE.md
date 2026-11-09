@@ -35,7 +35,9 @@ Nodes are "Self-Sovereign." They do not request an ID from a master.
   `node_identity.json` in the first data path. Back it up with the data. A node whose file is
   there but cannot be read, or holds a key that does not decode, refuses to start rather than
   make a new key — which would bring it up as another node over the same data. Removing the
-  file is how to start it as a new node deliberately.
+  file is how to start it as a new node deliberately — and a new node is refused by a cluster
+  that holds an index, since its shards would take key ranges whose documents do not move (see
+  [Deployment](DEPLOYMENT.md#2-multi-node-cluster-deployment)).
 
 ### 2.2. The Ring (Consistent Hashing)
 To ensure uniform data distribution without coordination:
@@ -608,7 +610,6 @@ The `RemotePeerPool` eliminates repeated swarm registry/DHT lookups on every rem
 | `RouterActor::try_remote` | Orchestrator | Routed single operations (search, write) |
 | `NodeOrchestrator::forward_bulk_to_remote` | Orchestrator | Bulk write forwarding |
 | `ClusterCoordinator::exchange_shards_with_peer` | Coordinator | Shard metadata exchange |
-| `ClusterCoordinator` stability sync | Coordinator | Post-bootstrap shard push |
-| `ClusterCoordinator` peer discovery | Coordinator | New peer shard fetch |
+| `ClusterCoordinator` peer discovery | Coordinator | Push this node's shard map to a new peer and pull the peer's |
 | `ClusterCoordinator` delete forwarding | Orchestrator | Cross-cluster index deletion |
 

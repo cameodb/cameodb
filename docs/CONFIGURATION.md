@@ -156,14 +156,20 @@ trying something rather than while writing a file.
 
 Inter-node forwarding has its own deadline, `network.cluster.messaging.request_timeout_secs`.
 Unset, it follows the HTTP timeout, so that a forwarded request is not abandoned while the
-client that triggered it is still waiting; set it shorter only deliberately.
+client that triggered it is still waiting; set it shorter only deliberately. The other
+direction holds too: a forwarded operation carries how much of its request's time the first node
+has spent, and the node that owns it judges it against what is left of its own
+`request_timeout_secs` — one that arrives with nothing left is refused with `503` rather than run
+for a client that has already been answered.
 
 **`limits.max_open_indexes` bounds what the node holds open, not what it stores.** Every open
 index costs an indexing arena and `indexer_num_threads + merge_num_threads` OS threads — three
 at the defaults — and none of that is proportional to how much data the index holds. On a node
 where callers create their own indexes, that makes resident memory a function of how many index
 *names* have been touched. Past the cap the least recently used index is committed and closed;
-its data is untouched and the next request for it reopens it, paying one reopen. Startup and
+its data is untouched and the next request for it reopens it, paying one reopen. Listing the
+indexes (`GET /_indexes`, `list_indexes`) is not a use: it counts a closed index from its stored
+documents without opening it, so a listing never evicts the indexes being worked on. Startup and
 `check-config` print what a given cap implies in both currencies:
 
 ```text
@@ -1332,8 +1338,8 @@ Points worth knowing:
 > **`record_query_text` keeps data, not just metadata.** A search for a person's name records
 > that name, so a trail turned on to answer "who read the customer index" starts accumulating
 > the customers who were looked up. Off by default; when you turn it on, treat the audit file
-> as sensitive as the index it describes. It covers `POST /api/{index}/search` and MCP tool
-> calls.
+> as sensitive as the index it describes. It covers `POST /api/{index}/search`, the streamed
+> `POST /api/{index}/search/stream`, and MCP tool calls.
 
 ### Reading it back
 

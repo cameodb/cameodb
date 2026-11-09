@@ -119,9 +119,10 @@ its id settled, so a load that cannot run leaves the index as it was.
 
 ### How CSV/TSV cells are read
 
-A delimited file has no types, so each cell is read by the type of the field it lands in — the
-index's schema when it has one, or the schema the scan detects when it does not. Nothing is sent
-until the scan has settled how every column is read.
+A delimited file has no types, so each cell is read by the type of the field it lands in: the
+index's field for that column when it has one, and otherwise the type the scan gave the column —
+also when the index exists but has no field for it, so the node creates that field with the type
+the scan reported. Nothing is sent until the scan has settled how every column is read.
 
 | Field type | Cell handling |
 |---|---|
@@ -130,7 +131,7 @@ until the scan has settled how every column is read.
 | `date` | Sent as text whenever the text is a date, so `20240315` and `2024` are dates, not seconds since 1970; a number the node does not read as a date string (seconds before 2000, or negative) is sent as epoch seconds. The accepted shapes are listed in the [date handling reference](../server/README.md#71-write-path-date-normalization) |
 | `boolean` | `true`/`false`, `yes`/`no`, `y`/`n`, `1`/`0`, in any case; a blank cell is *no value*, never `false` |
 | a list column (`text[]`) | `['a', 'b']` or `["a", "b"]` sent as an array: each element is a value of the field, matched on its own |
-| a column no field describes | Read by its look: numbers, booleans, else text |
+| a column the scan could not type (no value in the sample) | Read by its look: numbers, booleans, else text |
 
 **Date order.** The node reads a slash date month first (`03/04/2024` is March 4th) and a dotted
 date day first (`03.04.2024` is April 3rd). The loader decides per date column, and per separator,

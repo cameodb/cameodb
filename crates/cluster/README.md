@@ -316,7 +316,10 @@ impl RouterActor {
 ### Availability
 - **No SPOF**: No single point of failure in the routing layer
 - **Graceful Degradation**: System remains available even if some nodes are unreachable
-- **Fast Recovery**: New nodes can join without global synchronization
+- **Fast Recovery**: A node restarted on its own data rejoins without global synchronization. A
+  node the cluster has never known is taken in only while the cluster holds no index: this crate
+  places keys on a ring, but moving the documents a new node's tokens take over is the server's,
+  and it does not do that yet
 
 ## Advanced Features
 

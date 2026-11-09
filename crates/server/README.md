@@ -152,7 +152,9 @@ Each `MicroshardActor` manages a single shard’s data and index.
 The node builds a custom libp2p swarm with:
 
 - TCP (nodelay), QUIC, Noise, Yamux.
-- Kademlia DHT for peer discovery and routing metadata.
+- Kademlia DHT for peer discovery, and a record per node mapping its libp2p peer id to its node
+  UUID. Shard maps do not go through the DHT: coordinators push and pull them directly, on every
+  connection and every shard registration.
 - Custom `DhtBehaviour`:
   - `kademlia: kad::Behaviour<MemoryStore>`.
   - `kameo: kameo::remote::Behaviour`.
@@ -294,9 +296,13 @@ in the trail rather than being lost with the process.
 - Stop writer threads
 
 **Signal Handling:**
-- First SIGINT/Ctrl+C initiates graceful shutdown
-- Second SIGINT forces immediate exit (may lose uncommitted data)
-- Windows: Handles CTRL_CLOSE and CTRL_SHUTDOWN for service stop events
+- The first SIGINT (Ctrl+C) or SIGTERM starts the graceful shutdown
+- A second SIGINT or SIGTERM during it exits at once with status 1, as does a shutdown still
+  running at 120 s. An acknowledged write is replayed from the WAL at the next start; with
+  `wal_sync = false`, the writes since the last commit can be lost, as in a crash
+- Windows: CTRL+C, CTRL_CLOSE and CTRL_SHUTDOWN, and a service stop from the service manager
+- A node a cluster refused to take in (it brought new shards to a cluster that holds an index)
+  shuts down the same way and exits with the reason as its error
 
 This ensures clean state for fast startup (zero WAL replay) on next boot.
 
@@ -336,7 +342,11 @@ When a node restarts with persisted metadata, it performs **snapshot-vs-reality 
 5. Wait for peer discovery via libp2p Kademlia.
 
 **Reconciliation on Peer Join:**
-When a remote node sends `PeerDiscovered` and reports its shards via `MergeRemoteShards`:
+When a remote node sends `PeerDiscovered` and reports its shards via `MergeRemoteShards`, the
+shards of a node this node has never known — no shard of its in the map or the snapshot — are
+refused first while any index exists: they would take key ranges whose documents do not move.
+They stay out of the ring, the node is told why (`JoinRefused`) and, holding no documents, shuts
+down. With no index, a new node is taken in like any other. Then:
 
 1. **Compare** actual reported shards vs expected shards from snapshot.
 2. **Categorize**:

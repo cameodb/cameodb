@@ -83,6 +83,11 @@ box is a question that has not been answered, not a formality.
 10. **Commit the web project.** `publish.sh` only copies files; the `cameodb-web` checkout is
     left dirty for review.
 11. **Record the outcome below**, including anything skipped and why.
+12. **Add this release's compatibility fixture.** A shard written by the release build itself,
+    from a worktree at the release commit, under `crates/storage/tests/fixtures/compat/v<version>/`,
+    with a test for it in `compat_fixture_test.rs` — so every later build proves it still opens
+    this release's data. The procedure is in that directory's README; never rewrite an existing
+    fixture.
 
 ## Known gaps carried into every release
 
