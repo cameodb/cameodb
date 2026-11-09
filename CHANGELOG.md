@@ -52,6 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   MCP `search_index` as `metrics`, by the SDK's new `search_request` and by `cameodb client search
   --min FIELD --max FIELD`. Any other field — text and string included, whose column would answer a
   null that reads as "no data" — is refused with `400` before any shard runs.
+- **Moving a cluster node to another machine, documented.** DEPLOYMENT describes starting a
+  node's whole data directory on a machine with another address, where it rejoins as itself, and
+  the cluster suite rehearses it.
 
 ### Fixed
 

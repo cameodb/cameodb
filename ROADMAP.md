@@ -278,7 +278,7 @@ K2's merge and the refusal fix (`a2244ea`) their first multi-node check.
 | 5 ✅ | [OB26](#ob26--a-restarted-node-waits-on-every-expected-peer-before-it-leaves-bootstrap) with [N12](#n12--dead-surface-and-the-comments-that-no-longer-match)'s coordinator dead surface — built 2026-11-09; OB26's `cluster.sh` phase runs with steps 4–8 | About a day, mostly deletion; the join path step 6 changes |
 | 6 ✅ | [V1](#v1--a-node-that-brings-new-shards-cannot-join-a-cluster-that-holds-data): reproduce, then refuse — the refusal built 2026-11-09; its `cluster.sh` phase reproduces V1 on an older image and checks the refusal on this one | On the bootstrap step 5 leaves |
 | 7 ✅ | [O4](docs/ROADMAP-ARCHIVE.md#o4--the-request-budget-crosses-the-wire) — done 2026-11-09 | The field is optional on the wire, so mixed versions still work |
-| 8 | [V13](#v13--a-node-whose-disks-move-to-another-machine-rejoins-as-itself): a `cluster.sh` phase and a DEPLOYMENT procedure | Exercises everything above |
+| 8 ✅ | [V13](#v13--a-node-whose-disks-move-to-another-machine-rejoins-as-itself): a `cluster.sh` phase and a DEPLOYMENT procedure — both written 2026-11-09; what the phase finds is fixed after the run | Exercises everything above |
 | — | The `deny.toml` exceptions and the deferred dependency updates | Any time before 2026-12-31 |
 
 ---
@@ -382,7 +382,7 @@ first written down here, so the chronology stays visible under the cost ordering
 | [V10](#v10--move-drain-and-rebalance) | Move, drain and rebalance | 15 | 2026-11-08 | 📋 |
 | [V11](#v11--online-reindex-and-index-aliases) | Online reindex, and index aliases | 15 | 2026-11-08 | 📋 |
 | [V12](#v12--splitting-a-shard) | Splitting a shard | 15 | 2026-11-08 | 📋 |
-| [V13](#v13--a-node-whose-disks-move-to-another-machine-rejoins-as-itself) | A node whose disks move to another machine rejoins as itself — the recovery a partitioned cluster relies on when its HA is in the hardware | 15 | 2026-11-09 | 📋 |
+| [V13](#v13--a-node-whose-disks-move-to-another-machine-rejoins-as-itself) | A node whose disks move to another machine rejoins as itself — the recovery a partitioned cluster relies on when its HA is in the hardware | 15 | 2026-11-09 | ◐ |
 
 ---
 
@@ -3248,7 +3248,21 @@ more shards than it started with.
 
 ### V13 — A node whose disks move to another machine rejoins as itself
 
-📋 **Planned — phase 2.** The recovery a partitioned cluster relies on when its HA is in the
+◐ **Phase and procedure written 2026-11-09** (step 8 of [the 0.3.10 order](#the-order-of-the-remaining-work)); archived once the `cluster.sh` run passes it, with whatever it finds fixed.
+
+**What landed.** The `cluster.sh` *moved disks* phase stops node3 and starts its data directory
+as `node3b` — another hostname, so another address — while every other node's configuration
+still names node3. It checks the node id is unchanged, the ring converges, every node counts three
+nodes (the probe's new `nodes` command), no committed document is lost, every node writes and
+deletes, and that node1, restarted after the move, finds node3b again. Read from the code
+beforehand: the libp2p key is in the data directory, so the peer id is unchanged; nodes dial their
+seeds and DHT-discovered addresses, never the persisted registry, whose address is updated from the
+connection and persisted with the next generation. So nothing is expected to need fixing; the run
+decides. DEPLOYMENT gains *Moving a node to another machine*: keep the old machine from starting
+it again, bring every data path over whole, change only its own bind addresses, start it, check
+health, tidy the others' `seed_nodes` and `cluster_nodes` at their next restart.
+
+**The item, as filed.** Phase 2. The recovery a partitioned cluster relies on when its HA is in the
 hardware: a machine fails, its disks (or its data directory, restored whole) are put in another
 machine with another address, and the node comes back as itself. Read from the code 2026-11-09,
 not yet run: the identity is the data directory (`node_identity.json` beside the shards), the node

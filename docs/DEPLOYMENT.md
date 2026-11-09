@@ -166,6 +166,36 @@ docker-compose -f docker/docker-compose-cluster.yml up -d
 - **A node's data directory is its identity.** `node_identity.json` lives in it, beside the shards. A node restarted with its directory rejoins as itself; one started with an empty directory is a new node — refused while the cluster holds an index (below) — and its old identity stays on every node's ring. Until there is an operation to remove it, the old identity's key ranges cannot be written: single writes to them answer `503` naming it. Data on a lost node is not on any other: there is no replication yet. Keep each node's data directory, and restore it whole rather than starting a node empty.
 - **A cluster that holds an index takes in no new node.** A node the members have never known brings shards of its own, and taking them in would hand it key ranges whose documents stay where they are: a later write of an existing id would land on the new node and leave the old copy behind. So while any index exists, the members leave such a node's shards out of their ring and tell it why; the node, holding no documents, stops with that reason and a failing exit status (a node that does hold documents keeps running and refuses theirs in turn). Grow a cluster before it holds data, or start a new one; a node restarted on its own data directory is never refused.
 
+### Moving a node to another machine
+
+When a machine fails and its disks are sound — or its data directory is restored whole from a
+backup taken while the node was stopped — the node can be started on another machine, with
+another address, and rejoin as itself. Its identity, `node_identity.json`, and its libp2p key are
+in the data directory, so the cluster sees the same node with the same shards, not a new one (a new
+one is refused while the cluster holds an index; see above).
+
+1. **Make sure the old machine cannot start the node again.** Nothing stops two copies of one node
+   on two machines from both running, and two copies accept different writes for the same keys.
+   Take the old disks out, or keep the old machine off the network until it is wiped.
+2. **Bring every directory in `storage.data_paths` over whole**, at the paths the new machine's
+   configuration names: the shard directories, `metadata.redb` and `node_identity.json` together.
+   A partial copy is not this node.
+3. **Configure the new machine as the old one was**, except for its own addresses: `bind_address`
+   under `[network.http]` and `[network.cluster]`, and the same `cluster_name` and PSK. `seed_nodes`
+   lists the other members, which is how it finds them — nothing needs to know its new address in
+   advance.
+4. **Start it.** It dials its seeds; the members learn its new address from that connection, and
+   their node registry, and the snapshot they keep of it, takes the new address. Check
+   `/_cluster/health` on every node: `connected_nodes` and `total_nodes` as before the failure
+   (the node is counted once, under its new address), and `cluster_total_shards` unchanged.
+5. **Tidy the other nodes' configuration** at their next restart: replace the old address in their
+   `seed_nodes` and `cluster_nodes`. Neither is read while they run, and a stale entry only costs a
+   failed dial at their start.
+
+`scripts/validate/cluster.sh` rehearses this: its *moved disks* phase starts node3's data
+directory under another hostname and checks the identity, the documents, the node count, and a
+member restarted afterwards.
+
 ### One process per data directory
 
 A data directory serves one process at a time. Two processes writing the same redb files damage

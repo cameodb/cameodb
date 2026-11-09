@@ -6,6 +6,7 @@ saw either way, so the shell side can turn the exit code into a PASS or FAIL lin
 show the evidence. Nodes come from CLUSTER_NODES, a comma-separated list of base URLs.
 
   converge <seconds>                       every node sees every node, and agrees on the ring
+  nodes <n>                                every node counts <n> nodes in the cluster
   storm <seconds> <writers> <deleters>     the actor-cycle load; prints METRIC lines
   probe <timeout>                          a fresh-index write and an index delete on every node
   seed <index> <count>                     write <count> documents, spread across the nodes
@@ -90,6 +91,20 @@ def ring_view():
     ok = owned > 0 and all(v.get("connected_nodes") == len(NODES)
                            and v.get("cluster_total_shards") == owned for v in views)
     return ok, lines
+
+
+def cmd_nodes(expected):
+    """Every node counts `expected` nodes in the cluster: a node that came back at a new address
+    is the node it was, not one more."""
+    ok = True
+    for node in NODES:
+        body = health(node)
+        total = body.get("total_nodes") if body else None
+        good = total == expected
+        ok &= good
+        print(f"  {node}: total_nodes {total}" + ("" if good else f"   <-- expected {expected}"))
+    print(f"every node counts {expected} nodes" if ok else "a node counts the wrong number of nodes")
+    return 0 if ok else 1
 
 
 def cmd_converge(seconds):
@@ -734,6 +749,8 @@ def main():
     cmd, args = sys.argv[1], sys.argv[2:]
     if cmd == "converge":
         return cmd_converge(int(args[0]))
+    if cmd == "nodes":
+        return cmd_nodes(int(args[0]))
     if cmd == "storm":
         return cmd_storm(*(int(a) for a in args[:3]))
     if cmd == "probe":

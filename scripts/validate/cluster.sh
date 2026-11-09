@@ -21,6 +21,9 @@
 #               committed document is lost
 #   frozen peer node3 paused: node1 keeps answering, and after it resumes the ring converges,
 #               every node serves and no document is lost
+#   moved disks node3's data directory started under another hostname comes back as node3:
+#               its identity, shards and documents, three nodes counted, found again by a
+#               member restarted after the move (V13)
 #   logs        no panic; plus the connection and peer-loss counts the cluster work moves
 #
 # Checks are PASS/FAIL. Lines starting METRIC are measurements, not verdicts: latency and
@@ -107,7 +110,8 @@ check_cmd() {
 collect_logs() {
     local tag="$1" n
     mkdir -p "$WORK/logs"
-    for n in 1 2 3; do
+    for n in 1 2 3 3b; do
+        run_bounded 10 docker inspect "$PROJECT-node$n" > /dev/null 2>&1 || continue
         run_bounded 30 docker logs "$PROJECT-node$n" 2>&1 \
             | sed $'s/\x1b\\[[0-9;]*m//g' > "$WORK/logs/$tag-node$n.log"
     done
@@ -165,6 +169,7 @@ esac
 # bind mount that goes stale when a path is deleted and recreated under it.
 write_compose() {
     local data="$1" n
+    CURRENT_DATA="$data"
     mkdir -p "$data/node1" "$data/node2" "$data/node3"
     local members="${CLUSTER_MEMBERS:-node1:9580,node2:9580,node3:9580}"
     chmod -R 777 "$data"
@@ -410,6 +415,67 @@ grep -q '^RESULT' "$WORK/fault.txt" || fail "the fault probe reported" "$(tail -
 check_cmd "node3 resumed: every node sees every node and the same ring" probe converge "$FORM_SECS"
 check_cmd "node3 resumed: every node writes and deletes" probe probe 30
 check_cmd "no committed document lost across the freeze" probe count survivor "$SURVIVORS"
+
+section "moved disks (node3's data directory started on another host)"
+# A machine fails and its disks go into another, with another address: the recovery a
+# partitioned cluster relies on when its HA is in the hardware (V13). node3 is stopped and its
+# data directory started as node3b — another hostname, so another address — while every other
+# node's configuration still names node3. It must come back as itself: the same identity and
+# shards, every committed document found, writes and deletes through every node, three nodes
+# counted rather than four, and a member restarted afterwards finds it at its new address.
+node_id_on() {
+    curl -s --max-time 5 "http://127.0.0.1:$1/_cluster/health" \
+        | python3 -c 'import json, sys; print(json.load(sys.stdin).get("node_id", ""))' 2>/dev/null
+}
+before_id="$(node_id_on "${PORTS[2]}")"
+compose stop -t 10 node3 > /dev/null 2>&1
+cat >> "$WORK/compose.yml" <<YAML
+  node3b:
+    image: $IMAGE
+    container_name: $PROJECT-node3b
+    hostname: node3b
+    user: "65532:65532"
+    environment:
+      - RUST_LOG=info
+      - CAMEODB_NODE_LABEL=validate-node-3
+      - CAMEODB_CLUSTER_NAME=cameodb-validate
+      - CAMEODB_CLUSTER_ENABLED=true
+      - CAMEODB_HTTP_BIND_ADDRESS=node3b
+      - CAMEODB_HTTP_PORT=9480
+      - CAMEODB_CLUSTER_BIND_ADDRESS=node3b
+      - CAMEODB_CLUSTER_PORT=9580
+      - CAMEODB_SEED_NODES=node1:9580,node2:9580
+      - CAMEODB_CLUSTER_NODES=node1:9580,node2:9580,node3:9580
+      - CAMEODB_CLUSTER_PSK=$PSK
+    ports:
+      - "127.0.0.1:${PORTS[2]}:9480"
+    volumes:
+      - $CURRENT_DATA/node3:/data/cameodb
+    networks: [validate]
+YAML
+# The networks block was written last; move it back to the end so the file stays valid.
+python3 - "$WORK/compose.yml" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path).read()
+block = "networks:\n  validate:\n    driver: bridge\n"
+open(path, "w").write(text.replace(block, "", 1).rstrip("\n") + "\n" + block)
+PY
+compose up -d node3b > /dev/null 2>&1
+if ! wait_nodes "${PORTS[2]}"; then
+    fail "node3b starts on node3's data directory" "it never answered /_cluster/health"
+    collect_logs moved
+fi
+after_id="$(node_id_on "${PORTS[2]}")"
+check_eq "node3b is node3: the same node id" "$before_id" "$after_id"
+check_cmd "moved: every node sees every node and the same ring" probe converge "$FORM_SECS"
+check_cmd "moved: three nodes counted, not the old address as a fourth" probe nodes 3
+check_cmd "moved: no committed document lost" probe count survivor "$SURVIVORS"
+check_cmd "moved: every node writes and deletes" probe probe 30
+compose restart -t 10 node1 > /dev/null 2>&1
+wait_nodes "${PORTS[0]}"
+check_cmd "moved, node1 restarted: it finds node3b at its new address" probe converge "$FORM_SECS"
+check_cmd "moved, node1 restarted: no committed document lost" probe count survivor "$SURVIVORS"
 
 section "logs"
 collect_logs final
