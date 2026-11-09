@@ -1977,11 +1977,34 @@ The gazette's schemas showed how often it bites — one list of body names mixes
   in the right case, `metrics` for a number's span — and an empty result on a `string` field read
   as a value written differently before it is read as absent data.
 
-Left as their own items: telling the agent which spelling exists when a string clause matches
-nothing ([A9](../ROADMAP.md#a9--a-string-clause-that-matches-nothing-names-the-spelling-that-exists)), a field's top values
+Left as their own items: retrying a value that finds nothing in its other spellings
+([A9](#a9--a-string-value-that-finds-nothing-is-retried-in-its-other-spellings)), a field's top values
 ([A10](../ROADMAP.md#a10--the-values-a-string-field-holds)), a list flag
 ([A11](../ROADMAP.md#a11--a-field-declared-a-list)), and a whole-value tokenizer that ignores case
 ([U3](#u3--raw_fold-a-whole-value-matched-in-any-case)).
+
+### A9 — A string value that finds nothing is retried in its other spellings
+
+✅ **Done** 2026-11-09, in 0.3.10, as guidance rather than an engine change. Filed first as the node
+looking up a missed term's other spellings in the term dictionary and naming the one that exists;
+settled instead on the agent doing what that would have told it, in one request:
+
+- **The case a description shows comes first.** Enriched descriptions give a field's values as
+  stored (`ODLUKA, ZAKON, UREDBA`, `Vlada Republike Hrvatske`), so a value is written in the case
+  its examples use before anything is retried.
+- **One retry, every spelling in one set.** A value taken from the question that finds nothing is
+  retried once as an `IN` set — as given, lowercase, first letter capitalised, each word
+  capitalised, uppercase: `author: IN ["austen, jane" "Austen, jane" "Austen, Jane" "AUSTEN,
+  JANE"]`. On the 19.7M-row book index that finds the 24 books `"austen, jane"` alone missed, in
+  one call; the `OR` of the same clauses does too.
+- **`list` in a description** is read as several values per row: any one matching makes a hit,
+  and hits carry an array.
+
+In the syntax rule on learning a field's values, the session instructions and the orchestrator
+skill; the index-describe skill writes values exactly as stored, a small closed set whole, and
+`list` on every multi-valued field. The `IN` operator's examples show a quoted value. The engine
+probe is not built: with descriptions written from the data and the retry costing one request, it
+would answer a question the agent no longer has to ask.
 
 ## C. Phase 14 — Security Hardening — delivered items
 

@@ -112,9 +112,13 @@ how to read a record in order, which field searches which text, and what holds o
 1. What the value is, in the reader's terms (not the code's).
 2. Where it is: every row, or which row kinds; which years or parts. "Act rows only" and "from 2015" are the
    facts that most often make a query wrong when left out.
-3. Format and real examples, or the common values with labels for coded ones.
-4. How to query it when not obvious: exact quoted match on raw strings, list values, `sort` field pairs,
-   the field to use instead.
+3. Format and real examples, or the common values with labels for coded ones — written exactly as
+   stored, since a reader writes its query in the case your examples show. A small closed set
+   (up to about ten values) is given whole; a larger one by its most common values.
+4. `list` for a field holding several values per row — the reader's only signal that any one element
+   matches and that hits carry an array.
+5. How to query it when not obvious: exact quoted match on raw strings, `sort` field pairs, the field
+   to use instead.
 
 **Write affirmatively.** A description says what the field *is* and what it is *for*, as a statement the
 reader can act on. It is not a list of what is wrong with it.

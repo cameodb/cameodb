@@ -59,7 +59,7 @@ on one.
 | 10 — Field projection | ✅ Done | — |
 | 11 — Read/write hot-path optimizations | ✅ Done | — |
 | 11.5 — Jemalloc memory management | ✅ Done | — |
-| 12 — MCP server integration | ◐ Partial | Streaming, semantic routing, the documentation pass, and compliance tests and benchmarks; A8 (what a field tells an agent about matching it) done 2026-11-09, in 0.3.10; A9–A11 (the spelling that exists, a field's values, a list flag) planned |
+| 12 — MCP server integration | ◐ Partial | Streaming, semantic routing, the documentation pass, and compliance tests and benchmarks; A8 (what a field tells an agent about matching it) and A9 (one retry over a value's spellings) done 2026-11-09, in 0.3.10; A10 and A11 (a field's values, a list flag) deferred, descriptions carry both |
 | 13 — Thread-per-core & memory operations | ◐ Partial | Stage 2f.2 (CPU arenas) and 2f.3 (per-arena jemalloc stats) — both with the evidence against 2f.2 |
 | 14 — Security hardening | ◐ Partial | Complexity caps (C2), deferred. Stage C3, per-index role overrides, was built as M5 on 2026-09-25 and closed here on 2026-11-09. Posture items C3–C8 all closed, C8 by M3 on 2026-09-20 |
 | 15 — HA: reindex, replication, migration | 📋 Planned | All three stages, designed and built as [V](#v-cluster-ha--replication-the-two-node-mirror-and-elasticity--planned): D1 is V11, D2 is V5 and V9, D3 is V10 and V12 |
@@ -265,8 +265,7 @@ confined to clusters ([V2](#v2--document-versions-and-delete-markers)'s decision
   and never closed here.
 - **Added the same day, agent guidance:** [A8](docs/ROADMAP-ARCHIVE.md#a8--what-a-field-tells-an-agent-about-matching-it)
   and [U3](docs/ROADMAP-ARCHIVE.md#u3--raw_fold-a-whole-value-matched-in-any-case), `raw_fold`, the groundwork for
-  better-organised indexes, both done; [A9](#a9--a-string-clause-that-matches-nothing-names-the-spelling-that-exists)
-  if it fits. Schema changes and reindexing of existing indexes are the last resort, not part of this.
+  better-organised indexes, and [A9](docs/ROADMAP-ARCHIVE.md#a9--a-string-value-that-finds-nothing-is-retried-in-its-other-spellings), all done. Schema changes and reindexing of existing indexes are the last resort, not part of this.
 - **Not in 0.3.10:** N11, which opens V's phase 2, and V2–V5 and R3, which are 0.4.0. CH3 and P5
   stand as filed.
 
@@ -319,9 +318,9 @@ first written down here, so the chronology stays visible under the cost ordering
 | [A6](docs/ROADMAP-ARCHIVE.md#a6--the-syntax-reference-has-drifted-from-the-engine) | The syntax reference has drifted from the engine | 12 | 2026-08-27 | ✅ |
 | [A7](docs/ROADMAP-ARCHIVE.md#a7--a-short-page-and-a-stale-count-say-nothing-about-why) | A short page and a stale count say nothing about why | 12 | 2026-08-27 | ✅ |
 | [A8](docs/ROADMAP-ARCHIVE.md#a8--what-a-field-tells-an-agent-about-matching-it) | What a field tells an agent about matching it | 12 | 2026-11-09 | ✅ |
-| [A9](#a9--a-string-clause-that-matches-nothing-names-the-spelling-that-exists) | A string clause that matches nothing names the spelling that exists | 12 | 2026-11-09 | 📋 |
-| [A10](#a10--the-values-a-string-field-holds) | The values a string field holds | 12 | 2026-11-09 | 📋 |
-| [A11](#a11--a-field-declared-a-list) | A field declared a list | 12 | 2026-11-09 | 📋 |
+| [A9](docs/ROADMAP-ARCHIVE.md#a9--a-string-value-that-finds-nothing-is-retried-in-its-other-spellings) | A string value that finds nothing is retried in its other spellings | 12 | 2026-11-09 | ✅ |
+| [A10](#a10--the-values-a-string-field-holds) | The values a string field holds — descriptions carry them | 12 | 2026-11-09 | 💭 |
+| [A11](#a11--a-field-declared-a-list) | A field declared a list — descriptions carry it | 12 | 2026-11-09 | 💭 |
 | [B1](#b1--2f2--cpu-arenas-for-write--read--merge) | 2f.2 — CPU arenas for write / read / merge | 13 | 2026-08-08 | 📋 |
 | [B2](#b2--2f3--per-arena-jemalloc-stats) | 2f.3 — per-arena jemalloc stats | 13 | 2026-08-08 | 📋 |
 | [C1](docs/ROADMAP-ARCHIVE.md#m5--per-index-capability-subtraction) | Per-index role overrides — built as M5 on 2026-09-25 (`index_overrides`), closed here 2026-11-09 | 14 | 2026-07-30 | ✅ |
@@ -527,20 +526,16 @@ nothing depends on it and nothing blocks it.
 - ✅ [**A7 — A short page and a stale count say nothing about why**](docs/ROADMAP-ARCHIVE.md#a7--a-short-page-and-a-stale-count-say-nothing-about-why)
 - ✅ [**A8 — What a field tells an agent about matching it**](docs/ROADMAP-ARCHIVE.md#a8--what-a-field-tells-an-agent-about-matching-it)
 
-### A9 — A string clause that matches nothing names the spelling that exists
-
-📋 **Planned.** A `string` clause that matches nothing is most often a value in another case:
-`authors:"austen, jane"` against `Austen, Jane`. The node can tell cheaply: look the lowercase,
-uppercase and capitalised spellings of the term up in the term dictionary (three lookups per
-clause, no scan) and, where one exists, say so — in `validate_query`'s analysis and as a `_warning`
-on a search that returned nothing. Every existing index benefits with no reindex. Open: whether a
-multi-word value tries title case per word, and whether a folded spelling (`rjesenje` for
-`RJEŠENJE`) is worth a fourth lookup.
+- ✅ [**A9 — A string value that finds nothing is retried in its other spellings**](docs/ROADMAP-ARCHIVE.md#a9--a-string-value-that-finds-nothing-is-retried-in-its-other-spellings)
 
 ### A10 — The values a string field holds
 
-📋 **Planned.** An agent filtering on a `string` field has to know its values as written, and today
-reads them off a sample of hits (A8's rule) or a description. The most frequent values of a field
+💭 **Deferred** 2026-11-09: the descriptions written when an index is enriched after loading already
+give a field's common values as stored (the index-describe skill: a small closed set whole, a larger
+one by its most common values), and agents are told to take values and their case from there. Left
+as an engine feature for when a description cannot carry it — values that change with every load, or
+counts over a query's matches. An agent filtering on a `string` field has to know its values as
+written, and without a description reads them off a sample of hits. The most frequent values of a field
 over a query's matches, with counts — the term dictionary, or a terms aggregation over the matches
 — answers it directly and is the facet count a user interface wants too. Shaped like
 [K](docs/ROADMAP-ARCHIVE.md#k-phase-19--field-metrics-min-and-max--done)'s `metrics`: a search option, merged
@@ -548,8 +543,10 @@ across shards and nodes, on HTTP, MCP, the SDK and the CLI.
 
 ### A11 — A field declared a list
 
-📋 **Planned.** Whether a field holds one value or a list is said today only in descriptions
-("list"). A schema flag, reported by `describe_index`, would tell an agent that `field:value`
+💭 **Deferred** 2026-11-09: schema enrichment already writes `list` into the description of every
+multi-valued field, and agents are told what it means; a flag is worth building only if a writer
+should be refused a scalar where a list is declared. Whether a field holds one value or a list is
+said today only in descriptions ("list"). A schema flag, reported by `describe_index`, would tell an agent that `field:value`
 matches any element and that hits carry an array — and lets a writer refuse a scalar where a list
 is declared. Small; decide whether it is a declaration only or also checked on write.
 

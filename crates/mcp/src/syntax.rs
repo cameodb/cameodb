@@ -297,7 +297,11 @@ pub const OPERATORS: &[Operator] = &[
     Operator {
         syntax: "field: IN [a b c]",
         summary: "Match any of several values.",
-        examples: &["status: IN [active pending]", "year: IN [2023 2024]"],
+        examples: &[
+            "status: IN [active pending]",
+            "year: IN [2023 2024]",
+            "author: IN [\"Austen, Jane\" \"AUSTEN, JANE\"]",
+        ],
         types: &[
             TYPE_TEXT,
             TYPE_STRING,
@@ -437,8 +441,14 @@ pub const RULES: &[&str] = &[
      data is absent. To see how a field's values are written, search for rows that hold it with \
      `limit 5` and the field in `fields`, then copy the value; a prefix in the right case \
      (`field:Ab*`) finds values from their start. A field's `description`, where it has one, \
-     often lists its values. For a numeric or date field, `metrics` with `limit 0` gives its \
-     lowest and highest value over the matches.",
+     often lists its values, and the case its examples are written in is the case to try first \
+     (`ZAKON`, `Hrvatski sabor`). When a string value written from the question finds nothing, \
+     retry once with its spellings in one set — as given, lowercase, first letter capitalised, \
+     each word capitalised, uppercase: `author: IN [\"austen, jane\" \"Austen, jane\" \
+     \"Austen, Jane\" \"AUSTEN, JANE\"]` — one request rather than one per spelling. A \
+     description saying `list` means the field holds several values: a clause matches when any \
+     one of them does, and hits carry an array. For a numeric or date field, `metrics` with \
+     `limit 0` gives its lowest and highest value over the matches.",
     SHADOW_FIELD,
     GHOST_FIELD,
     "A text field whose `tokenizer` starts with `cjk` holds Chinese, Japanese or Korean. \

@@ -77,7 +77,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whole value is one term, case included: `authors:"austen, jane"` matches nothing where the data
   holds `Austen, Jane`, and nothing said so. The session instructions and the orchestrator skill
   tell an agent how to read a field's description and how to learn a field's values before
-  filtering on them.
+  filtering on them: a value in the case the description's examples show first, and a value from
+  the question that finds nothing retried once with its spellings in one `IN` set.
 
 ### Fixed
 
