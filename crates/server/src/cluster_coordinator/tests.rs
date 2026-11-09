@@ -554,7 +554,8 @@ mod tests {
     async fn a_node_that_brings_new_shards_is_refused_while_an_index_exists() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut cc = ClusterCoordinator::new(make_cluster());
-        cc.local_stores = vec![store_with_index(dir.path(), 0)];
+        let store = store_with_index(dir.path(), 0);
+        cc.local_stores = vec![std::sync::Arc::downgrade(&store)];
         let member = Uuid::new_v4();
         let (member_shard, member_meta) = shard_of(member, 10);
         cc.shard_assignments
@@ -606,7 +607,8 @@ mod tests {
     async fn a_known_member_is_never_refused() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut cc = ClusterCoordinator::new(make_cluster());
-        cc.local_stores = vec![store_with_index(dir.path(), 3)];
+        let store = store_with_index(dir.path(), 3);
+        cc.local_stores = vec![std::sync::Arc::downgrade(&store)];
         let member = Uuid::new_v4();
         let (shard, meta) = shard_of(member, 10);
         cc.shard_assignments.insert(shard, meta.clone());
@@ -622,9 +624,11 @@ mod tests {
         let empty = tempfile::TempDir::new().unwrap();
         let full = tempfile::TempDir::new().unwrap();
         let mut cc = ClusterCoordinator::new(make_cluster());
-        cc.local_stores = vec![store_with_index(empty.path(), 0)];
+        let empty_store = store_with_index(empty.path(), 0);
+        cc.local_stores = vec![std::sync::Arc::downgrade(&empty_store)];
         assert!(!cc.holds_documents());
-        cc.local_stores.push(store_with_index(full.path(), 2));
+        let full_store = store_with_index(full.path(), 2);
+        cc.local_stores.push(std::sync::Arc::downgrade(&full_store));
         assert!(cc.holds_documents());
     }
 }

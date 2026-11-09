@@ -57,8 +57,10 @@ pub struct ClusterCoordinator {
     /// [`ClusterCoordinator::persist_snapshot`].
     pub(crate) snapshot_writer: Option<tokio::sync::watch::Sender<Option<Arc<PendingSnapshot>>>>,
 
-    /// This node's shard stores, set with the local orchestrator: read to decide a join.
-    pub(crate) local_stores: Vec<Arc<storage::HybridStore>>,
+    /// This node's shard stores, set with the local orchestrator: read to decide a join. Weak,
+    /// because shutdown releases a store's files only when the orchestrator's handle is the
+    /// last; a strong one here kept every store open past the shutdown that reported it closed.
+    pub(crate) local_stores: Vec<std::sync::Weak<storage::HybridStore>>,
     /// Nodes whose shards this node refused to take into its ring (V1). Kept out of the node
     /// registry, and told once.
     pub(crate) refused_nodes: std::collections::HashSet<Uuid>,
@@ -794,7 +796,12 @@ impl ClusterCoordinator {
     /// so every member gives the same answer, which keeps their rings alike when they refuse a
     /// node — where a document count would differ from node to node.
     fn live_index(&self) -> Option<String> {
-        let records = self.local_stores.first()?.schema_records().ok()?;
+        let records = self
+            .local_stores
+            .first()?
+            .upgrade()?
+            .schema_records()
+            .ok()?;
         records
             .into_iter()
             .find(|record| !record.dropped)
@@ -807,6 +814,10 @@ impl ClusterCoordinator {
         // From the stored rows, not the search index: a write that is durable but not yet
         // committed to search is a document all the same.
         self.local_stores.iter().any(|store| {
+            // A store already closed is a node shutting down: it is not told to stop again.
+            let Some(store) = store.upgrade() else {
+                return true;
+            };
             store.schema_records().map_or(true, |records| {
                 records
                     .iter()
@@ -1372,7 +1383,7 @@ impl Message<SetLocalOrchestrator> for ClusterCoordinator {
     ) -> Self::Reply {
         info!("ClusterCoordinator: received local orchestrator reference");
         self.local_orchestrator = Some(msg.orchestrator);
-        self.local_stores = msg.stores;
+        self.local_stores = msg.stores.iter().map(Arc::downgrade).collect();
     }
 }
 
