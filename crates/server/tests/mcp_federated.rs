@@ -864,7 +864,30 @@ async fn the_discovery_tools_describe_the_fields_an_index_has() {
         Some("date"),
         "a field without its type cannot be queried correctly: {described}"
     );
-    assert_eq!(created["fast"].as_bool(), Some(true), "{described}");
+    assert_eq!(created["sortable"].as_bool(), Some(true), "{described}");
+
+    // What a query can do, not what the schema declares: `stored: false` read as "hits do not
+    // carry this field" when every hit does, so the declarations are not shown at all.
+    for field in fields {
+        for declaration in ["indexed", "stored", "fast", "index_record_option"] {
+            assert!(
+                field.get(declaration).is_none(),
+                "'{declaration}' is a declaration an agent reads as an answer: {field}"
+            );
+        }
+        assert_eq!(field["returned"].as_bool(), Some(true), "{field}");
+    }
+
+    // And how each tokenizer matches, once per tokenizer the fields use.
+    let tokenizer_hints = described["tokenizer_hints"]
+        .as_array()
+        .expect("tokenizer_hints");
+    assert!(
+        tokenizer_hints
+            .iter()
+            .any(|h| h["tokenizer"] == "default" && h["matching"].as_str().is_some()),
+        "the text field's tokenizer has no rule: {described}"
+    );
 
     // The per-type hints are the mechanism the whole guidance design rests on.
     let hints = described["query_hints"].as_array().expect("query_hints");

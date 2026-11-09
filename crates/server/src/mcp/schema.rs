@@ -12,7 +12,7 @@ use crate::state::AppState;
 /// An index's field definitions, or `Null` if they cannot be read.
 ///
 /// The catalogue listing reports field *names* and nothing else, so describing an index means
-/// composing it with this: types, `indexed` and `fast` flags and per-type query hints all come
+/// composing it with this: types, the `searchable` and `sortable` flags and the hints all come
 /// from the schema. The bundled CLI composes the same two calls to render `list indexes`.
 ///
 /// `Null` rather than an error: a schema that cannot be read costs the caller its hints, not
@@ -61,8 +61,9 @@ pub(super) async fn absent_index_reason(state: &AppState, index: &str) -> Option
 pub(super) struct FieldInfo {
     pub(super) name: String,
     pub(super) field_type: String,
-    pub(super) indexed: bool,
-    pub(super) fast: bool,
+    /// The analyzer a text field declares; `None` for a text field taking `default` and for
+    /// every type without one. A `string` field reports `raw`.
+    pub(super) tokenizer: Option<String>,
     pub(super) is_shadow: bool,
     /// Whether a query can reach this field *now*, as opposed to `indexed`, which is what the
     /// schema declares. The two differ for a field declared after the index was built: it has no
@@ -109,8 +110,10 @@ pub(super) fn extract_field_info(value: &JsonValue) -> Vec<FieldInfo> {
                         .and_then(|v| v.as_str())
                         .unwrap_or("text")
                         .to_string(),
-                    indexed: def.get("indexed").and_then(|v| v.as_bool()).unwrap_or(true),
-                    fast: def.get("fast").and_then(|v| v.as_bool()).unwrap_or(false),
+                    tokenizer: def
+                        .get("tokenizer")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
                     is_shadow: def.get("shadow").and_then(|v| v.as_bool()).unwrap_or(false),
                     searchable: def
                         .get("searchable")
@@ -134,23 +137,43 @@ pub(super) fn extract_field_names(value: &JsonValue) -> Vec<String> {
         .collect()
 }
 
+/// The schema keys a field carries for the node that wrote it and that an agent cannot act on.
+///
+/// `indexed`, `stored` and `fast` are declarations, and each was read as an answer: `stored:
+/// false` as "hits do not return this field", when every hit is read from the document store and
+/// carries it; `indexed` and `fast` as "searchable" and "sortable", which the built index decides
+/// and `searchable` and `sortable` report. `index_record_option` is how the column keeps
+/// postings, which the tokenizer's rule already accounts for. A read of `GET /_config` keeps all
+/// four, since that is the shape a schema is written back in.
+const DECLARATION_KEYS: &[&str] = &["indexed", "stored", "fast", "index_record_option"];
+
 /// Turn an index's schema block into the entry `describe_index` returns: the block as
-/// `GET /_config` reports it, with one `query_hint` per field type present, and without each
-/// field's `index_record_option`. That one is in the block so a read restores the index it came
-/// from; a caller writing a query cannot act on it — the tokenizer already says `raw` is exact
-/// match only — and on a wide index it would be a line per field of an agent's context.
+/// `GET /_config` reports it, each field described by what a query can do with it rather than
+/// by what its schema declares, with one `query_hint` per field type present and one
+/// `tokenizer_hint` per tokenizer.
+///
+/// Per field: `searchable` and `sortable` from the built index, `returned` — whether a hit
+/// carries it, false for a ghost alone — and the declaration keys removed
+/// ([`DECLARATION_KEYS`]). `shadow` and `default_search` stay on every field, so a `false` is
+/// an answer rather than an omission.
 /// [`enrich_index_entry`] for an entry held by reference.
 pub(super) fn enrich_index_entry_owned(entry: &JsonValue) -> JsonValue {
     enrich_index_entry(entry.clone())
 }
 
 pub(super) fn enrich_index_entry(mut entry: JsonValue) -> JsonValue {
+    // Read before the declarations go: `tokenizer` stays, but the reading is done once.
+    let field_infos = extract_field_info(&entry);
+
     if let Some(fields) = entry.get_mut("fields").and_then(JsonValue::as_array_mut) {
         for field in fields.iter_mut().filter_map(JsonValue::as_object_mut) {
-            field.remove("index_record_option");
+            for key in DECLARATION_KEYS {
+                field.remove(*key);
+            }
+            let returned = !field.contains_key("ghost");
+            field.insert("returned".to_string(), JsonValue::Bool(returned));
         }
     }
-    let field_infos = extract_field_info(&entry);
 
     // One hint per distinct type rather than per field: the hint depends on nothing else, so on
     // a wide index repeating it per field is the same paragraph a dozen times.
@@ -172,8 +195,33 @@ pub(super) fn enrich_index_entry(mut entry: JsonValue) -> JsonValue {
         })
         .collect();
 
+    // The same economy for tokenizers: the name on each field, the rule once. A string field
+    // reports `raw`, so the whole-value rule is here whenever a string field is.
+    let mut tokenizers: Vec<(&str, &str)> = Vec::new();
+    for info in field_infos.iter().filter(|info| !info.is_shadow) {
+        let name = match info.field_type.as_str() {
+            "string" | "exact" => "raw",
+            _ => info.tokenizer.as_deref().unwrap_or("default"),
+        };
+        if let Some(rule) =
+            cameodb_mcp::syntax::tokenizer_rule(&info.field_type, info.tokenizer.as_deref())
+            && !tokenizers.iter().any(|(seen, _)| *seen == name)
+        {
+            tokenizers.push((name, rule));
+        }
+    }
+    tokenizers.sort();
+    let tokenizer_hints: Vec<JsonValue> = tokenizers
+        .into_iter()
+        .map(|(tokenizer, matching)| serde_json::json!({"tokenizer": tokenizer, "matching": matching}))
+        .collect();
+
     if let Some(obj) = entry.as_object_mut() {
         obj.insert("query_hints".to_string(), JsonValue::Array(query_hints));
+        obj.insert(
+            "tokenizer_hints".to_string(),
+            JsonValue::Array(tokenizer_hints),
+        );
     }
 
     entry
@@ -240,5 +288,83 @@ pub(super) fn field_query_hint(info: &FieldInfo) -> String {
         cameodb_mcp::syntax::SHADOW_FIELD.to_string()
     } else {
         field_type_query_hint(&info.field_type)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every tokenizer the engine accepts has a matching rule an agent can read. The rules live
+    /// in the mcp crate, which cannot see the engine's list, so the two are pinned here.
+    #[test]
+    fn every_engine_tokenizer_has_a_matching_rule() {
+        let rules: Vec<&str> = cameodb_mcp::syntax::TOKENIZER_RULES
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        for name in storage::TOKENIZERS {
+            assert!(
+                rules.contains(name),
+                "no matching rule for tokenizer '{name}'"
+            );
+        }
+        assert_eq!(
+            rules.len(),
+            storage::TOKENIZERS.len(),
+            "a rule for no tokenizer: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn a_described_field_says_what_a_query_can_do_with_it() {
+        let entry = serde_json::json!({
+            "name": "books",
+            "fields": [
+                {"name": "title", "type": "text", "indexed": true, "stored": false, "fast": false,
+                 "shadow": false, "searchable": true, "sortable": false, "default_search": true,
+                 "tokenizer": "en_stem", "index_record_option": "WithFreqsAndPositions"},
+                {"name": "authors", "type": "string", "indexed": true, "stored": false,
+                 "fast": false, "shadow": false, "searchable": true, "sortable": false,
+                 "default_search": false, "tokenizer": "raw"},
+                {"name": "text_hr", "type": "text", "indexed": true, "stored": false,
+                 "fast": false, "shadow": false, "searchable": true, "sortable": false,
+                 "default_search": true, "tokenizer": "hr_stem_fold",
+                 "ghost": {"source": "title"}},
+                {"name": "year", "type": "i64", "indexed": true, "stored": false, "fast": true,
+                 "shadow": false, "searchable": true, "sortable": true, "default_search": false},
+            ]
+        });
+        let described = enrich_index_entry(entry);
+        let fields = described["fields"].as_array().unwrap();
+        let field = |name: &str| fields.iter().find(|f| f["name"] == name).unwrap();
+
+        for f in fields {
+            for key in DECLARATION_KEYS {
+                assert!(f.get(*key).is_none(), "{f}");
+            }
+        }
+        assert_eq!(field("title")["returned"], true);
+        assert_eq!(
+            field("text_hr")["returned"],
+            false,
+            "a ghost is searched, never returned"
+        );
+        assert_eq!(field("year")["sortable"], true);
+        assert_eq!(
+            field("authors")["shadow"],
+            false,
+            "false is an answer, so it stays"
+        );
+
+        let tokenizers: Vec<&str> = described["tokenizer_hints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["tokenizer"].as_str().unwrap())
+            .collect();
+        assert_eq!(tokenizers, ["en_stem", "hr_stem_fold", "raw"]);
+        let raw = &described["tokenizer_hints"][2]["matching"];
+        assert!(raw.as_str().unwrap().contains("case"), "{raw}");
     }
 }

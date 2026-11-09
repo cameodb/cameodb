@@ -48,8 +48,49 @@ pub struct Operator {
     pub examples: &'static [&'static str],
     /// Schema type names this form works against. Empty means it is not tied to a field.
     pub types: &'static [&'static str],
-    /// A constraint that changes the result rather than merely explaining the form.
-    pub caveat: Option<&'static str>,
+    /// Constraints that change the result rather than merely explaining the form, each for the
+    /// types it is true of.
+    pub caveats: &'static [Caveat],
+}
+
+/// A constraint on one operator, and the field types it applies to.
+///
+/// A caveat used to be one paragraph per operator, appended whole to the hint of every type the
+/// operator supports, so an integer field's hint explained how text ranges compare and a string
+/// field's how a stemmed prefix moves. Scoped to its types, each type's hint says only what is
+/// true of that type.
+#[derive(Debug, Clone, Copy)]
+pub struct Caveat {
+    /// The types it is true of; empty for every type the operator supports.
+    pub types: &'static [&'static str],
+    pub text: &'static str,
+}
+
+impl Caveat {
+    const fn all(text: &'static str) -> Self {
+        Self { types: &[], text }
+    }
+
+    const fn on(types: &'static [&'static str], text: &'static str) -> Self {
+        Self { types, text }
+    }
+
+    fn applies_to(&self, field_type: &str) -> bool {
+        self.types.is_empty() || self.types.contains(&field_type)
+    }
+}
+
+impl Operator {
+    /// Every caveat, joined, for the reference, which lists each operator once.
+    pub fn caveat_text(&self) -> Option<String> {
+        (!self.caveats.is_empty()).then(|| {
+            self.caveats
+                .iter()
+                .map(|caveat| caveat.text)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+    }
 }
 
 /// A query form a caller is likely to try that the engine does not support.
@@ -60,6 +101,9 @@ pub struct NotSupported {
     pub detail: &'static str,
 }
 
+/// Types a range or comparison orders by value rather than by text.
+const ORDERED_VALUE_TYPES: &[&str] = &[TYPE_I64, TYPE_U64, TYPE_F64, TYPE_DATE, TYPE_IP];
+
 /// Every supported query form.
 pub const OPERATORS: &[Operator] = &[
     Operator {
@@ -68,61 +112,74 @@ pub const OPERATORS: &[Operator] = &[
                   is returned.",
         examples: &["rust database", "machine learning"],
         types: &[],
-        caveat: Some(
+        caveats: &[Caveat::all(
             "Without a field name only text, string and json fields are searched. Numeric, date, \
              boolean, ip and facet fields must be named explicitly. Adding a term widens the \
              result rather than narrowing it: put `AND` between clauses, or `+` in front of each, \
              to require them all.",
-        ),
+        )],
     },
     Operator {
         syntax: "*",
         summary: "Match every document.",
         examples: &["*", "* limit 10"],
         types: &[],
-        caveat: None,
+        caveats: &[],
     },
     Operator {
         syntax: "field:value",
         summary: "Match a value in one field.",
         examples: &["title:rust", "year:2024", "flag:true"],
         types: ALL_TYPES,
-        caveat: None,
+        caveats: &[],
     },
     Operator {
         syntax: "field:\"a b\"",
         summary: "Exact phrase, terms in order. Text fields only.",
         examples: &["title:\"rust programming\""],
         types: &[TYPE_TEXT],
-        caveat: Some("Needs positions, which string fields do not index."),
+        caveats: &[Caveat::all(
+            "Needs word positions, which a text field keeps unless its schema declares otherwise.",
+        )],
     },
     Operator {
         syntax: "field:\"a b\"~N",
         summary: "Phrase allowing N extra words between terms.",
         examples: &["body:\"small bike\"~2"],
         types: &[TYPE_TEXT],
-        caveat: Some("A transposition costs 2, so \"a b\"~1 does not match \"b a\"."),
+        caveats: &[Caveat::all(
+            "A transposition costs 2, so \"a b\"~1 does not match \"b a\".",
+        )],
     },
     Operator {
         syntax: "\"a b pre\"*",
         summary: "Phrase whose last term is a prefix. Two or more terms.",
         examples: &["\"big bad wo\"*"],
         types: &[TYPE_TEXT],
-        caveat: None,
+        caveats: &[],
     },
     Operator {
         syntax: "field:pre*",
         summary: "Match every term starting with `pre`. One term, and the field is required.",
         examples: &["title:data*", "tag:urn:cve*"],
         types: &[TYPE_TEXT, TYPE_STRING],
-        caveat: Some(
-            "Runs as a lexicographic range, so a short prefix scans a wide slice of the term \
-             dictionary. A prefix shorter than the node's `min_prefix_length` (2 characters by \
-             default) is not expanded: it is matched as that term exactly, and reported. On a \
-             stemmed field the prefix is stemmed too, which can move where it lands. A value the \
-             analyzer cannot reduce to one term is matched as that term exactly instead, and \
-             reported.",
-        ),
+        caveats: &[
+            Caveat::all(
+                "Runs as a lexicographic range, so a short prefix scans a wide slice of the term \
+                 dictionary. A prefix shorter than the node's `min_prefix_length` (2 characters \
+                 by default) is not expanded: it is matched as that term exactly, and reported.",
+            ),
+            Caveat::on(
+                &[TYPE_TEXT],
+                "The prefix goes through the field's tokenizer: lowercased, and on a stemmed \
+                 field stemmed too, which can move where it lands. A prefix the tokenizer cannot \
+                 reduce to one term is matched as that term exactly instead, and reported.",
+            ),
+            Caveat::on(
+                &[TYPE_STRING],
+                "Case-sensitive, like the value: `Data*` and `data*` find different values.",
+            ),
+        ],
     },
     Operator {
         syntax: "AND / OR / NOT",
@@ -134,32 +191,34 @@ pub const OPERATORS: &[Operator] = &[
             "NOT tag:draft",
         ],
         types: &[],
-        caveat: Some(
+        caveats: &[Caveat::all(
             "`a AND NOT b` keeps what matches a and not b, `a OR NOT b` adds everything not \
              matching b, `a NOT b` and `NOT b` alone are exclusions. Lowercase is not reported: \
              `a and b` is three terms, which widens the query, and `a not b` matches everything.",
-        ),
+        )],
     },
     Operator {
         syntax: "+term / -term",
         summary: "Require or exclude a clause.",
         examples: &["+title:rust -tag:draft"],
         types: &[],
-        caveat: None,
+        caveats: &[],
     },
     Operator {
         syntax: "(...)",
         summary: "Group clauses to control precedence.",
         examples: &["(title:rust OR title:go) AND year:[2020 TO 2024]"],
         types: &[],
-        caveat: None,
+        caveats: &[],
     },
     Operator {
         syntax: "field:value^N",
         summary: "Weight a clause's score contribution.",
         examples: &["title:rust^3 OR body:rust"],
         types: ALL_TYPES,
-        caveat: Some("Affects ranking only, never which documents match."),
+        caveats: &[Caveat::all(
+            "Affects ranking only, never which documents match.",
+        )],
     },
     Operator {
         syntax: "field:[low TO high]",
@@ -174,11 +233,19 @@ pub const OPERATORS: &[Operator] = &[
             TYPE_DATE,
             TYPE_IP,
         ],
-        caveat: Some(
-            "Text and string ranges compare lexicographically. A bound holding a space or \
-             punctuation is quoted — `category:[\"Film & Animation\" TO Music]` — in every \
-             range and comparison form. The `fast` flag is needed for sorting, not for ranges.",
-        ),
+        caveats: &[
+            Caveat::on(
+                &[TYPE_TEXT, TYPE_STRING],
+                "Ranges and comparisons compare terms lexicographically, as text. A bound \
+                 holding a space or punctuation is quoted — `category:[\"Film & Animation\" TO \
+                 Music]` — in every range and comparison form.",
+            ),
+            Caveat::on(
+                ORDERED_VALUE_TYPES,
+                "Ranges and comparisons need no sort column: they work whether or not the field \
+                 is `sortable`.",
+            ),
+        ],
     },
     Operator {
         syntax: "field:{low TO high}",
@@ -193,7 +260,9 @@ pub const OPERATORS: &[Operator] = &[
             TYPE_DATE,
             TYPE_IP,
         ],
-        caveat: Some("Brackets and braces may be mixed to make one bound inclusive."),
+        caveats: &[Caveat::all(
+            "Brackets and braces may be mixed to make one bound inclusive.",
+        )],
     },
     Operator {
         syntax: "field:[low TO *]",
@@ -208,7 +277,7 @@ pub const OPERATORS: &[Operator] = &[
             TYPE_DATE,
             TYPE_IP,
         ],
-        caveat: None,
+        caveats: &[],
     },
     Operator {
         syntax: "field:>value",
@@ -222,7 +291,8 @@ pub const OPERATORS: &[Operator] = &[
             TYPE_F64,
             TYPE_DATE,
         ],
-        caveat: Some("Text and string values compare lexicographically, as in a range."),
+        // Compared as a range is: the range's caveats say how, once for both.
+        caveats: &[],
     },
     Operator {
         syntax: "field: IN [a b c]",
@@ -237,24 +307,24 @@ pub const OPERATORS: &[Operator] = &[
             TYPE_DATE,
             TYPE_BOOLEAN,
         ],
-        caveat: None,
+        caveats: &[],
     },
     Operator {
         syntax: "field:/path/to/value",
         summary: "Match a facet path.",
         examples: &["category:/electronics/phones", "category:/electronics"],
         types: &[TYPE_FACET],
-        caveat: Some(
+        caveats: &[Caveat::all(
             "Hierarchical: a parent path matches its descendants. The path ends at the first \
              space, so a path containing one cannot be queried.",
-        ),
+        )],
     },
     Operator {
         syntax: "id:value",
         summary: "Look up one document by id. Fastest retrieval path.",
         examples: &["id:doc-12345"],
         types: &[],
-        caveat: Some(
+        caveats: &[Caveat::all(
             "Reads the key-value store and skips the search index, but only when the whole query \
              is exactly `id:value`, with no other clause and no space, quote, parenthesis, `*` \
              or `^` in the value — those are syntax, so the query runs on the search index \
@@ -263,7 +333,7 @@ pub const OPERATORS: &[Operator] = &[
              them is reached by escaping it: `id:doc\\^2`. A `shadow` field is the identifier \
              under its source name and works the same way, alone or rewritten to `id` inside a \
              larger query.",
-        ),
+        )],
     },
 ];
 
@@ -357,9 +427,18 @@ pub const GHOST_FIELD: &str = "A field with a `ghost` property is a search colum
 pub const RULES: &[&str] = &[
     "A field name containing a dot is written as it is, unescaped: `k8s.node:worker-1`. Escaping \
      the dot makes the lookup miss.",
-    "A field that exists in the schema but is not indexed cannot be queried, unless it is marked \
-     `shadow`. Fields discovered from a document are added unindexed, and stay that way until a \
-     schema update promotes them, so check the `indexed` flag before naming a field.",
+    "A field that is not `searchable` cannot be queried, unless it is marked `shadow`. Fields \
+     discovered from a document are added unindexed, and stay that way until a schema update \
+     promotes them, so check the `searchable` flag before naming a field. Whether a hit carries \
+     a field is a separate question: every field is `returned` but a ghost.",
+    "Values are read from the data, not guessed from the question. A `string` field matches only \
+     its whole value as written, so a value in another case, or a part of one, finds nothing — \
+     and an empty result there more often means the value is written differently than that the \
+     data is absent. To see how a field's values are written, search for rows that hold it with \
+     `limit 5` and the field in `fields`, then copy the value; a prefix in the right case \
+     (`field:Ab*`) finds values from their start. A field's `description`, where it has one, \
+     often lists its values. For a numeric or date field, `metrics` with `limit 0` gives its \
+     lowest and highest value over the matches.",
     SHADOW_FIELD,
     GHOST_FIELD,
     "A text field whose `tokenizer` starts with `cjk` holds Chinese, Japanese or Korean. \
@@ -484,9 +563,16 @@ pub const MODIFIER_RULES: &[&str] = &[
 pub const FIELD_TYPES: &[(&str, &str)] = &[
     (
         TYPE_TEXT,
-        "Tokenized full text. Terms are split and lowercased.",
+        "Full text, split into terms by the field's `tokenizer`, which also decides case, \
+         stemming and diacritics — `describe_index` gives each tokenizer's rule in \
+         `tokenizer_hints`.",
     ),
-    (TYPE_STRING, "Exact value, not tokenized."),
+    (
+        TYPE_STRING,
+        "The whole value is one term, matched exactly: case, spaces and punctuation count, and \
+         a word or a part of the value matches nothing. Quote a value holding a space or \
+         punctuation — `author:\"Austen, Jane\"` — and copy it as the data writes it.",
+    ),
     (TYPE_I64, "Signed 64-bit integer."),
     (TYPE_U64, "Unsigned 64-bit integer."),
     (TYPE_F64, "64-bit float."),
@@ -511,6 +597,123 @@ pub const FIELD_TYPES: &[(&str, &str)] = &[
     ),
     (TYPE_FACET, "Hierarchical category path."),
 ];
+
+/// How each tokenizer a field may name matches, in the words a query is written in.
+///
+/// A tokenizer name is a decision about matching that the caller has to act on — whether case
+/// counts, whether `running` finds `runs`, whether `cafe` finds `café` — and the name alone says
+/// none of it. `describe_index` carries the rule for every tokenizer its fields use.
+pub const TOKENIZER_RULES: &[(&str, &str)] = &[
+    (
+        "raw",
+        "The whole value is one term, matched exactly: case, spaces and punctuation count, and a \
+         word or a part of the value matches nothing. Quote a value holding a space.",
+    ),
+    (
+        "whitespace",
+        "Split at spaces only; case and punctuation are kept, so `Word,` and `word` are \
+         different terms.",
+    ),
+    (
+        "default",
+        "Words, in any case; punctuation splits them. No stemming, and diacritics are kept: \
+         `run` does not find `running`, `cafe` does not find `café`.",
+    ),
+    (
+        "en_stem",
+        "Words in any case, English stemmed: `running` finds `runs`.",
+    ),
+    (
+        "de_stem",
+        "Words in any case, German stemmed; `Groesse` does not find `Größe`.",
+    ),
+    (
+        "de_stem_fold",
+        "Words in any case, German stemmed, umlauts folded: `Groesse` and `Grosse` find `Größe`.",
+    ),
+    (
+        "es_stem",
+        "Words in any case, Spanish stemmed; accents kept, so an unaccented word misses an \
+         accented one.",
+    ),
+    (
+        "es_stem_fold",
+        "Words in any case, Spanish stemmed, accents folded: `informacion` finds `información`.",
+    ),
+    (
+        "fr_stem",
+        "Words in any case, French stemmed; accents kept, so an unaccented word misses an \
+         accented one.",
+    ),
+    (
+        "fr_stem_fold",
+        "Words in any case, French stemmed, accents folded: `situee` finds `située`.",
+    ),
+    (
+        "it_stem",
+        "Words in any case, Italian stemmed; accents kept, so an unaccented word misses an \
+         accented one.",
+    ),
+    (
+        "it_stem_fold",
+        "Words in any case, Italian stemmed, accents folded: `citta` finds `città`.",
+    ),
+    (
+        "pt_stem",
+        "Words in any case, Portuguese stemmed, plurals to the singular; accents kept, so an \
+         unaccented word misses an accented one.",
+    ),
+    (
+        "pt_stem_fold",
+        "Words in any case, Portuguese stemmed, plurals to the singular, accents folded: \
+         `decisoes` finds `decisão`.",
+    ),
+    (
+        "hr_stem",
+        "Words in any case, Croatian stemmed, Serbian Cyrillic read as Latin; diacritics kept, \
+         so `zupanija` misses `županija`.",
+    ),
+    (
+        "hr_stem_fold",
+        "Words in any case, Croatian stemmed, Serbian Cyrillic read as Latin, diacritics folded: \
+         `zupanija` finds `županije`.",
+    ),
+    (
+        "cjk",
+        "Chinese, Japanese or Korean: each character alone and paired with the next. Write a word \
+         as its characters with no spaces; no script folding.",
+    ),
+    (
+        "cjk_fold",
+        "Chinese: each character alone and paired with the next, traditional folded to \
+         simplified, so `學習` finds `学习`. Write a word with no spaces.",
+    ),
+    (
+        "cjk_ja_fold",
+        "Japanese: each character alone and paired with the next, old kanji folded to new, so \
+         `清吉` finds `淸吉`. Write a word with no spaces.",
+    ),
+    (
+        "cjk_ko_fold",
+        "Korean: each character alone and paired with the next, Hanja read as Hangul, so `가족` \
+         finds `家族`. Write a word with no spaces.",
+    ),
+];
+
+/// How a field of this type and tokenizer matches a query value, or `None` for a type that has
+/// no tokenizer. A `string` field is always the raw rule, whatever it declares; a text field
+/// declaring no tokenizer is analysed by `default`.
+pub fn tokenizer_rule(field_type: &str, tokenizer: Option<&str>) -> Option<&'static str> {
+    let tokenizer = match normalize_type(field_type) {
+        TYPE_STRING => "raw",
+        TYPE_TEXT => tokenizer.unwrap_or("default"),
+        _ => return None,
+    };
+    TOKENIZER_RULES
+        .iter()
+        .find(|(name, _)| *name == tokenizer)
+        .map(|(_, rule)| *rule)
+}
 
 /// Markers delimiting the generated syntax table in the crate README.
 pub const README_BEGIN: &str = "<!-- BEGIN GENERATED SYNTAX -->";
@@ -552,11 +755,18 @@ pub fn hint_for_type(field_type: &str) -> String {
     let syntaxes: Vec<&str> = forms.iter().map(|op| op.syntax).collect();
     let mut hint = format!("{summary} Supports: {}.", syntaxes.join(", "));
 
-    // Only caveats belonging to a form this type actually supports.
-    let caveats: Vec<&str> = forms.iter().filter_map(|op| op.caveat).collect();
-    if !caveats.is_empty() {
-        hint.push(' ');
-        hint.push_str(&caveats.join(" "));
+    // Only the caveats true of this type, each under the form it belongs to: unattributed, a
+    // sentence about prefixes read as a sentence about the field.
+    for op in &forms {
+        let caveats: Vec<&str> = op
+            .caveats
+            .iter()
+            .filter(|caveat| caveat.applies_to(normalized))
+            .map(|caveat| caveat.text)
+            .collect();
+        if !caveats.is_empty() {
+            hint.push_str(&format!(" `{}`: {}", op.syntax, caveats.join(" ")));
+        }
     }
     hint
 }
@@ -571,7 +781,7 @@ pub fn reference_json() -> JsonValue {
                 "summary": op.summary,
                 "examples": op.examples,
                 "field_types": if op.types.is_empty() { json!("any") } else { json!(op.types) },
-                "caveat": op.caveat,
+                "caveat": op.caveat_text(),
             })
         })
         .collect();
@@ -608,6 +818,10 @@ pub fn reference_json() -> JsonValue {
         "sorting": SORT_RULES,
         "metrics": METRIC_RULES,
         "rules": RULES,
+        "tokenizers": TOKENIZER_RULES
+            .iter()
+            .map(|(name, rule)| json!({ "tokenizer": name, "matching": rule }))
+            .collect::<Vec<_>>(),
         "reserved_characters": RESERVED_CHARACTERS,
     })
 }
@@ -640,7 +854,9 @@ pub fn compact_reference() -> String {
          it.\n  \
          `AND` `OR` `NOT` `TO` `IN` count only in uppercase; lowercase is searched for as a word, \
          and for `and`, `or` and `not` that happens silently.\n  \
-         An unindexed field cannot be queried; check the `indexed` flag from `describe_index`. The \
+         A string field matches its whole value, case and all: copy values from a description or \
+         a hit, never from the question's wording.\n  \
+         A field that is not `searchable` cannot be queried; `describe_index` says which. The \
          exception is a `shadow` field, which is the identifier under another name: `field:VALUE` \
          on its own is the key-value fast path, inside a larger query it is rewritten to `id`, \
          and results carry it in place of `id`.\n  \
@@ -691,6 +907,11 @@ pub fn markdown_reference() -> String {
     out.push_str("\n**Rules**\n\n");
     for rule in RULES {
         out.push_str(&format!("- {rule}\n"));
+    }
+    out.push_str("\n**Tokenizers**, how a text field's values are matched\n\n");
+    out.push_str("| Tokenizer | Matching |\n|---|---|\n");
+    for (name, rule) in TOKENIZER_RULES {
+        out.push_str(&format!("| `{name}` | {rule} |\n"));
     }
     out.push_str("\n**Sorting**\n\n");
     for rule in SORT_RULES {
@@ -776,6 +997,51 @@ mod tests {
     fn the_string_alias_resolves() {
         assert_eq!(hint_for_type("exact"), hint_for_type(TYPE_STRING));
         assert!(!hint_for_type("exact").contains("Unrecognised"));
+    }
+
+    /// A type's hint says only what is true of that type.
+    ///
+    /// Every caveat of every operator a type supports used to be appended whole, so an integer's
+    /// hint explained how text compares and a string's how a stemmed prefix moves — and a reader
+    /// cannot tell which sentence was about its field.
+    #[test]
+    fn a_hint_carries_only_the_caveats_of_its_type() {
+        let string = hint_for_type(TYPE_STRING);
+        assert!(string.contains("case"), "{string}");
+        assert!(!string.contains("stemmed"), "{string}");
+        assert!(!string.contains("sortable"), "{string}");
+
+        let integer = hint_for_type(TYPE_I64);
+        assert!(!integer.contains("lexicographically"), "{integer}");
+        assert!(!integer.contains("Film & Animation"), "{integer}");
+
+        let text = hint_for_type(TYPE_TEXT);
+        assert!(text.contains("stemmed"), "{text}");
+        assert!(!text.contains("`Data*` and `data*`"), "{text}");
+
+        // Said once, under the form it belongs to, never twice.
+        for hint in [&string, &integer, &text] {
+            assert!(hint.matches("lexicographically").count() <= 1, "{hint}");
+            assert!(
+                hint.contains("`field:value^N`: Affects ranking only"),
+                "{hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_field_s_rule_follows_its_type_and_tokenizer() {
+        // A string field builds the raw column whatever it declares.
+        assert_eq!(
+            tokenizer_rule(TYPE_STRING, Some("en_stem")),
+            tokenizer_rule(TYPE_TEXT, Some("raw"))
+        );
+        assert_eq!(
+            tokenizer_rule(TYPE_TEXT, None),
+            tokenizer_rule(TYPE_TEXT, Some("default"))
+        );
+        assert!(tokenizer_rule(TYPE_I64, None).is_none());
+        assert!(tokenizer_rule(TYPE_TEXT, Some("klingon")).is_none());
     }
 
     #[test]

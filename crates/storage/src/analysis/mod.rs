@@ -47,7 +47,7 @@ pub(crate) const MAX_INDEXED_TOKEN_LEN: usize = 128;
 /// registered by [`register_tokenizers`]. A schema naming anything else is refused where it is
 /// declared ([`IndexSchema::validate_tokenizers`]): accepted, it would store, take writes into the
 /// WAL, and then fail every commit because the writer cannot find the analyzer.
-pub(crate) const TOKENIZERS: &[&str] = &[
+pub const TOKENIZERS: &[&str] = &[
     "default",
     "raw",
     "whitespace",

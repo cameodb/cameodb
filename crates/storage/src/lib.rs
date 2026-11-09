@@ -52,6 +52,7 @@ mod tests;
 // `store` whole, so any `pub` added in those modules widened the crate's API with no review step
 // (O4). Now widening it is an edit here: an item a caller outside the crate needs goes in the
 // list, on purpose, and everything else stays the crate's own business.
+pub use analysis::TOKENIZERS;
 pub use deadline::{DeadlineQuery, SearchDeadline};
 pub use delete_query::DeleteMatches;
 pub use merge::MergeStarted;

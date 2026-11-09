@@ -1941,6 +1941,48 @@ Tantivy's `num_docs`, so it is the count *as of the last commit* — and that is
 two honest-looking figures that never match is worse than one figure with a stated boundary. So
 `describe_index`, `list_indexes` and `get_catalog_stats` now say what their counts are counts of.
 
+### A8 — What a field tells an agent about matching it
+
+✅ **Done** 2026-11-09, in 0.3.10. Found by reading the live indexes the way an agent does: on a
+19.7M-row book index, `authors:"Austen, Jane"` finds 24 books, `authors:"austen, jane"`,
+`unit_type:Book` and `category:Novels` find none, and `validate_query` said all three parse with no
+warning. A `string` field matches its whole value in its own case, and nothing an agent read said
+so: the `string` hint was "Exact value, not tokenized" followed by every caveat of every operator
+the type supports, a stemmed prefix's among them; an `i64` hint explained how text ranges compare.
+The gazette's schemas showed how often it bites — one list of body names mixes
+`Vlada Republike Hrvatske` with `PREDSJEDNICA REPUBLIKE HRVATSKE`, places are written
+`Sastavljeno u Parizu` and `SASTAVLJENO U PARIZU`.
+
+**What landed**, with no change to storage or the wire:
+
+- **Hints carry only their type's caveats, each under its operator.** An operator's caveats are
+  scoped to the types they are true of (`Caveat`), the hint attributes each to its form
+  (`` `field:pre*`: … ``), and the comparison form no longer repeats the range's. The `string`
+  summary says the whole value is one term, case, spaces and punctuation counting, quoted and
+  copied as the data writes it; a string prefix is case-sensitive.
+- **`tokenizer_hints` on `describe_index`**, one per tokenizer present: whether case counts, whether
+  a word finds its other forms, whether an unaccented word finds an accented one. A field's
+  `tokenizer` was a bare name. `validate_query` gives each field it names its `matching` rule.
+  `TOKENIZER_RULES` is pinned against the engine's tokenizer list.
+- **A field is described by what a query can do with it.** `describe_index` drops `indexed`,
+  `stored`, `fast` and `index_record_option` — `stored: false` read as "hits do not carry this
+  field" when every hit does — and adds `returned`, false for a ghost alone. `searchable` and
+  `sortable`, already there, are the answers the instructions now name. `GET /_config` keeps the
+  declarations.
+- **A reader's contract for descriptions** in the session instructions and the orchestrator skill:
+  which rows hold a field, its values as written, recipes to copy, and where a text is searched but
+  returned elsewhere; values taken from a description or a hit, never from the question. The
+  index-describe skill writes to the same contract.
+- **How to learn a field's values**, a syntax rule: `limit 5` with the field in `fields`, a prefix
+  in the right case, `metrics` for a number's span — and an empty result on a `string` field read
+  as a value written differently before it is read as absent data.
+
+Left as their own items: telling the agent which spelling exists when a string clause matches
+nothing ([A9](../ROADMAP.md#a9--a-string-clause-that-matches-nothing-names-the-spelling-that-exists)), a field's top values
+([A10](../ROADMAP.md#a10--the-values-a-string-field-holds)), a list flag
+([A11](../ROADMAP.md#a11--a-field-declared-a-list)), and a whole-value tokenizer that ignores case
+([U3](../ROADMAP.md#u3--raw_fold-a-whole-value-matched-in-any-case)).
+
 ## C. Phase 14 — Security Hardening — delivered items
 
 The introduction to this group and its open items are in [ROADMAP.md](../ROADMAP.md), under [C. Phase 14 — Security Hardening](../ROADMAP.md#c-phase-14--security-hardening--partial).

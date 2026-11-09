@@ -56,6 +56,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   node's whole data directory on a machine with another address, where it rejoins as itself, and
   the cluster suite rehearses it.
 
+### Changed
+
+- **MCP: a field says how a query value meets it.** `describe_index` describes each field by what a
+  query can do with it: `searchable`, `sortable`, and the new `returned` (false for a ghost alone),
+  without the schema's `indexed`, `stored`, `fast` and `index_record_option` — `stored: false` was
+  read as "hits do not carry this field" when every hit does. `GET /api/{index}/_config` still
+  reports them. A new `tokenizer_hints` array gives each tokenizer's matching rule once — whether
+  case counts, whether a word finds its other forms, whether an unaccented word finds an accented
+  one — and `validate_query` gives it per field the query names. The per-type `query_hint` carries
+  only the caveats true of that type, each under its operator, and the `string` hint says that the
+  whole value is one term, case included: `authors:"austen, jane"` matches nothing where the data
+  holds `Austen, Jane`, and nothing said so. The session instructions and the orchestrator skill
+  tell an agent how to read a field's description and how to learn a field's values before
+  filtering on them.
+
 ### Fixed
 
 - **On a cluster, a search the index cannot answer is refused, not answered as a partial page.** An

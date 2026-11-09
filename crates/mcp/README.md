@@ -38,18 +38,19 @@ CameoDB is designed as a self-contained document store where indexed fields, sch
 **Optimized Schema Responses:**
 Schema and field structures are optimized to return only relevant information for AI clients to build effective queries. The schema is delivered once, by the discovery tools; the operational tools (`validate_query`, `search_index`) describe only the fields a query names. Responses focus on:
 - `field_names` (from `list_indexes`): Every field name, for choosing an index
-- `fields` (from `describe_index`): Per-field type and flags
+- `fields` (from `describe_index`): Per-field type, tokenizer, and what a query can do with it
 - `query_hints` (from `describe_index`): One entry per field type present, naming the operators it supports
+- `tokenizer_hints` (from `describe_index`): One entry per tokenizer present, saying how it matches a value — case, stemming, diacritics
 - Essential statistics and metadata (for context)
 
 **Agent workflow (no prior knowledge required):**
 
-1. **`list_indexes`** → Discover all indexes with schemas and per-field `query_hint` (what operators work with each field type)
-2. **`describe_index`** → Deep-dive into a specific index: field definitions, types, stats, `fields` array, and `query_hints` section
+1. **`list_indexes`** → Discover all indexes: name, description, document count and field names
+2. **`describe_index`** → Deep-dive into a specific index: field definitions, types, stats, `fields` array, and the `query_hints` and `tokenizer_hints` sections
 3. **`search_index`** → Construct queries using the field names and operators learned from the schema
 4. **`validate_query`** *(optional)* → Parse a query with the same parser a search uses: whether it parses, where it fails, the form the engine will actually run, and which clauses can never match. Also "did you mean?" corrections for unknown fields, and the full syntax reference when called with no arguments
 
-Each `fields` entry from `describe_index` carries the `indexed`, `fast` and `shadow` flags that decide whether a field can be queried and sorted at all, and `query_hints` names the operators each type supports. The hints are rendered from [`src/syntax.rs`](src/syntax.rs), so they cannot disagree with the reference.
+Each `fields` entry from `describe_index` carries the `searchable`, `sortable`, `returned` and `shadow` flags that decide whether a field can be queried, sorted and projected, `query_hints` names the operators each type supports, and `tokenizer_hints` says how each tokenizer matches. The hints are rendered from [`src/syntax.rs`](src/syntax.rs), so they cannot disagree with the reference.
 
 This means an agent can go from zero knowledge to well-formed queries in **two tool calls** (`list_indexes` → `search_index`), with the schema metadata providing all the guidance needed for operator selection.
 
@@ -214,19 +215,29 @@ Retrieve schema and statistics for a single CameoDB index.
 **Parameters:**
 - `index` (string, required): Name of the CameoDB index
 
-**Returns:** Complete field definitions, types, document count, size, metadata, and a `fields` array with per-field details, plus `query_hints` section showing which operators work with each field type.
+**Returns:** Complete field definitions, types, document count, size, metadata, and a `fields` array with per-field details, plus a `query_hints` section showing which operators work with each field type and a `tokenizer_hints` section saying how each tokenizer present matches a value.
 
 `description` appears on the index and on a field only when an operator wrote one. It is the one part of a schema that says what the data is rather than how it is shaped, so prefer it over anything a field name suggests; most indexes carry none, and its absence says nothing about them. See [Create/Update Index Schema](../../docs/API_REFERENCE.md#createupdate-index-schema) for how they are set and the length limits.
 
-Two of the per-field flags are answers rather than declarations, and they are the ones to read
-before writing a query. `indexed` is what the schema says; `searchable` is whether the built index
-can actually reach the field — they differ for a field declared after the index was built, which is
-`indexed` and matches nothing. `fast` is likewise a declaration, and `sortable` is whether the built
-index carries the column a sort orders on: a numeric sort on a field that is `fast` but not
-`sortable` fails, and a text sort on one silently returns an approximate order. Sort on `sortable`
-fields; query `searchable` ones.
+Each field is described by what a query can do with it, not by what its schema declares.
+`searchable` is whether the built index can reach the field — a field declared after the index was
+built is not, and matches nothing. `sortable` is whether the built index carries the column a sort
+orders on: a numeric sort on a field that is not `sortable` fails, and a text sort on one returns
+an approximate order. `returned` is whether a hit carries the field: every hit is read from the
+document store, so every field is returned except a ghost, which is a search column only. The
+schema's own declarations — `indexed`, `stored`, `fast`, `index_record_option` — are left out:
+`stored: false` read as "hits do not carry this field" when they do, and the other two are what
+`searchable` and `sortable` answer. `GET /api/{index}/_config` still reports them, since that is
+the shape a schema is written back in. `shadow` and `default_search` are on every field, so a
+`false` is an answer rather than an omission.
 
-A field marked `shadow` is the document identifier under the name the source data gave it. The value lives only in `id` and is not stored or indexed again under that name, so the field is a name in the schema rather than data in the index — and the name is applied to `id` in both directions. It is queryable despite being unindexed (`shadow_field:VALUE` on its own is the same key-value lookup as `id:VALUE`, and inside a larger query the reference is rewritten to `id` and runs against the search index), and every hit returns the identifier under the shadow name with no `id` field, so `indexed` alone answers neither what may be queried nor what may be projected.
+`tokenizer` names the field's analyzer (a `string` field reports `raw`), and `tokenizer_hints`
+carries each one's rule once: whether case counts, whether a word finds its other forms, whether an
+unaccented word finds an accented one. `raw`'s rule is the one most worth reading — a `string`
+field matches its whole value in the case it was written, so a value in another case or a part of
+one finds nothing.
+
+A field marked `shadow` is the document identifier under the name the source data gave it. The value lives only in `id` and is not stored or indexed again under that name, so the field is a name in the schema rather than data in the index — and the name is applied to `id` in both directions. It is queryable despite being unindexed (`shadow_field:VALUE` on its own is the same key-value lookup as `id:VALUE`, and inside a larger query the reference is rewritten to `id` and runs against the search index), and every hit returns the identifier under the shadow name with no `id` field, so `searchable` alone answers neither what may be queried nor what may be projected.
 
 **Example:**
 ```json
@@ -238,48 +249,57 @@ A field marked `shadow` is the document identifier under the name the source dat
 }
 ```
 
-**Response includes `fields` and `query_hints`:**
+**Response includes `fields`, `query_hints` and `tokenizer_hints`:**
 ```json
 {
   "description": "Peer-reviewed papers, one document per paper.",
   "fields": [
     {
-      "field": "id",
+      "name": "id",
       "type": "text",
-      "indexed": true,
+      "tokenizer": "raw",
       "searchable": true,
-      "fast": false,
       "sortable": false,
-      "shadow": false
-    },
-    {
-      "field": "sha1",
-      "type": "text",
-      "indexed": false,
-      "searchable": true,
-      "fast": false,
-      "sortable": false,
-      "shadow": true
-    },
-    {
-      "field": "year",
-      "type": "i64",
-      "indexed": true,
-      "searchable": true,
-      "fast": true,
-      "sortable": true,
+      "returned": true,
       "shadow": false,
+      "default_search": false
+    },
+    {
+      "name": "venue",
+      "type": "string",
+      "tokenizer": "raw",
+      "searchable": true,
+      "sortable": false,
+      "returned": true,
+      "shadow": false,
+      "default_search": false,
+      "description": "Venue as printed: NeurIPS, ICML, ACL ..."
+    },
+    {
+      "name": "year",
+      "type": "i64",
+      "searchable": true,
+      "sortable": true,
+      "returned": true,
+      "shadow": false,
+      "default_search": false,
       "description": "Year of publication, not of submission."
     }
   ],
   "query_hints": [
     {
-      "type": "text",
-      "query_hint": "Tokenized full-text. Supports: field:term, field:\"phrase\", field:\"phrase\"~N (slop)..."
+      "type": "i64",
+      "query_hint": "Signed 64-bit integer. Supports: field:value, field:value^N, field:[low TO high] ..."
     },
     {
-      "type": "i64",
-      "query_hint": "Numeric field. Supports: field:value, field:[low TO high], field:{low TO high}..."
+      "type": "string",
+      "query_hint": "The whole value is one term, matched exactly: case, spaces and punctuation count ..."
+    }
+  ],
+  "tokenizer_hints": [
+    {
+      "tokenizer": "raw",
+      "matching": "The whole value is one term, matched exactly: case, spaces and punctuation count ..."
     }
   ]
 }
@@ -494,7 +514,8 @@ schema, and the table below, which is generated and checked against the tables b
 **Rules**
 
 - A field name containing a dot is written as it is, unescaped: `k8s.node:worker-1`. Escaping the dot makes the lookup miss.
-- A field that exists in the schema but is not indexed cannot be queried, unless it is marked `shadow`. Fields discovered from a document are added unindexed, and stay that way until a schema update promotes them, so check the `indexed` flag before naming a field.
+- A field that is not `searchable` cannot be queried, unless it is marked `shadow`. Fields discovered from a document are added unindexed, and stay that way until a schema update promotes them, so check the `searchable` flag before naming a field. Whether a hit carries a field is a separate question: every field is `returned` but a ghost.
+- Values are read from the data, not guessed from the question. A `string` field matches only its whole value as written, so a value in another case, or a part of one, finds nothing — and an empty result there more often means the value is written differently than that the data is absent. To see how a field's values are written, search for rows that hold it with `limit 5` and the field in `fields`, then copy the value; a prefix in the right case (`field:Ab*`) finds values from their start. A field's `description`, where it has one, often lists its values. For a numeric or date field, `metrics` with `limit 0` gives its lowest and highest value over the matches.
 - A field marked `shadow` is the name the source data used for its identifier. The value lives only in `id`, the key in both the key-value store and the search index, and is never stored or indexed again under the descriptive name — the schema carries the name and nothing carries a second copy of the data, which is what makes the field a shadow. Querying it is therefore querying `id`: `shadowfield:VALUE` on its own is the fastest retrieval CameoDB has, answered from the key-value store without the search index, and named inside a larger query the reference is rewritten to `id` and runs against the search index like any other clause. A trailing `*` is a prefix over the identifiers, which a short one pays for in the term dictionary the way any prefix query does. Results come back the same way round: every hit carries the identifier under the shadow name and has no `id` field, so name the shadow field in `fields` or `return` — asking for `id` there is rewritten to the shadow name and returns the identifier all the same. `describe_index` says which name that is: on such an index the `id` field carries `returned_as`, naming the shadow field the hits use in its place, and it is the only thing relating the two. Sorting by a shadow field works and orders by the identifier, which is the one thing an unindexed field can be used for beyond the key lookup: the order is approximate, as it is for any text field with no fast column, and `_approximate_sort` names the field the hits carry that order under — the shadow name, whichever of the two names you sorted by.
 - A field with a `ghost` property is a search column filled from another field, its `source`, rather than from a value of its own: from every document, or from those whose `when.field` is (`in`) or is not (`not_in`) one of the listed values — one stemmed column per language beside a text stored once, for instance. Query it like any text field; it is analysed by its own tokenizer. It is never stored, so hits do not carry it: project, sort and pivot on the source, which holds the text. A query naming an unindexed source says which ghosts search its text instead.
 - A text field whose `tokenizer` starts with `cjk` holds Chinese, Japanese or Korean. Write a word as its characters, with no spaces: `text_zh:孔子` matches only where 孔 and 子 stand together, and a single character matches wherever it stands. Spaces between the characters make each a separate clause that matches anywhere in the text. Under `cjk_fold` traditional and simplified Chinese find each other (`學習` finds `学习`), under `cjk_ja_fold` old and new kanji (`清吉` finds `淸吉`), under `cjk_ko_fold` Hanja and Hangul (`가족` finds `家族`); under `cjk` none do.
@@ -502,6 +523,31 @@ schema, and the table below, which is generated and checked against the tables b
 - Every date literal form works wherever a date value goes: alone, in a range, after a comparison, and in an `IN` set. But a date matched *alone* is an exact instant, so `created:2024-06-15` means midnight precisely and matches nothing unless a document sits on that second. A day, a month or a year is a range: `created:[2024-06-15 TO 2024-06-16}`, `created:[2024 TO 2025}`.
 - A date literal containing a space must be quoted — `created:"2024-06-15 12:00:00"` — because an unquoted value ends at the first space, and the remainder is read as a new clause: `created:2024-06-15 12:00:00` reports `12` as an unknown field. Writing the `T` avoids the question: `created:2024-06-15T12:00:00`.
 - A date outside the range Tantivy represents is clamped to the nearest bound rather than refused, on the way in and in a query: before 1677-09-21 becomes that instant, after 2262-04-11 becomes that one. So a far-future sentinel compares as though it were 2262-04-11, and `created:>9999-01-01` matches nothing rather than erroring.
+
+**Tokenizers**, how a text field's values are matched
+
+| Tokenizer | Matching |
+|---|---|
+| `raw` | The whole value is one term, matched exactly: case, spaces and punctuation count, and a word or a part of the value matches nothing. Quote a value holding a space. |
+| `whitespace` | Split at spaces only; case and punctuation are kept, so `Word,` and `word` are different terms. |
+| `default` | Words, in any case; punctuation splits them. No stemming, and diacritics are kept: `run` does not find `running`, `cafe` does not find `café`. |
+| `en_stem` | Words in any case, English stemmed: `running` finds `runs`. |
+| `de_stem` | Words in any case, German stemmed; `Groesse` does not find `Größe`. |
+| `de_stem_fold` | Words in any case, German stemmed, umlauts folded: `Groesse` and `Grosse` find `Größe`. |
+| `es_stem` | Words in any case, Spanish stemmed; accents kept, so an unaccented word misses an accented one. |
+| `es_stem_fold` | Words in any case, Spanish stemmed, accents folded: `informacion` finds `información`. |
+| `fr_stem` | Words in any case, French stemmed; accents kept, so an unaccented word misses an accented one. |
+| `fr_stem_fold` | Words in any case, French stemmed, accents folded: `situee` finds `située`. |
+| `it_stem` | Words in any case, Italian stemmed; accents kept, so an unaccented word misses an accented one. |
+| `it_stem_fold` | Words in any case, Italian stemmed, accents folded: `citta` finds `città`. |
+| `pt_stem` | Words in any case, Portuguese stemmed, plurals to the singular; accents kept, so an unaccented word misses an accented one. |
+| `pt_stem_fold` | Words in any case, Portuguese stemmed, plurals to the singular, accents folded: `decisoes` finds `decisão`. |
+| `hr_stem` | Words in any case, Croatian stemmed, Serbian Cyrillic read as Latin; diacritics kept, so `zupanija` misses `županija`. |
+| `hr_stem_fold` | Words in any case, Croatian stemmed, Serbian Cyrillic read as Latin, diacritics folded: `zupanija` finds `županije`. |
+| `cjk` | Chinese, Japanese or Korean: each character alone and paired with the next. Write a word as its characters with no spaces; no script folding. |
+| `cjk_fold` | Chinese: each character alone and paired with the next, traditional folded to simplified, so `學習` finds `学习`. Write a word with no spaces. |
+| `cjk_ja_fold` | Japanese: each character alone and paired with the next, old kanji folded to new, so `清吉` finds `淸吉`. Write a word with no spaces. |
+| `cjk_ko_fold` | Korean: each character alone and paired with the next, Hanja read as Hangul, so `가족` finds `家族`. Write a word with no spaces. |
 
 **Sorting**
 

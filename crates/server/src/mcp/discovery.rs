@@ -138,8 +138,6 @@ pub(super) fn validate_query(
                         serde_json::json!({
                             "name": info.name,
                             "type": info.field_type,
-                            "indexed": info.indexed,
-                            "fast": info.fast,
                             "sortable": info.sortable,
                             "shadow": info.is_shadow,
                             "searchable": info.searchable,

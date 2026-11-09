@@ -515,11 +515,22 @@ pub(super) fn analyze_query(query_text: &str, field_infos: &[FieldInfo]) -> Json
                 } else {
                     info.field_type.clone()
                 };
-                field_hints.push(serde_json::json!({
+                let mut entry = serde_json::json!({
                     "field": field_name,
                     "type": info.field_type,
                     "hint": key,
-                }));
+                });
+                // How the value in the query meets the field's terms — case, stemming,
+                // diacritics — which the type's hint cannot say, since it is the tokenizer's.
+                if !info.is_shadow
+                    && let Some(rule) = cameodb_mcp::syntax::tokenizer_rule(
+                        &info.field_type,
+                        info.tokenizer.as_deref(),
+                    )
+                {
+                    entry["matching"] = JsonValue::String(rule.to_string());
+                }
+                field_hints.push(entry);
                 hints
                     .entry(key)
                     .or_insert_with(|| JsonValue::String(field_query_hint(info)));
@@ -749,8 +760,7 @@ mod search_error_interception_tests {
         FieldInfo {
             name: name.to_string(),
             field_type: field_type.to_string(),
-            indexed: true,
-            fast: false,
+            tokenizer: None,
             is_shadow: false,
             searchable: true,
             sortable: false,
@@ -896,8 +906,7 @@ mod field_suggestion_tests {
         FieldInfo {
             name: name.to_string(),
             field_type: field_type.to_string(),
-            indexed: true,
-            fast: false,
+            tokenizer: None,
             is_shadow: false,
             searchable: true,
             sortable: false,
@@ -918,6 +927,41 @@ mod field_suggestion_tests {
             .into_iter()
             .map(|info| info.name.clone())
             .collect()
+    }
+
+    /// A field the query names comes back with how its values are matched: a string field
+    /// matches its whole value in its own case, which is the commonest reason a query that
+    /// parses finds nothing, and the type's operator list cannot say it.
+    #[test]
+    fn a_named_field_carries_its_matching_rule() {
+        let mut title = info("title", "text");
+        title.tokenizer = Some("en_stem".to_string());
+        let fields = vec![info("authors", "string"), title, info("year", "i64")];
+        let analysis = analyze_query(
+            "authors:\"austen, jane\" AND title:pride AND year:1813",
+            &fields,
+        );
+        let hints = analysis["field_hints"].as_array().expect("field_hints");
+        let matching = |name: &str| {
+            hints
+                .iter()
+                .find(|h| h["field"] == name)
+                .and_then(|h| h["matching"].as_str())
+                .map(str::to_string)
+        };
+        assert!(
+            matching("authors").is_some_and(|m| m.contains("case")),
+            "{analysis}"
+        );
+        assert!(
+            matching("title").is_some_and(|m| m.contains("English")),
+            "{analysis}"
+        );
+        assert_eq!(
+            matching("year"),
+            None,
+            "a number has no tokenizer: {analysis}"
+        );
     }
 
     /// A path inside a json field is not an unknown field: no "did you mean" for it, and the
@@ -1055,7 +1099,7 @@ mod field_suggestion_tests {
         // On an index with a shadow field, the shadow name is the identifier to point at.
         if let Some(digest) = fields.iter_mut().find(|f| f.name == "sample_digest") {
             digest.is_shadow = true;
-            digest.indexed = false;
+            digest.searchable = false;
         }
         let far = analyze_query("zzz_nonexistent:x", &fields);
         assert!(

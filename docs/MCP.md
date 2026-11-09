@@ -67,11 +67,14 @@ most of that:
   exist yet. `default_fields` deserves the same attention: it is the list a bare,
   unqualified term searches, which is exactly what a first-pass agent query is.
 - **Pick types for the operators you want used.** A numeric or date field sorts only with
-  its `fast` column; a `text` field is stemmed and searched loosely where a `string`
-  field answers exact keyword and set operations; `indexed: false` keeps a payload field
-  returned in hits but out of queries. `describe_index` reports each field's `type`,
-  `indexed`, `fast` and a `query_hint` naming the operators that type supports — an
-  agent builds from that, so the type chosen is the vocabulary offered.
+  its `fast` column; a `text` field is matched by word under its tokenizer, where a `string`
+  field matches its whole value in the case it is written — so a `string` field whose values
+  vary in case, or that a reader will search by one word of, is better as `text`;
+  `indexed: false` keeps a payload field returned in hits but out of queries.
+  `describe_index` reports each field's `type`, `tokenizer`, whether it is `searchable`,
+  `sortable` and `returned`, a `query_hint` per type naming its operators and a
+  `tokenizer_hint` per tokenizer saying how it matches — an agent builds from that, so the
+  type chosen is the vocabulary offered.
 
 When in doubt, `validate_query` — also exposed as a tool — reports a query's normalized
 form and the clauses it would discard before any search is run.

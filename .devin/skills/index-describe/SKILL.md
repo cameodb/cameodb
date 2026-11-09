@@ -136,7 +136,12 @@ reader can act on. It is not a list of what is wrong with it.
 
 Rules:
 - Every statement is checked against the profile or a count. Copy nothing from an old description unchecked.
-- Values exactly as stored — case and diacritics matter on `raw` fields (`RJEŠENJE`, `A` vs `a`).
+- Values exactly as stored — case and diacritics matter on `raw` fields (`RJEŠENJE`, `A` vs `a`). A reader
+  copies values from the description, so where a field's values vary in case, give them as written
+  (`Vlada Republike Hrvatske`, `PREDSJEDNICA REPUBLIKE HRVATSKE`) rather than one normalised form.
+- How a tokenizer matches (case, stemming, folding) is reported by `describe_index` in `tokenizer_hints`;
+  spend the description on what the reader cannot get there: scope, values, recipes, and where a text is
+  searched but returned in another field ("Searched only, returned in text_exact").
 - No counts that go stale with the next load: "about two thirds of acts", not "66,093". Ranges that only grow
   are written as "from 2015", not "2015–2026".
 - No history and no implementation (`nn_links.py` produced it) unless the reader needs it to trust the value.
