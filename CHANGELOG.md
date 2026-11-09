@@ -45,6 +45,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **On a cluster, a search the index cannot answer is refused, not answered as a partial page.** An
+  unsortable sort, or a query whose every clause was dropped, is decided by each node against the
+  same schema; the node that received the request answered its own refusal as an empty block, and
+  its peers' copies of it as failures inside a `200` (`stats.shards.failed` and `errors`). The
+  receiving node's refusal is now the answer — the `400` a single node gives — on both the plain and
+  the streamed cluster merge.
 - **An index's document count could stay at its pre-commit value for an hour.** `/_indexes`
   serves counts and sizes from a per-shard cache kept up to an hour. A write batch dropped the
   entry, but before the commit that made the batch searchable, so a request in between measured

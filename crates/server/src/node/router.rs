@@ -1005,6 +1005,11 @@ impl RouterActor {
                     push_hits(&mut val, &mut blocks, &mut stats)
                 }
                 Err(e) if holds_no_such_index(&e) => absent += 1,
+                // Every node runs the same refusals against the same schema — an unsortable sort, a
+                // query with nothing left — so this node's is the
+                // cluster's answer, as it would be on one node. Merged, it became a 200 with the
+                // peers' copies of it as failures.
+                Err(e) if is_caller_error(&e) => return Err(e),
                 Err(e) => {
                     error_count += 1;
                     warn!(error = %e, "Broadcast: local search failed");
@@ -1423,6 +1428,10 @@ impl RouterActor {
                         unique_shard_ids.insert(Uuid::nil());
                         nodes_contacted += 1;
                     }
+                    // A refusal is the cluster's answer, as in `handle_broadcast`: every node runs it
+                    // against the same schema. Taken as an empty block it vanished, and the peers'
+                    // copies of it arrived as errors inside a 200.
+                    Err(e) if is_caller_error(&e) => return Err(e),
                     Err(e) => {
                         if holds_no_such_index(&e) {
                             absent += 1;
