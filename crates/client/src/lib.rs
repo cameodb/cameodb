@@ -3,6 +3,6 @@ pub mod sdk;
 
 pub use cli::run_cli;
 pub use sdk::{
-    CameoClient, ClientAuth, Credential, DeleteByQueryOptions, HttpFailure, TlsTrust,
-    failure_status,
+    CameoClient, ClientAuth, Credential, DeleteByQueryOptions, HttpFailure, SearchRequest,
+    TlsTrust, failure_status,
 };

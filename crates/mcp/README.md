@@ -512,6 +512,13 @@ schema, and the table below, which is generated and checked against the tables b
 - Under a numeric or date sort every hit carries `_score` of 1.0, because no relevance score is computed. Do not read it as a ranking.
 - Ascending unless `desc` is given.
 
+**Min and max**
+
+- `metrics: {"min": [fields], "max": [fields]}` on `search_index` answers the lowest and highest value of each field over every document the query matches — not just the page — as `metrics` beside `total_hits`. With `limit: 0` it is the count and the range alone.
+- It applies to i64, u64, f64 and date fields with a fast column: the numeric and date fields `describe_index` reports `sortable`. Any other field, text and string included, is refused with `cannot take the min or max of 'FIELD'` and the reason, before any shard runs.
+- An integer comes back exact at any size, and a date as RFC 3339 in UTC. An array field counts every element. A field no matching document holds is `null`, which is not 0.
+- `search_across_indexes` does not take it: its rows come from different indexes.
+
 Reserved characters, which must be escaped with a backslash to be matched literally: + ^ ` : { } " ' [ ] ( ) ! \ * and space
 
 <!-- END GENERATED SYNTAX -->

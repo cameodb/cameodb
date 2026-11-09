@@ -43,6 +43,9 @@ pub struct SearchOptions<'a> {
     /// The query whose matching elements a cut array leads with — see
     /// [`fetch_documents`](HybridStore::fetch_documents). `None` cuts every array to its head.
     pub match_query: Option<&'a str>,
+    /// Fields whose lowest and highest value over the matching documents the answer carries —
+    /// see [`crate::MetricsSpec`]. `None` measures nothing.
+    pub metrics: Option<&'a crate::MetricsSpec>,
 }
 
 /// For each array of `doc` the cap will cut and `matcher` tests, the positions it matched.
@@ -581,6 +584,22 @@ impl HybridStore {
     /// `opts.fields` is answered by the fetch phase, not this one: a key has no fields
     /// to trim.
     pub fn search_keys(
+        &self,
+        index: &str,
+        query: &str,
+        limit: usize,
+        sort: Option<&SortSpec>,
+        opts: &SearchOptions<'_>,
+    ) -> Result<KeyOutcome, StoreError> {
+        let mut outcome = self.search_keys_unmeasured(index, query, limit, sort, opts)?;
+        if let Some(spec) = opts.metrics {
+            outcome.metrics = Some(self.measure(index, query, spec, opts.deadline.as_ref())?);
+        }
+        Ok(outcome)
+    }
+
+    /// [`search_keys`](Self::search_keys) without the metrics: the page of keys and the count.
+    fn search_keys_unmeasured(
         &self,
         index: &str,
         query: &str,
@@ -1342,7 +1361,49 @@ impl HybridStore {
             narrowed_default_fields,
             emptied,
             timings,
+            metrics: None,
         })
+    }
+
+    /// The extremes `spec` asks for over the documents `query` matches (ROADMAP K1).
+    ///
+    /// Parsed exactly as the key phase parses it — the same discarded clauses, and the same rule
+    /// that a query with nothing left of it matches nothing — so the extremes are over the
+    /// documents the count counted, under the same deadline. An index with no commit yet holds
+    /// no document: every field asked for has no value.
+    fn measure(
+        &self,
+        index: &str,
+        query: &str,
+        spec: &MetricsSpec,
+        deadline: Option<&SearchDeadline>,
+    ) -> Result<FieldMetrics, StoreError> {
+        let Some((reader, fields)) = self.get_reader(index)? else {
+            return Ok(FieldMetrics::nothing(spec));
+        };
+        let searcher = reader.searcher();
+        let tantivy_index = searcher.index();
+        let collector = crate::metrics::MetricsCollector::new(&tantivy_index.schema(), spec)?;
+        let schema = self
+            .get_schema_cached(index)?
+            .unwrap_or_else(|| Arc::new(IndexSchema::default()));
+
+        let prepared =
+            prepare_query_parser(tantivy_index, &fields, &schema, query, &self.config.query)?;
+        let (parsed_query, parse_errors, range_notes) = prepared.parse();
+        let mut discarded = describe_discarded_all(&parse_errors, query, &schema);
+        discarded.extend(prepared.notes.iter().cloned());
+        discarded.extend(range_notes);
+        let emptied =
+            !discarded.is_empty() && nothing_survived(parsed_query.as_ref(), &parse_errors);
+        let parsed_query: Box<dyn tantivy::query::Query> = if emptied {
+            Box::new(tantivy::query::EmptyQuery)
+        } else {
+            parsed_query
+        };
+        let parsed_query = with_deadline(parsed_query, deadline);
+        let extremes = deadline_or(searcher.search(&parsed_query, &collector), deadline)?;
+        Ok(collector.metrics_from(extremes))
     }
 
     /// The second phase of [`search_documents_with`]: the documents behind a list of

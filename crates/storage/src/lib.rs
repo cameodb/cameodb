@@ -38,6 +38,7 @@ mod delete_query;
 mod directory;
 mod matched;
 mod merge;
+mod metrics;
 mod projection;
 mod query;
 mod schema;
@@ -54,6 +55,7 @@ mod tests;
 pub use deadline::{DeadlineQuery, SearchDeadline};
 pub use delete_query::DeleteMatches;
 pub use merge::MergeStarted;
+pub use metrics::{FieldMetrics, MetricValue, MetricsSpec, merge_metrics_json};
 pub use projection::{
     MATCHED_ELEMENTS_FIELD, MATCHED_POSITIONS_WITHOUT_ELEMENTS, TRUNCATED_ARRAYS_FIELD,
     apply_field_projection, cap_document_arrays, cap_document_arrays_leading,
@@ -379,6 +381,9 @@ pub struct KeyOutcome {
     /// Where the key phase spent its time. Fetch and build stay zero unless the
     /// approximate sort path fetched candidate documents to order them.
     pub timings: SearchTimings,
+    /// The extremes asked for with [`SearchOptions::metrics`], over the same matching documents;
+    /// `None` when none were asked for.
+    pub metrics: Option<FieldMetrics>,
 }
 
 /// What `fetch_documents` answers: the documents behind a list of document keys, in

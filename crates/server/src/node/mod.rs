@@ -442,6 +442,13 @@ pub enum OrchestratorError {
     #[error("cannot sort by '{field}': {reason}")]
     UnsortableField { field: String, reason: String },
 
+    /// A min or max on a field the engine cannot measure: one the index lacks, one with no fast
+    /// column, or one whose type has no order (ROADMAP K1). Refused before any shard is asked,
+    /// for the reason [`Self::UnsortableField`] is — and because a fast text column answers a
+    /// metric with a null that reads as "no data" rather than failing.
+    #[error("cannot take the min or max of '{field}': {reason}")]
+    UnmeasurableField { field: String, reason: String },
+
     /// Every clause was discarded, so the query that reached the engine was empty.
     ///
     /// A 400 for the reason [`Self::UnsortableField`] is one: the engine cannot run what was
@@ -702,6 +709,7 @@ impl OrchestratorError {
             Self::SchemaBeingMinted { .. } => RemoteVerdict::Minting,
 
             Self::UnsortableField { .. }
+            | Self::UnmeasurableField { .. }
             | Self::UnrunnableQuery { .. }
             | Self::SearchDeadlineExceeded { .. } => RemoteVerdict::BadRequest,
 
@@ -974,6 +982,9 @@ impl From<OrchestratorError> for RemoteError {
             OrchestratorError::UnsortableField { field, reason } => {
                 RemoteError::InvalidInput(format!("cannot sort by '{field}': {reason}"))
             }
+            OrchestratorError::UnmeasurableField { field, reason } => RemoteError::InvalidInput(
+                format!("cannot take the min or max of '{field}': {reason}"),
+            ),
             OrchestratorError::UnrunnableQuery { notes } => RemoteError::InvalidInput(format!(
                 "no clause of this query can run against this index: {notes}"
             )),
@@ -1127,6 +1138,10 @@ pub struct SearchKeysRequest {
     pub query: String,
     pub limit: Option<usize>,
     pub sort: Option<SortSpec>,
+    /// Fields whose extremes over the matches the reply carries (ROADMAP K1). A shard on a
+    /// build that predates the field ignores it and answers without them.
+    #[serde(default)]
+    pub metrics: Option<storage::MetricsSpec>,
 }
 
 /// What a shard's key phase answered: the matches as keys, plus the same
@@ -1151,6 +1166,9 @@ pub struct SearchKeysReply {
     /// Where the key phase spent its time; see [`SearchReply::timings`].
     #[serde(default)]
     pub timings: storage::SearchTimings,
+    /// The extremes the request asked for, over this shard's matches; `None` when none were.
+    #[serde(default)]
+    pub metrics: Option<storage::FieldMetrics>,
 }
 
 /// Phase 2 of a two-phase search: the documents behind a set of keys, in key order.
@@ -1216,6 +1234,11 @@ pub enum ClientOp {
         /// peer on a build that predates the field: every array's head, as before.
         #[serde(default)]
         match_elements: bool,
+        /// Fields whose lowest and highest value over the matching documents the answer carries
+        /// as `metrics` (ROADMAP K). `None` from a peer on a build that predates the field: no
+        /// metrics, and nothing else changes.
+        #[serde(default)]
+        metrics: Option<storage::MetricsSpec>,
     },
     /// The search an earlier build sent for a streamed request: the first `limit` hits, no
     /// offset. Never built here — the stream route builds a `Search` — and kept on the wire only
@@ -1476,6 +1499,7 @@ impl ClientOp {
                 sort,
                 array_limit: None,
                 match_elements: false,
+                metrics: None,
             },
             other => other,
         }

@@ -136,6 +136,9 @@ pub(crate) struct SearchIndexArgs {
     /// single index is done some other way".
     #[serde(default)]
     pub(crate) sort: Option<SortSpec>,
+    /// Fields whose lowest and highest value over the matches the answer carries as `metrics`.
+    #[serde(default)]
+    pub(crate) metrics: Option<crate::backend::McpMetrics>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -214,6 +217,26 @@ fn sort_schema() -> JsonValue {
     })
 }
 
+/// The `metrics` property of `search_index`: the extremes of fields over everything matched.
+fn metrics_schema() -> JsonValue {
+    let list = |side: &str| {
+        json!({
+            "type": "array",
+            "items": { "type": "string" },
+            "description": format!("Fields whose {side} value over every matching document to return.")
+        })
+    };
+    json!({
+        "type": "object",
+        "description": "The lowest and highest value of fields over every document the query matches — not just the page — returned as `metrics: {\"min\": {field: value}, \"max\": {field: value}}`. Combine with `limit: 0` for the range alone. Exact for i64, u64 and f64; a date comes back as RFC 3339. Applies to numeric and date fields that `describe_index` reports `sortable`; any other field is refused with a 400 naming it. A field no matching document holds is null, which is not 0.",
+        "properties": {
+            "min": list("lowest"),
+            "max": list("highest")
+        },
+        "additionalProperties": false
+    })
+}
+
 /// The `array` property both search schemas carry, bounded by the host's maximum.
 fn array_schema(max_array_limit: usize) -> JsonValue {
     json!({
@@ -273,7 +296,8 @@ pub(crate) fn search_index_input_schema(limits: ToolLimits) -> JsonValue {
             },
             "array": array_schema(max_array_limit),
             "matches": matches_schema(),
-            "sort": sort_schema()
+            "sort": sort_schema(),
+            "metrics": metrics_schema()
         },
         "required": ["index", "query"],
         "additionalProperties": false

@@ -264,6 +264,10 @@ pub(super) fn search_index(
                     sort: final_sort,
                     array_limit: Some(array_limit),
                     match_elements,
+                    metrics: index.metrics.map(|asked| storage::MetricsSpec {
+                        min: asked.min,
+                        max: asked.max,
+                    }),
                 },
                 None,
                 OperationType::Read,
@@ -367,6 +371,7 @@ pub(super) fn search_across_indexes(
                     index,
                     fields,
                     sort,
+                    metrics: _,
                 } = index_request;
                 let index_name = index.clone();
                 let state = state.clone();
@@ -401,6 +406,7 @@ pub(super) fn search_across_indexes(
                                 sort: storage_sort,
                                 array_limit: Some(array_limit),
                                 match_elements,
+                                metrics: None,
                             },
                             None,
                             OperationType::Read,

@@ -325,6 +325,44 @@ curl -s -X POST http://localhost:9480/api/books/search \
 > }
 > ```
 
+> **Min and max (`metrics`):** name fields in `"metrics": {"min": [...], "max": [...]}` and the
+> response carries `metrics` with the lowest and highest value of each over **every** document the
+> query matches — not only the page. With `"limit": 0` that is the count and the range alone; with a
+> real limit the page comes with it. On a cluster the nodes' answers are merged, and the streamed
+> route carries `metrics` in its footer.
+>
+> ```bash
+> curl -s -X POST http://localhost:9480/api/books/search \
+>   -H "Content-Type: application/json" \
+>   -d '{"query": "genre:scifi", "limit": 0,
+>        "metrics": {"min": ["publication_year", "added"], "max": ["publication_year", "price"]}}'
+> ```
+>
+> ```json
+> {
+>   "hits": [],
+>   "total_hits": 42,
+>   "metrics": {
+>     "min": {"publication_year": 1951, "added": "2024-02-11T09:30:00Z"},
+>     "max": {"publication_year": 2025, "price": 39.99}
+>   }
+> }
+> ```
+>
+> - **Which fields:** `i64`, `u64`, `f64` and `date` fields with a fast column — the numeric and
+>   date fields `describe_index` reports `sortable`. Any other field, text and string included, is
+>   refused with `400` and `cannot take the min or max of 'FIELD'`, before any shard runs: a text
+>   column would answer with a null that reads as "no data".
+> - **Exact:** an integer comes back exactly at any size (it is read from the column in its own
+>   type, not through a floating-point value), and a date as RFC 3339 in UTC.
+> - **Arrays** count every element. A field that no matching document holds is `null`, which is not
+>   `0`; so is every field when nothing matched.
+> - **Partial answers say so:** a shard or node that did not answer is counted in
+>   `stats.shards.failed`, as for the hits, so a range over fewer shards than the index has is never
+>   silently narrowed.
+> - The query is the search's own: clauses dropped from it are dropped from the metrics too, and
+>   reported once in `_discarded_clauses`.
+
 **Response:**
 ```json
 {

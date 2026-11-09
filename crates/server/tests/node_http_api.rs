@@ -2205,6 +2205,112 @@ async fn a_sort_on_a_field_the_index_cannot_order_by_is_refused() {
     }
 }
 
+/// A search answers the lowest and highest value of a field over what it matched (ROADMAP K):
+/// merged across the node's shards, alone with `limit: 0` or beside a page, absent unless asked,
+/// and refused — not answered null — for a field with no order or no column.
+#[tokio::test]
+async fn a_search_answers_the_min_and_max_of_what_it_matched() {
+    let node = TestNode::start("").await;
+    let client = node.client();
+    let docs: Vec<serde_json::Value> = (0..10)
+        .map(|n| {
+            let id = format!("m{n}");
+            json!({"id": id, "doc": {
+                "rank": n as i64 - 4,
+                "price": n as f64 * 1.5,
+                "seen": format!("2026-01-{:02}T00:00:00Z", n + 1),
+                "body": if n % 2 == 0 { "page" } else { "other" },
+                "flag": n % 3 == 0,
+            }})
+        })
+        .collect();
+    client
+        .bulk_index("measured", &docs)
+        .await
+        .expect("bulk write");
+    client.admin_index_commit("measured").await.expect("commit");
+
+    let metrics = json!({"min": ["rank", "seen"], "max": ["rank", "price", "seen"]});
+    let (status, body) = post_json(
+        &node,
+        "/api/measured/search",
+        json!({"query": "body:page", "limit": 0, "metrics": metrics}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["total_hits"], 5, "{body}");
+    assert_eq!(body["hits"], json!([]));
+    assert_eq!(
+        body["metrics"],
+        json!({
+            "min": {"rank": -4, "seen": "2026-01-01T00:00:00Z"},
+            "max": {"rank": 4, "price": 12.0, "seen": "2026-01-09T00:00:00Z"},
+        }),
+        "the even documents only, from both shards: {body}"
+    );
+
+    let (status, page) = post_json(
+        &node,
+        "/api/measured/search",
+        json!({"query": "body:page", "limit": 2, "metrics": metrics}),
+    )
+    .await;
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(page["hits"].as_array().map(Vec::len), Some(2));
+    assert_eq!(
+        page["metrics"], body["metrics"],
+        "a page carries the same metrics"
+    );
+
+    let (_, nothing) = post_json(
+        &node,
+        "/api/measured/search",
+        json!({"query": "body:absent", "limit": 0, "metrics": {"min": ["rank"]}}),
+    )
+    .await;
+    assert_eq!(
+        nothing["metrics"],
+        json!({"min": {"rank": null}}),
+        "{nothing}"
+    );
+
+    let (_, plain) = post_json(&node, "/api/measured/search", json!({"query": "body:page"})).await;
+    assert!(plain.get("metrics").is_none(), "{plain}");
+
+    for field in ["body", "flag", "id", "no_such_field"] {
+        let (status, refused) = post_json(
+            &node,
+            "/api/measured/search",
+            json!({"query": "*", "limit": 0, "metrics": {"max": [field]}}),
+        )
+        .await;
+        assert_eq!(status, 400, "a max of '{field}' is refused: {refused}");
+        assert!(
+            refused["details"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(field),
+            "the refusal names the field: {refused}"
+        );
+    }
+
+    // The streamed answer carries them in its footer, with the count.
+    with_tls_provider();
+    let streamed = reqwest::Client::new()
+        .post(format!("{}/api/measured/search/stream", node.url))
+        .json(&json!({"query": "body:page", "limit": 3, "metrics": metrics}))
+        .send()
+        .await
+        .expect("request")
+        .text()
+        .await
+        .expect("body");
+    let footer: serde_json::Value =
+        serde_json::from_str(streamed.lines().last().expect("a footer line")).expect("footer json");
+    assert_eq!(footer["_footer"], true, "{streamed}");
+    assert_eq!(footer["metrics"], body["metrics"], "{streamed}");
+}
+
 /// A shadow field sorts, and sorts identically to `id`.
 ///
 /// A shadow field is the document key under the source's own name — the query path already maps

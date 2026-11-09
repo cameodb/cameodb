@@ -152,6 +152,7 @@ where
                         index: args.index,
                         fields: args.fields,
                         sort: args.sort,
+                        metrics: args.metrics,
                     },
                     args.query,
                     McpSearchBounds {

@@ -413,6 +413,19 @@ pub const SORT_RULES: &[&str] = &[
     "Ascending unless `desc` is given.",
 ];
 
+/// How `metrics` — the min and max of fields over a search's matches — behaves (ROADMAP K).
+pub const METRIC_RULES: &[&str] = &[
+    "`metrics: {\"min\": [fields], \"max\": [fields]}` on `search_index` answers the lowest and \
+     highest value of each field over every document the query matches — not just the page — as \
+     `metrics` beside `total_hits`. With `limit: 0` it is the count and the range alone.",
+    "It applies to i64, u64, f64 and date fields with a fast column: the numeric and date fields \
+     `describe_index` reports `sortable`. Any other field, text and string included, is refused \
+     with `cannot take the min or max of 'FIELD'` and the reason, before any shard runs.",
+    "An integer comes back exact at any size, and a date as RFC 3339 in UTC. An array field counts \
+     every element. A field no matching document holds is `null`, which is not 0.",
+    "`search_across_indexes` does not take it: its rows come from different indexes.",
+];
+
 /// Inline modifiers CameoDB accepts after the query itself.
 pub const INLINE_MODIFIERS: &[(&str, &str, &str)] = &[
     (
@@ -593,6 +606,7 @@ pub fn reference_json() -> JsonValue {
         "inline_modifiers": inline,
         "inline_modifier_rules": MODIFIER_RULES,
         "sorting": SORT_RULES,
+        "metrics": METRIC_RULES,
         "rules": RULES,
         "reserved_characters": RESERVED_CHARACTERS,
     })
@@ -631,6 +645,8 @@ pub fn compact_reference() -> String {
          on its own is the key-value fast path, inside a larger query it is rewritten to `id`, \
          and results carry it in place of `id`.\n  \
          Sorting a text or string field is approximate, and sets every `_score` to 1.0.\n  \
+         `metrics` gives the min and max of numeric and date fields over every match, not the \
+         page; any other field is refused, and a field no match holds is null, not 0.\n  \
          A modifier is searched for as text unless its whole run parses, so give a field list its \
          commas and a sort an `asc` or `desc`.\n",
     );
@@ -678,6 +694,10 @@ pub fn markdown_reference() -> String {
     }
     out.push_str("\n**Sorting**\n\n");
     for rule in SORT_RULES {
+        out.push_str(&format!("- {rule}\n"));
+    }
+    out.push_str("\n**Min and max**\n\n");
+    for rule in METRIC_RULES {
         out.push_str(&format!("- {rule}\n"));
     }
     out.push_str(&format!(

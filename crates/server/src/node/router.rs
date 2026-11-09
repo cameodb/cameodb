@@ -131,6 +131,7 @@ pub(super) fn widen_broadcast_op(op: ClientOp, window: SearchWindow) -> ClientOp
             sort,
             array_limit,
             match_elements,
+            metrics,
             ..
         } => ClientOp::Search {
             index,
@@ -141,6 +142,7 @@ pub(super) fn widen_broadcast_op(op: ClientOp, window: SearchWindow) -> ClientOp
             sort,
             array_limit,
             match_elements,
+            metrics,
         },
         other => other,
     }
@@ -209,6 +211,12 @@ pub(super) fn push_hits(
         .narrowed_default_fields
         .take()
         .or_else(|| collect_narrowed_default_fields(std::slice::from_ref(value)));
+    if let Some(metrics) = value.get("metrics") {
+        match stats.metrics.as_mut() {
+            Some(merged) => storage::merge_metrics_json(merged, metrics),
+            None => stats.metrics = Some(metrics.clone()),
+        }
+    }
     stats.nodes_contacted += 1;
     if let Some(t) = value.get("took_ms").and_then(|v| v.as_u64()) {
         stats.max_took_ms = match stats.max_took_ms {
@@ -992,6 +1000,7 @@ impl RouterActor {
                 discarded: Vec::new(),
                 approximate_sort: None,
                 narrowed_default_fields: None,
+                metrics: None,
             };
 
             // The local node is rank 0, then each peer in the order it was dispatched to.
@@ -1006,7 +1015,7 @@ impl RouterActor {
                 }
                 Err(e) if holds_no_such_index(&e) => absent += 1,
                 // Every node runs the same refusals against the same schema — an unsortable sort, a
-                // query with nothing left — so this node's is the
+                // metric with no column, a query with nothing left — so this node's is the
                 // cluster's answer, as it would be on one node. Merged, it became a 200 with the
                 // peers' copies of it as failures.
                 Err(e) if is_caller_error(&e) => return Err(e),
@@ -1069,6 +1078,9 @@ impl RouterActor {
             attach_discarded(&mut response, stats.discarded);
             attach_approximate_sort(&mut response, stats.approximate_sort);
             attach_narrowed_default_fields(&mut response, stats.narrowed_default_fields);
+            if let Some(metrics) = stats.metrics {
+                response["metrics"] = metrics;
+            }
             if attach_searched_schema(&mut response, &searched) {
                 self.schemas_diverged(index, &searched);
             }
@@ -1409,6 +1421,17 @@ impl RouterActor {
                 let mut errors = Vec::new();
                 let sources = 1 + remote.len();
                 let mut absent = 0usize;
+                // Lowest low, highest high across the sources that answered (ROADMAP K2). A source that
+                // failed is in `errors`, so a metric over fewer nodes than the cluster has says so.
+                let mut metrics: Option<JsonValue> = None;
+                let mut take_metrics = |val: &JsonValue| {
+                    if let Some(theirs) = val.get("metrics") {
+                        match metrics.as_mut() {
+                            Some(merged) => storage::merge_metrics_json(merged, theirs),
+                            None => metrics = Some(theirs.clone()),
+                        }
+                    }
+                };
 
                 match local {
                     Ok(mut val) => {
@@ -1422,6 +1445,7 @@ impl RouterActor {
                         // Counted from the result, not from its hits — a shard that matched
                         // nothing still answered, and reading the id back out of each
                         // document missed that as well as costing a copy of it per hit.
+                        take_metrics(&val);
                         if let Some(total) = val.get("total_hits").and_then(|t| t.as_u64()) {
                             total_hits_sum += total as usize;
                         }
@@ -1459,6 +1483,7 @@ impl RouterActor {
                                 let block: Vec<JsonValue> = std::mem::take(hits);
                                 blocks.push(((1, node_id), block));
                             }
+                            take_metrics(&val);
                             if let Some(total) = val.get("total_hits").and_then(|t| t.as_u64()) {
                                 total_hits_sum += total as usize;
                             }
@@ -1527,6 +1552,9 @@ impl RouterActor {
                         }
                     },
                 });
+                if let Some(metrics) = metrics {
+                    response["metrics"] = metrics;
+                }
                 attach_shard_errors(&mut response, errors);
                 if attach_searched_schema(&mut response, &searched) {
                     self.schemas_diverged(&index, &searched);

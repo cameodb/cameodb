@@ -598,6 +598,7 @@ fn a_search_without_an_array_limit_reads_as_whole_arrays_and_one_with_it_keeps_i
         sort: None,
         array_limit: Some(7),
         match_elements: true,
+        metrics: None,
     };
     let widened = super::router::widen_broadcast_op(
         op,
@@ -2802,6 +2803,7 @@ fn a_fan_out_reads_the_page_off_the_operation() {
         sort: None,
         array_limit: None,
         match_elements: false,
+        metrics: None,
     };
 
     assert_eq!(
@@ -4056,6 +4058,7 @@ fn only_what_a_worker_can_serve_leaves_the_mailbox() {
             sort: None,
             array_limit: None,
             match_elements: false,
+            metrics: None,
         },
         // Asks the peers when the schema is not held here; see
         // `a_config_this_node_does_not_hold_is_asked_of_its_peers`.
@@ -4271,4 +4274,103 @@ fn a_missing_index_is_told_apart_from_a_failure_across_the_wire() {
     assert!(!holds_no_such_index(&OrchestratorError::PeerUnreachable {
         message: "gone".to_string()
     }));
+}
+
+/// A min or max is refused before any shard runs for every field a shard would refuse, and for
+/// the text and string fields a sort would approximate instead (ROADMAP K1): their fast column
+/// answers a metric with a null that reads as "no data".
+#[test]
+fn a_metric_the_engine_cannot_answer_is_refused_before_any_shard_runs() {
+    let mut schema = IndexSchema::default();
+    for (name, field_type, fast) in [
+        ("rank", TantivyFieldType::I64, None),
+        ("seen", TantivyFieldType::Date, None),
+        ("slow", TantivyFieldType::I64, Some(false)),
+        ("title", TantivyFieldType::Text, None),
+        ("status", TantivyFieldType::String, Some(true)),
+        ("addr", TantivyFieldType::Ip, Some(true)),
+    ] {
+        let mut def = FieldDef::new(name.to_string(), field_type);
+        def.fast = fast;
+        schema.fields.insert(name.to_string(), def);
+    }
+    let mut ghost = FieldDef::new("rank_copy".to_string(), TantivyFieldType::I64);
+    ghost.ghost = Some(storage::Ghost {
+        source: "rank".to_string(),
+        when: None,
+    });
+    schema.fields.insert("rank_copy".to_string(), ghost);
+
+    let refusal = |field: &str| {
+        unmeasurable_metric_field(
+            &schema,
+            Some(&storage::MetricsSpec {
+                min: vec!["rank".to_string()],
+                max: vec![field.to_string()],
+            }),
+        )
+    };
+    assert!(refusal("rank").is_none());
+    assert!(refusal("seen").is_none());
+    for (field, says) in [
+        ("slow", "declared fast"),
+        ("title", "no min or max"),
+        ("status", "no min or max"),
+        ("addr", "no min or max"),
+        ("rank_copy", "ghost"),
+        ("id", "document key"),
+        ("missing", "no column of that name"),
+    ] {
+        let Some(OrchestratorError::UnmeasurableField {
+            field: named,
+            reason,
+        }) = refusal(field)
+        else {
+            panic!("'{field}' must be refused");
+        };
+        assert_eq!(named, field);
+        assert!(reason.contains(says), "'{field}': {reason}");
+    }
+    assert!(
+        unmeasurable_metric_field(
+            &IndexSchema::default(),
+            Some(&storage::MetricsSpec::default())
+        )
+        .is_none(),
+        "an index whose schema is not known yet is left to its shards"
+    );
+}
+
+/// Each node's `metrics` fold into one answer as the broadcast merge takes its sources in
+/// (ROADMAP K2): lowest low, highest high, a node that matched nothing changing neither.
+#[test]
+fn a_broadcast_merges_each_nodes_metrics_into_one() {
+    let mut stats = BroadcastStats {
+        total_shards_queried: 0,
+        nodes_contacted: 0,
+        max_took_ms: None,
+        total_hits_sum: 0,
+        discarded: Vec::new(),
+        approximate_sort: None,
+        narrowed_default_fields: None,
+        metrics: None,
+    };
+    let mut blocks = Vec::new();
+    for mut answer in [
+        json!({"hits": [], "total_hits": 3,
+               "metrics": {"min": {"rank": 4}, "max": {"seen": "2026-01-02T00:00:00Z"}}}),
+        json!({"hits": [], "total_hits": 0,
+               "metrics": {"min": {"rank": null}, "max": {"seen": null}}}),
+        json!({"hits": [], "total_hits": 2,
+               "metrics": {"min": {"rank": -7}, "max": {"seen": "2026-03-01T00:00:00Z"}}}),
+        // A node on a build without metrics answers without the key.
+        json!({"hits": [], "total_hits": 1}),
+    ] {
+        super::router::push_hits(&mut answer, &mut blocks, &mut stats);
+    }
+    assert_eq!(stats.total_hits_sum, 6);
+    assert_eq!(
+        stats.metrics,
+        Some(json!({"min": {"rank": -7}, "max": {"seen": "2026-03-01T00:00:00Z"}}))
+    );
 }

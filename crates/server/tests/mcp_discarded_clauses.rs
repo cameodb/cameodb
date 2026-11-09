@@ -463,3 +463,52 @@ async fn validate_query_works_on_a_declared_index_with_no_documents() {
     let body: Value = serde_json::from_str(&text).expect("structured result");
     assert_eq!(body["query_analysis"]["parses"], json!(true));
 }
+
+/// `search_index` takes `metrics` and answers the min and max of what matched (ROADMAP K3), and a
+/// field with no order is refused to the agent rather than answered with a null.
+#[tokio::test]
+async fn search_index_answers_metrics_and_refuses_a_field_with_no_order() {
+    let node = TestNode::start().await;
+    for (id, year) in [("y1", 1999), ("y2", 2024)] {
+        let status = http()
+            .put(format!("{}/api/years/document", node.url))
+            .json(&json!({"id": id, "doc": {"title": "rust", "year": year}}))
+            .send()
+            .await
+            .expect("write")
+            .status();
+        assert!(status.is_success(), "seeding {id} failed: {status}");
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while node.http_search("years", "title:rust").await.1["total_hits"].as_u64() != Some(2) {
+        assert!(
+            Instant::now() < deadline,
+            "the documents never became searchable"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let (is_error, text) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "years", "query": "title:rust", "limit": 0,
+                   "metrics": {"min": ["year"], "max": ["year"]}}),
+        )
+        .await;
+    assert!(!is_error, "{text}");
+    let answer: Value = serde_json::from_str(&text).expect("json result");
+    assert_eq!(
+        answer["metrics"],
+        json!({"min": {"year": 1999}, "max": {"year": 2024}}),
+        "{text}"
+    );
+
+    let (is_error, text) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "years", "query": "*", "metrics": {"max": ["title"]}}),
+        )
+        .await;
+    assert!(is_error, "a max of a text field must be refused: {text}");
+    assert!(text.contains("min or max of 'title'"), "{text}");
+}

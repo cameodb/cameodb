@@ -42,6 +42,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Reclaiming deleted documents`. Default `0`, off: a node that does not set it merges exactly as
   before. `--reclaim-deleted-ratio` / `CAMEODB_RECLAIM_DELETED_RATIO`. The documents themselves, in
   redb, are still returned by `cameodb compact`.
+- **Min and max: `"metrics": {"min": [...], "max": [...]}` on a search.** The lowest and highest
+  value of `i64`, `u64`, `f64` and `date` fields over every document the query matches — not only
+  the page — returned as `metrics` beside `total_hits`; with `"limit": 0`, the count and the range
+  alone. Read from each field's fast column in its own type, so an integer is exact at any size
+  (Tantivy's aggregation API, which answers in `f64`, would have returned 2⁵³ + 1 as 2⁵³) and a date
+  comes back as RFC 3339. An array counts every element; a field no matching document holds is
+  `null`, not `0`. Merged across shards and nodes, carried in the streamed search's footer, taken by
+  MCP `search_index` as `metrics`, by the SDK's new `search_request` and by `cameodb client search
+  --min FIELD --max FIELD`. Any other field — text and string included, whose column would answer a
+  null that reads as "no data" — is refused with `400` before any shard runs.
 
 ### Fixed
 

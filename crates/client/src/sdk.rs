@@ -261,6 +261,26 @@ pub struct DeleteByQueryOptions {
     pub refresh: bool,
 }
 
+/// One search with every option named; see [`CameoClient::search_request`]. An option left `None` is
+/// not sent, and the node applies its own default.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SearchRequest {
+    pub query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    /// Hits to skip before the first one returned: the page, where `limit` is its size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort: Option<storage::SortSpec>,
+    /// The lowest and highest value of fields over every matching document, answered as
+    /// `metrics`; with `limit: Some(0)`, the count and the range alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<storage::MetricsSpec>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CameoClient {
     base_url: Url,
@@ -435,15 +455,25 @@ impl CameoClient {
         fields: Option<Vec<String>>,
         sort: Option<storage::SortSpec>,
     ) -> Result<JsonValue> {
+        self.search_request(
+            index,
+            &SearchRequest {
+                query: query.to_string(),
+                limit,
+                offset,
+                fields,
+                sort,
+                metrics: None,
+            },
+        )
+        .await
+    }
+
+    /// Run a search described in full: [`search`](Self::search)'s options, and the ones it does not
+    /// take positionally — `metrics`, the min and max of fields over every match.
+    pub async fn search_request(&self, index: &str, request: &SearchRequest) -> Result<JsonValue> {
         let url = self.base_url.join(&format!("api/{}/search", index))?;
-        let body = serde_json::json!({
-            "query": query,
-            "limit": limit,
-            "offset": offset,
-            "fields": fields,
-            "sort": sort,
-        });
-        self.send_json(self.http.post(url).json(&body), "Search")
+        self.send_json(self.http.post(url).json(request), "Search")
             .await
     }
 

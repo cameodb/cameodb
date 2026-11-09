@@ -20,7 +20,7 @@ pub(crate) use shell::*;
 
 use crate::sdk::{
     CameoClient, ClientAuth, Credential, DeleteByQueryOptions, IndexInfo, KeyRequest,
-    ListIndexesResponse, MintedKey, TenantRequest, TlsTrust,
+    ListIndexesResponse, MintedKey, SearchRequest, TenantRequest, TlsTrust,
 };
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -482,6 +482,12 @@ pub enum ClientCommand {
         /// Skip this many results — the page, where --limit is the page size
         #[arg(short = 'o', long)]
         offset: Option<usize>,
+        /// Also answer the lowest value of this numeric or date field over every match (repeatable)
+        #[arg(long = "min", value_name = "FIELD")]
+        min: Vec<String>,
+        /// Also answer the highest value of this numeric or date field over every match (repeatable)
+        #[arg(long = "max", value_name = "FIELD")]
+        max: Vec<String>,
     },
 
     /// Schema utilities
@@ -1004,6 +1010,8 @@ pub async fn run_cli() -> Result<()> {
             query,
             limit,
             offset,
+            min,
+            max,
         } => {
             if query.trim().is_empty() {
                 anyhow::bail!("Query cannot be empty");
@@ -1012,8 +1020,19 @@ pub async fn run_cli() -> Result<()> {
             // the one definition of where a modifier run may appear. The flags here win over
             // the inline form, which is what lets a caller page through a query it did not
             // write itself.
+            let metrics =
+                (!min.is_empty() || !max.is_empty()).then_some(storage::MetricsSpec { min, max });
             let results = client
-                .search(&index, &query, limit, offset, None, None)
+                .search_request(
+                    &index,
+                    &SearchRequest {
+                        query,
+                        limit,
+                        offset,
+                        metrics,
+                        ..Default::default()
+                    },
+                )
                 .await?;
             print_json(&results)?;
         }

@@ -1824,6 +1824,7 @@ impl MicroshardActor {
                         fields: fields.as_deref(),
                         array_limit,
                         match_query: None,
+                        metrics: None,
                     },
                 )
             })
@@ -1865,6 +1866,7 @@ impl MicroshardActor {
         let limit = request.limit.unwrap_or(self.default_search_limit);
         let index = request.index.clone();
         let sort = request.sort;
+        let metrics = request.metrics;
 
         let deadline = self
             .read_budget
@@ -1881,6 +1883,7 @@ impl MicroshardActor {
                     sort.as_ref(),
                     &storage::SearchOptions {
                         deadline,
+                        metrics: metrics.as_ref(),
                         ..Default::default()
                     },
                 )
@@ -1896,6 +1899,7 @@ impl MicroshardActor {
             narrowed_default_fields: outcome.narrowed_default_fields,
             emptied: outcome.emptied,
             timings: outcome.timings,
+            metrics: outcome.metrics,
         })
     }
 

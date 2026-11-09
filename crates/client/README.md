@@ -67,7 +67,7 @@ cameodb client data load myindex https://external.com/data.csv --insecure-source
 | `health` | Fetch `_cluster/health` and pretty-print response |
 | `list indexes` | List all indexes with stats + cached field names |
 | `list index <name>` | Show detailed stats and schema for one index |
-| `search <index> <query>` | Run hybrid search. The query may end in a run of `return`/`limit`/`sort` clauses; the subcommand also takes `--limit N` |
+| `search <index> <query>` | Run hybrid search. The query may end in a run of `return`/`limit`/`sort` clauses; the subcommand also takes `--limit N`, and `--min FIELD` / `--max FIELD` (repeatable) for the lowest and highest value of a numeric or date field over every match |
 | `schema detect <file> [--delimiter ...] [--id COL[,COL...]] [--report]` | Detect schema from CSV/TSV/JSON/JSONL/NDJSON (auto or forced delimiter, supports compression & HTTP(S)); `--report` explains each column and the keys found |
 | `schema load <index> <file> [--delimiter ...] [--id COL[,COL...]]` | Detect schema from CSV/TSV/JSON/JSONL/NDJSON, or read a schema file, and apply it to an index (supports compression & HTTP(S)) |
 | `data load <index> <file> [--delimiter ...] [--batch-size N] [--parallel N] [--id COL[,COL...]] [--recreate]` | Ingest CSV/TSV/JSON/JSONL/NDJSON data in batches, up to N at once (supports compression & HTTP(S)) |

@@ -39,6 +39,10 @@ pub struct SearchPayload {
     /// Whether an array `array` cuts leads with the elements the query matched. Absent is the
     /// node's `[search] match_elements_first`.
     pub matches: Option<bool>,
+    /// Fields whose lowest and highest value over every matching document the answer carries
+    /// as `metrics`: `{"min": [...], "max": [...]}`. With `limit: 0`, the metrics and the count
+    /// alone (ROADMAP K3).
+    pub metrics: Option<storage::MetricsSpec>,
 }
 
 /// Handler for standard search operations
@@ -110,6 +114,7 @@ pub(super) async fn search_handler(
         sort: final_sort,
         array_limit: Some(array_limit),
         match_elements,
+        metrics: payload.metrics,
     };
 
     let result = state
@@ -202,6 +207,7 @@ pub(super) async fn search_stream_handler(
         sort: final_sort,
         array_limit: Some(array_limit),
         match_elements,
+        metrics: payload.metrics,
     };
 
     // The search runs here, so a refusal answers with its own status; only the answer streams.

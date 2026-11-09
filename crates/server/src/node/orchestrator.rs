@@ -1199,6 +1199,9 @@ pub(super) struct BroadcastStats {
     pub(super) approximate_sort: Option<String>,
     /// The narrowed default fields, if any node reported them; see [`NARROWED_DEFAULT_FIELDS`].
     pub(super) narrowed_default_fields: Option<storage::NarrowedDefaultFields>,
+    /// The `metrics` the nodes answered, merged: lowest low, highest high (ROADMAP K2). `None`
+    /// until a node answers with them.
+    pub(super) metrics: Option<JsonValue>,
 }
 
 /// Whether a shard's failure is the request's fault rather than this node's.
@@ -1218,6 +1221,7 @@ pub(super) fn is_caller_error(err: &OrchestratorError) -> bool {
             std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData
         ),
         OrchestratorError::UnsortableField { .. }
+        | OrchestratorError::UnmeasurableField { .. }
         | OrchestratorError::UnrunnableQuery { .. }
         | OrchestratorError::SearchDeadlineExceeded { .. }
         | OrchestratorError::NoShardAnswered { .. } => true,
@@ -2785,6 +2789,7 @@ impl OrchestratorEngine {
                 sort,
                 array_limit,
                 match_elements,
+                metrics,
             } => WorkerOutcome::Done(
                 self.engine_search(
                     &index,
@@ -2799,6 +2804,7 @@ impl OrchestratorEngine {
                         limit: array_limit,
                         lead_with_matches: match_elements,
                     },
+                    metrics.as_ref(),
                 )
                 .await,
             ),
@@ -3142,6 +3148,7 @@ impl OrchestratorEngine {
     }
 
     /// Parallel scatter-gather search across all local shards.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn engine_search(
         &self,
         index: &str,
@@ -3150,6 +3157,7 @@ impl OrchestratorEngine {
         fields: Option<&[String]>,
         sort: Option<&SortSpec>,
         arrays: ArrayCut,
+        metrics: Option<&storage::MetricsSpec>,
     ) -> Result<JsonValue, OrchestratorError> {
         let shards = self.shards.load();
         if shards.is_empty() {
@@ -3169,7 +3177,7 @@ impl OrchestratorEngine {
             schema: &schema,
             max_concurrent_shard_searches: self.max_concurrent_shard_searches,
         }
-        .gather(index, query, window, fields, sort, arrays)
+        .gather(index, query, window, fields, sort, arrays, metrics)
         .await
     }
 }
@@ -5058,6 +5066,7 @@ impl NodeOrchestrator {
                 sort,
                 array_limit,
                 match_elements,
+                metrics,
             } => {
                 self.orch_search(
                     &index,
@@ -5072,6 +5081,7 @@ impl NodeOrchestrator {
                         limit: array_limit,
                         lead_with_matches: match_elements,
                     },
+                    metrics.as_ref(),
                 )
                 .await
             }
@@ -5786,6 +5796,7 @@ impl NodeOrchestrator {
         batches
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn orch_search(
         &self,
         index: &str,
@@ -5794,6 +5805,7 @@ impl NodeOrchestrator {
         fields: Option<&[String]>,
         sort: Option<&SortSpec>,
         arrays: ArrayCut,
+        metrics: Option<&storage::MetricsSpec>,
     ) -> Result<JsonValue, OrchestratorError> {
         if self.shards.is_empty() {
             return Ok(
@@ -5812,7 +5824,7 @@ impl NodeOrchestrator {
             schema: &schema,
             max_concurrent_shard_searches: self.max_concurrent_shard_searches,
         }
-        .gather(index, query, window, fields, sort, arrays)
+        .gather(index, query, window, fields, sort, arrays, metrics)
         .await
     }
 

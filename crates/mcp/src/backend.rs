@@ -17,6 +17,17 @@ pub struct SortSpec {
     pub order: SortOrder,
 }
 
+/// The extremes a search asks for: the lowest value of each field in `min`, the highest of each in
+/// `max`, over every document the query matches (ROADMAP K3).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpMetrics {
+    #[serde(default)]
+    pub min: Vec<String>,
+    #[serde(default)]
+    pub max: Vec<String>,
+}
+
 /// Sort order direction
 #[derive(Debug, Clone, Copy, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -41,6 +52,9 @@ pub struct McpIndexSearchRequest {
     pub index: String,
     pub fields: Option<Vec<String>>,
     pub sort: Option<SortSpec>,
+    /// The extremes `search_index` was asked for. Not taken per index by `search_across_indexes`,
+    /// whose rows come from different indexes: always `None` there.
+    pub metrics: Option<McpMetrics>,
 }
 
 /// Written by hand rather than derived from an untagged enum.
@@ -78,6 +92,7 @@ impl<'de> Deserialize<'de> for McpIndexSearchRequest {
                     index: index.to_string(),
                     fields: None,
                     sort: None,
+                    metrics: None,
                 })
             }
 
@@ -90,6 +105,7 @@ impl<'de> Deserialize<'de> for McpIndexSearchRequest {
                     index: named.index,
                     fields: named.fields,
                     sort: named.sort,
+                    metrics: None,
                 })
             }
         }

@@ -29,8 +29,8 @@ mod transport;
 
 pub use authz::{McpAuthz, McpAuthzRef, McpCapability, McpUnrestricted, tool_capability};
 pub use backend::{
-    McpBackend, McpIndexSearchRequest, McpSearchBounds, RateLimitVerdict, SortOrder, SortSpec,
-    ToolCall, ToolError,
+    McpBackend, McpIndexSearchRequest, McpMetrics, McpSearchBounds, RateLimitVerdict, SortOrder,
+    SortSpec, ToolCall, ToolError,
 };
 pub use protocol::MCP_SESSION_ID_HEADER;
 pub use session::McpShutdownHandle;

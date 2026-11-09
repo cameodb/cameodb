@@ -212,6 +212,7 @@ impl ScatterCtx<'_> {
     /// `arrays` rides the fetch phase to the shards that own the page, so an array is
     /// shortened where the document is built rather than after it has crossed to this node —
     /// and led by its matching elements there, where the whole array still is.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn gather(
         &self,
         index: &str,
@@ -220,6 +221,7 @@ impl ScatterCtx<'_> {
         fields: Option<&[String]>,
         sort: Option<&SortSpec>,
         arrays: ArrayCut,
+        metrics: Option<&storage::MetricsSpec>,
     ) -> Result<JsonValue, OrchestratorError> {
         let start = std::time::Instant::now();
         let schema = self.schema;
@@ -244,6 +246,11 @@ impl ScatterCtx<'_> {
         if let Some(refusal) = unsortable_sort_field(schema, sort) {
             return Err(refusal);
         }
+        // The same for a min or max: a field with no column, or a type with no order, would fail on
+        // every shard alike.
+        if let Some(refusal) = unmeasurable_metric_field(schema, metrics) {
+            return Err(refusal);
+        }
 
         // The search runs in two phases: every shard answers keys only — score, sort
         // key and document id — the merge windows those, and phase two asks the owning
@@ -264,6 +271,7 @@ impl ScatterCtx<'_> {
                     query: query.to_string(),
                     limit: Some(window.fetch_count()),
                     sort: sort.cloned(),
+                    metrics: metrics.cloned(),
                 };
                 async move { (shard_id, shard.handle_search_keys(req).await) }
             }))
@@ -294,10 +302,19 @@ impl ScatterCtx<'_> {
         // The shards ran in parallel, so the stage cost of the search is the worst of
         // them, not the sum. Fetch and build fold in here too: the approximate-sort path
         // fetches its candidate documents inside the key phase.
+        // The lowest of the shards' lows and the highest of their highs; a shard that matched
+        // nothing has no value and changes neither. A failed shard is in `failed` and `errors`,
+        // so a metric over fewer shards than the index has is never silently narrowed.
+        let mut merged_metrics: Option<storage::FieldMetrics> =
+            metrics.map(storage::FieldMetrics::nothing);
         let mut timings = storage::SearchTimings::default();
         for (shard_id, result) in shard_results {
             match result {
                 Ok(r) => {
+                    if let (Some(into), Some(from)) = (merged_metrics.as_mut(), r.metrics.as_ref())
+                    {
+                        into.merge(from);
+                    }
                     emptied |= r.emptied;
                     total_hits_sum += r.total_hits;
                     timings.parse_ms = timings.parse_ms.max(r.timings.parse_ms);
@@ -497,6 +514,9 @@ impl ScatterCtx<'_> {
         attach_discarded(&mut response, discarded);
         attach_approximate_sort(&mut response, approximate_sort);
         attach_narrowed_default_fields(&mut response, narrowed_default_fields);
+        if let Some(merged) = merged_metrics {
+            response["metrics"] = merged.to_json();
+        }
         Ok(response)
     }
 }
@@ -1212,6 +1232,66 @@ pub(super) fn unsortable_sort_field(
         "a {} field must be declared fast to sort, and this one is not",
         def.field_type.to_string()
     ))
+}
+
+/// Refuse a min or max the engine cannot answer, before any shard is asked (ROADMAP K1).
+///
+/// A metric is answerable exactly when the field is an `i64`, `u64`, `f64` or `date` with a fast
+/// column — `sortable` and numeric or a date, as `describe_index` reports it. Unlike a sort, a
+/// text or string field is refused rather than approximated: its fast column answers a metric
+/// with a null that reads as "no data", and a min over words is not what anyone asked. `id` and
+/// its shadow names are strings, and so refused too.
+///
+/// Decided from the declared schema, as [`unsortable_sort_field`] is, with the same blind spot: a
+/// field declared fast after its index was built has no column, and each shard refuses it.
+/// Skipped for an index whose schema is not known yet.
+pub(super) fn unmeasurable_metric_field(
+    schema: &IndexSchema,
+    metrics: Option<&storage::MetricsSpec>,
+) -> Option<OrchestratorError> {
+    let metrics = metrics?;
+    if schema.fields.is_empty() {
+        return None;
+    }
+    for field in metrics.fields() {
+        let refuse = |reason: String| {
+            Some(OrchestratorError::UnmeasurableField {
+                field: field.to_string(),
+                reason,
+            })
+        };
+        if field == "id" || schema.is_shadow_field(field) {
+            return refuse("it is the document key, a string, which has no min or max".into());
+        }
+        let Some(def) = schema.fields.get(field) else {
+            return refuse("the index has no column of that name".into());
+        };
+        if let Some(ghost) = &def.ghost {
+            return refuse(format!(
+                "a ghost field holds no value of its own; measure '{}', its source",
+                ghost.source
+            ));
+        }
+        if !matches!(
+            def.field_type,
+            TantivyFieldType::I64
+                | TantivyFieldType::U64
+                | TantivyFieldType::F64
+                | TantivyFieldType::Date
+        ) {
+            return refuse(format!(
+                "a {} field has no min or max; they apply to i64, u64, f64 and date fields",
+                def.field_type.to_string()
+            ));
+        }
+        if !def.is_fast() {
+            return refuse(format!(
+                "a {} field must be declared fast for a min or max, and this one is not",
+                def.field_type.to_string()
+            ));
+        }
+    }
+    None
 }
 
 /// Collect the distinct dropped clauses from per-node responses.
