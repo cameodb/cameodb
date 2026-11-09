@@ -175,17 +175,29 @@ pub(super) fn string_value_clauses(query: &str, fields: &[FieldInfo]) -> Vec<(St
 /// caller has checked the clause alone matches nothing, so the advice never blames a clause that
 /// was right while another one emptied the result.
 pub(super) fn string_case_advice(field: &str, value: &str) -> String {
-    let set = spellings(value)
+    let spellings = spellings(value);
+    let opening = format!(
+        "`{field}:\"{value}\"` alone matches nothing. '{field}' matches only a whole value, as \
+         the data writes it, so"
+    );
+    let read = "read how the values are written: in the field's description, or from a few hits \
+                with `limit 5` and the field in `fields`.";
+    // A value with no letters has one spelling, so a retry over its spellings would send the
+    // same clause again: what is left is a part of a value, or a value written another way.
+    if spellings.len() < 2 {
+        return format!(
+            "{opening} a part of one, or one written another way, finds nothing: {read}"
+        );
+    }
+    let set = spellings
         .iter()
         .map(|spelling| format!("\"{spelling}\""))
         .collect::<Vec<_>>()
         .join(" ");
     format!(
-        "`{field}:\"{value}\"` alone matches nothing. '{field}' matches only a whole value, as \
-         the data writes it, so a value in another case, or a part of one, finds nothing. If \"{value}\" came from the question, retry once with its \
-         spellings in one set — `{field}: IN [{set}]` — and if that finds nothing too, read how \
-         the values are written: in the field's description, or from a few hits with `limit 5` \
-         and the field in `fields`."
+        "{opening} a value in another case, or a part of one, finds nothing. If \"{value}\" came \
+         from the question, retry once with its spellings in one set — `{field}: IN [{set}]` — \
+         and if that finds nothing too, {read}"
     )
 }
 
@@ -1121,6 +1133,10 @@ mod field_suggestion_tests {
             ),
             "{advice}"
         );
+        // A value with no letters has no other spelling to retry.
+        let advice = super::string_case_advice("id", "1212_0004");
+        assert!(!advice.contains("IN ["), "{advice}");
+        assert!(advice.contains("a part of one"), "{advice}");
         // The quotes of a string value are not a phrase to the general advice.
         let clauses = vec![("authors".to_string(), "austen, jane".to_string())];
         let stripped = super::without_string_value_quotes(
