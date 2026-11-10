@@ -5,6 +5,9 @@
 #   ./scripts/build/docker-push.sh                   # Build + push latest tag
 #   ./scripts/build/docker-push.sh 0.2.2             # Build + push with version tag
 #   ./scripts/build/docker-push.sh 0.2.2 --no-push   # Build both platforms, no push
+#   ./scripts/build/docker-push.sh 0.2.2 --repo cameodb/cameodb   # Push to another DockerHub repo
+#
+# Target repo: --repo <name> (or --repo=<name>), else $CAMEODB_DOCKER_REPO, else goranc/cameodb.
 #
 # Can be run from any directory (auto-detects project root)
 #
@@ -27,25 +30,32 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-REPO="goranc/cameodb"
+REPO="${CAMEODB_DOCKER_REPO:-goranc/cameodb}"
 BUILDER_NAME="cameo-builder"
 PLATFORMS="linux/amd64,linux/arm64"
 # Corporate CA for TLS-intercepting proxies, passed to the build as the `corporate-ca`
 # secret. Override with CAMEODB_CA_CERT=/path/to/ca.crt; skipped when absent or empty.
 CORPORATE_CA_CERT="${CAMEODB_CA_CERT:-/var/tmp/buildkit-ca/corporate-ca.crt}"
 
-# Parse arguments
-VERSION="${1:-}"
+# Parse arguments: [VERSION] [--no-push] [--repo NAME]
+VERSION=""
 NO_PUSH=false
-for arg in "$@"; do
-    if [ "$arg" = "--no-push" ]; then
-        NO_PUSH=true
-    fi
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-push) NO_PUSH=true ;;
+        --repo)
+            [ $# -ge 2 ] || { echo -e "${RED}--repo needs a value${NC}" >&2; exit 1; }
+            REPO="$2"; shift ;;
+        --repo=*) REPO="${1#--repo=}" ;;
+        -*) echo -e "${RED}Unknown option: $1${NC}" >&2; exit 1 ;;
+        *) VERSION="$1" ;;
+    esac
+    shift
 done
 
 # Build tag list
 TAGS=("-t" "${REPO}:latest")
-if [[ -n "$VERSION" && "$VERSION" != "--no-push" ]]; then
+if [[ -n "$VERSION" ]]; then
     TAGS+=("-t" "${REPO}:${VERSION}")
 fi
 

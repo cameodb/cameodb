@@ -135,6 +135,9 @@ Build for multiple platforms (amd64 + arm64) and push to DockerHub:
 
 # Build only (no push) for testing multi-platform builds
 ../scripts/build/docker-push.sh 0.3.0 --no-push
+
+# Push to another DockerHub repo (default goranc/cameodb; or set CAMEODB_DOCKER_REPO)
+../scripts/build/docker-push.sh 0.3.0 --repo cameodb/cameodb
 ```
 
 **Prerequisites:**
