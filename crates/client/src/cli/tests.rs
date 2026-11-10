@@ -455,6 +455,56 @@ mod tests {
         assert!(pairs.iter().any(|p| p.replacement == "title:"));
     }
 
+    /// `min(`/`max(` are offered beside the keyword modifiers once a term is in the query,
+    /// and inside the clause only the fields a metric can measure — the numeric and date
+    /// ones — are completed, the clause head kept in the replacement and a comma left for
+    /// the next field. The same holds when the clause head sits in an earlier token.
+    #[test]
+    fn metric_clauses_offer_and_complete_their_fields() {
+        let cache = Arc::new(RwLock::new(HashMap::new()));
+        cache.write().unwrap().insert(
+            "myindex".to_string(),
+            IndexMetadata {
+                fields: ["price", "seen", "title"]
+                    .into_iter()
+                    .zip(["i64", "date", "text"])
+                    .map(|(name, field_type)| FieldInfo {
+                        name: name.to_string(),
+                        field_type: field_type.to_string(),
+                    })
+                    .collect(),
+            },
+        );
+        let c = IndexCompleter::new(cache);
+        let history = MemHistory::new();
+
+        let line = "search myindex rust m";
+        let (_, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
+        assert!(
+            pairs.iter().any(|p| p.replacement == "min(")
+                && pairs.iter().any(|p| p.replacement == "max("),
+            "got: {:?}",
+            replacements(&pairs)
+        );
+
+        for (line, expected) in [
+            ("search myindex rust min(", vec!["min(price,", "min(seen,"]),
+            ("search myindex rust max(p", vec!["max(price,"]),
+            ("search myindex rust min(price,s", vec!["min(price,seen,"]),
+            ("search myindex rust min(price, s", vec!["seen,"]),
+        ] {
+            let (_, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
+            assert_eq!(
+                pairs
+                    .iter()
+                    .map(|p| p.replacement.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{line:?}"
+            );
+        }
+    }
+
     /// A refused document is named by where it is in the source, not by its line in one batch.
     ///
     /// Every batch is a request of its own and the node counts lines per request, so a load of

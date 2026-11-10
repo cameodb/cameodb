@@ -511,4 +511,53 @@ async fn search_index_answers_metrics_and_refuses_a_field_with_no_order() {
         .await;
     assert!(is_error, "a max of a text field must be refused: {text}");
     assert!(text.contains("min or max of 'title'"), "{text}");
+
+    // The same question asked as `min(f)`/`max(f)` clauses in the query answers the same
+    // metrics, and the argument form still wins over a clause beside it.
+    let (is_error, text) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "years", "query": "title:rust min(year) max(year) limit 0"}),
+        )
+        .await;
+    assert!(!is_error, "{text}");
+    let answer: Value = serde_json::from_str(&text).expect("json result");
+    assert_eq!(
+        answer["metrics"],
+        json!({"min": {"year": 1999}, "max": {"year": 2024}}),
+        "{text}"
+    );
+
+    let (is_error, text) = node
+        .call_tool(
+            "search_index",
+            json!({"index": "years", "query": "title:rust min(year) limit 0",
+                   "metrics": {"max": ["year"]}}),
+        )
+        .await;
+    assert!(!is_error, "{text}");
+    let answer: Value = serde_json::from_str(&text).expect("json result");
+    assert_eq!(
+        answer["metrics"],
+        json!({"max": {"year": 2024}}),
+        "the argument wins over the clause: {text}"
+    );
+}
+
+/// A metric clause means nothing across indexes — `search_across_indexes` refuses it rather
+/// than dropping it, pointing at `search_index` where it is answered.
+#[tokio::test]
+async fn search_across_indexes_refuses_a_metric_clause() {
+    let node = TestNode::start().await;
+    let (is_error, text) = node
+        .call_tool(
+            "search_across_indexes",
+            json!({"indexes": [{"index": "years"}], "query": "title:rust min(year)"}),
+        )
+        .await;
+    assert!(is_error, "a metric clause must be refused here: {text}");
+    assert!(
+        text.contains("min(...)"),
+        "the refusal names the clause: {text}"
+    );
 }

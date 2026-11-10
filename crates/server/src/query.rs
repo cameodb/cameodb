@@ -1,5 +1,5 @@
 //! The inline modifiers a query may carry after its text: `return`, `limit`, `offset`, `sort`,
-//! `array` and `matches`.
+//! `array`, `matches` and the `min(field)`/`max(field)` metric clauses.
 //!
 //! Shared by every surface — an HTTP search, an MCP tool call and the bundled client all accept
 //! the same query string, so they have to agree on where the query ends and the modifiers begin.
@@ -7,10 +7,17 @@
 //! REPL express a search *entirely* through this grammar, so a paging option that exists only as
 //! a JSON field is a paging option they cannot reach.
 
-use storage::{SortOrder, SortSpec};
+use storage::{MetricsSpec, SortOrder, SortSpec};
 
 /// The keywords that open an inline modifier clause.
 const MODIFIER_KEYWORDS: [&str; 6] = ["return", "limit", "offset", "sort", "array", "matches"];
+
+/// Whether a token opens a modifier clause — one of the keywords, or a `min(`/`max(` metric
+/// clause, which is one clause spanning as few tokens as `min(price)` and as many as
+/// `min(price, seen)`.
+fn opens_modifier(token: &str) -> bool {
+    MODIFIER_KEYWORDS.contains(&token) || token.starts_with("min(") || token.starts_with("max(")
+}
 
 /// Whether a token has the shape of a field name, which rules out quoted text, groups and a
 /// `field:value` clause.
@@ -67,6 +74,40 @@ fn parse_field_list(tokens: &[&str]) -> Option<Vec<String>> {
     (!names.is_empty()).then_some(names)
 }
 
+/// A `min(...)`/`max(...)` clause: which side it sets, the fields it names, and how many
+/// tokens it took — one for `min(price)`, several for `min(price, seen)`.
+///
+/// The field list ends at the token carrying the closing paren, and a comma must separate
+/// names — `min(a, b)` is two fields while `min(a b)` is not a clause at all, the same rule a
+/// `return` list holds its names to. Every name must be field-shaped, so `min(a)b)` and
+/// `min()` fail to a query term rather than silently measuring another field.
+fn parse_metric_clause(tokens: &[&str]) -> Option<(bool, Vec<String>, usize)> {
+    let first = tokens.first()?;
+    let (min_side, mut inner) = match first.strip_prefix("min(") {
+        Some(rest) => (true, rest.to_string()),
+        None => (false, first.strip_prefix("max(")?.to_string()),
+    };
+    let mut taken = 1;
+    while !inner.ends_with(')') {
+        // The list continues only across a comma, never across a bare space.
+        if !inner.ends_with(',') {
+            return None;
+        }
+        inner.push_str(tokens.get(taken)?);
+        taken += 1;
+    }
+    inner.pop();
+
+    let names: Vec<String> = inner
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect();
+    (names.iter().all(|name| is_field_name(name)) && !names.is_empty())
+        .then_some((min_side, names, taken))
+}
+
 /// What a run of inline modifiers set, and the query left in front of them.
 ///
 /// A struct rather than a tuple because there are five optional values and three of them are
@@ -85,6 +126,9 @@ pub(crate) struct QueryModifiers {
     pub array: Option<usize>,
     /// Whether a cut array leads with the elements the query matched.
     pub matches: Option<bool>,
+    /// The fields `min(...)`/`max(...)` clauses measure over every match; `None` when the run
+    /// held none. Repeatable — `min(a) min(b)` names both.
+    pub metrics: Option<MetricsSpec>,
 }
 
 /// Parse `tokens` as an unbroken run of modifier clauses, in any order and at most one of each.
@@ -145,13 +189,23 @@ fn parse_modifier_run(tokens: &[&str]) -> Option<QueryModifiers> {
                 run.sort = Some(spec);
             }
             "return" if run.fields.is_none() => {
-                // The field list runs to the next keyword, since only a keyword can end it.
+                // The field list runs to the next clause, since only a clause can end it.
                 let end = tokens[idx + 1..]
                     .iter()
-                    .position(|token| MODIFIER_KEYWORDS.contains(token))
+                    .position(|token| opens_modifier(token))
                     .map_or(tokens.len(), |rel| idx + 1 + rel);
                 run.fields = Some(parse_field_list(&tokens[idx + 1..end])?);
                 idx = end;
+            }
+            token if token.starts_with("min(") || token.starts_with("max(") => {
+                let (min_side, fields, taken) = parse_metric_clause(&tokens[idx..])?;
+                let spec = run.metrics.get_or_insert_with(MetricsSpec::default);
+                if min_side {
+                    spec.min.extend(fields);
+                } else {
+                    spec.max.extend(fields);
+                }
+                idx += taken;
             }
             _ => return None,
         }
@@ -174,7 +228,7 @@ pub(crate) fn parse_query_keywords(query: &str) -> QueryModifiers {
     // Earliest start first, so `return a limit 5` is one run rather than a query ending in
     // `return a`.
     for start in 1..tokens.len() {
-        if MODIFIER_KEYWORDS.contains(&tokens[start])
+        if opens_modifier(tokens[start])
             && let Some(run) = parse_modifier_run(&tokens[start..])
         {
             return QueryModifiers {
@@ -802,6 +856,66 @@ mod tests {
             let m = parse_query_keywords(query);
             assert_eq!(m.query, query, "{query}");
             assert_eq!(m.matches, None, "{query}");
+        }
+    }
+
+    #[test]
+    fn min_and_max_clauses_parse_to_metrics() {
+        let m = parse_query_keywords("title:rust min(price) max(price)");
+        assert_eq!(m.query, "title:rust");
+        let metrics = m.metrics.expect("metrics");
+        assert_eq!(metrics.min, vec!["price".to_string()]);
+        assert_eq!(metrics.max, vec!["price".to_string()]);
+    }
+
+    /// `min(a,b)` and `min(a, b)` are the same two fields; the clause is repeatable.
+    #[test]
+    fn a_metric_clause_lists_fields_and_repeats() {
+        for (query, expected) in [
+            ("* min(a,b)", vec!["a", "b"]),
+            ("* min(a, b)", vec!["a", "b"]),
+            ("* min(a) min(b)", vec!["a", "b"]),
+        ] {
+            let m = parse_query_keywords(query);
+            assert_eq!(m.query, "*", "{query}");
+            assert_eq!(
+                m.metrics.expect("metrics").min,
+                expected.into_iter().map(str::to_string).collect::<Vec<_>>(),
+                "{query}"
+            );
+        }
+    }
+
+    /// A metric clause sits anywhere in the run, beside the keyword clauses, and a `return`
+    /// list ends at it rather than swallowing it.
+    #[test]
+    fn metric_clauses_mix_with_the_keyword_modifiers() {
+        let m = parse_query_keywords("title:rust return title min(price) limit 5 max(year)");
+        assert_eq!(m.query, "title:rust");
+        assert_eq!(m.fields, Some(vec!["title".to_string()]));
+        assert_eq!(m.limit, Some(5));
+        let metrics = m.metrics.expect("metrics");
+        assert_eq!(metrics.min, vec!["price".to_string()]);
+        assert_eq!(metrics.max, vec!["year".to_string()]);
+    }
+
+    /// `min` and `max` as plain words stay in the query — the clause is the parenthesized
+    /// form, and a run still has to reach the end of the query.
+    #[test]
+    fn min_and_max_as_words_stay_in_the_query() {
+        for query in [
+            "the min and max",
+            "title:rust min price",
+            "find the max(price) of it",
+            "determine(x) the value",
+            "title:rust min()",
+            "title:rust min(a b)",
+            "title:rust min(a)b",
+            "title:rust min(price) more",
+        ] {
+            let m = parse_query_keywords(query);
+            assert_eq!(m.query, query, "{query}");
+            assert!(m.metrics.is_none(), "{query}");
         }
     }
 }

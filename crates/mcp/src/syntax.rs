@@ -504,15 +504,18 @@ pub const SORT_RULES: &[&str] = &[
 
 /// How `metrics` — the min and max of fields over a search's matches — behaves (ROADMAP K).
 pub const METRIC_RULES: &[&str] = &[
-    "`metrics: {\"min\": [fields], \"max\": [fields]}` on `search_index` answers the lowest and \
-     highest value of each field over every document the query matches — not just the page — as \
-     `metrics` beside `total_hits`. With `limit: 0` it is the count and the range alone.",
+    "`metrics: {\"min\": [fields], \"max\": [fields]}` on `search_index`, or `min(field)` and \
+     `max(field)` clauses in the query itself, answers the lowest and highest value of each \
+     field over every document the query matches — not just the page — as `metrics` beside \
+     `total_hits`. With `limit: 0` it is the count and the range alone. Both may be given; the \
+     argument wins over the clauses.",
     "It applies to i64, u64, f64 and date fields with a fast column: the numeric and date fields \
      `describe_index` reports `sortable`. Any other field, text and string included, is refused \
      with `cannot take the min or max of 'FIELD'` and the reason, before any shard runs.",
     "An integer comes back exact at any size, and a date as RFC 3339 in UTC. An array field counts \
      every element. A field no matching document holds is `null`, which is not 0.",
-    "`search_across_indexes` does not take it: its rows come from different indexes.",
+    "`search_across_indexes` does not take it, as an argument or as a clause: its rows come from \
+     different indexes.",
 ];
 
 /// Inline modifiers CameoDB accepts after the query itself.
@@ -554,6 +557,12 @@ pub const INLINE_MODIFIERS: &[(&str, &str, &str)] = &[
          their stored positions in `_matched_elements`; an array that is not cut keeps its order. \
          `matches on` asks for it where the node's default is off.",
         "string_ipv4:10.0.0.1 array 5 matches off",
+    ),
+    (
+        "min(f) max(f)",
+        "The lowest and highest value of a field over every document the query matches — see \
+         the min and max rules. Repeatable and comma-listing: `min(a, b)`.",
+        "title:rust min(price) max(year)",
     ),
 ];
 

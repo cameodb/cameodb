@@ -63,7 +63,7 @@ pub(super) async fn search_handler(
         ));
     }
 
-    // Parse query string for embedded limit/offset/return/sort keywords
+    // Parse query string for embedded limit/offset/return/sort/min()/max() clauses
     let inline = parse_query_keywords(&payload.query);
     let cleaned_query = inline.query;
 
@@ -72,6 +72,7 @@ pub(super) async fn search_handler(
     let final_offset = payload.offset.or(inline.offset);
     let final_fields = payload.fields.or(inline.fields);
     let final_sort = payload.sort.or(inline.sort);
+    let final_metrics = payload.metrics.or(inline.metrics);
     let array_limit = state
         .checked_array_limit(payload.array.or(inline.array))
         .map_err(AppError::bad_request)?;
@@ -115,7 +116,7 @@ pub(super) async fn search_handler(
         sort: final_sort,
         array_limit: Some(array_limit),
         match_elements,
-        metrics: payload.metrics,
+        metrics: final_metrics,
     };
 
     let result = state
@@ -163,7 +164,7 @@ pub(super) async fn search_stream_handler(
         ));
     }
 
-    // Parse query string for embedded limit/return/sort keywords
+    // Parse query string for embedded limit/return/sort/min()/max() clauses
     let inline = parse_query_keywords(&payload.query);
     let cleaned_query = inline.query;
 
@@ -171,6 +172,7 @@ pub(super) async fn search_stream_handler(
     let final_limit = payload.limit.or(inline.limit);
     let final_fields = payload.fields.or(inline.fields);
     let final_sort = payload.sort.or(inline.sort);
+    let final_metrics = payload.metrics.or(inline.metrics);
     let array_limit = state
         .checked_array_limit(payload.array.or(inline.array))
         .map_err(AppError::bad_request)?;
@@ -215,7 +217,7 @@ pub(super) async fn search_stream_handler(
         sort: final_sort,
         array_limit: Some(array_limit),
         match_elements,
-        metrics: payload.metrics,
+        metrics: final_metrics,
     };
 
     // The search runs here, so a refusal answers with its own status; only the answer streams.

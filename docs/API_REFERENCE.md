@@ -326,11 +326,13 @@ curl -s -X POST http://localhost:9480/api/books/search \
 > }
 > ```
 
-> **Min and max (`metrics`):** name fields in `"metrics": {"min": [...], "max": [...]}` and the
-> response carries `metrics` with the lowest and highest value of each over **every** document the
-> query matches — not only the page. With `"limit": 0` that is the count and the range alone; with a
-> real limit the page comes with it. On a cluster the nodes' answers are merged, and the streamed
-> route carries `metrics` in its footer.
+> **Min and max (`metrics`):** name fields in `"metrics": {"min": [...], "max": [...]}` — or write
+> `min(field)`/`max(field)` clauses in the query itself, repeatable and comma-listing
+> (`min(a, b)`) — and the response carries `metrics` with the lowest and highest value of each over
+> **every** document the query matches — not only the page. With `"limit": 0` that is the count and
+> the range alone; with a real limit the page comes with it. On a cluster the nodes' answers are
+> merged, and the streamed route carries `metrics` in its footer. Both may be given; the `"metrics"`
+> field wins over the clauses, the precedence every explicit field holds over its inline form.
 >
 > ```bash
 > curl -s -X POST http://localhost:9480/api/books/search \

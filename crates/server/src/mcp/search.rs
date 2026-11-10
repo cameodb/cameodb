@@ -319,6 +319,15 @@ pub(super) fn search_index(
         // that passed a structured sort chose it deliberately, where the clause may be part of
         // a query string it copied.
         let final_sort = index.sort.map(to_storage_sort).or(inline.sort);
+        // The structured argument wins over `min(f)`/`max(f)` clauses in the query, the same
+        // precedence `sort` holds: an agent that passed both chose the argument deliberately.
+        let metrics = index
+            .metrics
+            .map(|asked| storage::MetricsSpec {
+                min: asked.min,
+                max: asked.max,
+            })
+            .or(inline.metrics);
 
         let result = state
             .router
@@ -333,10 +342,7 @@ pub(super) fn search_index(
                     sort: final_sort,
                     array_limit: Some(array_limit),
                     match_elements,
-                    metrics: index.metrics.map(|asked| storage::MetricsSpec {
-                        min: asked.min,
-                        max: asked.max,
-                    }),
+                    metrics,
                 },
                 None,
                 OperationType::Read,
@@ -414,6 +420,14 @@ pub(super) fn search_across_indexes(
         let inline = parse_query_keywords(&query);
         let cleaned_query = inline.query;
         let cleaned_for_advice = cleaned_query.clone();
+        // An extreme over rows from different indexes is no index's answer, so the clause is
+        // refused here rather than dropped — `search_index` takes it.
+        if inline.metrics.is_some() {
+            return Err(ToolError::caller(format!(
+                "search_across_indexes does not take min(...) or max(...) clauses: its rows \
+                 come from different indexes. Call search_index on one index for '{query}'."
+            )));
+        }
         let parsed_fields = inline.fields;
         let parsed_sort = inline.sort;
 

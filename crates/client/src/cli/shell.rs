@@ -197,9 +197,9 @@ pub(crate) fn preceding_token<'a>(tokens: &[&'a str]) -> Option<&'a str> {
 }
 
 /// A replacement that closes its own token: a field's colon, a projection's comma, a directory's
-/// slash, or a space the suggestion carries itself.
+/// slash, a `min(`/`max(` clause's paren, or a space the suggestion carries itself.
 pub(crate) fn is_self_terminating(replacement: &str) -> bool {
-    replacement.ends_with([' ', ':', ',', '/'])
+    replacement.ends_with([' ', ':', ',', '/', '('])
 }
 
 /// The prefix every replacement shares, which is what rustyline splices into the line when the
@@ -328,6 +328,38 @@ impl IndexCompleter {
                 .map(|field| Pair {
                     display: field.name.clone(),
                     replacement: format!("{}{},", listed, field.name),
+                })
+                .collect();
+        }
+        Vec::new()
+    }
+
+    /// Fields for a `min(`/`max(` clause — the token under the cursor is the whole clause so
+    /// far, `min(` plus whatever is inside; only the part after its last `(` or `,` completes,
+    /// and each suggestion closes with a comma so the list can grow (a `)` typed after ends it,
+    /// as a `return` list ends at the next keyword).
+    ///
+    /// Only numeric and date fields are offered — the types a metric can measure.
+    pub(crate) fn metric_field_suggestions(&self, index: &str, prefix: &str) -> Vec<Pair> {
+        if let Ok(cache) = self.cache.read()
+            && let Some(metadata) = cache.get(index)
+        {
+            let head_len = prefix.rfind(['(', ',']).map_or(0, |i| i + 1);
+            let (head, partial) = prefix.split_at(head_len);
+            return metadata
+                .fields
+                .iter()
+                .filter(|field| {
+                    let ft = field.field_type.to_lowercase();
+                    field.name.starts_with(partial)
+                        && (ft.contains("u64")
+                            || ft.contains("i64")
+                            || ft.contains("f64")
+                            || ft.contains("date"))
+                })
+                .map(|field| Pair {
+                    display: field.name.clone(),
+                    replacement: format!("{head}{},", field.name),
                 })
                 .collect();
         }
@@ -816,11 +848,40 @@ impl IndexCompleter {
             "search" if tokens.len() >= 3 => {
                 let index = tokens[1];
 
+                // Inside a `min(`/`max(` clause only its fields are suggested — the token
+                // under the cursor carries the clause head with it.
+                if current.starts_with("min(") || current.starts_with("max(") {
+                    let suggestions = self.metric_field_suggestions(index, current);
+                    return Some(suggestions);
+                }
+
                 // Check if we're after a 'return' keyword to suggest fields
                 let query_tokens = &tokens[2..];
                 // The token under the cursor is still being written: `return` with no space after
                 // it is the keyword to finish, not a clause to complete fields for.
                 let settled = &query_tokens[..query_tokens.len() - 1];
+
+                // A `min(`/`max(` clause opened in an earlier token and still unclosed offers
+                // its fields here: `min(price, s`. The slot is open when the clause has no `)`
+                // yet and its text ends at a comma — or at the opener itself, wanting its
+                // first field. `min(price ` is left to the keyword offers, since a space
+                // across a comma-less field is not part of a list.
+                if let Some(open) = settled
+                    .iter()
+                    .rposition(|t| t.starts_with("min(") || t.starts_with("max("))
+                {
+                    let inside: String = settled[open..]
+                        .iter()
+                        .flat_map(|t| t.chars())
+                        .skip_while(|ch| *ch != '(')
+                        .skip(1)
+                        .collect();
+                    if !inside.contains(')') && (inside.is_empty() || inside.ends_with(',')) {
+                        let suggestions = self.metric_field_suggestions(index, current);
+                        return Some(suggestions);
+                    }
+                }
+
                 let after_return = settled.iter().rposition(|t| *t == "return");
 
                 if let Some(return_pos) = after_return {
@@ -866,7 +927,9 @@ impl IndexCompleter {
                     && (current.is_empty()
                         || "return".starts_with(current)
                         || "limit".starts_with(current)
-                        || "sort".starts_with(current))
+                        || "sort".starts_with(current)
+                        || "min(".starts_with(current)
+                        || "max(".starts_with(current))
                 {
                     let mut suggestions = Vec::new();
 
@@ -892,6 +955,18 @@ impl IndexCompleter {
                             display: "sort <field:order>".to_string(),
                             replacement: "sort ".to_string(),
                         });
+                    }
+
+                    // `min(`/`max(` are repeatable — each is a clause of its own, so no
+                    // already-used check, and no trailing space: the paren takes the fields.
+                    for (clause, display) in [("min(", "min(<fields>)"), ("max(", "max(<fields>)")]
+                    {
+                        if clause.starts_with(current) {
+                            suggestions.push(Pair {
+                                display: display.to_string(),
+                                replacement: clause.to_string(),
+                            });
+                        }
                     }
 
                     if current.is_empty() {

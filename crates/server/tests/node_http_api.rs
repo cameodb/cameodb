@@ -2309,6 +2309,48 @@ async fn a_search_answers_the_min_and_max_of_what_it_matched() {
         serde_json::from_str(streamed.lines().last().expect("a footer line")).expect("footer json");
     assert_eq!(footer["_footer"], true, "{streamed}");
     assert_eq!(footer["metrics"], body["metrics"], "{streamed}");
+
+    // The same question asked in the query itself — `min(f)`/`max(f)` clauses, repeatable and
+    // comma-listing across a space — is the same `metrics` in the answer.
+    let (status, inlined) = post_json(
+        &node,
+        "/api/measured/search",
+        json!({"query": "body:page min(rank, seen) max(rank,price,seen) limit 0"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{inlined}");
+    assert_eq!(inlined["metrics"], body["metrics"], "{inlined}");
+
+    // A `metrics` field given beside the clauses wins, as every explicit field does over its
+    // inline form.
+    let (status, payload_wins) = post_json(
+        &node,
+        "/api/measured/search",
+        json!({"query": "body:page max(rank) limit 0", "metrics": {"min": ["rank"]}}),
+    )
+    .await;
+    assert_eq!(status, 200, "{payload_wins}");
+    assert_eq!(
+        payload_wins["metrics"],
+        json!({"min": {"rank": -4}}),
+        "the field wins over the clause: {payload_wins}"
+    );
+
+    // And a clause naming an unmeasurable field is refused the way a `metrics` argument is.
+    let (status, refused) = post_json(
+        &node,
+        "/api/measured/search",
+        json!({"query": "body:page min(body)"}),
+    )
+    .await;
+    assert_eq!(status, 400, "a min of 'body' is refused: {refused}");
+    assert!(
+        refused["details"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("body"),
+        "the refusal names the field: {refused}"
+    );
 }
 
 /// A shadow field sorts, and sorts identically to `id`.
