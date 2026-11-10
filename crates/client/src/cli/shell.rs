@@ -1005,6 +1005,33 @@ impl IndexCompleter {
                 Some(suggestions)
             }
             "delete" => {
+                let index = tokens[1];
+
+                // Words after `--query` are the delete's query until the next flag: exact
+                // clauses completed to the index's fields, as `search` does. A flag under the
+                // cursor, or words after the query's flags began, keeps the flag offers.
+                let in_query = !current.starts_with("--")
+                    && tokens
+                        .iter()
+                        .position(|t| *t == "--query")
+                        .is_some_and(|at| {
+                            !tokens[at + 1..tokens.len() - 1]
+                                .iter()
+                                .any(|t| t.starts_with("--"))
+                        });
+                if in_query {
+                    let suggestions = self.field_suggestions(index, current);
+                    return Some(suggestions);
+                }
+
+                match preceding_token(tokens) {
+                    Some("--ids-file") => return Some(self.file_path_suggestions(current)),
+                    // A number, a document id, a routing key: nothing to complete.
+                    Some("--max-docs") | Some("--id") | Some("--routing-key") => {
+                        return Some(Vec::new());
+                    }
+                    _ => {}
+                }
                 let suggestions = self.delete_flag_suggestions(current, tokens);
                 Some(suggestions)
             }

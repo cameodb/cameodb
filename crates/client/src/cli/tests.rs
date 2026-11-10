@@ -505,6 +505,43 @@ mod tests {
         }
     }
 
+    /// Words after `--query` are the delete's own query, completed to the index's fields the
+    /// way `search` does — until a flag follows them, which hands the offers back to the
+    /// flags.
+    #[test]
+    fn delete_query_completes_fields_and_then_flags_again() {
+        let c = completer_with_index();
+        let history = MemHistory::new();
+
+        for (line, expected_any) in [
+            ("delete myindex --query ", "title:"),
+            ("delete myindex --query ti", "title:"),
+            ("delete myindex --query title:x AND ", "title:"),
+        ] {
+            let (_, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
+            assert!(
+                pairs.iter().any(|p| p.replacement == expected_any),
+                "{line:?} got: {:?}",
+                replacements(&pairs)
+            );
+        }
+
+        // A flag under the cursor, inside the query region or after its flags, is still a flag.
+        for line in ["delete myindex --", "delete myindex --query title:x --"] {
+            let (_, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
+            assert!(
+                pairs.iter().any(|p| p.replacement.starts_with("--")),
+                "{line:?} got: {:?}",
+                replacements(&pairs)
+            );
+        }
+
+        // A number after --max-docs completes to nothing.
+        let line = "delete myindex --query title:x --max-docs ";
+        let (_, pairs) = c.complete(line, line.len(), &ctx(&history)).unwrap();
+        assert!(pairs.is_empty(), "{line:?} got: {:?}", replacements(&pairs));
+    }
+
     /// A refused document is named by where it is in the source, not by its line in one batch.
     ///
     /// Every batch is a request of its own and the node counts lines per request, so a load of
