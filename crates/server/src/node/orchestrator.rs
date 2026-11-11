@@ -306,9 +306,12 @@ impl BulkCtx<'_> {
                         written += items;
                         errors.extend(reasons);
                     }
-                    // The batch never got an answer, so none of it was written.
+                    // The batch as a whole failed: refused, or — with no answer — unconfirmed.
                     Err(e) => errors.extend(positions.into_iter().map(|position| {
-                        format!("document {position}: forwarding to node {node_id} failed: {e}")
+                        e.item_reason(
+                            &format!("document {position}"),
+                            &format!("forwarding to node {node_id}"),
+                        )
                     })),
                 }
             }
@@ -539,11 +542,12 @@ impl BulkCtx<'_> {
                         deleted += count;
                         errors.extend(reasons);
                     }
-                    // The batch never got an answer, so none of it was deleted.
-                    Err(err) => errors.extend(
-                        ids.into_iter()
-                            .map(|id| format!("{id}: forwarding to node {node_id} failed: {err}")),
-                    ),
+                    // The batch as a whole failed: refused, or — with no answer — unconfirmed.
+                    Err(err) => {
+                        errors.extend(ids.into_iter().map(|id| {
+                            err.item_reason(&id, &format!("forwarding to node {node_id}"))
+                        }))
+                    }
                 }
             }
         }
@@ -2363,12 +2367,14 @@ pub(super) async fn orchestrator_worker_loop<F, Fut>(
                                      its pool slot has been reclaimed so the node keeps serving. \
                                      This is a defect — an operation should not reach this."
                                 );
+                                // Abandoned is not undone, so the caller hears that the
+                                // outcome is unconfirmed rather than that nothing happened.
                                 (
-                                    WorkerOutcome::Done(Err(OrchestratorError::Io(
-                                        std::io::Error::other(
-                                            "operation exceeded the worker liveness cap",
-                                        ),
-                                    ))),
+                                    WorkerOutcome::Done(Err(OrchestratorError::Unanswered {
+                                        message: "the operation passed the worker liveness cap \
+                                                  and was abandoned"
+                                            .to_string(),
+                                    })),
                                     false,
                                 )
                             }
@@ -2808,6 +2814,7 @@ impl OrchestratorEngine {
             },
             ClientOp::Search {
                 spent_ms: _,
+                wait_ms: _,
                 index,
                 query,
                 limit,
@@ -5112,6 +5119,7 @@ impl NodeOrchestrator {
             ClientOp::Stream { .. } => unreachable!("normalized to a search above"),
             ClientOp::Search {
                 spent_ms: _,
+                wait_ms: _,
                 index,
                 query,
                 limit,
@@ -6803,7 +6811,7 @@ impl Message<ClientOp> for NodeOrchestrator {
         // on. One that arrives with that budget gone is refused here: it would be run for a
         // client the first node has already answered. An op from a peer that sends no
         // `spent_ms` starts its clock now, as every peer op did before.
-        let arrived = match peer_op_clock(msg.spent_ms(), self.read_budget) {
+        let arrived = match peer_op_clock(msg.spent_ms(), self.read_budget, msg.wait_ms()) {
             Ok(arrived) => arrived,
             Err(spent) => {
                 debug!(error = %spent, "a peer's op arrived with its request's budget spent; refused");
@@ -6819,10 +6827,33 @@ impl Message<ClientOp> for NodeOrchestrator {
             if let Ok(permit) = lane.try_acquire_owned() {
                 let (delegated, reply) = ctx.reply_sender();
                 let orchestrator = ctx.actor_ref().downgrade();
+                // Counted where this node's own work is counted. The lane runs on the same read
+                // pool and writer threads as the worker pool, but its ops were in neither the
+                // pool's depth nor its service estimate, so the door judged a node carrying two
+                // peers' shares as if it carried only its own requests. Now the door's depth
+                // includes them and its estimate learns what they cost, so it refuses new
+                // requests here once the shares already running would make them wait too long.
+                // A share is not refused on arrival: its request was admitted at its own door,
+                // and the budget it carries still sheds it at the read pool.
+                let stats = self
+                    .worker_tx
+                    .as_ref()
+                    .map(|tx| Arc::clone(&tx.dispatch_stats));
+                let slot = stats
+                    .as_ref()
+                    .map(|stats| super::admission::MailboxSlot::enter(Arc::clone(stats)));
+                let class = OpClass::of(&msg);
                 tokio::spawn(REQUEST_STARTED_AT.scope(arrived, async move {
+                    let started = Instant::now();
                     let result = match engine.execute(msg).await {
-                        WorkerOutcome::Done(result) => result,
+                        WorkerOutcome::Done(result) => {
+                            if let Some(stats) = &stats {
+                                stats.record_service(class, started.elapsed());
+                            }
+                            result
+                        }
                         WorkerOutcome::UseActor(op) => {
+                            drop(slot);
                             drop(permit);
                             on_actor(&orchestrator, *op).await
                         }
@@ -6845,11 +6876,25 @@ impl Message<ClientOp> for NodeOrchestrator {
 /// deadline checks it meets here measure the budget its client is still waiting on. Refused, as
 /// the worker pool's dequeue check refuses, when that is already more than `budget`. No
 /// `spent_ms` — a peer that predates it, or an op sent outside any request — arrives now.
+///
+/// A share whose sender waits `wait_ms`, less than the budget it has left, counts the rest of
+/// the budget as spent: the clock starts `budget - wait_ms` back, so every deadline check here
+/// ends the work when the sender stops waiting for it. Judged against this node's own budget,
+/// so a peer configured with a different timeout still gets the sender's wait, not a refusal.
 pub(crate) fn peer_op_clock(
     spent_ms: Option<u64>,
     budget: Option<Duration>,
+    wait_ms: Option<u64>,
 ) -> Result<Instant, OrchestratorError> {
-    let arrived = spent_ms
+    let unwaited = match (wait_ms, budget) {
+        (Some(wait), Some(budget)) => Some((budget.as_millis() as u64).saturating_sub(wait)),
+        _ => None,
+    };
+    let spent = match (spent_ms, unwaited) {
+        (Some(spent), Some(unwaited)) => Some(spent.max(unwaited)),
+        (spent, unwaited) => spent.or(unwaited),
+    };
+    let arrived = spent
         .and_then(|spent| Instant::now().checked_sub(Duration::from_millis(spent)))
         .unwrap_or_else(Instant::now);
     within_budget(arrived, budget)
@@ -6902,11 +6947,11 @@ impl Message<OnActor> for NodeOrchestrator {
         // The actor's clock for this node's own op is the request's, as it is for a peer's,
         // queue time included. One that reaches the actor with its budget gone is refused
         // rather than run for nobody, as the worker pool refuses one at dequeue.
-        let arrived = match within_budget(msg.started.unwrap_or_else(Instant::now), self.read_budget)
-        {
-            Ok(arrived) => arrived,
-            Err(spent) => return ctx.reply(Err(spent)),
-        };
+        let arrived =
+            match within_budget(msg.started.unwrap_or_else(Instant::now), self.read_budget) {
+                Ok(arrived) => arrived,
+                Err(spent) => return ctx.reply(Err(spent)),
+            };
         REQUEST_STARTED_AT
             .scope(arrived, self.run_on_actor(msg.op, ctx))
             .await

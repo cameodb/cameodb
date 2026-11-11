@@ -135,6 +135,7 @@ pub(super) fn widen_broadcast_op(op: ClientOp, window: SearchWindow) -> ClientOp
             ..
         } => ClientOp::Search {
             spent_ms: None,
+            wait_ms: None,
             index,
             query,
             limit: Some(window.fetch_count()),
@@ -388,9 +389,10 @@ impl RouterActor {
                             // is the whole point of the fast/slow split: the actor owns the
                             // `&mut` state that schema evolution and bulk writes need.
                             Ok(WorkerOutcome::UseActor(op)) => self.ask_orchestrator(*op).await,
-                            Err(_) => Err(OrchestratorError::Io(std::io::Error::other(
-                                "Worker dropped reply channel",
-                            ))),
+                            // The job may have run before its worker dropped the reply.
+                            Err(_) => Err(OrchestratorError::Unanswered {
+                                message: "the worker dropped the reply channel".to_string(),
+                            }),
                         };
                     }
                     Err(err) => match *err {
@@ -936,7 +938,10 @@ impl RouterActor {
             _ => self.broadcast_timeout,
         };
         let remote_router = self.clone();
-        let remote_op = op.clone();
+        let mut remote_op = op.clone();
+        // A search share says how long it is waited on, so the peer stops there too instead
+        // of walking on for the rest of the budget into an answer this node no longer reads.
+        remote_op.set_wait(remote_timeout);
         // Each peer carries the ordinal it was dispatched at. `buffer_unordered` yields in
         // completion order, and a merge that breaks ties by which peer answered first is a merge
         // that answers one query two ways.
@@ -946,7 +951,7 @@ impl RouterActor {
                 .take(self.broadcast_fanout_limit)
                 .enumerate()
                 .map(move |(dispatch_ordinal, peer)| {
-                    let op_clone = remote_op.clone();
+                    let mut op_clone = remote_op.clone();
                     let remote_router = remote_router.clone();
                     let node_id = peer.node_id;
                     let peer_addr = peer.address;
@@ -962,7 +967,7 @@ impl RouterActor {
                         }
                         let outcome = timeout(
                             remote_timeout,
-                            remote_router.try_remote(&op_clone, node_id, &peer_addr),
+                            remote_router.try_remote(&mut op_clone, node_id, &peer_addr),
                         )
                         .await;
                         (dispatch_ordinal, node_id, outcome)
@@ -1632,9 +1637,15 @@ impl RouterActor {
     /// the same schema and the same verdict; not wrapped, because the wrapper described a
     /// transport that worked perfectly; and not reported as a dial failure, because it says
     /// nothing about connectivity. Only an attempt that failed to *reach* the peer is retried.
+    ///
+    /// **An attempt that ran out of time is not retried either.** It may have reached the
+    /// peer, which may be running it still: a second attempt sent while the first runs doubles
+    /// the load on a node that is slow already, and the first can land after the second. It is
+    /// answered [`OrchestratorError::Unanswered`] — not confirmed — and with no redial, since
+    /// a slow answer says nothing about the connection.
     pub(super) async fn handle_remote(
         &self,
-        op: ClientOp,
+        mut op: ClientOp,
         node_id: Uuid,
         peer_addr: String,
     ) -> Result<JsonValue, OrchestratorError> {
@@ -1644,7 +1655,7 @@ impl RouterActor {
         for attempt in 1..=max_attempts {
             match timeout(
                 self.remote_timeout,
-                self.try_remote(&op, node_id, &peer_addr),
+                self.try_remote(&mut op, node_id, &peer_addr),
             )
             .await
             {
@@ -1671,19 +1682,20 @@ impl RouterActor {
                     );
                     last_err = Some(err);
                 }
-                Err(elapsed) => {
+                Err(_) => {
                     warn!(
                         %node_id,
                         %peer_addr,
                         attempt,
-                        max_attempts,
                         timeout_ms = self.remote_timeout.as_millis(),
-                        error = %elapsed,
-                        "RouterActor: remote attempt timed out"
+                        "RouterActor: remote attempt timed out; not retried, its outcome is unconfirmed"
                     );
-                    last_err = Some(OrchestratorError::Io(std::io::Error::other(
-                        elapsed.to_string(),
-                    )));
+                    return Err(OrchestratorError::Unanswered {
+                        message: format!(
+                            "node {node_id} did not answer within {}ms",
+                            self.remote_timeout.as_millis()
+                        ),
+                    });
                 }
             }
         }
@@ -1714,15 +1726,15 @@ impl RouterActor {
     /// Attempt a remote call to a microshard on another node.
     /// Uses the cached RemotePeerPool to avoid repeated swarm registry lookups.
     ///
-    /// **Borrows the operation.** `ask` serialises from a reference, so nothing here ever needed
-    /// to own one — and taking it by value obliged every caller to hand over a copy it could not
-    /// get back. The retry loop in [`handle_remote`](Self::handle_remote) paid that on every
-    /// attempt including the first, so an ordinary cross-node write deep-cloned its whole
-    /// document for a call that succeeded. A fan-out still clones once per peer, which is real:
-    /// those futures run concurrently and each needs its own.
+    /// **Borrows the operation, mutably.** `ask` serialises from a reference, so nothing here
+    /// needs to own one; the borrow is mutable only so each attempt can stamp the time spent
+    /// so far (O4) into the caller's op. Cloning it to stamp a copy deep-cloned the whole
+    /// document of every cross-node write on every attempt, including a first that succeeded
+    /// (CH12). A fan-out still clones once per peer, which is real: those futures run
+    /// concurrently and each needs its own.
     pub(super) async fn try_remote(
         &self,
-        op: &ClientOp,
+        op: &mut ClientOp,
         node_id: Uuid,
         peer_addr: &str,
     ) -> Result<JsonValue, OrchestratorError> {
@@ -1751,9 +1763,8 @@ impl RouterActor {
         // noticed. Drop the peer's refs so the next call looks it up afresh. Not on this
         // router's own timers: those fire on a slow answer as readily as on a lost one.
         // Stamped per attempt, so a retry tells the peer how much less time is left (O4).
-        let mut op = op.clone();
         op.stamp_spent();
-        let answer = remote_answer(remote.ask(&op).await);
+        let answer = remote_answer(remote.ask(&*op).await);
         if let Err(never_arrived) = &answer
             && !matches!(never_arrived, OrchestratorError::Remote { .. })
         {

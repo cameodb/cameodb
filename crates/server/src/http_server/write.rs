@@ -699,12 +699,12 @@ async fn flush_lines(
                 });
             (written, renumbered)
         }
-        // The batch never got an answer, so none of it was written.
+        // The batch as a whole failed: refused, or — with no answer — unconfirmed.
         Err(e) => (
             0,
             lines
                 .into_iter()
-                .map(|line| format!("line {line}: dispatching this batch failed: {e}"))
+                .map(|line| e.item_reason(&format!("line {line}"), "dispatching this batch"))
                 .collect(),
         ),
     }

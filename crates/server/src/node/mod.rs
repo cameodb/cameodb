@@ -599,6 +599,18 @@ pub enum OrchestratorError {
     #[error("{message}")]
     PeerUnreachable { message: String },
 
+    /// The operation was handed on — to a peer, or to a worker — and no answer came back in
+    /// time. Unlike [`Self::PeerUnreachable`] this is not "nothing happened": the other side
+    /// may be running it still, or have finished it and lost the reply, so what it carried is
+    /// *not confirmed* either way. A caller told "not written" for documents that were stored
+    /// would count them wrong and resend them into a node that is slow already; one told "not
+    /// confirmed" can read back before it resends.
+    ///
+    /// Answered as "not now", like an unreachable peer: a write is an idempotent upsert, so a
+    /// retry converges, and the answer to whether it landed is a read away.
+    #[error("{message}; not confirmed, it may still have taken effect")]
+    Unanswered { message: String },
+
     /// A verdict another node reached, carried across the boundary intact.
     ///
     /// See [`RemoteVerdict`]. The variant a peer actually raised cannot be rebuilt here — the
@@ -673,6 +685,17 @@ impl RemoteVerdict {
 }
 
 impl OrchestratorError {
+    /// The reason given for `item` when the whole `call` that carried it failed with this
+    /// error. A call that went out and got no answer is not a call that failed: the item is
+    /// reported as not confirmed, since it may have been applied, and not as refused.
+    pub(crate) fn item_reason(&self, item: &str, call: &str) -> String {
+        if matches!(self, Self::Unanswered { .. }) {
+            format!("{item}: not confirmed, {call} got no answer: {self}")
+        } else {
+            format!("{item}: {call} failed: {self}")
+        }
+    }
+
     /// The error as a caller is shown it: a store's error as the store words it, without the
     /// `storage error:` this wrapper puts in front for the log. A caller is told which index does
     /// not exist, not which layer noticed.
@@ -700,6 +723,7 @@ impl OrchestratorError {
             // is rebuilt on the next write, and the caller should retry.
             Self::SchemaUnconfirmed { .. }
             | Self::PeerUnreachable { .. }
+            | Self::Unanswered { .. }
             | Self::ReadDeadlineExpired { .. }
             | Self::Overloaded { .. }
             | Self::NotReady(_)
@@ -1034,6 +1058,7 @@ impl From<OrchestratorError> for RemoteError {
             // is the microshard path and has no retryable kind of its own, so `Unavailable`
             // travels as `Io` here — a shard call does not produce one.
             OrchestratorError::PeerUnreachable { message } => RemoteError::Io(message),
+            err @ OrchestratorError::Unanswered { .. } => RemoteError::Io(err.to_string()),
             // Carried like `PeerUnreachable`: a peer that shed the read did not answer, and the
             // gather reports it as the partial outage it is.
             OrchestratorError::ReadDeadlineExpired {
@@ -1256,6 +1281,14 @@ pub enum ClientOp {
         /// forwarded variant.
         #[serde(default)]
         spent_ms: Option<u64>,
+        /// How long the node that sent this share waits for its answer, when that is shorter
+        /// than the request's budget: a broadcast search waits on each peer for the broadcast
+        /// timeout, then answers without it. The receiving node ends its own work there too
+        /// (see `peer_op_clock`) rather than walking on for the rest of the budget into an
+        /// answer nobody reads. `None` on an op that is not a peer's share, or from a peer on a
+        /// build that predates the field: the budget alone bounds it, as before.
+        #[serde(default)]
+        wait_ms: Option<u64>,
     },
     /// The search an earlier build sent for a streamed request: the first `limit` hits, no
     /// offset. Never built here — the stream route builds a `Search` — and kept on the wire only
@@ -1523,6 +1556,22 @@ impl ClientOp {
         }
     }
 
+    /// How long the sender of this op waits for its answer, if it said (see `Search::wait_ms`).
+    pub(crate) fn wait_ms(&self) -> Option<u64> {
+        match self {
+            Self::Search { wait_ms, .. } => *wait_ms,
+            _ => None,
+        }
+    }
+
+    /// Say on a search share how long this node will wait for its answer. Other ops are
+    /// waited on for their whole budget and carry nothing.
+    pub(crate) fn set_wait(&mut self, wait: Duration) {
+        if let Self::Search { wait_ms, .. } = self {
+            *wait_ms = Some(wait.as_millis() as u64);
+        }
+    }
+
     /// Stamp the current request's spent budget on an op about to go to a peer (ROADMAP O4), so
     /// the peer judges it against the client's deadline. Leaves the op as it is outside a
     /// request's scope, and on an op that does not carry the field.
@@ -1556,6 +1605,7 @@ impl ClientOp {
                 sort,
             } => ClientOp::Search {
                 spent_ms: None,
+                wait_ms: None,
                 index,
                 query,
                 limit,

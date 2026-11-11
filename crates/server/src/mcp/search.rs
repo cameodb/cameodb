@@ -237,6 +237,7 @@ async fn clause_matches_nothing(state: &AppState, index: &str, clause: &str) -> 
         .route_and_handle(
             ClientOp::Search {
                 spent_ms: None,
+                wait_ms: None,
                 index: index.to_string(),
                 query: clause.to_string(),
                 limit: Some(0),
@@ -334,6 +335,7 @@ pub(super) fn search_index(
             .route_and_handle(
                 ClientOp::Search {
                     spent_ms: None,
+                    wait_ms: None,
                     index: index.index,
                     query: cleaned_query,
                     limit: Some(window.limit),
@@ -496,6 +498,7 @@ pub(super) fn search_across_indexes(
                         .route_and_handle_keeping_sort_keys(
                             ClientOp::Search {
                                 spent_ms: None,
+                                wait_ms: None,
                                 index: index.clone(),
                                 query: cleaned_query,
                                 limit: Some(window.fetch_count()),

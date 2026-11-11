@@ -108,6 +108,7 @@ pub(super) async fn search_handler(
     // bound have been applied once, here, and every layer below reads the same numbers back.
     let client_op = ClientOp::Search {
         spent_ms: None,
+        wait_ms: None,
         index,
         query: cleaned_query,
         limit: Some(window.limit),
@@ -209,6 +210,7 @@ pub(super) async fn search_stream_handler(
     // The first `limit` hits: a stream has no page to take, and the route refuses an offset.
     let client_op = ClientOp::Search {
         spent_ms: None,
+        wait_ms: None,
         index,
         query: cleaned_query,
         limit: Some(window.limit),

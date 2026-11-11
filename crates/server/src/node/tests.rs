@@ -592,6 +592,7 @@ fn a_search_without_an_array_limit_reads_as_whole_arrays_and_one_with_it_keeps_i
 
     let op = ClientOp::Search {
         spent_ms: None,
+        wait_ms: None,
         index: "i".to_string(),
         query: "*".to_string(),
         limit: Some(10),
@@ -1687,8 +1688,9 @@ async fn an_operation_that_never_returns_costs_one_slot_not_the_pool() {
     // that hangs reports nothing. The regression has to be a failure, not a stall.
     for answer in [first, second] {
         match tokio::time::timeout(Duration::from_millis(500), answer).await {
-            Ok(Ok(WorkerOutcome::Done(Err(_)))) => {}
-            Ok(Ok(_)) => panic!("a job past the liveness cap must answer with an error"),
+            // Unconfirmed, not failed: an abandoned job may still finish.
+            Ok(Ok(WorkerOutcome::Done(Err(OrchestratorError::Unanswered { .. })))) => {}
+            Ok(Ok(_)) => panic!("a job past the liveness cap must answer unconfirmed"),
             Ok(Err(_)) => panic!("a job past the liveness cap dropped its reply channel"),
             Err(_) => panic!(
                 "a parked job was never answered — its slot is still held and the pool is short one"
@@ -2830,6 +2832,7 @@ fn a_paged_merge_returns_the_right_slice_of_the_full_order() {
 fn a_fan_out_reads_the_page_off_the_operation() {
     let search = |limit: Option<usize>, offset: Option<usize>| ClientOp::Search {
         spent_ms: None,
+        wait_ms: None,
         index: "books".to_string(),
         query: "rust".to_string(),
         limit,
@@ -3140,6 +3143,12 @@ fn a_verdict_survives_the_wire() {
             RemoteVerdict::Unavailable,
         ),
         (
+            OrchestratorError::Unanswered {
+                message: "node 1 did not answer within 30s".into(),
+            },
+            RemoteVerdict::Unavailable,
+        ),
+        (
             OrchestratorError::Io(std::io::Error::other("a disk gave up")),
             RemoteVerdict::ServerFault,
         ),
@@ -3177,6 +3186,28 @@ fn a_verdict_survives_the_wire() {
             "the message must arrive unchanged, and without the tag"
         );
     }
+}
+
+/// An item a failed call carried is refused when the call failed, and unconfirmed when it got
+/// no answer: the other side may have applied it, and saying "failed" would count a stored
+/// document as missing.
+#[test]
+fn an_unanswered_call_leaves_its_items_unconfirmed_not_failed() {
+    let unanswered = OrchestratorError::Unanswered {
+        message: "node n1 did not answer within 30s".into(),
+    };
+    let reason = unanswered.item_reason("document 3", "forwarding to node n1");
+    assert!(reason.starts_with("document 3: not confirmed"), "{reason}");
+    assert!(reason.contains("may still have taken effect"), "{reason}");
+    assert!(!reason.contains("failed"), "{reason}");
+
+    let unreachable = OrchestratorError::PeerUnreachable {
+        message: "node n1 is not reachable".into(),
+    };
+    assert_eq!(
+        unreachable.item_reason("document 3", "forwarding to node n1"),
+        "document 3: forwarding to node n1 failed: node n1 is not reachable"
+    );
 }
 
 /// A node that predates the tagged form still gets an answer, and its answers are still read.
@@ -3593,6 +3624,64 @@ async fn the_placement_counts_the_same_shards_as_the_shard_map() {
         assert_eq!(placement.load().live.len(), created);
         assert_eq!(orchestrator.shard_count(), created);
     }
+}
+
+/// A peer's op runs on the peer lane, beside the worker pool rather than in it, but on the same
+/// read pool and writers — so the door has to see it. It is counted in the pool's depth while it
+/// runs and its service time is folded into the estimate the door refuses against.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peers_op_is_counted_where_the_door_looks() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut orchestrator = NodeOrchestrator::new(
+        NodeConfig {
+            storage_path: dir.path().to_path_buf(),
+            storage_paths: vec![dir.path().to_path_buf()],
+            ..NodeConfig::default()
+        },
+        NodeIdentity::new(),
+        10,
+        4,
+    )
+    .await
+    .expect("an orchestrator with no shards");
+    orchestrator.create_initial_shards(1).await;
+    orchestrator.spawn_worker_pool();
+    let stats = Arc::clone(
+        &orchestrator
+            .worker_tx
+            .as_ref()
+            .expect("a pool")
+            .dispatch_stats,
+    );
+    assert_eq!(stats.service_ewma_read_us.load(AtomicOrdering::Relaxed), 0);
+    let actor = <NodeOrchestrator as kameo::actor::Spawn>::spawn(orchestrator);
+
+    // As a peer sends it: through the actor's `ClientOp` handler, not the router.
+    let _ = actor
+        .ask(ClientOp::Search {
+            index: "books".into(),
+            query: "*".into(),
+            limit: Some(10),
+            offset: None,
+            fields: None,
+            sort: None,
+            array_limit: None,
+            match_elements: false,
+            metrics: None,
+            spent_ms: Some(0),
+            wait_ms: None,
+        })
+        .await;
+
+    assert!(
+        stats.service_ewma_read_us.load(AtomicOrdering::Relaxed) > 0,
+        "the peer's search was not folded into the read estimate"
+    );
+    assert_eq!(
+        stats.outstanding.load(AtomicOrdering::Relaxed),
+        0,
+        "the peer's op left its count behind"
+    );
 }
 
 /// A first boot budgets every shard as one of the shards it creates. A shard's share of the
@@ -4091,6 +4180,7 @@ fn only_what_a_worker_can_serve_leaves_the_mailbox() {
         },
         ClientOp::Search {
             spent_ms: None,
+            wait_ms: None,
             index: index(),
             query: "*".to_string(),
             limit: None,
@@ -4475,7 +4565,7 @@ async fn an_op_sent_from_a_request_carries_what_it_has_spent() {
 #[test]
 fn a_peers_op_is_judged_against_its_requests_budget() {
     let budget = Some(Duration::from_millis(1_000));
-    match peer_op_clock(Some(1_500), budget) {
+    match peer_op_clock(Some(1_500), budget, None) {
         Err(OrchestratorError::ReadDeadlineExpired {
             waited_ms,
             budget_ms,
@@ -4486,16 +4576,62 @@ fn a_peers_op_is_judged_against_its_requests_budget() {
         other => panic!("expected the spent op refused, got {other:?}"),
     }
 
-    let arrived = peer_op_clock(Some(400), budget).expect("budget left");
+    let arrived = peer_op_clock(Some(400), budget, None).expect("budget left");
     assert!(arrived.elapsed() >= Duration::from_millis(400));
 
-    let fresh = peer_op_clock(None, budget).expect("no spent_ms");
+    let fresh = peer_op_clock(None, budget, None).expect("no spent_ms");
     assert!(fresh.elapsed() < Duration::from_millis(100));
 
     assert!(
-        peer_op_clock(Some(60_000), None).is_ok(),
+        peer_op_clock(Some(60_000), None, None).is_ok(),
         "no budget, nothing refused"
     );
+}
+
+/// A share its sender waits on for less than the budget ends when the wait does: the rest of
+/// the budget counts as spent. Judged against the peer's own budget — so a sender with a longer
+/// timeout than this peer still gets its wait, not a refusal — and never extending a request
+/// that has spent more than the wait leaves.
+#[test]
+fn a_waited_share_ends_where_its_sender_stops_waiting() {
+    let budget = Some(Duration::from_millis(10_000));
+    // 10s budget, waited on for 2s: starts 8s back, so 2s remain.
+    let arrived = peer_op_clock(None, budget, Some(2_000)).expect("in budget");
+    let left = Duration::from_millis(10_000).saturating_sub(arrived.elapsed());
+    assert!(left <= Duration::from_millis(2_000), "{left:?}");
+    assert!(left > Duration::from_millis(1_500), "{left:?}");
+
+    // Spent more than the wait leaves: the spent clock stands.
+    let arrived = peer_op_clock(Some(9_000), budget, Some(2_000)).expect("in budget");
+    assert!(arrived.elapsed() >= Duration::from_millis(9_000));
+
+    // A wait longer than this peer's budget is no reason to refuse.
+    let arrived = peer_op_clock(Some(100), budget, Some(60_000)).expect("in budget");
+    assert!(arrived.elapsed() < Duration::from_millis(1_000));
+
+    // No budget here, nothing to shorten.
+    let arrived = peer_op_clock(None, None, Some(2_000)).expect("no budget");
+    assert!(arrived.elapsed() < Duration::from_millis(100));
+}
+
+/// The sender says the wait on a search share only.
+#[test]
+fn only_a_search_share_carries_its_wait() {
+    let mut search = ClientOp::Search {
+        index: "docs".into(),
+        query: "*".into(),
+        limit: Some(10),
+        offset: None,
+        fields: None,
+        sort: None,
+        array_limit: None,
+        match_elements: false,
+        metrics: None,
+        spent_ms: None,
+        wait_ms: None,
+    };
+    search.set_wait(Duration::from_secs(5));
+    assert_eq!(search.wait_ms(), Some(5_000));
 }
 
 /// And the clock the peer starts reaches its read pool: a search whose request had spent most
@@ -4508,7 +4644,8 @@ fn a_forwarded_reads_deadline_is_its_requests_deadline() {
         .build()
         .expect("runtime");
     runtime.block_on(async {
-        let arrived = peer_op_clock(Some(90), Some(Duration::from_millis(100))).expect("in budget");
+        let arrived =
+            peer_op_clock(Some(90), Some(Duration::from_millis(100)), None).expect("in budget");
         tokio::time::sleep(Duration::from_millis(20)).await;
         let read: Result<(), OrchestratorError> = REQUEST_STARTED_AT
             .scope(

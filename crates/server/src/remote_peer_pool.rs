@@ -127,7 +127,9 @@ impl RemotePeerPool {
     /// never got there: the cached ref may be the problem (a restarted peer answers an old ref
     /// with "actor not running" until something notices it left), so it is dropped and the next
     /// call looks the peer up afresh, and the caller hears `PeerUnreachable` — "not now", a
-    /// retryable `503`, rather than a failure of this node.
+    /// retryable `503`, rather than a failure of this node. A conversation cut off by the
+    /// deadline is answered [`OrchestratorError::Unanswered`] instead: it may have reached the
+    /// peer, so what it carried is not confirmed either way.
     pub(crate) async fn converse<T>(
         &self,
         node_id: Uuid,
@@ -149,9 +151,12 @@ impl RemotePeerPool {
                     message: format!("node {node_id} could not be reached: {never_arrived}"),
                 })
             }
+            // Out of time is not "never arrived": the ask may have reached the peer, which may
+            // be running it still. So the caller hears that nothing is confirmed, not that
+            // nothing happened.
             Err(_) => {
                 self.invalidate_peer(node_id);
-                Err(OrchestratorError::PeerUnreachable {
+                Err(OrchestratorError::Unanswered {
                     message: format!(
                         "node {node_id} did not answer within {}s",
                         self.peer_timeout.as_secs()
@@ -416,9 +421,10 @@ mod tests {
     }
 
     /// The deadline covers the whole conversation — lookup, ask and resend — once, so a peer
-    /// that stops answering half-way holds the caller no longer than the pool's timeout.
+    /// that stops answering half-way holds the caller no longer than the pool's timeout. What
+    /// it was asked is unconfirmed, not refused: the peer may be doing it still.
     #[tokio::test]
-    async fn a_conversation_that_outlives_the_deadline_is_cut_off() {
+    async fn a_conversation_that_outlives_the_deadline_is_cut_off_unconfirmed() {
         let pool = RemotePeerPool::with_peer_timeout(Duration::from_millis(50));
         let started = Instant::now();
         let stalled = pool
@@ -427,10 +433,7 @@ mod tests {
                 Ok::<(), OrchestratorError>(())
             })
             .await;
-        assert!(matches!(
-            stalled,
-            Err(OrchestratorError::PeerUnreachable { .. })
-        ));
+        assert!(matches!(stalled, Err(OrchestratorError::Unanswered { .. })));
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 

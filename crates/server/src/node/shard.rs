@@ -2356,17 +2356,16 @@ impl MicroshardActor {
     ) -> Result<storage::DeleteCount, OrchestratorError> {
         let store = self.store_for_delete()?;
         let deadline = self.delete_deadline();
-        self.spawn_on_read_pool(move || {
-            store.delete_query_count(&index, &query, deadline.as_ref())
-        })
-        .await?
-        .map_err(store_error_to_orchestrator)
+        self.spawn_on_read_pool(move || store.delete_query_count(&index, &query, deadline.as_ref()))
+            .await?
+            .map_err(store_error_to_orchestrator)
     }
 
     fn store_for_delete(&self) -> Result<Arc<HybridStore>, OrchestratorError> {
-        self.store.as_ref().map(Arc::clone).ok_or_else(|| {
-            OrchestratorError::NotReady("HybridStore not initialized".to_string())
-        })
+        self.store
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| OrchestratorError::NotReady("HybridStore not initialized".to_string()))
     }
 
     fn delete_deadline(&self) -> Option<storage::SearchDeadline> {
