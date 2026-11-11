@@ -295,9 +295,13 @@ impl HybridStore {
     pub(crate) fn smart_refresh_reader(&self, index: &str) -> Result<(), StoreError> {
         // Dropped after the reload, on both paths, not before it: a stats request between a
         // drop and the reload would measure the old reader and cache it again.
-        // Fast path: Try to reload existing reader
-        if let Some(reader_ref) = self.readers.get(index) {
-            match reader_ref.value().reload() {
+        // Fast path: Try to reload existing reader. Cloned out of the map first — a clone shares
+        // the reload — so the map's shard lock is not held across it: a reload rebuilds every
+        // segment reader, and a first open of another index hashed to the same map shard would
+        // queue behind it, with every search of the indexes on that shard queued behind the open.
+        let cached = self.readers.get(index).map(|reader| reader.value().clone());
+        if let Some(reader) = cached {
+            match reader.reload() {
                 Ok(_) => {
                     tracing::debug!(index = %index, "Reader reloaded successfully (fast path)");
                     self.invalidate_size_cache(index);
@@ -489,8 +493,9 @@ impl HybridStore {
         // A reader is an open index too. `readers` holds an `IndexReader` with its segment
         // readers and their fast-field caches, which is the largest of the ten per-index
         // structures now that the document cache is gone — counting only writers would leave
-        // a search-only workload unbounded.
-        self.admit_open_index(index);
+        // a search-only workload unbounded. Admitted as a reader: it may close only indexes
+        // that hold no writer, so a search never pays another index's commit.
+        self.admit_open_index(index, false);
 
         // Use DashMap entry API for concurrent-safe creation
         let reader = self
@@ -757,7 +762,10 @@ impl HybridStore {
             .map(|spec| crate::metrics::MetricsCollector::new(&tantivy_index.schema(), spec))
             .transpose()?;
         let measured = |extremes: Option<Vec<crate::metrics::Extremes>>| {
-            metrics.as_ref().zip(extremes).map(|(m, e)| m.metrics_from(e))
+            metrics
+                .as_ref()
+                .zip(extremes)
+                .map(|(m, e)| m.metrics_from(e))
         };
 
         // Count-only mode: limit=0 means return just total_hits without document data.

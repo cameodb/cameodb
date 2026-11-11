@@ -572,8 +572,8 @@ pub fn evaluate(config: &CameoDbConfig) -> Result<Posture, String> {
             ))
         } else {
             Outcome::Pass(format!(
-                "{open_cap} indexes open at once = {arenas_mb} MB of arenas and {open_threads} \
-                 writer threads worst case"
+                "{open_cap} index openings at once (one per index per shard) = {arenas_mb} MB \
+                 of arenas and {open_threads} writer threads worst case"
             ))
         },
     );

@@ -117,7 +117,8 @@ max_body_size_mb = 0
 # The node's memory budget in MB (default: 2048).
 total_memory_limit_mb = 2048
 
-# Largest number of indexes held open at once. 0 (default) derives it from the memory budget.
+# Largest number of index openings held at once, counted once per index per shard: at 4 shards
+# a cap of 32 holds 8 index names. 0 (default) derives it from the memory budget.
 max_open_indexes = 0
 
 # Largest MCP search response in bytes. Unset, it follows the HTTP body ceiling.
@@ -169,11 +170,18 @@ where callers create their own indexes, that makes resident memory a function of
 *names* have been touched. Past the cap the least recently used index is committed and closed;
 its data is untouched and the next request for it reopens it, paying one reopen. Listing the
 indexes (`GET /_indexes`, `list_indexes`) is not a use: it counts a closed index from its stored
-documents without opening it, so a listing never evicts the indexes being worked on. Startup and
-`check-config` print what a given cap implies in both currencies:
+documents without opening it, so a listing never evicts the indexes being worked on.
+
+The cap counts an index once per shard it is open on, and an index is open on every shard that
+holds part of it — so 32 at 4 shards is 8 index names. That is the right unit for what it
+bounds: each (shard, index) opening with a writer has its own arena and threads. An index opened
+only for searching holds neither, so a search makes room only among indexes open for reading: it
+never closes, and so never commits, an index that holds a writer. When every colder index holds
+one, the search's index is admitted one past the cap, and the next search's takes its place.
+Startup and `check-config` print what a given cap implies in both currencies:
 
 ```text
-  limits           PASS  32 indexes open at once = 2048 MB of arenas and 96 writer threads worst case
+  limits           PASS  32 index openings at once (one per index per shard) = 2048 MB of arenas and 96 writer threads worst case
 ```
 
 There is no setting for "unbounded" — `0` derives rather than disables. A deployment that

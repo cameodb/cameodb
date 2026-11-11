@@ -81,6 +81,10 @@ fn a_pruned_page_holds_only_live_matches() {
     assert_eq!(outcome.hits.len(), 100);
     for hit in &outcome.hits {
         let n: usize = hit.id[1..].parse().expect("numbered id");
-        assert!(n.is_multiple_of(2) && n >= 100, "{} is not a live a", hit.id);
+        assert!(
+            n.is_multiple_of(2) && n >= 100,
+            "{} is not a live a",
+            hit.id
+        );
     }
 }

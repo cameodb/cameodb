@@ -329,3 +329,50 @@ fn listing_the_indexes_opens_none_of_them() {
         "and so must not evict the indexes in use"
     );
 }
+
+/// A search makes room among the indexes open for reading only. Closing one with a writer
+/// commits what it buffered, and a search would pay for it on a read thread for a reader that
+/// holds no arena; so a reader is admitted one past the cap when every colder index holds a
+/// writer, and the next reader takes its place rather than a writer's.
+#[test]
+fn a_search_never_closes_an_index_with_a_writer() {
+    let dir = TempDir::new().unwrap();
+    let cap = 2;
+    let store = HybridStore::new(capped_config(dir.path(), cap), 1).expect("store");
+
+    // Two indexes searched later, written and then closed so they are on disk and not open.
+    for name in ["read-1", "read-2"] {
+        write_one(&store, name, "doc-1");
+        assert!(store.close_index(name), "{name} closes");
+    }
+    // The cap's worth of indexes with writers.
+    for name in ["write-1", "write-2"] {
+        write_one(&store, name, "doc-1");
+    }
+    assert_eq!(store.open_index_count(), cap);
+
+    let search = |index: &str| {
+        store
+            .search_documents(index, "*", 10, None)
+            .expect("search")
+    };
+
+    search("read-1");
+    assert!(store.is_index_open("write-1") && store.is_index_open("write-2"));
+    assert!(store.is_index_open("read-1"));
+    assert_eq!(store.open_index_count(), cap + 1, "one reader past the cap");
+
+    search("read-2");
+    assert!(store.is_index_open("write-1") && store.is_index_open("write-2"));
+    assert!(
+        !store.is_index_open("read-1"),
+        "the colder reader made room"
+    );
+    assert!(store.is_index_open("read-2"));
+    assert_eq!(store.open_index_count(), cap + 1);
+
+    // A write still makes room among writers, as it always did.
+    write_one(&store, "write-3", "doc-1");
+    assert!(store.open_index_count() <= cap + 1);
+    assert!(store.is_index_open("write-3"));
+}

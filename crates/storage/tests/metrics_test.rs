@@ -161,8 +161,16 @@ fn an_exact_id_lookup_is_measured_over_its_one_document() {
     let (_temp, store) = store();
     for limit in [0, 5] {
         let metrics = measure(&store, "id:b", limit, &spec(&["delta"], &["delta"]));
-        assert_eq!(metrics.min["delta"], Some(MetricValue::I64(12)), "limit {limit}");
-        assert_eq!(metrics.max["delta"], Some(MetricValue::I64(12)), "limit {limit}");
+        assert_eq!(
+            metrics.min["delta"],
+            Some(MetricValue::I64(12)),
+            "limit {limit}"
+        );
+        assert_eq!(
+            metrics.max["delta"],
+            Some(MetricValue::I64(12)),
+            "limit {limit}"
+        );
     }
 }
 

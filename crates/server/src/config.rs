@@ -292,7 +292,12 @@ pub struct LimitsConfig {
     #[serde(default)]
     pub max_response_bytes: Option<usize>,
 
-    /// Largest number of indexes held open at once. `0` derives it from the memory budget.
+    /// Largest number of index openings held at once. `0` derives it from the memory budget.
+    ///
+    /// Counted once per index per shard: an index is open on every shard that holds part of it,
+    /// so 32 at 4 shards holds 8 index names. Each such opening with a writer has its own arena
+    /// and threads, which is what this bounds; one open only for searching has neither, and a
+    /// search never closes an index with a writer to make room for it.
     ///
     /// An open index costs an indexing arena and, with it, `indexer_num_threads +
     /// merge_num_threads` OS threads. None of that is proportional to how much data the index

@@ -333,7 +333,11 @@ fn the_matches_stop_near_the_cap_and_count_what_is_left() {
         .delete_query_matches(INDEX, "status:expired", cap, None)
         .expect("matches");
     assert!(found.ids.len() >= cap, "kept {}", found.ids.len());
-    assert!(found.ids.len() < cap + 4_096 + 64, "kept {}", found.ids.len());
+    assert!(
+        found.ids.len() < cap + 4_096 + 64,
+        "kept {}",
+        found.ids.len()
+    );
     assert_eq!(found.ids.len() + found.unexamined, total);
 
     let all = store

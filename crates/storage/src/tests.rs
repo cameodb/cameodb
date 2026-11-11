@@ -2953,7 +2953,9 @@ mod commit_interval_tests {
         let store = HybridStore::new(config(&temp_dir, INTERVAL_MS), 1).expect("store");
         let index = "deferred";
 
-        store.apply_batch(index, vec![put("a")]).expect("deferred write");
+        store
+            .apply_batch(index, vec![put("a")])
+            .expect("deferred write");
         assert!(
             !store
                 .maybe_commit_writer_at_backstop(index)

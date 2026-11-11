@@ -885,7 +885,15 @@ impl HybridStore {
     /// When no victim can be closed the index is admitted anyway and the overshoot is logged:
     /// exceeding the cap is recoverable and the next admission will try again, while a
     /// deadlocked writer thread is not.
-    pub(crate) fn admit_open_index(&self, index: &str) {
+    ///
+    /// **A reader evicts readers only** (`may_close_writers` false). Closing an index with a
+    /// writer commits what it buffered, and an admission for a search runs on a read-pool
+    /// thread: a cold index's first search paid an unrelated index's commit and fsyncs, while
+    /// the reader it was making room for holds no arena and no threads — not the cost the cap
+    /// exists to bound. So a reader takes the place of the coldest index open for reading
+    /// only, and when every colder index holds a writer it is admitted past the cap. That
+    /// overshoot is one at most: the next reader's admission closes this one first.
+    pub(crate) fn admit_open_index(&self, index: &str, may_close_writers: bool) {
         let tick = self.open_tick.fetch_add(1, Ordering::Relaxed);
 
         if let Some(entry) = self.open_indexes.get(index) {
@@ -900,9 +908,18 @@ impl HybridStore {
             let mut skips_left = self.open_indexes.len();
             // `>=` because this call is about to add one.
             while self.open_indexes.len() >= self.max_open_indexes {
-                match self.coldest_closable_index(index) {
+                match self.coldest_closable_index(index, may_close_writers) {
                     Some(victim) if self.close_index(&victim) => {}
                     Some(_) if skips_left > 0 => skips_left -= 1,
+                    None if !may_close_writers => {
+                        tracing::debug!(
+                            index = %index,
+                            open = self.open_indexes.len(),
+                            cap = self.max_open_indexes,
+                            "Open-index cap: every colder index holds a writer; reader admitted past it"
+                        );
+                        break;
+                    }
                     _ => {
                         tracing::warn!(
                             index = %index,
@@ -929,11 +946,16 @@ impl HybridStore {
     /// `exclude` is the index being admitted, which must never be its own victim. An index
     /// whose writer mutex is held is passed over rather than waited for; see
     /// [`Self::admit_open_index`] for why that is the whole point.
-    fn coldest_closable_index(&self, exclude: &str) -> Option<String> {
+    ///
+    /// With `writers_too` false, an index that holds a writer is passed over as well.
+    fn coldest_closable_index(&self, exclude: &str, writers_too: bool) -> Option<String> {
         let mut coldest: Option<(u64, String)> = None;
         for entry in self.open_indexes.iter() {
             let name = entry.key();
             if name == exclude {
+                continue;
+            }
+            if !writers_too && self.writers.contains_key(name) {
                 continue;
             }
             if let Some(writer) = self.writers.get(name)
@@ -2004,7 +2026,7 @@ impl HybridStore {
 
         // Admitted here rather than on the way in: immediately before the insert it accounts
         // for, so a failure anywhere above leaves nothing counted as open that is not.
-        self.admit_open_index(index);
+        self.admit_open_index(index, true);
 
         // Store in cache
         self.writers
