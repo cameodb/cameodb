@@ -283,7 +283,94 @@ pub(crate) struct IndexSizes {
     pub(crate) document_count: u64,
 }
 
+/// The shortest time between two looks at an open index's `meta.json` on the search path.
+const META_PROBE_INTERVAL_MS: u64 = 1_000;
+
+/// The state of an index's `meta.json`, which changes whenever a commit or a merge publishes a
+/// new set of segments.
+type MetaStamp = (std::time::SystemTime, u64);
+
+/// What a cached reader last saw of its index's `meta.json`, and when it was last checked.
+pub(crate) struct MetaProbe {
+    /// On the commit clock, so a search decides whether a look is due with one atomic read.
+    probed_ms: std::sync::atomic::AtomicU64,
+    seen: std::sync::Mutex<Option<MetaStamp>>,
+}
+
+impl MetaProbe {
+    fn new(seen: Option<MetaStamp>) -> Self {
+        Self {
+            probed_ms: std::sync::atomic::AtomicU64::new(0),
+            seen: std::sync::Mutex::new(seen),
+        }
+    }
+}
+
 impl HybridStore {
+    /// The state of `index`'s `meta.json` now, or `None` when it cannot be read.
+    fn meta_stamp(&self, index: &str) -> Option<MetaStamp> {
+        let meta = fs::metadata(self.index_dir(index).ok()?.join("meta.json")).ok()?;
+        Some((meta.modified().ok()?, meta.len()))
+    }
+
+    /// Reload `index`'s reader if its segments changed without a commit of ours — a background
+    /// merge finished — and nothing has looked since.
+    ///
+    /// The reader is reloaded by `commit_index`, and by nothing else, which is right while an
+    /// index is written to: a merge is started by a commit, and the next commit sees what it
+    /// published. A merge that finishes after the last commit has no next one to wait for, so
+    /// the reader went on holding the pre-merge segments — their files undeletable, their
+    /// deleted documents still searched, the merge's work unused — for as long as the index
+    /// went unwritten.
+    ///
+    /// Looked for on the search path rather than on a timer: an index nobody searches costs
+    /// nothing, and the reader tantivy would watch the file with (`OnCommitWithDelay`) is a
+    /// thread per open index waking twice a second. A look is one `stat`, at most once per
+    /// [`META_PROBE_INTERVAL_MS`] per index, and the first search to find a change pays the
+    /// reload that every search after it benefits from.
+    fn refresh_if_merged(&self, index: &str) {
+        let Some(probe) = self.meta_probes.get(index) else {
+            return;
+        };
+        let now = self.commit_clock_now();
+        let last = probe.probed_ms.load(std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(last) < META_PROBE_INTERVAL_MS
+            || probe
+                .probed_ms
+                .compare_exchange(
+                    last,
+                    now,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_err()
+        {
+            return;
+        }
+        let stamp = self.meta_stamp(index);
+        let changed =
+            stamp.is_some() && *probe.seen.lock().unwrap_or_else(|e| e.into_inner()) != stamp;
+        // Released before the reload, which writes this map.
+        drop(probe);
+        if changed && let Err(e) = self.smart_refresh_reader(index) {
+            tracing::warn!(index = %index, error = %e, "Reload after a background merge failed");
+        }
+    }
+
+    /// Record what `index`'s `meta.json` looked like **before** a reader was opened or reloaded,
+    /// so a change landing during the reload reads as a change afterwards, not as already seen.
+    fn note_meta_seen(&self, index: &str, stamp: Option<MetaStamp>) {
+        match self.meta_probes.get(index) {
+            Some(probe) => {
+                *probe.seen.lock().unwrap_or_else(|e| e.into_inner()) = stamp;
+            }
+            None => {
+                self.meta_probes
+                    .insert(index.to_string(), MetaProbe::new(stamp));
+            }
+        }
+    }
+
     /// Smart refresh strategy for reader cache
     /// Tries fast reload first, falls back to remove + recreate if reload fails
     /// This preserves cache when possible while ensuring data freshness
@@ -301,8 +388,10 @@ impl HybridStore {
         // queue behind it, with every search of the indexes on that shard queued behind the open.
         let cached = self.readers.get(index).map(|reader| reader.value().clone());
         if let Some(reader) = cached {
+            let before = self.meta_stamp(index);
             match reader.reload() {
                 Ok(_) => {
+                    self.note_meta_seen(index, before);
                     tracing::debug!(index = %index, "Reader reloaded successfully (fast path)");
                     self.invalidate_size_cache(index);
                     return Ok(());
@@ -464,12 +553,18 @@ impl HybridStore {
 
     /// Get or create a cached IndexReader for the given index.
     ///
-    /// Lock-free fast path via DashMap. Readers reload only when `commit_index` tells them to.
+    /// Lock-free fast path via DashMap. A reader reloads when `commit_index` tells it to, and
+    /// when a search finds a background merge has published segments since
+    /// ([`Self::refresh_if_merged`]).
     pub(crate) fn get_reader(
         &self,
         index: &str,
     ) -> Result<Option<(IndexReader, SchemaFields)>, StoreError> {
         self.touch_open_index(index);
+
+        // Before the lookup below, which holds the map's shard lock while it runs: a reload
+        // takes that lock itself.
+        self.refresh_if_merged(index);
 
         // Fast path: Zero-lock retrieval from cache
         if let Some(reader_ref) = self.readers.get(index) {
@@ -497,6 +592,9 @@ impl HybridStore {
         // that hold no writer, so a search never pays another index's commit.
         self.admit_open_index(index, false);
 
+        // Taken before the open, for the same reason a reload takes it first.
+        let opened_at = self.meta_stamp(index);
+
         // Use DashMap entry API for concurrent-safe creation
         let reader = self
             .readers
@@ -517,7 +615,9 @@ impl HybridStore {
                 // What manual reloading gives up: segments published by a background merge
                 // become visible at the next commit rather than within 500ms. Nothing reads
                 // stale data — the live searcher keeps its own (pre-merge) segments
-                // referenced, and merges are triggered by commits anyway.
+                // referenced, and merges are triggered by commits anyway. A merge that ends
+                // after the last commit is picked up by the first search that looks
+                // (`refresh_if_merged`), which costs one `stat` a second instead of a thread.
                 //
                 // Also deliberately no tantivy `Warmer`: warmers run synchronously inside
                 // reload(), which happens on the shard writer thread, so one would put
@@ -530,6 +630,8 @@ impl HybridStore {
 
                 Ok::<IndexReader, StoreError>(reader)
             })?;
+
+        self.note_meta_seen(index, opened_at);
 
         // Warm up fields cache
         let tantivy_index = reader.value().searcher().index().clone();

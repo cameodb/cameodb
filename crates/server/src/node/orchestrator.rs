@@ -2163,8 +2163,12 @@ struct PoolSlot {
     counters: Option<Arc<WorkerCounters>>,
     stats: Option<Arc<DispatchCounters>>,
     finished: bool,
-    /// Held for the lifetime of the guard; released by its destructor.
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    /// Held for the lifetime of the guard; returned first when it drops, so that whoever is
+    /// woken by the departure finds the slot free.
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    gate: Arc<SlotGate>,
+    /// Whether this job was counted in the gate's writer total when it started.
+    writer: bool,
 }
 
 impl PoolSlot {
@@ -2172,6 +2176,8 @@ impl PoolSlot {
         counters: Option<Arc<WorkerCounters>>,
         stats: Option<Arc<DispatchCounters>>,
         permit: tokio::sync::OwnedSemaphorePermit,
+        gate: Arc<SlotGate>,
+        writer: bool,
     ) -> Self {
         if let Some(c) = &counters {
             c.in_flight.fetch_add(1, AtomicOrdering::Relaxed);
@@ -2180,7 +2186,9 @@ impl PoolSlot {
             counters,
             stats,
             finished: false,
-            _permit: permit,
+            permit: Some(permit),
+            gate,
+            writer,
         }
     }
 
@@ -2193,6 +2201,12 @@ impl PoolSlot {
 
 impl Drop for PoolSlot {
     fn drop(&mut self) {
+        drop(self.permit.take());
+        if self.writer {
+            self.gate
+                .writers_running
+                .fetch_sub(1, AtomicOrdering::AcqRel);
+        }
         if let Some(c) = &self.counters {
             c.in_flight.fetch_sub(1, AtomicOrdering::Relaxed);
             if self.finished {
@@ -2205,6 +2219,9 @@ impl Drop for PoolSlot {
                 s.jobs_dropped.fetch_add(1, AtomicOrdering::Relaxed);
             }
         }
+        // Last, so the loop that wakes sees the slot, the writer count and the gauges as
+        // they now are.
+        self.gate.freed.notify_one();
     }
 }
 
@@ -2230,6 +2247,42 @@ fn shed_stale_job(
     )));
 }
 
+/// What the worker loop hears back from the jobs it started: how many of them are writer
+/// work, and a wake-up whenever one leaves.
+#[derive(Default)]
+struct SlotGate {
+    /// Jobs running that land on a shard's writer thread — writes, deletes and bulk work.
+    writers_running: AtomicUsize,
+    /// Signalled whenever any job leaves the pool, after its permit has been returned.
+    freed: tokio::sync::Notify,
+}
+
+/// A job the worker has taken off its channel and not yet started.
+struct Waiting {
+    arrived_at: Instant,
+    op: Box<ClientOp>,
+    affinity_shard: Option<Uuid>,
+    reply: tokio::sync::oneshot::Sender<WorkerOutcome>,
+}
+
+/// Whether the operation spends its time on a shard's writer thread.
+pub(super) fn is_writer_work(op: &ClientOp) -> bool {
+    matches!(OpClass::of(op), OpClass::Write | OpClass::Bulk)
+}
+
+/// How many of a worker's slots writer work may hold at once; the rest are kept for reads.
+///
+/// Writes to one shard run one after another on its writer thread, so a write beyond the
+/// first few on a busy shard only waits — and while it holds a slot, a search that would be
+/// served in milliseconds waits for the slot too. A quarter of the width, at least one, is
+/// left to reads. A width of one has nothing to split.
+pub(super) fn writer_slot_cap(width: usize) -> usize {
+    if width <= 1 {
+        return width.max(1);
+    }
+    width - (width / 4).max(1)
+}
+
 pub(super) async fn orchestrator_worker_loop<F, Fut>(
     mut rx: mpsc::Receiver<OrchestratorJob>,
     run_op: F,
@@ -2245,166 +2298,235 @@ pub(super) async fn orchestrator_worker_loop<F, Fut>(
     Fut: std::future::Future<Output = WorkerOutcome> + Send + 'static,
 {
     let width = max_in_flight.max(1);
+    let writer_cap = writer_slot_cap(width);
+    // Jobs held back, per kind. A bound, not a target: reaching it stops the loop taking more
+    // off the channel, which is where the queue's own capacity and its refusals live.
+    let parked_limit = width * 2;
     let in_flight = Arc::new(tokio::sync::Semaphore::new(width));
+    let gate = Arc::new(SlotGate::default());
+    // Taken off the channel, waiting for a slot. Kept in arrival order: a job starts only when
+    // everything of its kind ahead of it has, but a read is never held behind a write.
+    //
+    // This used to be one job at a time: the loop took a job, then waited for a permit before
+    // looking at the next. A write that could not run — its shard's writer busy, every slot
+    // already holding a write — held the head, and every search behind it waited for the
+    // write, though reads share nothing with the writer thread.
+    let mut parked: std::collections::VecDeque<Waiting> = std::collections::VecDeque::new();
+    let mut closed = false;
+
+    // How much budget a job of this class needs left over to be worth starting.
+    // Not `waited > budget`: admitting a job with barely any budget left is a
+    // slower way of wasting the work — the queue settles exactly on the deadline,
+    // every job that passes spends its remaining microseconds being searched for,
+    // and the answer still lands after the client has gone. Measured: 11,656 jobs
+    // shed and goodput still zero, because the 13,363 that passed all finished late.
+    let reserve_for = |class: OpClass, budget: Duration| {
+        dispatch_stats
+            .as_ref()
+            .map(|s| s.service_reserve_for(class, budget))
+            .unwrap_or_default()
+    };
+
+    let left_queue = || {
+        if let Some(c) = &counters {
+            c.queue_depth.fetch_sub(1, AtomicOrdering::Relaxed);
+        }
+    };
+
+    // On the pinned path this spawns onto the worker's own current_thread
+    // runtime, so the operation stays on that core and pinning still means what
+    // it says. On the default path it spawns onto the shared multi-threaded
+    // runtime, where a worker is an admission-control unit rather than a place.
+    let launch = |job: Waiting, permit: tokio::sync::OwnedSemaphorePermit, writer: bool| {
+        let run_op = run_op.clone();
+        let counters = counters.clone();
+        let service_stats = dispatch_stats.clone();
+        let gate = Arc::clone(&gate);
+        let Waiting {
+            arrived_at,
+            op,
+            affinity_shard,
+            reply,
+        } = job;
+        let service_class = OpClass::of(&op);
+        // No budget means the pre-F7 contract — every job runs, however long it takes —
+        // and that is left reachable rather than quietly capped.
+        let liveness_cap =
+            budget.map(|b| (b * WORKER_LIVENESS_MULTIPLE).min(WORKER_LIVENESS_CEILING));
+        // Run the op inside the request's arrival scope: `request_started_at` is
+        // inherited by `spawn`, so deadline checks reached from inside the op — the
+        // read pool's, or a re-dispatch's — measure against the same clock this
+        // dequeue check did rather than a fresh one.
+        tokio::spawn(REQUEST_STARTED_AT.scope(arrived_at, async move {
+            // Everything this job holds — both gauges, the completion tally and the
+            // permit — is released by this guard, so it is released however the job
+            // ends. The releases used to be statements at the tail of this task, which
+            // meant a future that parked or was dropped kept all four forever: OB14 lost
+            // one slot per timed-out request that way, until the width was gone and with
+            // it every worker-eligible operation on the node.
+            let mut slot = PoolSlot::enter(counters, service_stats.clone(), permit, gate, writer);
+
+            let started = Instant::now();
+            // `finished` is whether the operation ran to its own conclusion, which is a
+            // different question from whether the caller got an answer. A capped job
+            // answers — with an error, so nobody is left hanging — but it did not finish,
+            // so it is counted as dropped and its duration is not folded into the service
+            // estimate. A stuck operation's elapsed time is not a service time, and
+            // admitting the next job against it would spread the damage.
+            let (result, finished) = match liveness_cap {
+                Some(cap) => match tokio::time::timeout(cap, run_op(op, affinity_shard)).await {
+                    Ok(result) => (result, true),
+                    Err(_) => {
+                        // The operation is abandoned, not cancelled: anything it handed
+                        // to a blocking pool or a writer thread runs on and replies into
+                        // a dropped receiver. What is reclaimed here is the pool slot,
+                        // which is the resource whose loss takes the node down.
+                        error!(
+                            worker_id = worker_id,
+                            class = ?service_class,
+                            cap_ms = cap.as_millis() as u64,
+                            "Worker operation passed the liveness cap and was abandoned; \
+                             its pool slot has been reclaimed so the node keeps serving. \
+                             This is a defect — an operation should not reach this."
+                        );
+                        // Abandoned is not undone, so the caller hears that the
+                        // outcome is unconfirmed rather than that nothing happened.
+                        (
+                            WorkerOutcome::Done(Err(OrchestratorError::Unanswered {
+                                message: "the operation passed the worker liveness cap \
+                                          and was abandoned"
+                                    .to_string(),
+                            })),
+                            false,
+                        )
+                    }
+                },
+                None => (run_op(op, affinity_shard).await, true),
+            };
+
+            // What this job actually cost once admitted, which is what the next job's
+            // admission decision is measured against.
+            if finished {
+                if let Some(stats) = &service_stats {
+                    stats.record_service(service_class, started.elapsed());
+                }
+                slot.finished();
+            }
+            // Ignore the error: the caller may have given up and dropped the receiver.
+            let _ = reply.send(result);
+        }));
+    };
+
     loop {
-        match rx.recv().await {
-            Some(OrchestratorJob::Execute {
-                arrived_at,
-                op,
-                affinity_shard,
-                reply,
-            }) => {
-                let run_op = run_op.clone();
-                let counters = counters.clone();
-                if let Some(c) = &counters {
-                    c.queue_depth.fetch_sub(1, AtomicOrdering::Relaxed);
+        // The F7 check, and it has to be here rather than deeper. Everything past the start
+        // is uncancellable: the operation runs, the search reaches the read pool as a
+        // blocking closure tokio will never interrupt, and the answer is produced whether or
+        // not anyone is still waiting for it. Under sustained overload that was *every*
+        // request — the node stayed fully busy and delivered nothing.
+        //
+        // Refusing a parked job costs one comparison and never takes a slot, so the queue
+        // drains at the rate work is offered rather than the rate it can be served, and the
+        // node returns to serving whatever it can actually keep up with. It runs over every
+        // parked job on every pass, so a job that has outlived its request is refused while
+        // it waits — the guard that sheds stale work used to be unreachable in exactly the
+        // state it exists for, when parked jobs held the whole width (OB14, `abandoned`
+        // stayed 0 through arms where every job waited seconds against a 1s budget).
+        //
+        // `arrived_at` is the request's arrival at the node, not its enqueue: the body
+        // read, parse and routing it already paid for are spent budget too, and a
+        // request that arrived expired — a max-size record at the derived timeout is
+        // the standing example — is refused here rather than run for nobody.
+        if let Some(budget) = budget {
+            let mut kept = std::collections::VecDeque::with_capacity(parked.len());
+            for job in parked.drain(..) {
+                let waited = job.arrived_at.elapsed();
+                if waited + reserve_for(OpClass::of(&job.op), budget) > budget {
+                    left_queue();
+                    shed_stale_job(&dispatch_stats, job.reply, waited, budget);
+                } else {
+                    kept.push_back(job);
                 }
+            }
+            parked = kept;
+        }
 
-                // The F7 check, and it has to be here rather than deeper. Everything past this
-                // point is uncancellable: the operation runs, the search reaches the read pool
-                // as a blocking closure tokio will never interrupt, and the answer is produced
-                // whether or not anyone is still waiting for it. Under sustained overload that
-                // was *every* request — the node stayed fully busy and delivered nothing.
-                //
-                // Refusing here costs one comparison and gives the permit straight back, so the
-                // queue drains at the rate work is offered rather than the rate it can be
-                // served, and the node returns to serving whatever it can actually keep up with.
-                //
-                // `arrived_at` is the request's arrival at the node, not its enqueue: the body
-                // read, parse and routing it already paid for are spent budget too, and a
-                // request that arrived expired — a max-size record at the derived timeout is
-                // the standing example — is refused here rather than run for nobody.
-                let service_class = OpClass::of(&op);
+        // Start what fits. A write that cannot start — every writer slot is taken — holds back
+        // the writes behind it, so they start in the order they arrived, but not the reads.
+        let mut writers_blocked = false;
+        let mut at = 0;
+        while at < parked.len() {
+            let writer = is_writer_work(&parked[at].op);
+            if writer
+                && (writers_blocked
+                    || gate.writers_running.load(AtomicOrdering::Acquire) >= writer_cap)
+            {
+                writers_blocked = true;
+                at += 1;
+                continue;
+            }
+            let Ok(permit) = Arc::clone(&in_flight).try_acquire_owned() else {
+                // No slot of any kind is free.
+                break;
+            };
+            let Some(job) = parked.remove(at) else {
+                break;
+            };
+            left_queue();
+            if writer {
+                gate.writers_running.fetch_add(1, AtomicOrdering::AcqRel);
+            }
+            launch(job, permit, writer);
+        }
 
-                // How much budget a job of this class needs left over to be worth starting.
-                // Not `waited > budget`: admitting a job with barely any budget left is a
-                // slower way of wasting the work — the queue settles exactly on the deadline,
-                // every job that passes spends its remaining microseconds being searched for,
-                // and the answer still lands after the client has gone. Measured: 11,656 jobs
-                // shed and goodput still zero, because the 13,363 that passed all finished late.
-                let reserve_for = |budget: Duration| {
-                    dispatch_stats
-                        .as_ref()
-                        .map(|s| s.service_reserve_for(service_class, budget))
-                        .unwrap_or_default()
-                };
+        if closed && parked.is_empty() {
+            break;
+        }
 
-                // **Before** waiting for capacity, not after. The loop used to take a permit and
-                // then receive, which meant that once parked jobs held the width no worker ever
-                // reached this comparison — the one guard that sheds stale work was unreachable
-                // in precisely the state it exists for. OB14 measured that: `abandoned` stayed 0
-                // through arms where every job waited seconds against a 1s budget. Checking here
-                // also means an already-dead job never occupies a slot a live one could use.
-                if let Some(budget) = budget {
-                    let waited = arrived_at.elapsed();
-                    if waited + reserve_for(budget) > budget {
-                        shed_stale_job(&dispatch_stats, reply, waited, budget);
-                        continue;
-                    }
-                }
+        // When the first parked job goes stale, so a job nobody can start is still refused on
+        // time rather than when something happens to finish.
+        let next_stale = budget.and_then(|budget| {
+            parked
+                .iter()
+                .map(|job| {
+                    budget
+                        .saturating_sub(job.arrived_at.elapsed())
+                        .saturating_sub(reserve_for(OpClass::of(&job.op), budget))
+                })
+                .min()
+                .map(|left| left.max(Duration::from_millis(1)))
+        });
+        let parked_writers = parked.iter().filter(|j| is_writer_work(&j.op)).count();
+        let can_receive = !closed
+            && parked_writers < parked_limit
+            && parked.len() - parked_writers < parked_limit;
 
-                // Capacity, waited for only by a job that still has budget to spend.
-                // Never closed while the loop runs, so this only fails if the semaphore is dropped.
-                let Ok(permit) = Arc::clone(&in_flight).acquire_owned().await else {
+        tokio::select! {
+            job = rx.recv(), if can_receive => match job {
+                Some(OrchestratorJob::Execute {
+                    arrived_at,
+                    op,
+                    affinity_shard,
+                    reply,
+                }) => parked.push_back(Waiting {
+                    arrived_at,
+                    op,
+                    affinity_shard,
+                    reply,
+                }),
+                Some(OrchestratorJob::Shutdown) => {
+                    debug!(
+                        worker_id = worker_id,
+                        "Orchestrator worker received shutdown signal"
+                    );
                     break;
-                };
-
-                // The wait for a permit is itself spent budget, and under saturation it is most
-                // of it. A job that was worth starting a moment ago may not be now.
-                if let Some(budget) = budget {
-                    let waited = arrived_at.elapsed();
-                    if waited + reserve_for(budget) > budget {
-                        drop(permit);
-                        shed_stale_job(&dispatch_stats, reply, waited, budget);
-                        continue;
-                    }
                 }
-
-                // On the pinned path this spawns onto the worker's own current_thread
-                // runtime, so the operation stays on that core and pinning still means what
-                // it says. On the default path it spawns onto the shared multi-threaded
-                // runtime, where a worker is an admission-control unit rather than a place.
-                let service_stats = dispatch_stats.clone();
-                // No budget means the pre-F7 contract — every job runs, however long it takes —
-                // and that is left reachable rather than quietly capped.
-                let liveness_cap =
-                    budget.map(|b| (b * WORKER_LIVENESS_MULTIPLE).min(WORKER_LIVENESS_CEILING));
-                // Run the op inside the request's arrival scope: `request_started_at` is
-                // inherited by `spawn`, so deadline checks reached from inside the op — the
-                // read pool's, or a re-dispatch's — measure against the same clock this
-                // dequeue check did rather than a fresh one.
-                tokio::spawn(REQUEST_STARTED_AT.scope(arrived_at, async move {
-                    // Everything this job holds — both gauges, the completion tally and the
-                    // permit — is released by this guard, so it is released however the job
-                    // ends. The releases used to be statements at the tail of this task, which
-                    // meant a future that parked or was dropped kept all four forever: OB14 lost
-                    // one slot per timed-out request that way, until the width was gone and with
-                    // it every worker-eligible operation on the node.
-                    let mut slot = PoolSlot::enter(counters, service_stats.clone(), permit);
-
-                    let started = Instant::now();
-                    // `finished` is whether the operation ran to its own conclusion, which is a
-                    // different question from whether the caller got an answer. A capped job
-                    // answers — with an error, so nobody is left hanging — but it did not finish,
-                    // so it is counted as dropped and its duration is not folded into the service
-                    // estimate. A stuck operation's elapsed time is not a service time, and
-                    // admitting the next job against it would spread the damage.
-                    let (result, finished) = match liveness_cap {
-                        Some(cap) => match tokio::time::timeout(cap, run_op(op, affinity_shard))
-                            .await
-                        {
-                            Ok(result) => (result, true),
-                            Err(_) => {
-                                // The operation is abandoned, not cancelled: anything it handed
-                                // to a blocking pool or a writer thread runs on and replies into
-                                // a dropped receiver. What is reclaimed here is the pool slot,
-                                // which is the resource whose loss takes the node down.
-                                error!(
-                                    worker_id = worker_id,
-                                    class = ?service_class,
-                                    cap_ms = cap.as_millis() as u64,
-                                    "Worker operation passed the liveness cap and was abandoned; \
-                                     its pool slot has been reclaimed so the node keeps serving. \
-                                     This is a defect — an operation should not reach this."
-                                );
-                                // Abandoned is not undone, so the caller hears that the
-                                // outcome is unconfirmed rather than that nothing happened.
-                                (
-                                    WorkerOutcome::Done(Err(OrchestratorError::Unanswered {
-                                        message: "the operation passed the worker liveness cap \
-                                                  and was abandoned"
-                                            .to_string(),
-                                    })),
-                                    false,
-                                )
-                            }
-                        },
-                        None => (run_op(op, affinity_shard).await, true),
-                    };
-
-                    // What this job actually cost once admitted, which is what the next job's
-                    // admission decision is measured against.
-                    if finished {
-                        if let Some(stats) = &service_stats {
-                            stats.record_service(service_class, started.elapsed());
-                        }
-                        slot.finished();
-                    }
-                    // Ignore the error: the caller may have given up and dropped the receiver.
-                    let _ = reply.send(result);
-                }));
-            }
-            Some(OrchestratorJob::Shutdown) => {
-                debug!(
-                    worker_id = worker_id,
-                    "Orchestrator worker received shutdown signal"
-                );
-                break;
-            }
-            None => {
-                debug!(worker_id = worker_id, "Orchestrator worker exiting");
-                break;
-            }
+                None => {
+                    debug!(worker_id = worker_id, "Orchestrator worker exiting");
+                    closed = true;
+                }
+            },
+            _ = gate.freed.notified(), if !parked.is_empty() => {}
+            _ = tokio::time::sleep(next_stale.unwrap_or_default()), if next_stale.is_some() => {}
         }
     }
 

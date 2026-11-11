@@ -4283,3 +4283,78 @@ mod listing_tests {
         assert!(!store.is_index_open("closed"));
     }
 }
+
+#[cfg(test)]
+mod merge_reload_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// A merge that finishes after the last commit is picked up by the next search, with no
+    /// write in between: the reader dropped its pre-merge segments, so their files can go.
+    #[test]
+    fn a_search_after_an_idle_merge_reads_the_merged_segments() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = HybridStore::new(
+            StorageConfig {
+                shard_path: temp.path().to_path_buf(),
+                default_batch_size: 100_000,
+                ..StorageConfig::default()
+            },
+            1,
+        )
+        .expect("store");
+        let index = "idle";
+        for batch in 0..3 {
+            let ops = (0..10)
+                .map(|n| WalOp::Put {
+                    id: format!("d{batch}-{n}"),
+                    json_blob: Some(serde_json::json!({ "title": "word" })),
+                })
+                .collect();
+            store.apply_batch(index, ops).expect("write");
+            store.commit_index(index).expect("commit");
+        }
+        let segments = |store: &HybridStore| {
+            store
+                .readers
+                .get(index)
+                .expect("a reader is open")
+                .searcher()
+                .segment_readers()
+                .len()
+        };
+        let search = |store: &HybridStore| {
+            store
+                .search_keys(index, "*", 5, None, &SearchOptions::default())
+                .expect("search")
+                .total_hits
+        };
+        assert_eq!(search(&store), 30);
+        assert_eq!(segments(&store), 3);
+
+        // A merge, run to its end, with nothing committed after it.
+        let writer = Arc::clone(store.writers.get(index).expect("a writer").value());
+        {
+            let mut writer = writer.lock().expect("writer");
+            let ids = writer
+                .index()
+                .searchable_segment_ids()
+                .expect("segment ids");
+            writer.merge(&ids).wait().expect("merge");
+        }
+        assert_eq!(
+            segments(&store),
+            3,
+            "the reader keeps what it had until something tells it"
+        );
+
+        // Within the interval a search does not look; after it, it does.
+        std::thread::sleep(Duration::from_millis(1_100));
+        assert_eq!(search(&store), 30, "the merge changed no answer");
+        assert_eq!(
+            segments(&store),
+            1,
+            "the search found the merge and reloaded"
+        );
+    }
+}

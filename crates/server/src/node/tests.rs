@@ -955,6 +955,24 @@ async fn a_config_this_node_does_not_hold_is_asked_of_its_peers() {
 type TestOp = std::pin::Pin<Box<dyn std::future::Future<Output = WorkerOutcome> + Send>>;
 
 fn placeholder_op() -> Box<ClientOp> {
+    Box::new(ClientOp::Search {
+        spent_ms: None,
+        wait_ms: None,
+        index: "bench".to_string(),
+        query: "*".to_string(),
+        limit: Some(10),
+        offset: None,
+        fields: None,
+        sort: None,
+        array_limit: None,
+        match_elements: false,
+        metrics: None,
+    })
+}
+
+/// An operation that lands on a shard's writer thread, for the tests about how writer work
+/// shares a worker's slots.
+fn writer_op() -> Box<ClientOp> {
     Box::new(ClientOp::Write {
         spent_ms: None,
         index: "bench".to_string(),
@@ -1613,6 +1631,181 @@ fn recording_runner(
             WorkerOutcome::Done(Ok(json!({"ok": true})))
         })
     }
+}
+
+/// A runner whose writer work never returns while everything else answers at once: a shard
+/// writer that has stopped, seen from the worker pool.
+fn stalled_writer_runner() -> impl Fn(Box<ClientOp>, Option<Uuid>) -> TestOp + Clone {
+    move |op, _shard| {
+        Box::pin(async move {
+            if is_writer_work(&op) {
+                std::future::pending::<WorkerOutcome>().await
+            } else {
+                WorkerOutcome::Done(Ok(json!({"ok": true})))
+            }
+        })
+    }
+}
+
+async fn submit_op(
+    tx: &mpsc::Sender<OrchestratorJob>,
+    op: Box<ClientOp>,
+) -> tokio::sync::oneshot::Receiver<WorkerOutcome> {
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    tx.send(OrchestratorJob::Execute {
+        arrived_at: Instant::now(),
+        op,
+        affinity_shard: None,
+        reply,
+    })
+    .await
+    .expect("the worker channel is open");
+    answer
+}
+
+/// Writes that cannot run — their writer is not taking work — used to sit at the head of the
+/// worker, one holding its place and the rest behind it, and every search queued after them
+/// waited for a writer it never needed. Reads are served past them.
+#[tokio::test]
+async fn reads_are_served_while_writes_wait_for_a_stalled_writer() {
+    let (tx, rx) = mpsc::channel::<OrchestratorJob>(64);
+    tokio::spawn(orchestrator_worker_loop(
+        rx,
+        stalled_writer_runner(),
+        0,
+        None,
+        4,
+        None,
+        None,
+    ));
+
+    // More writes than the worker has slots, all of them stuck.
+    let mut writes = Vec::new();
+    for _ in 0..10 {
+        writes.push(submit_op(&tx, writer_op()).await);
+    }
+    // Searches arrive behind every one of them.
+    for n in 0..20 {
+        let answer = submit_op(&tx, placeholder_op()).await;
+        let served = tokio::time::timeout(Duration::from_secs(2), answer)
+            .await
+            .unwrap_or_else(|_| panic!("search {n} waited behind a stalled write"));
+        assert!(matches!(served, Ok(WorkerOutcome::Done(Ok(_)))));
+    }
+    drop(writes);
+}
+
+/// The slots left to reads: writer work never holds the whole width, whatever is queued.
+#[tokio::test]
+async fn writer_work_never_holds_the_whole_width() {
+    let (tx, rx) = mpsc::channel::<OrchestratorJob>(64);
+    let writing = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let runner = {
+        let (writing, peak) = (Arc::clone(&writing), Arc::clone(&peak));
+        move |op: Box<ClientOp>, _shard: Option<Uuid>| -> TestOp {
+            let (writing, peak) = (Arc::clone(&writing), Arc::clone(&peak));
+            Box::pin(async move {
+                if is_writer_work(&op) {
+                    let now = writing.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                    peak.fetch_max(now, AtomicOrdering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    writing.fetch_sub(1, AtomicOrdering::SeqCst);
+                }
+                WorkerOutcome::Done(Ok(json!({"ok": true})))
+            })
+        }
+    };
+    tokio::spawn(orchestrator_worker_loop(rx, runner, 0, None, 4, None, None));
+
+    let mut answers = Vec::new();
+    for _ in 0..24 {
+        answers.push(submit_op(&tx, writer_op()).await);
+    }
+    for answer in answers {
+        answer.await.expect("every write is answered eventually");
+    }
+    assert_eq!(
+        peak.load(AtomicOrdering::SeqCst),
+        writer_slot_cap(4),
+        "writes use every slot they are given and no more"
+    );
+    assert_eq!(writer_slot_cap(4), 3);
+    assert_eq!(writer_slot_cap(8), 6);
+    assert_eq!(
+        writer_slot_cap(1),
+        1,
+        "a width of one has nothing to reserve"
+    );
+}
+
+/// Waiting does not suspend the budget: a write parked behind a stalled writer is refused at
+/// its deadline, with the read-side error a client already handles, rather than held until
+/// something else happens to finish.
+#[tokio::test]
+async fn a_parked_write_is_refused_at_its_deadline() {
+    let (tx, rx) = mpsc::channel::<OrchestratorJob>(64);
+    let stats = Arc::new(DispatchCounters::default());
+    tokio::spawn(orchestrator_worker_loop(
+        rx,
+        stalled_writer_runner(),
+        0,
+        None,
+        4,
+        Some(Duration::from_millis(200)),
+        Some(Arc::clone(&stats)),
+    ));
+    let mut writes = Vec::new();
+    for _ in 0..6 {
+        writes.push(submit_op(&tx, writer_op()).await);
+    }
+    // The last three could not start. Each is answered at its deadline, and the first three,
+    // which did start, are left to the liveness cap.
+    for late in writes.drain(3..) {
+        match tokio::time::timeout(Duration::from_secs(2), late).await {
+            Ok(Ok(WorkerOutcome::Done(Err(OrchestratorError::ReadDeadlineExpired { .. })))) => {}
+            _ => panic!("a parked write must be refused at its deadline"),
+        }
+    }
+    assert_eq!(stats.abandoned.load(AtomicOrdering::Relaxed), 3);
+}
+
+/// Writes still start in the order they arrived: setting them aside does not reorder them.
+#[tokio::test]
+async fn parked_writes_start_in_arrival_order() {
+    let (tx, rx) = mpsc::channel::<OrchestratorJob>(64);
+    let started = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let runner = {
+        let started = Arc::clone(&started);
+        move |op: Box<ClientOp>, _shard: Option<Uuid>| -> TestOp {
+            let started = Arc::clone(&started);
+            Box::pin(async move {
+                if let ClientOp::Write { id, .. } = &*op {
+                    started.lock().expect("lock").push(id.clone());
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+                }
+                WorkerOutcome::Done(Ok(json!({"ok": true})))
+            })
+        }
+    };
+    tokio::spawn(orchestrator_worker_loop(rx, runner, 0, None, 4, None, None));
+
+    let mut answers = Vec::new();
+    for n in 0..12 {
+        let mut op = writer_op();
+        if let ClientOp::Write { id, .. } = &mut *op {
+            *id = format!("{n:02}");
+        }
+        answers.push(submit_op(&tx, op).await);
+    }
+    for answer in answers {
+        answer.await.expect("answered");
+    }
+    let order = started.lock().expect("lock").clone();
+    let mut sorted = order.clone();
+    sorted.sort();
+    assert_eq!(order, sorted, "writes began out of order: {order:?}");
+    assert_eq!(order.len(), 12);
 }
 
 /// A runner whose operation never returns, for the two properties that are only observable

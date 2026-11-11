@@ -371,6 +371,9 @@ pub struct HybridStore {
     pub(crate) writers: Arc<DashMap<String, Arc<Mutex<IndexWriter>>>>,
     /// Cache of IndexReaders keyed by index name
     pub(crate) readers: Arc<DashMap<String, IndexReader>>,
+    /// What each cached reader last saw of its index's `meta.json`, and when the file was last
+    /// looked at; see [`Self::refresh_if_merged`].
+    pub(crate) meta_probes: Arc<DashMap<String, crate::search::MetaProbe>>,
     /// Atomic counters for WAL sequence IDs per index
     pub(crate) current_seq: Arc<DashMap<String, AtomicU64>>,
     /// Operation counters for smart commits per index
@@ -629,6 +632,7 @@ impl HybridStore {
             kv,
             writers: Arc::new(DashMap::new()),
             readers: Arc::new(DashMap::new()),
+            meta_probes: Arc::new(DashMap::new()),
             current_seq: Arc::new(DashMap::new()),
             operations_counter: Arc::new(DashMap::new()),
             pending_since: Arc::new(DashMap::new()),
@@ -2184,7 +2188,7 @@ impl HybridStore {
 
     /// The commit clock's reading now: never zero, so a mark set in the first millisecond is
     /// not read as "nothing pending".
-    fn commit_clock_now(&self) -> u64 {
+    pub(crate) fn commit_clock_now(&self) -> u64 {
         (self.commit_clock_epoch.elapsed().as_millis() as u64).max(1)
     }
 
