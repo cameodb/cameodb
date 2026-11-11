@@ -198,11 +198,19 @@ fn lock_writer_within<'w>(
 /// `pending_since` holds this while an index has nothing waiting for a commit.
 pub(crate) const NOTHING_PENDING: u64 = 0;
 
-/// With a commit interval configured, how far past the count threshold an index may run before
-/// it commits regardless of the clock. The interval is what normally triggers a commit; this
-/// bounds the WAL tail a restart replays and the buffer a commit has to flush, when writes
-/// arrive faster than an interval can cover.
+/// How far past the count threshold an index may run before it commits regardless of the clock.
+/// The interval is what normally triggers a commit; this, with [`COMMIT_BACKSTOP_ARENAS`], bounds
+/// the WAL tail a restart replays when writes arrive faster than an interval can cover. Counted
+/// in operations because a delete costs the writer a queued term whatever its size.
 pub(crate) const COMMIT_BACKSTOP_MULTIPLE: u64 = 20;
+
+/// The uncommitted bytes an index may hold on a shard before it commits regardless of the
+/// clock, in writer arenas (`indexer_memory_min_mb`): what a restart replays is re-indexed
+/// through that arena, so this bounds the replay at a few arena fills per index per shard.
+///
+/// Counted in bytes because the operation count alone said nothing about them: the same count
+/// of one-megabyte documents is a thousand times the tail of one-kilobyte ones.
+pub(crate) const COMMIT_BACKSTOP_ARENAS: u64 = 4;
 
 /// What a drain's writes made of an index's next commit — see [`HybridStore::commit_due`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -378,15 +386,15 @@ pub struct HybridStore {
     pub(crate) current_seq: Arc<DashMap<String, AtomicU64>>,
     /// Operation counters for smart commits per index
     pub(crate) operations_counter: Arc<DashMap<String, AtomicU64>>,
+    /// Bytes written to each index since its last commit — the documents and the WAL entries —
+    /// which is what a restart would replay. See [`COMMIT_BACKSTOP_ARENAS`].
+    pub(crate) uncommitted_bytes: Arc<DashMap<String, AtomicU64>>,
     /// When each index's oldest uncommitted operation was counted, in milliseconds after
     /// `commit_clock_epoch`, or [`NOTHING_PENDING`]. What `commit_interval_ms` is measured
     /// from; see [`Self::should_commit_writer`].
     pub(crate) pending_since: Arc<DashMap<String, AtomicU64>>,
     /// The origin `pending_since` is measured from.
     pub(crate) commit_clock_epoch: std::time::Instant,
-    /// Cache of optimal memory budgets per index to avoid frequent syscalls.
-    /// See [`BudgetCacheEntry`] for why it carries a timestamp rather than a bare number.
-    pub(crate) budget_cache: Arc<DashMap<String, BudgetCacheEntry>>,
     /// Cache of schemas per index to avoid repeated redb reads
     pub(crate) schema_cache: Arc<DashMap<String, Arc<IndexSchema>>>,
     /// Cache of Tantivy field mappings per index
@@ -635,9 +643,9 @@ impl HybridStore {
             meta_probes: Arc::new(DashMap::new()),
             current_seq: Arc::new(DashMap::new()),
             operations_counter: Arc::new(DashMap::new()),
+            uncommitted_bytes: Arc::new(DashMap::new()),
             pending_since: Arc::new(DashMap::new()),
             commit_clock_epoch: std::time::Instant::now(),
-            budget_cache: Arc::new(DashMap::new()),
             schema_cache: Arc::new(DashMap::new()),
             fields_cache: Arc::new(DashMap::new()),
             index_init_locks: Arc::new(DashMap::new()),
@@ -749,8 +757,8 @@ impl HybridStore {
 
         // Clear all caches
         self.schema_cache.clear();
-        self.budget_cache.clear();
         self.operations_counter.clear();
+        self.uncommitted_bytes.clear();
         self.pending_since.clear();
         self.current_seq.clear();
         self.index_size_cache
@@ -832,11 +840,11 @@ impl HybridStore {
         self.current_seq.remove(index);
         self.schema_cache.remove(index);
         self.fields_cache.remove(index);
-        self.budget_cache.remove(index);
         // The operations counter tracks documents buffered in the writer we just dropped.
         // Leaving it non-zero makes the next commit_index for this name believe there is
         // unflushed data.
         self.operations_counter.remove(index);
+        self.uncommitted_bytes.remove(index);
         self.pending_since.remove(index);
         // Warmup is invalidated by generation equality, and this name's next reader starts
         // its generation counter from zero. Dropping both entries is what makes the next
@@ -1343,6 +1351,7 @@ impl HybridStore {
         // sequence really has been applied.
         let mut replayed_count = 0;
         let mut replayed_since_commit = 0u64;
+        let mut replayed_bytes_since_commit = 0u64;
         let mut skipped_duplicates = 0usize;
         let mut applied_ids: HashSet<String> = HashSet::new();
 
@@ -1350,6 +1359,7 @@ impl HybridStore {
             let (seq_guard, wal_data_guard) = result?;
             let seq_id = seq_guard.value();
             let id = decode_wal_entry(wal_data_guard.value())?;
+            replayed_bytes_since_commit += wal_data_guard.value().len() as u64;
 
             if !applied_ids.insert(id.clone()) {
                 skipped_duplicates += 1;
@@ -1369,6 +1379,7 @@ impl HybridStore {
 
             match stored {
                 Some(doc_guard) => {
+                    replayed_bytes_since_commit += doc_guard.value().len() as u64;
                     let stored_doc: StoredDocOwned = serde_json::from_slice(doc_guard.value())
                         .map_err(|e| StoreError::Serialization(e.to_string()))?;
 
@@ -1416,6 +1427,7 @@ impl HybridStore {
                 self.durability_barrier()?;
                 commit_writer_at(writer, seq_id)?;
                 replayed_since_commit = 0;
+                replayed_bytes_since_commit = 0;
             }
 
             // Log progress every 1000 documents
@@ -1435,7 +1447,7 @@ impl HybridStore {
         // or supervisor idle timeout) flushes them; otherwise the no-op guard in commit_index
         // would leave them buffered until unrelated traffic arrives for this index.
         if replayed_since_commit > 0 {
-            self.add_operations(index, replayed_since_commit);
+            self.add_operations(index, replayed_since_commit, replayed_bytes_since_commit);
         }
 
         tracing::info!(
@@ -1930,11 +1942,6 @@ impl HybridStore {
             .config
             .get_optimal_memory_budget(&index_path, field_count);
 
-        // Cache the budget, stamped: this is the measurement the TTL in
-        // `should_commit_writer` ages out.
-        self.budget_cache
-            .insert(index.to_string(), BudgetCacheEntry::now(optimal_budget));
-
         let num_worker_threads = self.config.indexer_num_threads.max(1);
         let num_merge_threads = self.config.merge_num_threads.max(1);
         let memory_per_thread = optimal_budget / num_worker_threads;
@@ -2075,93 +2082,53 @@ impl HybridStore {
         Ok((writer_arc, fields))
     }
 
-    /// ACID-compliant commit threshold with optimized batching to reduce transaction overhead.
-    /// Larger batches mean fewer commits and less fsync overhead while maintaining Durability::Immediate.
+    /// Whether `index`'s commit is due with `operations_since_commit` pending: at the count
+    /// threshold, or — with a commit interval set — once the oldest of them has waited an
+    /// interval; and at the backstop either way.
     pub(crate) fn should_commit_writer(&self, index: &str, operations_since_commit: u64) -> bool {
-        let base_ops = self.commit_base_ops(index);
-
-        // Additional optimization: larger thresholds for indices with high operation counts
-        // This detects bulk operation patterns and adjusts accordingly
         if self.config.commit_interval_ms > 0 {
-            return self.interval_commit_due(index, operations_since_commit, base_ops);
+            return self.interval_commit_due(index, operations_since_commit);
         }
-
-        let default_batch = self.config.default_batch_size as u64;
-        let threshold = if operations_since_commit > default_batch * 5 {
-            // For very large batches, allow up to 50% more accumulation
-            // This reduces fsync overhead during bulk imports
-            (base_ops as f64 * 1.5) as u64
-        } else {
-            base_ops
-        };
-
-        operations_since_commit >= threshold
+        operations_since_commit >= self.commit_base_ops()
+            || self.at_commit_backstop(index, operations_since_commit)
     }
 
     /// The most operations an index may hold uncommitted however the commit is otherwise
     /// decided: [`COMMIT_BACKSTOP_MULTIPLE`] times the count threshold. The interval policy's
     /// own ceiling, and the one a writer whose batches all defer the commit decision is still
     /// held to — see `StorageCommand::BatchWrite::defer_commit` in the server.
-    pub fn commit_backstop_ops(&self, index: &str) -> u64 {
-        self.commit_base_ops(index)
+    pub fn commit_backstop_ops(&self) -> u64 {
+        self.commit_base_ops()
             .saturating_mul(COMMIT_BACKSTOP_MULTIPLE)
     }
 
-    /// The operation count a commit is normally decided on for `index`, scaled with the
-    /// index's memory budget: `default_batch_size` at the minimum budget, twenty times it at
-    /// the maximum.
-    fn commit_base_ops(&self, index: &str) -> u64 {
-        // The budget for this index, measured at most once per `BUDGET_CACHE_TTL`. This is
-        // the only place the measurement is taken: `commit_index` used to re-take it after
-        // every single commit, which is ~300 `stat` calls on a fifty-segment index, on the
-        // writer thread, to refresh a five-bucket size class whose boundaries are hundreds of
-        // megabytes apart.
-        // Read the cached budget and *release the guard* before deciding anything.
-        //
-        // `DashMap::get` returns a `Ref` holding a read lock on the map's shard, and a match
-        // scrutinee's temporary lives to the end of the match — so an arm that calls `insert`
-        // asks the same shard for its write lock while this thread still holds the read lock.
-        // dashmap's `RwLock` is not reentrant: the writer waits for a reader that is itself,
-        // on the shard writer thread, forever. It survived review because the deadlock needs
-        // the *stale* arm, which cannot be reached until `BUDGET_CACHE_TTL` has passed since
-        // this index's writer was opened — so every short test hit the fresh arm and passed.
-        // See ROADMAP OB14 for what it did to a node under load.
-        //
-        // `and_then` consumes the `Ref` and drops it when the closure returns, so the lock is
-        // gone before the `match` below can take the write path.
-        let cached = self
-            .budget_cache
-            .get(index)
-            .and_then(|entry| (!entry.value().is_stale()).then(|| entry.value().budget));
+    /// The most bytes an index may hold uncommitted on this shard however the commit is
+    /// otherwise decided: [`COMMIT_BACKSTOP_ARENAS`] writer arenas.
+    ///
+    /// Per index and per shard, like the arena it is counted in: an index spread over several
+    /// shards holds up to this much on each, and each shard replays its own in parallel.
+    pub fn commit_backstop_bytes(&self) -> u64 {
+        (self.config.indexer_memory_min_mb.max(1) as u64)
+            .saturating_mul(1024 * 1024)
+            .saturating_mul(COMMIT_BACKSTOP_ARENAS)
+    }
 
-        let budget = match cached {
-            Some(budget) => budget,
-            None => {
-                // Measurement only, but the path is still built by `index_dir` so no
-                // caller-supplied name is ever joined by hand.
-                let b = match self.index_dir(index) {
-                    Ok(index_path) => self.config.get_optimal_memory_budget(&index_path, None),
-                    Err(_) => self.config.indexer_memory_budget,
-                };
-                self.budget_cache
-                    .insert(index.to_string(), BudgetCacheEntry::now(b));
-                b
-            }
-        };
+    /// Whether `index` has reached either backstop: the operations or the bytes since its last
+    /// commit.
+    fn at_commit_backstop(&self, index: &str, pending_ops: u64) -> bool {
+        pending_ops >= self.commit_backstop_ops()
+            || self.get_uncommitted_bytes(index) >= self.commit_backstop_bytes()
+    }
 
-        // ACID-safe optimization: Scale commit frequency with memory budget
-        // More memory = larger batches = fewer commits = less transaction overhead
-        let min_budget = self.config.indexer_memory_min_mb * 1024 * 1024;
-        let max_budget = self.config.indexer_memory_max_mb * 1024 * 1024;
-
-        // Enhanced adaptive threshold for ACID-compliant commit optimization
-        let budget_ratio = (budget - min_budget) as f64 / (max_budget - min_budget) as f64;
-        let default_batch = self.config.default_batch_size as f64;
-
-        // Optimized scaling: 1x default (min) to 20x default (max)
-        // e.g., default=1000: 1000 ops (32MB) -> 20000 ops (512MB)
-        // This reduces commit frequency while maintaining ACID via Durability::Immediate
-        (default_batch * (1.0 + budget_ratio * 19.0)) as u64
+    /// The operation count a commit is decided on when no interval is set, and the unit the
+    /// operation backstop is counted in: `default_batch_size`.
+    ///
+    /// This used to scale with a size class of the index, read by walking its directory — a
+    /// `stat` per file on the writer thread, every thirty seconds per index — to choose a
+    /// number whose only use, on a node, was the backstop. The bytes now bound what the size
+    /// class was standing in for.
+    fn commit_base_ops(&self) -> u64 {
+        (self.config.default_batch_size as u64).max(1)
     }
 
     /// The commit policy when `commit_interval_ms` is set: commit once the oldest uncommitted
@@ -2173,11 +2140,11 @@ impl HybridStore {
     /// after it: a quiet index takes a write, waits an interval for company, and commits once.
     /// Called on the writer thread after each drain, which is when a write can have arrived;
     /// an index whose writes stop inside an interval is committed by the node's idle commit.
-    fn interval_commit_due(&self, index: &str, pending_ops: u64, base_ops: u64) -> bool {
+    fn interval_commit_due(&self, index: &str, pending_ops: u64) -> bool {
         if pending_ops == 0 {
             return false;
         }
-        if pending_ops >= base_ops.saturating_mul(COMMIT_BACKSTOP_MULTIPLE) {
+        if self.at_commit_backstop(index, pending_ops) {
             return true;
         }
 
@@ -2244,19 +2211,35 @@ impl HybridStore {
             .unwrap_or(0)
     }
 
-    /// Count `operations` toward the index's next commit.
-    pub(crate) fn add_operations(&self, index: &str, operations: u64) {
+    /// Bytes written to `index` since its last commit.
+    pub fn get_uncommitted_bytes(&self, index: &str) -> u64 {
+        self.uncommitted_bytes
+            .get(index)
+            .map(|bytes| bytes.value().load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// Count `operations`, of `bytes` in all, toward the index's next commit.
+    pub(crate) fn add_operations(&self, index: &str, operations: u64, bytes: u64) {
         self.operations_counter
             .entry(index.to_string())
             .or_insert_with(|| AtomicU64::new(0))
             .value()
             .fetch_add(operations, Ordering::SeqCst);
+        self.uncommitted_bytes
+            .entry(index.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .value()
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Reset operation counter after commit
     pub fn reset_operations_counter(&self, index: &str) {
         if let Some(counter) = self.operations_counter.get(index) {
             counter.value().store(0, Ordering::SeqCst);
+        }
+        if let Some(bytes) = self.uncommitted_bytes.get(index) {
+            bytes.value().store(0, Ordering::Relaxed);
         }
         // Nothing is waiting any more, so the next operation starts a fresh interval.
         if let Some(since) = self.pending_since.get(index) {
@@ -2343,13 +2326,6 @@ impl HybridStore {
 
         // CRITICAL: Smart refresh reader cache after commit to ensure search sees latest data
         self.smart_refresh_reader(index)?;
-
-        // The budget is deliberately *not* re-measured here. It used to be, on the grounds
-        // that a commit changes the index size — true, and it changes it by far less than the
-        // size class it feeds can notice. `should_commit_writer` re-measures on its own TTL,
-        // which bounds the directory walk to twice a minute per index however hard the index
-        // is written, instead of once per commit on the writer thread between the Tantivy
-        // commit and the checkpoint transaction.
 
         self.checkpoint_after_commit(index, committed_seq)
     }
@@ -2466,7 +2442,8 @@ impl HybridStore {
         self.commit_if(index, self.commit_due(index, false) != CommitDue::No)
     }
 
-    /// Commit only if the uncommitted count has reached [`Self::commit_backstop_ops`] — the
+    /// Commit only if the index has reached its backstop ([`Self::commit_backstop_ops`],
+    /// [`Self::commit_backstop_bytes`]) — the
     /// decision [`Self::commit_due`] makes for a `deferred` drain.
     pub fn maybe_commit_writer_at_backstop(&self, index: &str) -> Result<bool, StoreError> {
         self.commit_if(index, self.commit_due(index, true) == CommitDue::AtBackstop)
@@ -2497,7 +2474,7 @@ impl HybridStore {
         if pending == 0 {
             return CommitDue::No;
         }
-        if pending >= self.commit_backstop_ops(index) {
+        if self.at_commit_backstop(index, pending) {
             return CommitDue::AtBackstop;
         }
         if deferred {
@@ -3513,6 +3490,7 @@ impl HybridStore {
 
         // Collect sequence IDs during processing
         let mut seq_ids = Vec::with_capacity(ops_len);
+        let mut batch_bytes = 0u64;
 
         {
             // A schema row is metadata and is always written with `Immediate`; folding it into
@@ -3551,6 +3529,7 @@ impl HybridStore {
 
                 // Write to WAL
                 wal_table.insert(seq_id, wal_bytes.as_slice())?;
+                batch_bytes += (wal_bytes.len() + doc_bytes.as_ref().map_or(0, Vec::len)) as u64;
 
                 // Collect sequence ID for final result
                 seq_ids.push(seq_id);
@@ -3656,7 +3635,7 @@ impl HybridStore {
 
             // Counted before the writer is released, so a commit never sees the documents
             // without the count that makes it commit them.
-            self.add_operations(index, batch_size);
+            self.add_operations(index, batch_size, batch_bytes);
 
             tracing::debug!(
                 index = %index,

@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde_json::Value as JsonValue;
@@ -226,46 +226,9 @@ pub(crate) fn index_size_bytes(index_path: &Path) -> Option<u64> {
     Some(total)
 }
 
-/// A commit-cadence memory budget, and when it was measured.
-///
-/// The budget comes from [`index_size_bytes`], which is a `read_dir` plus a `stat` per file —
-/// some three hundred syscalls on a fifty-segment index. What it buys is a five-bucket size
-/// class (100MB / 500MB / 2GB / 8GB) that scales how many operations accumulate before the next
-/// commit. `commit_index` used to re-measure it after *every* commit, on the writer thread, in
-/// the window between the Tantivy commit and the checkpoint transaction — precision nobody
-/// could use, since an index crosses one of those boundaries after hundreds of megabytes of
-/// writing. The timestamp is what lets one measurement stand for many commits.
-#[derive(Clone, Copy)]
-pub(crate) struct BudgetCacheEntry {
-    pub(crate) budget: usize,
-    pub(crate) measured_at: Instant,
-}
-
-/// How long a measured budget stands before the index directory is walked again.
-///
-/// Bounds the walk at two per index per minute however hard the index is being written, against
-/// one per commit before. A budget this stale is still right: crossing a size class takes orders
-/// of magnitude longer than 30s of writing at any rate this engine sustains, and being one
-/// bucket behind for a few seconds costs a commit cadence slightly off its optimum, not
-/// correctness.
-pub(crate) const BUDGET_CACHE_TTL: Duration = Duration::from_secs(30);
-
 /// Keys [`HybridStore::keys_present_with`] reads under one redb read transaction: a few
 /// milliseconds of point lookups, so no transaction it opens outlives a writer's commit by much.
 pub(crate) const PRESENCE_TXN_KEYS: usize = 4_096;
-
-impl BudgetCacheEntry {
-    pub(crate) fn now(budget: usize) -> Self {
-        Self {
-            budget,
-            measured_at: Instant::now(),
-        }
-    }
-
-    pub(crate) fn is_stale(&self) -> bool {
-        self.measured_at.elapsed() >= BUDGET_CACHE_TTL
-    }
-}
 
 /// Unified cache entry for index sizes (both Tantivy directory and Redb table) with timestamp
 #[derive(Clone)]

@@ -16,8 +16,8 @@
 //!     - "/mnt/disk1/cameodb"
 //!     - "/mnt/disk2/cameodb"
 //! search:
-//!   indexer_memory_min_mb: 16
-//!   indexer_memory_max_mb: 256
+//!   indexer_memory_min_mb: 64
+//!   indexer_memory_max_mb: 512
 //!   memory_pressure_threshold_percent: 80
 //! ```
 
@@ -698,11 +698,12 @@ pub struct MessagingConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SearchConfig {
-    /// Minimum indexer memory in MB (default: 16)
+    /// Minimum indexer memory in MB (default: 64). Per index writer on each shard, not divided
+    /// between shards; four times it is the bytes backstop on a shard's uncommitted writes.
     #[serde(default = "default_indexer_memory_min_mb")]
     pub indexer_memory_min_mb: usize,
 
-    /// Maximum indexer memory in MB (default: 256)
+    /// Maximum indexer memory in MB (default: 512)
     #[serde(default = "default_indexer_memory_max_mb")]
     pub indexer_memory_max_mb: usize,
 
@@ -816,7 +817,8 @@ pub struct SearchConfig {
     /// load committed on nearly every batch, and a trickle that never reached the count was
     /// not searchable until it did. By time, a bulk load commits once per interval however
     /// fast it arrives, and a trickle is searchable within one. The count still applies,
-    /// twenty times higher, as a backstop bounding what a restart replays.
+    /// twenty times higher, as a backstop bounding what a restart replays, and so do the bytes:
+    /// four writer arenas (`indexer_memory_min_mb`) per index per shard.
     ///
     /// Each shard runs a little longer than this, by up to half of it in steps of its ordinal,
     /// so the shards of a node do not all commit in the same instant; and a shard's writer

@@ -1,5 +1,4 @@
 //! Unit tests for the storage engine, kept beside the modules they exercise.
-use crate::search::{BUDGET_CACHE_TTL, BudgetCacheEntry};
 use crate::*;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -781,158 +780,6 @@ mod tests {
             count(&store),
             2,
             "the commit published the delete; the cached count of 3 must not outlive it"
-        );
-    }
-
-    /// A commit does not re-walk the index directory to refresh the memory budget.
-    ///
-    /// `commit_index` used to call `get_optimal_memory_budget` on every commit, which is a
-    /// `read_dir` plus a `stat` per file — some three hundred syscalls on a fifty-segment index
-    /// — on the writer thread, in the window between the Tantivy commit and the checkpoint
-    /// transaction. It fed one thing: the five-bucket size class that scales how many
-    /// operations accumulate before the *next* commit, whose boundaries are 100MB, 500MB, 2GB
-    /// and 8GB apart. A commit cannot move an index across one of those, so the measurement was
-    /// precision nobody could use.
-    ///
-    /// The timestamp is the evidence: it is stamped when the budget is measured, so an
-    /// unchanged one means no walk happened. `should_commit_writer` ages it out on its own TTL,
-    /// which bounds the walk per index rather than per commit.
-    #[test]
-    fn a_commit_does_not_re_measure_the_memory_budget() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let store = HybridStore::new(small_store_config(&temp_dir), 1).expect("store");
-        let index = "cadence";
-
-        store
-            .store_schema_and_cache(index, &IndexSchema::default())
-            .expect("store schema");
-        store
-            .apply_write(
-                index,
-                WalOp::Put {
-                    id: "d1".to_string(),
-                    json_blob: Some(serde_json::json!({ "title": "one" })),
-                },
-            )
-            .expect("write");
-
-        let measured_at = store
-            .budget_cache
-            .get(index)
-            .expect("opening the index measures the budget once")
-            .value()
-            .measured_at;
-
-        for _ in 0..3 {
-            store.commit_index(index).expect("commit");
-        }
-
-        let after = store
-            .budget_cache
-            .get(index)
-            .expect("the entry must still be there")
-            .value()
-            .measured_at;
-        assert_eq!(
-            measured_at, after,
-            "a commit must not re-measure the budget; the TTL decides when that happens"
-        );
-
-        // And the heuristic the budget feeds still answers, from the entry that stood.
-        assert!(
-            !store.should_commit_writer(index, 0),
-            "nothing pending, so no commit is due"
-        );
-        assert_eq!(
-            store
-                .budget_cache
-                .get(index)
-                .expect("entry")
-                .value()
-                .measured_at,
-            measured_at,
-            "a fresh entry must be used as-is rather than re-measured"
-        );
-    }
-
-    /// A budget entry past its TTL does not deadlock the writer thread.
-    ///
-    /// `should_commit_writer` reads the cached budget and, when it is stale, re-measures and
-    /// writes the result back. `DashMap::get` hands back a `Ref` holding a read lock on the
-    /// map's shard, and a match scrutinee's temporary lives to the end of the match — so the
-    /// original form asked that same shard for its write lock from inside an arm, while this
-    /// thread still held the read lock. dashmap's `RwLock` is not reentrant, so the thread
-    /// waited for itself, on the shard's writer thread, forever.
-    ///
-    /// Two details are why it survived review and every test above. It needs the *stale* arm,
-    /// unreachable until `BUDGET_CACHE_TTL` has passed since the index's writer was opened, so
-    /// short tests all took the fresh arm — [`a_commit_does_not_re_measure_the_memory_budget`]
-    /// included. And it needs the entry to be *present*: a missing one makes `get` return
-    /// `None`, which holds no guard, so the insert goes through. Present-but-stale is the only
-    /// state that hangs, and it is the state every long-lived index reaches.
-    ///
-    /// Asserted with a deadline on another thread, because the regression is a hang and an
-    /// assertion on a return value cannot fail if the call never returns. ROADMAP OB14.
-    #[test]
-    fn a_stale_budget_entry_does_not_deadlock_the_writer() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let store = Arc::new(HybridStore::new(small_store_config(&temp_dir), 1).expect("store"));
-        let index = "stale";
-
-        store
-            .store_schema_and_cache(index, &IndexSchema::default())
-            .expect("store schema");
-        store
-            .apply_write(
-                index,
-                WalOp::Put {
-                    id: "d1".to_string(),
-                    json_blob: Some(serde_json::json!({ "title": "one" })),
-                },
-            )
-            .expect("write");
-
-        // Age the entry past the TTL in place, so the stale arm is taken without waiting out
-        // `BUDGET_CACHE_TTL` in real time. The entry stays present, which is the state that hangs.
-        let aged = Instant::now()
-            .checked_sub(BUDGET_CACHE_TTL + Duration::from_secs(1))
-            .expect("clock far enough from its origin to age an entry");
-        store.budget_cache.insert(
-            index.to_string(),
-            BudgetCacheEntry {
-                budget: 32 * 1024 * 1024,
-                measured_at: aged,
-            },
-        );
-        assert!(
-            store
-                .budget_cache
-                .get(index)
-                .expect("entry")
-                .value()
-                .is_stale(),
-            "the entry has to be stale for this test to exercise anything"
-        );
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        let probe = Arc::clone(&store);
-        std::thread::spawn(move || {
-            let _ = probe.should_commit_writer(index, 0);
-            let _ = tx.send(());
-        });
-
-        rx.recv_timeout(Duration::from_secs(10)).expect(
-            "should_commit_writer must return on a stale entry, not deadlock on its own shard",
-        );
-
-        assert!(
-            !store
-                .budget_cache
-                .get(index)
-                .expect("entry")
-                .value()
-                .is_stale(),
-            "the stale entry must have been replaced by a fresh measurement"
         );
     }
 
@@ -2817,8 +2664,7 @@ mod commit_interval_tests {
     const BATCH: usize = 100;
     const INTERVAL_MS: u64 = 150;
 
-    /// A count threshold of exactly `BATCH`: every name here is new, so its budget is the
-    /// minimum and the budget-scaled threshold is the batch size itself.
+    /// A count threshold of exactly `BATCH`, whatever the index's size.
     fn config(temp_dir: &TempDir, commit_interval_ms: u64) -> StorageConfig {
         StorageConfig {
             max_open_indexes: 0,
@@ -2887,6 +2733,88 @@ mod commit_interval_tests {
 
         assert!(!store.should_commit_writer("burst", backstop - 1));
         assert!(store.should_commit_writer("burst", backstop));
+    }
+
+    /// The bytes backstop: an index holding a few writer arenas uncommitted commits at once,
+    /// however few operations that took — with an interval or without one.
+    #[test]
+    fn the_bytes_backstop_commits_large_documents_before_the_count() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        for interval in [INTERVAL_MS, 0] {
+            let store = HybridStore::new(config(&temp_dir, interval), 1).expect("store");
+            let limit = store.commit_backstop_bytes();
+            assert_eq!(limit, 16 * 1024 * 1024 * COMMIT_BACKSTOP_ARENAS);
+
+            store.add_operations("large", 3, limit - 1);
+            assert!(
+                !store.should_commit_writer("large", 3),
+                "interval {interval}"
+            );
+            assert_eq!(store.commit_due("large", true), CommitDue::No);
+
+            store.add_operations("large", 1, 1);
+            assert!(
+                store.should_commit_writer("large", 4),
+                "interval {interval}"
+            );
+            assert_eq!(
+                store.commit_due("large", true),
+                CommitDue::AtBackstop,
+                "a deferred drain is held to the bytes as to the count"
+            );
+        }
+    }
+
+    /// What a write adds to the bytes is what it put in redb — its document and its WAL entry
+    /// — and a commit starts the count again.
+    #[test]
+    fn a_write_counts_its_bytes_until_the_commit() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = HybridStore::new(config(&temp_dir, INTERVAL_MS), 1).expect("store");
+        let index = "bytes";
+        let body = "x".repeat(10_000);
+        store
+            .apply_batch(
+                index,
+                vec![WalOp::Put {
+                    id: "a".to_string(),
+                    json_blob: Some(serde_json::json!({ "title": body })),
+                }],
+            )
+            .expect("write");
+        let counted = store.get_uncommitted_bytes(index);
+        assert!(counted > 10_000 && counted < 11_000, "counted {counted}");
+
+        store
+            .apply_batch(
+                index,
+                vec![WalOp::Delete {
+                    id: "a".to_string(),
+                }],
+            )
+            .expect("delete");
+        assert!(
+            store.get_uncommitted_bytes(index) > counted,
+            "a delete counts its WAL entry"
+        );
+
+        store.commit_index(index).expect("commit");
+        assert_eq!(store.get_uncommitted_bytes(index), 0);
+    }
+
+    /// The operation backstop no longer depends on the memory settings: equal minimum and
+    /// maximum used to divide by zero into a backstop of nothing, a commit on every drain.
+    #[test]
+    fn the_operation_backstop_does_not_depend_on_the_memory_range() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut equal = config(&temp_dir, INTERVAL_MS);
+        equal.indexer_memory_max_mb = equal.indexer_memory_min_mb;
+        let store = HybridStore::new(equal, 1).expect("store");
+        assert_eq!(
+            store.commit_backstop_ops(),
+            BATCH as u64 * COMMIT_BACKSTOP_MULTIPLE
+        );
+        assert!(!store.should_commit_writer("equal", 1));
     }
 
     /// `0` is the count-only policy, unchanged: the threshold commits and the clock is not read.
@@ -2979,7 +2907,7 @@ mod commit_interval_tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let store = HybridStore::new(config(&temp_dir, INTERVAL_MS), 1).expect("store");
         let index = "deferred-backstop";
-        let backstop = store.commit_backstop_ops(index) as usize;
+        let backstop = store.commit_backstop_ops() as usize;
 
         let ops = (0..backstop).map(|i| put(&format!("d{i}"))).collect();
         store.apply_batch(index, ops).expect("deferred writes");

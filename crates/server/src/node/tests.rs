@@ -5249,7 +5249,7 @@ async fn a_deferred_batch_still_commits_at_the_backstop() {
     let mut shard = started_shard(eager_commit_config(dir.path().to_path_buf())).await;
     seed(&shard, index, 60).await;
     let store = Arc::clone(shard.store.as_ref().expect("store"));
-    let backstop = store.commit_backstop_ops(index) as usize;
+    let backstop = store.commit_backstop_ops() as usize;
     assert!(backstop > 1 && backstop < 60, "backstop {backstop}");
 
     // Under the backstop: no commit.

@@ -293,7 +293,9 @@ level. A config the node refuses is refused into the file too.
 
 ```toml
 [search]
-# Minimum memory for each indexer thread in MB (default: 64)
+# Minimum memory for each indexer thread in MB (default: 64). Per index writer, on each shard:
+# not divided between shards. Four times this, per index per shard, is the most uncommitted
+# writes an index holds before it commits regardless of commit_interval_ms.
 indexer_memory_min_mb = 64
 
 # Maximum memory for each indexer thread in MB (default: 512)
@@ -481,7 +483,9 @@ wal_segment_size_mb = 64
 # Default batch size for bulk ingestion; also the base of the commit count (default: 1000).
 # With `[search] commit_interval_ms` set (the default), time triggers a commit and twenty times
 # this count is only a backstop bounding what a restart replays; with it at 0, this count is
-# the commit threshold itself.
+# the commit threshold itself. Either way an index also commits once it holds four writer
+# arenas (4 x `indexer_memory_min_mb`) of uncommitted writes on a shard, so large documents
+# do not stretch the replay the count was meant to bound. Both are per index, per shard.
 #
 # This is an internal commit-cadence parameter, NOT the number of documents to put in a
 # `_bulk` request. The two are easy to confuse and only the second one moves ingest

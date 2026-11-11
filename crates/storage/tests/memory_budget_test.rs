@@ -1,9 +1,8 @@
 //! What `get_optimal_memory_budget` reads off disk, and the size classes it maps that to.
 //!
-//! The budget it returns is the tantivy arena an index's writer is built with, and — through
-//! `should_commit_writer` — how many operations accumulate before the next commit. It is
-//! measured by walking the index directory, which is why `commit_index` no longer does it per
-//! commit and a TTL governs it instead (M0-g): these tests pin the answer, not its cadence.
+//! The budget it returns is the tantivy arena an index's writer is built with, measured by
+//! walking the index directory once, when the writer opens. It no longer sets the commit
+//! cadence: that is `default_batch_size` and the bytes backstop.
 //!
 //! This file used to also test `StorageConfig::get_bulk_operation_budget`, which documented
 //! bulk writes receiving 1.5× and 2× arenas. They never did: a writer's
