@@ -322,7 +322,9 @@ delete_max_docs = 100000
 # Longest a write waits to become searchable while writes to its index keep arriving, in
 # milliseconds (default: 2000). A commit is what makes writes visible to search and it is the
 # expensive half of a write, so this is also what a bulk load's commit cost is amortized over.
-# 0 commits by operation count alone (`default_batch_size`), the policy before 0.3.5.
+# 0 commits by operation count alone (`default_batch_size`), the policy before 0.3.5. Each shard
+# runs up to half again as long, staggered by its place on the node, so shards do not all commit
+# at once.
 commit_interval_ms = 2000
 
 # Seconds after an index's last write before it is committed anyway (default: 3): the idle

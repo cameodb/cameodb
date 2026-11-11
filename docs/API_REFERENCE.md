@@ -747,6 +747,8 @@ The same request with `"confirm": true` deletes them:
   "matched": 240512,
   "deleted": 240512,
   "skipped_inexact": 0,
+  "remaining": 0,
+  "complete": true,
   "max_docs": 100000,
   "dry_run": false,
   "shards": {"total": 12, "failed": 0},
@@ -788,9 +790,25 @@ matches more. The error names the clause and why.
   that did not answer in time, and its documents are *not confirmed* deleted: a node that was
   slow, not down, still deletes once the request reaches it. Send a `dry_run` of the same query
   to see what is left.
-- **Charged like a bulk delete:** each deleted document against
-  [`write_documents_per_minute`](CONFIGURATION.md#rate-limiting-tool-calls-search-and-writes-securitylimits),
-  when that is on. `confirm` skips only the `max_docs` check.
+- **A delete that cannot finish in time says so, it does not just fail.** The delete runs in
+  rounds across a node's shards, sharing their writers with regular writes. When the request's
+  own budget cannot cover another round the node stops cleanly, starts the commit of what it
+  removed without waiting for it, and answers `200` with `"complete": false` and `remaining` —
+  the matched count minus what was deleted. Sending the same request again continues the delete
+  from there; nothing is deleted twice. `complete` is also false when a shard or node failed
+  partway.
+- **At most a million documents per node per request.** A larger match deletes what it found
+  first and answers the rest as `remaining`, with `"complete": false`; the same request continues
+  it. Past that limit a `text` clause's candidates are counted before their stored-value check, so
+  `remaining` can then include some the check will turn away.
+- **The count is charged as a search**, against `tool_calls_per_minute` when that is on — a
+  `dry_run`, and a delete refused past `max_docs`, cost one search.
+- **The delete is charged like a bulk delete**, against
+  [`write_documents_per_minute`](CONFIGURATION.md#rate-limiting-tool-calls-search-and-writes-securitylimits)
+  when that is on: admitted on the matched count, as a bulk delete is on its document count —
+  at most the whole allowance, so a caller without it gets `429` before anything is deleted —
+  and then charged only what it deleted. A delete that fails partway is charged what it was
+  admitted on. `confirm` skips only the `max_docs` check.
 - **Visibility** as for any delete — see above — or at once with `"refresh": true`. The disk is
   returned when a merge rewrites the segments (`POST /_admin/index/{index}/merge`, or without
   asking with `[search] reclaim_deleted_ratio`).

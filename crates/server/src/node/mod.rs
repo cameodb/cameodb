@@ -1660,6 +1660,12 @@ pub enum StorageCommand {
     BatchWrite {
         index: String,
         ops: Vec<WalOp>,
+        /// Do not let this batch decide a commit: the sender commits once, when it has sent
+        /// its last batch. A delete by query sends many, and a commit decided per batch —
+        /// each resolving the deletes against every segment — was most of what its writer
+        /// thread spent while regular writes waited behind it. A drain that also carries an
+        /// undeferred write to the index still decides the commit as usual.
+        defer_commit: bool,
         reply: tokio::sync::oneshot::Sender<Result<Vec<u64>, StoreError>>,
     },
     Commit {

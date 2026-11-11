@@ -282,6 +282,12 @@ impl RouterActor {
         }
     }
 
+    /// The node's request budget — the same `request_timeout_secs` the orchestrator's
+    /// `read_budget` is — as the worker pool resolved it. `None` without a pool or a timeout.
+    fn request_budget(&self) -> Option<Duration> {
+        self.worker_tx.as_ref().and_then(|tx| tx.load().budget())
+    }
+
     /// The mailbox lane's backlog gate, for the endpoints that report what refusals are made on.
     pub(crate) fn mailbox_load(&self) -> Option<&Arc<QueueLoad>> {
         self.mailbox_load.as_ref()
@@ -482,10 +488,12 @@ impl RouterActor {
         op: ClientOp,
     ) -> Result<JsonValue, OrchestratorError> {
         // `OnActor`, not the op itself: a `ClientOp` is a peer's, and would be offered to the
-        // worker lane again — which is where most ops reaching here were just declined.
+        // worker lane again — which is where most ops reaching here were just declined. It
+        // carries the request's start, so the actor runs the op on the request's clock —
+        // mailbox wait included — rather than on one started when the mailbox reached it.
         match self
             .orchestrator
-            .ask(super::orchestrator::OnActor(op))
+            .ask(super::orchestrator::OnActor::in_request(op))
             .await
         {
             Ok(result) => Ok(result),
@@ -912,7 +920,21 @@ impl RouterActor {
 
         // Fan out to remote peers (up to fanout_limit)
         let remote_limit = self.streaming.max_concurrent_remote_searches.max(1);
-        let remote_timeout = self.broadcast_timeout;
+        // A search's share is waited on for the broadcast timeout. A delete by query's delete
+        // phase is not a search: each peer paces its rounds to the request's budget — it knows
+        // what the request has spent from `spent_ms` — so it is waited on until just before
+        // that budget ends. Under the broadcast timeout a peer's tally and its `remaining`
+        // were lost; under the remote deadline a hung peer turned the answer into a `408`.
+        let remote_timeout = match &op {
+            ClientOp::DeleteByQuery { mode, .. } => super::delete_query::peer_wait(
+                *mode,
+                self.request_budget(),
+                super::request_started_at(),
+                self.broadcast_timeout,
+                self.remote_timeout,
+            ),
+            _ => self.broadcast_timeout,
+        };
         let remote_router = self.clone();
         let remote_op = op.clone();
         // Each peer carries the ordinal it was dispatched at. `buffer_unordered` yields in

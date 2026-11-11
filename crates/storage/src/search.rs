@@ -181,6 +181,10 @@ pub(crate) struct BudgetCacheEntry {
 /// correctness.
 pub(crate) const BUDGET_CACHE_TTL: Duration = Duration::from_secs(30);
 
+/// Keys [`HybridStore::keys_present_with`] reads under one redb read transaction: a few
+/// milliseconds of point lookups, so no transaction it opens outlives a writer's commit by much.
+pub(crate) const PRESENCE_TXN_KEYS: usize = 4_096;
+
 impl BudgetCacheEntry {
     pub(crate) fn now(budget: usize) -> Self {
         Self {
@@ -301,7 +305,10 @@ impl HybridStore {
         let read_txn = self.kv.begin_read()?;
         let data_table = match read_txn.open_table(data_table_def) {
             Ok(table) => table,
-            Err(_) => return Ok(Vec::new()), // Table doesn't exist
+            // An index never written holds nothing. Any other failure is the store's, and
+            // answering it as "no such documents" would hide it behind an empty page.
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(err) => return Err(err.into()),
         };
 
         let mut results = Vec::with_capacity(keys.len());
@@ -319,6 +326,50 @@ impl HybridStore {
         }
 
         Ok(results)
+    }
+
+    /// Which of `keys` the store holds a row for, in `keys`' order, under a search deadline.
+    ///
+    /// [`get_batch_by_keys_with`](Self::get_batch_by_keys_with) without the bodies: a delete by
+    /// query asks this of its matches to drop the ones deleted since the last commit, and has
+    /// no use for the document itself unless a `text` clause is to be checked against it.
+    ///
+    /// One read transaction per [`PRESENCE_TXN_KEYS`] keys rather than one for the lot: a
+    /// delete by query can ask this of millions of ids, and a read transaction held that long
+    /// keeps every page the writer frees meanwhile from being reused. Each key is answered as
+    /// of the transaction that read it, which is all a check against a moving store can be.
+    pub fn keys_present_with(
+        &self,
+        index: &str,
+        keys: &[String],
+        deadline: Option<&SearchDeadline>,
+    ) -> Result<Vec<bool>, StoreError> {
+        let data_table_name = format!("data_{}", index);
+        let data_table_def = TableDefinition::<&str, &[u8]>::new(&data_table_name);
+        let mut present = Vec::with_capacity(keys.len());
+        for chunk in keys.chunks(PRESENCE_TXN_KEYS) {
+            let read_txn = self.kv.begin_read()?;
+            let data_table = match read_txn.open_table(data_table_def) {
+                Ok(table) => table,
+                // An index never written holds none of them. Any other failure is the store's,
+                // and reading it as "none present" would make a delete match nothing and call
+                // itself complete.
+                Err(redb::TableError::TableDoesNotExist(_)) => {
+                    present.resize(keys.len(), false);
+                    return Ok(present);
+                }
+                Err(err) => return Err(err.into()),
+            };
+            for (i, key) in chunk.iter().enumerate() {
+                if i.is_multiple_of(256)
+                    && let Some(deadline) = deadline
+                {
+                    deadline.check()?;
+                }
+                present.push(data_table.get(key.as_str())?.is_some());
+            }
+        }
+        Ok(present)
     }
 
     /// Helper: Get fields cache (Lock-Free Read)

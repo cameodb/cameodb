@@ -471,6 +471,7 @@ fn bare_engine() -> OrchestratorEngine {
             coordinator: None,
             pool: None,
         },
+        request_budget: None,
     }
 }
 
@@ -1232,6 +1233,32 @@ fn the_service_estimate_starts_permissive_and_reserves_a_margin() {
     assert!(
         reserve > Duration::from_millis(190) && reserve < Duration::from_millis(215),
         "the estimate should have converged on ~100ms, reserving ~200ms, got {reserve:?}"
+    );
+}
+
+/// A bulk sample counts in the blend and the histogram the door predicts from, as well as in
+/// its own class. Keeping it out was tried: a lane whose backlog is bulk ops then predicted no
+/// wait at all, admitted everything, and timed everything out.
+#[test]
+fn a_bulk_sample_counts_in_the_depth_prediction() {
+    let mut stats = DispatchCounters::default();
+    stats.record_service(OpClass::Bulk, Duration::from_secs(3));
+    // The sample lands in the active generation; the prediction reads the one that closed.
+    // Age the window's base so `maybe_rotate` folds it — `rotated_at_us` is already zero on a
+    // fresh histogram, so storing zero there rotates nothing.
+    stats.service_hist.base = Instant::now() - SERVICE_WINDOW;
+    stats.service_hist.maybe_rotate();
+
+    assert_eq!(stats.service_estimate_for(OpClass::Bulk), 3_000_000);
+    assert_eq!(
+        stats.service_ewma_us.load(AtomicOrdering::Relaxed),
+        3_000_000,
+        "the blend carries it"
+    );
+    assert!(
+        stats.service_hist.estimate_us() >= 3_000_000,
+        "and so does the histogram, got {}",
+        stats.service_hist.estimate_us()
     );
 }
 
@@ -4494,4 +4521,424 @@ fn a_forwarded_reads_deadline_is_its_requests_deadline() {
             "a read on a fresh clock would have run: {read:?}"
         );
     });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Delete by query: the round loop (ROADMAP S1 pacing)
+// ---------------------------------------------------------------------------------------------
+
+use super::delete_query::{DeletesRounds, Pace, run_rounds};
+
+/// A shard that deletes a round after a fixed delay, fails the nth round if told to, and
+/// records every round it was given.
+struct FakeShard {
+    delay: Duration,
+    fail_round: Option<usize>,
+    rounds: std::sync::Mutex<Vec<usize>>,
+}
+
+impl FakeShard {
+    fn new(delay: Duration, fail_round: Option<usize>) -> Self {
+        Self {
+            delay,
+            fail_round,
+            rounds: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn rounds(&self) -> Vec<usize> {
+        self.rounds.lock().expect("rounds").clone()
+    }
+}
+
+impl DeletesRounds for FakeShard {
+    async fn delete_round(
+        &self,
+        _index: &str,
+        ids: Vec<String>,
+    ) -> Result<usize, OrchestratorError> {
+        let n = {
+            let mut rounds = self.rounds.lock().expect("rounds");
+            rounds.push(ids.len());
+            rounds.len()
+        };
+        tokio::time::sleep(self.delay).await;
+        if self.fail_round == Some(n) {
+            return Err(OrchestratorError::Io(std::io::Error::other(
+                "writer thread closed",
+            )));
+        }
+        Ok(ids.len())
+    }
+}
+
+fn ids(n: usize) -> Vec<String> {
+    (0..n).map(|i| format!("d{i}")).collect()
+}
+
+fn pace(budget: Option<Duration>) -> Pace {
+    Pace {
+        started: Instant::now(),
+        budget,
+    }
+}
+
+/// Without a budget every id goes, in rounds of the share asked for, and nothing remains.
+#[tokio::test]
+async fn rounds_without_a_budget_delete_everything() {
+    let shard = FakeShard::new(Duration::ZERO, None);
+    let out = run_rounds(&shard, "idx", ids(2_500), 1_000, &pace(None)).await;
+    assert_eq!(out.deleted, 2_500);
+    assert_eq!(out.remaining, 0);
+    assert!(!out.stopped && out.failed.is_none(), "{out:?}");
+    assert_eq!(shard.rounds(), vec![1_000, 1_000, 500]);
+}
+
+/// The first round always runs, even when the find phases before it spent the budget: a
+/// delete makes progress on every request, so a retry loop converges instead of deleting
+/// nothing forever.
+#[tokio::test]
+async fn the_first_round_runs_with_the_budget_already_spent() {
+    let shard = FakeShard::new(Duration::ZERO, None);
+    let pace = Pace {
+        started: Instant::now() - Duration::from_secs(5),
+        budget: Some(Duration::from_secs(1)),
+    };
+    let out = run_rounds(&shard, "idx", ids(300), 100, &pace).await;
+    assert_eq!(out.deleted, 100, "{out:?}");
+    assert_eq!(out.remaining, 200);
+    assert!(out.stopped);
+    assert_eq!(shard.rounds(), vec![100]);
+}
+
+/// A stop between rounds: when a round like the longest so far, plus the answer's tail, no
+/// longer fits, the loop stops and reports the rest as remaining — rather than running on
+/// into the request timeout and losing the tally.
+#[tokio::test]
+async fn rounds_stop_when_the_next_one_would_not_fit() {
+    // 40ms per round against a 300ms budget whose tail floor is 250ms: the first round runs
+    // unconditionally, the second is refused (40 + 250 > 300 - elapsed).
+    let shard = FakeShard::new(Duration::from_millis(40), None);
+    let out = run_rounds(
+        &shard,
+        "idx",
+        ids(1_000),
+        100,
+        &pace(Some(Duration::from_millis(300))),
+    )
+    .await;
+    assert!(out.stopped, "{out:?}");
+    assert!(out.failed.is_none());
+    assert_eq!(
+        out.deleted + out.remaining,
+        1_000,
+        "every id is accounted for"
+    );
+    assert!(out.deleted >= 100 && out.deleted < 1_000, "{out:?}");
+}
+
+/// A round that fails ends the shard's rounds: what it carried and what was left are both
+/// remaining, the error is kept, and what earlier rounds deleted still counts.
+#[tokio::test]
+async fn a_failed_round_leaves_its_ids_remaining() {
+    let shard = FakeShard::new(Duration::ZERO, Some(2));
+    let out = run_rounds(&shard, "idx", ids(1_000), 300, &pace(None)).await;
+    assert_eq!(out.deleted, 300, "{out:?}");
+    assert_eq!(
+        out.remaining, 700,
+        "the failed round's 300 and the 400 never sent"
+    );
+    assert!(out.failed.is_some());
+    assert!(!out.stopped);
+    assert_eq!(shard.rounds(), vec![300, 300]);
+}
+
+/// A count — dry run or the phase a delete is decided on — waits on a peer for the broadcast
+/// timeout, as a search's share does; a hung peer is named in the tally rather than holding
+/// the request into its timeout.
+#[test]
+fn a_count_waits_on_a_peer_for_the_broadcast_timeout() {
+    use super::delete_query::{DeleteMode, peer_wait};
+    let wait = peer_wait(
+        DeleteMode::Count,
+        Some(Duration::from_secs(30)),
+        Instant::now(),
+        Duration::from_secs(5),
+        Duration::from_secs(30),
+    );
+    assert_eq!(wait, Duration::from_secs(5));
+}
+
+/// A delete waits until half the answer tail before the request budget ends — after every
+/// peer's last round, before the request timeout — measured from the request's start, and never
+/// past the remote deadline. Without a budget the remote deadline alone.
+#[test]
+fn a_delete_waits_on_a_peer_until_just_before_the_budget_ends() {
+    use super::delete_query::{DeleteMode, peer_wait};
+    let broadcast = Duration::from_secs(5);
+    let remote = Duration::from_secs(60);
+
+    // 30 s budget: a 3 s tail, so 28.5 s from the start; 10 s already spent leaves 18.5 s.
+    let started = Instant::now() - Duration::from_secs(10);
+    let wait = peer_wait(
+        DeleteMode::Delete,
+        Some(Duration::from_secs(30)),
+        started,
+        broadcast,
+        remote,
+    );
+    assert!(
+        wait <= Duration::from_millis(18_500) && wait > Duration::from_millis(18_000),
+        "{wait:?}"
+    );
+
+    // Capped by the remote deadline.
+    let wait = peer_wait(
+        DeleteMode::Delete,
+        Some(Duration::from_secs(30)),
+        Instant::now(),
+        broadcast,
+        Duration::from_secs(2),
+    );
+    assert_eq!(wait, Duration::from_secs(2));
+
+    // A budget already spent waits not at all, rather than past the timeout.
+    let wait = peer_wait(
+        DeleteMode::Delete,
+        Some(Duration::from_secs(1)),
+        Instant::now() - Duration::from_secs(5),
+        broadcast,
+        remote,
+    );
+    assert_eq!(wait, Duration::ZERO);
+
+    // No budget: the remote deadline.
+    let wait = peer_wait(DeleteMode::Delete, None, Instant::now(), broadcast, remote);
+    assert_eq!(wait, remote);
+}
+
+/// A delete by query's find takes at most half the read pool, and always at least one thread,
+/// so searches keep the rest however many shards it walks.
+#[test]
+fn a_delete_find_takes_half_the_read_pool_at_most() {
+    use super::delete_query::find_width;
+    assert_eq!(find_width(16), 8);
+    assert_eq!(find_width(5), 2);
+    assert_eq!(find_width(2), 1);
+    assert_eq!(find_width(1), 1, "a pool of one still runs the find");
+}
+
+/// Rounds come off the end of the list — moved, not copied — and the last round is the
+/// remainder.
+#[tokio::test]
+async fn rounds_are_the_share_asked_for_and_the_remainder_last() {
+    let shard = FakeShard::new(Duration::ZERO, None);
+    let out = run_rounds(&shard, "idx", ids(1_250), 500, &pace(None)).await;
+    assert_eq!(out.deleted, 1_250);
+    assert_eq!(shard.rounds(), vec![500, 500, 250]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Delete by query: deferred commits on the writer thread
+// ---------------------------------------------------------------------------------------------
+
+/// A shard whose every write commits at once — `default_batch_size = 1` in count mode — so a
+/// commit the writer thread decides is visible to the next search, and one it does not decide
+/// is not.
+fn eager_commit_config(path: std::path::PathBuf) -> StorageConfig {
+    StorageConfig {
+        default_batch_size: 1,
+        ..writer_test_config(path)
+    }
+}
+
+async fn started_shard(config: StorageConfig) -> MicroshardActor {
+    let mut shard = MicroshardActor::new(
+        Uuid::new_v4(),
+        config,
+        ShardRuntime {
+            default_search_limit: 10,
+            read_pool_handle: None,
+            read_pool_health: None,
+            read_budget: None,
+            total_shards: 1,
+            writer_shutdown_timeout_secs: 5,
+            supervisor_timeout_secs: 600,
+            writer_pin: WriterPin {
+                target: None,
+                outcome: Arc::new(AtomicI64::new(UNPINNED)),
+            },
+            writer_liveness: Arc::new(WriterLiveness::default()),
+        },
+    );
+    shard.start().await.expect("start");
+    shard
+}
+
+fn searchable(shard: &MicroshardActor, index: &str) -> usize {
+    shard
+        .store
+        .as_ref()
+        .expect("store")
+        .search_documents(index, "*", 0, None)
+        .expect("search")
+        .total_hits
+}
+
+async fn wait_searchable(shard: &MicroshardActor, index: &str, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while searchable(shard, index) != expected {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("automatic commit publishes the expected count");
+}
+
+async fn seed(shard: &MicroshardActor, index: &str, n: usize) {
+    let docs = (0..n)
+        .map(|i| DocPayload {
+            id: format!("d{i}"),
+            routing_key: None,
+            doc: json!({"title": format!("document {i}")}),
+        })
+        .collect();
+    shard
+        .handle_batch_write(BatchWriteRequest {
+            index: index.to_string(),
+            docs,
+        })
+        .await
+        .expect("seed");
+    shard
+        .admin_commit_via_channel(index.to_string())
+        .await
+        .expect("commit");
+}
+
+/// The writer makes one due commit per drain and carries the rest; a carried commit is made
+/// on the drains after, with no further write to bring it — the idle commit here is ten
+/// minutes away, so only the carry can have published every index.
+#[tokio::test(flavor = "multi_thread")]
+async fn commits_due_together_are_carried_and_all_made() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut shard = started_shard(eager_commit_config(dir.path().to_path_buf())).await;
+    let indexes: Vec<String> = (0..8).map(|n| format!("carried-{n}")).collect();
+
+    // Sent together, so several land in one drain and fall due in it.
+    futures::future::join_all(indexes.iter().map(|index| {
+        shard.handle_batch_write(BatchWriteRequest {
+            index: index.clone(),
+            docs: (0..3)
+                .map(|i| DocPayload {
+                    id: format!("d{i}"),
+                    routing_key: None,
+                    doc: json!({"title": format!("document {i}")}),
+                })
+                .collect(),
+        })
+    }))
+    .await
+    .into_iter()
+    .for_each(|written| {
+        written.expect("write");
+    });
+
+    for index in &indexes {
+        wait_searchable(&shard, index, 3).await;
+    }
+    shard.shutdown_writer().await;
+}
+
+/// Shards' commit intervals are spread over up to half again the interval, by ordinal, and
+/// never shortened; the count-only policy stays count-only.
+#[test]
+fn commit_intervals_are_staggered_by_shard_ordinal() {
+    use super::orchestrator::staggered_commit_interval;
+    let spread: Vec<u64> = (0..4)
+        .map(|ordinal| staggered_commit_interval(2000, ordinal, 4))
+        .collect();
+    assert_eq!(spread, vec![2000, 2250, 2500, 2750]);
+    assert_eq!(
+        staggered_commit_interval(2000, 9, 8),
+        2125,
+        "an ordinal past the shard count wraps"
+    );
+    assert_eq!(staggered_commit_interval(2000, 0, 0), 2000);
+    assert_eq!(staggered_commit_interval(0, 3, 4), 0);
+}
+
+/// A deferred batch delete does not decide a commit; an undeferred one does; and the commit
+/// the deferring sender asks for publishes what it deferred.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deferred_batch_delete_leaves_the_commit_to_its_sender() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let index = "deferred";
+    let mut shard = started_shard(eager_commit_config(dir.path().to_path_buf())).await;
+    seed(&shard, index, 10).await;
+    assert_eq!(searchable(&shard, index), 10);
+
+    // Deferred: durable in the store, invisible to search until a commit.
+    shard
+        .handle_deferred_batch_delete(index.to_string(), ids(3))
+        .await
+        .expect("deferred delete");
+    assert_eq!(
+        searchable(&shard, index),
+        10,
+        "a deferred batch must not have committed on its own"
+    );
+
+    // The sender's commit publishes it.
+    shard
+        .admin_commit_via_channel(index.to_string())
+        .await
+        .expect("commit");
+    assert_eq!(searchable(&shard, index), 7);
+
+    // An undeferred batch of the same shape commits at once under this config.
+    shard
+        .handle_batch_delete(index.to_string(), vec!["d5".to_string()])
+        .await
+        .expect("delete");
+    wait_searchable(&shard, index, 6).await;
+    assert_eq!(
+        searchable(&shard, index),
+        6,
+        "an undeferred batch decides its commit as it always did"
+    );
+    shard.shutdown_writer().await;
+}
+
+/// Deferred or not, an index is held to the backstop: a deferring sender that writes past
+/// `COMMIT_BACKSTOP_MULTIPLE` times the threshold is committed by the writer thread anyway.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deferred_batch_still_commits_at_the_backstop() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let index = "backstop";
+    let mut shard = started_shard(eager_commit_config(dir.path().to_path_buf())).await;
+    seed(&shard, index, 60).await;
+    let store = Arc::clone(shard.store.as_ref().expect("store"));
+    let backstop = store.commit_backstop_ops(index) as usize;
+    assert!(backstop > 1 && backstop < 60, "backstop {backstop}");
+
+    // Under the backstop: no commit.
+    shard
+        .handle_deferred_batch_delete(index.to_string(), ids(backstop - 1))
+        .await
+        .expect("deferred delete");
+    assert_eq!(searchable(&shard, index), 60);
+
+    // One more deferred op reaches it: committed.
+    shard
+        .handle_deferred_batch_delete(index.to_string(), vec![format!("d{}", backstop - 1)])
+        .await
+        .expect("deferred delete");
+    wait_searchable(&shard, index, 60 - backstop).await;
+    assert_eq!(
+        searchable(&shard, index),
+        60 - backstop,
+        "the backstop commits what a deferring sender has written"
+    );
+    shard.shutdown_writer().await;
 }

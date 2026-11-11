@@ -495,6 +495,38 @@ impl Meter {
             }
         }
     }
+
+    /// Give back what an admitted `charged` did not use: `check_at` took `charged` — capped
+    /// at capacity, as it caps it — and the work came to `used`. The bucket refills by the
+    /// difference, never past capacity.
+    ///
+    /// For the one route whose cost is not known until it has run. A delete by query is
+    /// admitted on what it matched, so the gate is the one every write meets — a caller needs
+    /// the tokens for what it asks to delete, up to everything the bucket holds — and then
+    /// pays only for what it deleted, which its budget may have cut short. Nothing is given
+    /// back when the work failed: the caller is not told what it removed, so it pays for the
+    /// whole of what it was admitted to.
+    fn refund_unused_at(&self, caller: &Caller, charged: u32, used: u32, now: Instant) {
+        if !self.rate.enabled() {
+            return;
+        }
+        let capacity = self.rate.capacity();
+        let refill = self.rate.refill_per_sec();
+        // What `check_at` actually took for `charged`, not `charged` itself.
+        let taken = f64::from(charged.max(1)).min(capacity);
+        let unused = (taken - f64::from(used)).max(0.0);
+        if unused == 0.0 {
+            return;
+        }
+        let mut buckets = self
+            .buckets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let slot = buckets.slot_for(caller, capacity, refill, now);
+        let bucket = buckets.bucket(slot, capacity, now);
+        bucket.tokens = (bucket.refilled(capacity, refill, now) + unused).min(capacity);
+        bucket.last = now;
+    }
 }
 
 /// Outcome of asking to spend tokens.
@@ -537,6 +569,13 @@ impl RateLimiter {
     /// unit: see `write_documents_per_minute`.
     pub fn check_write(&self, caller: &Caller, documents: u32) -> Verdict {
         self.writes.check_at(caller, documents, Instant::now())
+    }
+
+    /// Give back the part of an admitted write charge the work did not use — see
+    /// `Meter::refund_unused_at`.
+    pub fn refund_unused_write(&self, caller: &Caller, charged: u32, written: u32) {
+        self.writes
+            .refund_unused_at(caller, charged, written, Instant::now())
     }
 }
 
@@ -935,5 +974,59 @@ mod tests {
         for _ in 0..1_000 {
             assert_eq!(limiter.check_write(&key("k1"), 5_000), Verdict::Allow);
         }
+    }
+
+    /// A delete by query is admitted on what it matched — the gate every write meets — and
+    /// gets back what it did not delete. Charging the match outright billed a delete its
+    /// budget cut short for documents still there, and the request continuing it for them
+    /// again; admitting on a one-token probe let a caller with one token left delete without
+    /// limit.
+    #[test]
+    fn a_delete_by_query_is_admitted_on_its_match_and_charged_what_it_deleted() {
+        let limiter = write_limiter(600, 100);
+
+        // Admitted on the match: a caller without the tokens for it is refused.
+        let k1 = key("k1");
+        assert_eq!(limiter.check_write(&k1, 99), Verdict::Allow);
+        assert!(
+            matches!(limiter.check_write(&k1, 80), Verdict::Deny { .. }),
+            "one token left must not admit a delete of eighty"
+        );
+
+        // Admitted on 80, deleted 30: 50 come back, so seventy remain.
+        let k2 = key("k2");
+        assert_eq!(limiter.check_write(&k2, 80), Verdict::Allow);
+        limiter.refund_unused_write(&k2, 80, 30);
+        assert_eq!(
+            limiter.check_write(&k2, 70),
+            Verdict::Allow,
+            "thirty charged of a hundred should leave seventy"
+        );
+        assert!(matches!(limiter.check_write(&k2, 1), Verdict::Deny { .. }));
+
+        // A match past capacity was charged the capacity; deleting less than that gives back
+        // the difference from what was taken, not from the match.
+        let k3 = key("k3");
+        assert_eq!(limiter.check_write(&k3, 5_000), Verdict::Allow);
+        limiter.refund_unused_write(&k3, 5_000, 40);
+        assert_eq!(limiter.check_write(&k3, 60), Verdict::Allow);
+        assert!(
+            matches!(limiter.check_write(&k3, 1), Verdict::Deny { .. }),
+            "forty deleted of a hundred taken leaves sixty, not more"
+        );
+
+        // Deleting more than was taken — a match past capacity — gives nothing back, and
+        // nothing is ever refunded past capacity.
+        let k4 = key("k4");
+        assert_eq!(limiter.check_write(&k4, 5_000), Verdict::Allow);
+        limiter.refund_unused_write(&k4, 5_000, 5_000);
+        assert!(matches!(limiter.check_write(&k4, 1), Verdict::Deny { .. }));
+        let k5 = key("k5");
+        limiter.refund_unused_write(&k5, 50, 0);
+        assert!(
+            matches!(limiter.check_write(&k5, 101), Verdict::Allow),
+            "a cost past capacity takes the bucket; the bucket was full, not overfull"
+        );
+        assert!(matches!(limiter.check_write(&k5, 1), Verdict::Deny { .. }));
     }
 }

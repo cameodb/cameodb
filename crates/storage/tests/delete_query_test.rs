@@ -94,15 +94,22 @@ fn sample(temp: &TempDir) -> HybridStore {
 
 fn matched(store: &HybridStore, query: &str) -> (Vec<String>, usize) {
     let found = store
-        .delete_query_matches(INDEX, query, None)
+        .delete_query_matches(INDEX, query, usize::MAX, None)
         .unwrap_or_else(|err| panic!("{query}: {err}"));
     let mut ids = found.ids;
     ids.sort();
     (ids, found.skipped_inexact)
 }
 
+fn counted(store: &HybridStore, query: &str) -> (usize, usize) {
+    let count = store
+        .delete_query_count(INDEX, query, None)
+        .unwrap_or_else(|err| panic!("{query}: {err}"));
+    (count.matched, count.skipped_inexact)
+}
+
 fn refusal(store: &HybridStore, query: &str) -> String {
-    match store.delete_query_matches(INDEX, query, None) {
+    match store.delete_query_matches(INDEX, query, usize::MAX, None) {
         Ok(found) => panic!("{query}: accepted, matching {:?}", found.ids),
         Err(err @ StoreError::QueryParser(_)) => err.to_string(),
         Err(other) => panic!("{query}: refused the wrong way: {other}"),
@@ -206,12 +213,141 @@ fn every_match_is_found_not_a_page() {
     assert_eq!(ids.first().map(String::as_str), Some("doc-00000"));
 }
 
+/// A document deleted since the last commit is still in the searcher the matches are read
+/// from — a delete by query its budget stopped leaves ids tombstoned but unpublished until a
+/// commit lands — and its redb row is already gone. The request that continues the delete
+/// must not find it again: it cannot be deleted a second time, and counting it would report
+/// matches the continuing request will never remove.
+#[test]
+fn an_id_whose_row_is_already_gone_is_not_a_match() {
+    let temp = TempDir::new().unwrap();
+    let store = sample(&temp);
+
+    // Applied, not committed: redb loses the row, the searcher still holds the document.
+    store
+        .apply_batch(
+            INDEX,
+            vec![WalOp::Delete {
+                id: "b".to_string(),
+            }],
+        )
+        .expect("uncommitted delete");
+    assert_eq!(
+        store
+            .search_documents(INDEX, "status:expired", 10, None)
+            .expect("search")
+            .total_hits,
+        2,
+        "the last committed searcher must still see it, or this test proves nothing"
+    );
+
+    assert_eq!(
+        matched(&store, "status:expired"),
+        (vec!["a".to_string()], 0),
+        "b's row is gone; finding it would double-count for the next request"
+    );
+
+    // The exact-check path drops it the same way — there is no stored body to check, so it
+    // is neither kept nor counted skipped_inexact. A company value only "gone" holds makes
+    // it the phrase's only index candidate.
+    let temp2 = TempDir::new().unwrap();
+    let store2 = store_with(
+        &temp2,
+        &[
+            (
+                "gone",
+                json!({"status": "expired", "company": "Unique Corp"}),
+            ),
+            ("stay", json!({"status": "expired", "company": "Other Ltd"})),
+        ],
+    );
+    store2
+        .apply_batch(
+            INDEX,
+            vec![WalOp::Delete {
+                id: "gone".to_string(),
+            }],
+        )
+        .expect("uncommitted delete");
+    assert_eq!(
+        matched(&store2, r#"company:"Unique Corp""#),
+        (vec![], 0),
+        "a deleted row is not skipped_inexact; it is not a candidate at all"
+    );
+}
+
+/// The count phase answers what the delete phase would find, on each of its paths: the index's
+/// own count, the stored-value check of a `text` clause, and the presence check after a write
+/// since the last commit.
+#[test]
+fn the_count_agrees_with_the_matches() {
+    let temp = TempDir::new().unwrap();
+    let store = sample(&temp);
+    let agree = |store: &HybridStore, query: &str| {
+        let (ids, skipped) = matched(store, query);
+        assert_eq!(counted(store, query), (ids.len(), skipped), "{query}");
+    };
+    for query in [
+        "status:expired",
+        "status:expired OR status:live",
+        "port:[1000 TO 9000]",
+        r#"company:"Acme Corp""#,
+        r#"company:"acme corp""#,
+    ] {
+        agree(&store, query);
+    }
+
+    store
+        .apply_batch(
+            INDEX,
+            vec![WalOp::Delete {
+                id: "b".to_string(),
+            }],
+        )
+        .expect("uncommitted delete");
+    assert_eq!(
+        counted(&store, "status:expired"),
+        (1, 0),
+        "with a write since the commit, the count checks presence as the delete does"
+    );
+    agree(&store, "status:expired");
+}
+
+/// Past its cap a delete keeps no more ids, and counts the candidates it left: together they
+/// are every match, and the ids kept stop within a chunk of the cap.
+#[test]
+fn the_matches_stop_near_the_cap_and_count_what_is_left() {
+    let temp = TempDir::new().unwrap();
+    let total = 20_000;
+    let docs: Vec<(String, JsonValue)> = (0..total)
+        .map(|n| (format!("doc-{n:05}"), json!({"status": "expired"})))
+        .collect();
+    let refs: Vec<(&str, JsonValue)> = docs
+        .iter()
+        .map(|(id, b)| (id.as_str(), b.clone()))
+        .collect();
+    let store = store_with(&temp, &refs);
+
+    let cap = 5_000;
+    let found = store
+        .delete_query_matches(INDEX, "status:expired", cap, None)
+        .expect("matches");
+    assert!(found.ids.len() >= cap, "kept {}", found.ids.len());
+    assert!(found.ids.len() < cap + 4_096 + 64, "kept {}", found.ids.len());
+    assert_eq!(found.ids.len() + found.unexamined, total);
+
+    let all = store
+        .delete_query_matches(INDEX, "status:expired", usize::MAX, None)
+        .expect("matches");
+    assert_eq!((all.ids.len(), all.unexamined), (total, 0));
+}
+
 #[test]
 fn a_shard_without_the_index_has_nothing_to_delete() {
     let temp = TempDir::new().unwrap();
     let store = HybridStore::new(config(temp.path()), 1).expect("store");
     let found = store
-        .delete_query_matches("absent", "status:expired", None)
+        .delete_query_matches("absent", "status:expired", usize::MAX, None)
         .expect("no index is nothing to delete");
     assert!(found.ids.is_empty());
 }

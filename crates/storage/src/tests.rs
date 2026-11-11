@@ -2942,6 +2942,94 @@ mod commit_interval_tests {
             "the commit restarted the clock; a write right after it waits its own interval"
         );
     }
+
+    /// A drain whose writes all deferred the commit decision is held to the backstop alone,
+    /// but still starts the interval's clock: if the deferring sender's own commit never lands,
+    /// the next undeferred write is committed an interval after the deferred ones, not an
+    /// interval after itself.
+    #[test]
+    fn a_deferred_drain_starts_the_interval_clock() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = HybridStore::new(config(&temp_dir, INTERVAL_MS), 1).expect("store");
+        let index = "deferred";
+
+        store.apply_batch(index, vec![put("a")]).expect("deferred write");
+        assert!(
+            !store
+                .maybe_commit_writer_at_backstop(index)
+                .expect("backstop check"),
+            "one op, far below the backstop"
+        );
+
+        past_the_interval();
+        let (_, committed) = store
+            .apply_write_and_maybe_commit(index, put("b"))
+            .expect("undeferred write");
+        assert!(
+            committed,
+            "the interval runs from the deferred write, which has waited one"
+        );
+    }
+
+    /// The backstop applies to deferred drains as it does to any: past it, they commit.
+    #[test]
+    fn a_deferred_drain_commits_at_the_backstop() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = HybridStore::new(config(&temp_dir, INTERVAL_MS), 1).expect("store");
+        let index = "deferred-backstop";
+        let backstop = store.commit_backstop_ops(index) as usize;
+
+        let ops = (0..backstop).map(|i| put(&format!("d{i}"))).collect();
+        store.apply_batch(index, ops).expect("deferred writes");
+        assert!(
+            store
+                .maybe_commit_writer_at_backstop(index)
+                .expect("backstop check")
+        );
+        assert_eq!(store.get_operations_count(index), 0);
+    }
+
+    /// A reader cloned before an eviction sees the commit the eviction makes. The close drops
+    /// the index's pending count, so a clone left on the pre-commit searcher would read as
+    /// current to anything that trusts a zero count — a delete by query's presence check.
+    #[test]
+    fn closing_an_index_reloads_a_reader_cloned_before_the_close() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = HybridStore::new(config(&temp_dir, INTERVAL_MS), 1).expect("store");
+        let index = "evicted";
+
+        store
+            .apply_batch(index, vec![put("a"), put("b")])
+            .expect("writes");
+        store.commit_index(index).expect("commit");
+        let (reader, _) = store
+            .get_reader(index)
+            .expect("reader")
+            .expect("the index is open");
+        assert_eq!(reader.searcher().num_docs(), 2);
+
+        store
+            .apply_batch(
+                index,
+                vec![WalOp::Delete {
+                    id: "a".to_string(),
+                }],
+            )
+            .expect("delete");
+        assert!(store.get_operations_count(index) > 0);
+        assert!(store.close_index(index), "nothing holds the writer");
+
+        assert_eq!(
+            store.get_operations_count(index),
+            0,
+            "the close zeroes the count"
+        );
+        assert_eq!(
+            reader.searcher().num_docs(),
+            1,
+            "the clone sees the commit the close made"
+        );
+    }
 }
 
 #[cfg(test)]

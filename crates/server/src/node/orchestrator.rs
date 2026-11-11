@@ -1760,6 +1760,25 @@ impl OwnedBulkView {
     }
 }
 
+/// A shard's commit interval: `interval_ms` lengthened by up to half of itself, in even steps
+/// by the shard's ordinal among `total_shards`. `0`, the count-only policy, stays `0`.
+///
+/// Each shard's interval runs from its own oldest pending write, and a bulk request lands on
+/// every shard at once, so shards on one interval committed in step — every segment flush,
+/// fsync, re-warm and merge on the node starting in the same instant, against the searches
+/// beside them. Intervals that differ drift the shards apart after the first commit and keep
+/// them apart. Longer, never shorter: no write waits past `1.5 ×` the interval configured, and
+/// the idle commit, which covers writes that stop, is unchanged.
+pub(super) fn staggered_commit_interval(
+    interval_ms: u64,
+    ordinal: usize,
+    total_shards: usize,
+) -> u64 {
+    let shards = total_shards.max(1) as u64;
+    let step = (ordinal as u64) % shards;
+    interval_ms + interval_ms * step / (2 * shards)
+}
+
 /// Whether the worker lane serves this op — on a worker for this node's own requests, on the
 /// peer lane for a peer's.
 ///
@@ -2716,6 +2735,9 @@ pub(super) struct OrchestratorEngine {
     /// What a canvass of the peers needs, so a worker can run one — see
     /// [`ClientOp::FindSchemaInCluster`] in `execute`.
     pub(super) canvass: SchemaCanvass,
+    /// The request budget — `NodeOrchestrator::read_budget` — for an op that paces itself
+    /// against it, as a delete by query does between rounds.
+    pub(super) request_budget: Option<Duration>,
 }
 
 impl std::fmt::Debug for OrchestratorEngine {
@@ -2879,6 +2901,7 @@ impl OrchestratorEngine {
                         &query,
                         mode,
                         refresh,
+                        self.request_budget,
                     )
                     .await
                 }
@@ -4301,6 +4324,7 @@ impl NodeOrchestrator {
             max_concurrent_shard_searches: self.max_concurrent_shard_searches,
             remote_peer_pool: pool,
             canvass: self.schema_canvass(),
+            request_budget: self.read_budget,
         });
 
         // Worker count: min(local_shards * 2, cpu_cores * 2), minimum 1.
@@ -4601,11 +4625,13 @@ impl NodeOrchestrator {
         let total_shards = existing_shards.len();
         for &shard_id in &existing_shards {
             let shard_path = self.deterministic_shard_directory(shard_id);
-            let storage_config = self.create_shard_storage_config(shard_id, shard_path);
             let sem = Arc::clone(&semaphore);
             // Placed here rather than inside the task: hydration runs concurrently, and an
-            // ordinal handed out in completion order would not survive a restart.
+            // ordinal handed out in completion order would not survive a restart. Before the
+            // storage config, which staggers the commit interval by it.
             let runtime = self.shard_runtime(shard_id, total_shards);
+            let storage_config =
+                self.create_shard_storage_config(shard_id, shard_path, total_shards);
 
             let task = tokio::spawn(async move {
                 // Acquire semaphore permit before starting heavy I/O
@@ -4741,12 +4767,15 @@ impl NodeOrchestrator {
         Ok(shard_ids)
     }
 
-    /// Creates a storage configuration for a specific shard.
+    /// Creates a storage configuration for a specific shard, placed — see
+    /// [`Self::shard_runtime`] — as one of `total_shards`.
     pub(super) fn create_shard_storage_config(
         &self,
-        _shard_id: Uuid,
+        shard_id: Uuid,
         shard_path: PathBuf,
+        total_shards: usize,
     ) -> StorageConfig {
+        let ordinal = self.placement.load().ordinal(&shard_id).unwrap_or(0);
         // Start at the minimum writer memory; storage will scale between min/max as the index grows.
         let indexer_memory_mb = self.config.indexer_memory_min_mb;
 
@@ -4771,7 +4800,11 @@ impl NodeOrchestrator {
             default_batch_size: self.config.default_batch_size,
             wal_sync: self.config.wal_sync,
             quick_repair: self.config.quick_repair,
-            commit_interval_ms: self.config.commit_interval_ms,
+            commit_interval_ms: staggered_commit_interval(
+                self.config.commit_interval_ms,
+                ordinal,
+                total_shards,
+            ),
             query: self.config.query_policy.clone(),
         }
     }
@@ -4834,8 +4867,8 @@ impl NodeOrchestrator {
 
         let shard_path = self.deterministic_shard_directory(shard_id);
         fs::create_dir_all(&shard_path)?;
-        let storage_config = self.create_shard_storage_config(shard_id, shard_path);
         let runtime = self.shard_runtime(shard_id, total_shards);
+        let storage_config = self.create_shard_storage_config(shard_id, shard_path, total_shards);
         let mut microshard = MicroshardActor::new(shard_id, storage_config, runtime);
         microshard.start().await?;
 
@@ -5181,8 +5214,12 @@ impl NodeOrchestrator {
                     Err(err) => return Answer::Now(Err(err)),
                 };
                 let shards = self.owned_bulk_view().shards;
+                let budget = self.read_budget;
                 return Answer::Later(Box::pin(async move {
-                    delete_by_query_on_shards(&shards, &schema, &index, &query, mode, refresh).await
+                    delete_by_query_on_shards(
+                        &shards, &schema, &index, &query, mode, refresh, budget,
+                    )
+                    .await
                 }));
             }
             ClientOp::PrepareSchema {
@@ -6815,6 +6852,12 @@ pub(crate) fn peer_op_clock(
     let arrived = spent_ms
         .and_then(|spent| Instant::now().checked_sub(Duration::from_millis(spent)))
         .unwrap_or_else(Instant::now);
+    within_budget(arrived, budget)
+}
+
+/// `arrived`, unless more than `budget` has passed since — then the refusal the worker pool's
+/// dequeue check answers with.
+fn within_budget(arrived: Instant, budget: Option<Duration>) -> Result<Instant, OrchestratorError> {
     if let Some(budget) = budget {
         let waited = arrived.elapsed();
         if waited > budget {
@@ -6833,13 +6876,40 @@ pub(crate) fn peer_op_clock(
 /// Its own message rather than a [`ClientOp`], so that an op a worker declined is never offered
 /// to a worker again — `ClientOp` is the peer entry, and it sends what a worker can serve to the
 /// peer lane.
-pub(crate) struct OnActor(pub(crate) ClientOp);
+pub(crate) struct OnActor {
+    pub(crate) op: ClientOp,
+    /// When the request this op serves started, as the sender's scope had it — `None` for
+    /// work outside any request. An `Instant`, not a `spent_ms` figure: this message stays in
+    /// the process, and a figure taken when it was sent would leave out the time it then
+    /// waited in the mailbox, which under load is most of the time it waits at all.
+    pub(crate) started: Option<Instant>,
+}
+
+impl OnActor {
+    /// `op`, on the clock of the request being served here — see [`OnActor::started`].
+    pub(crate) fn in_request(op: ClientOp) -> Self {
+        Self {
+            op,
+            started: REQUEST_STARTED_AT.try_with(|started| *started).ok(),
+        }
+    }
+}
 
 impl Message<OnActor> for NodeOrchestrator {
     type Reply = DelegatedReply<Result<JsonValue, OrchestratorError>>;
 
     async fn handle(&mut self, msg: OnActor, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
-        self.run_on_actor(msg.0, ctx).await
+        // The actor's clock for this node's own op is the request's, as it is for a peer's,
+        // queue time included. One that reaches the actor with its budget gone is refused
+        // rather than run for nobody, as the worker pool refuses one at dequeue.
+        let arrived = match within_budget(msg.started.unwrap_or_else(Instant::now), self.read_budget)
+        {
+            Ok(arrived) => arrived,
+            Err(spent) => return ctx.reply(Err(spent)),
+        };
+        REQUEST_STARTED_AT
+            .scope(arrived, self.run_on_actor(msg.op, ctx))
+            .await
     }
 }
 
@@ -6853,7 +6923,7 @@ async fn on_actor(
             "the orchestrator stopped before the op could run".to_string(),
         ));
     };
-    match orchestrator.ask(OnActor(op)).await {
+    match orchestrator.ask(OnActor::in_request(op)).await {
         Ok(result) => Ok(result),
         Err(kameo::error::SendError::HandlerError(err)) => Err(err),
         Err(other) => Err(OrchestratorError::NotReady(format!(
@@ -6878,6 +6948,11 @@ impl NodeOrchestrator {
         // predicts against what is folded here.
         let class = OpClass::of(&msg);
         let started = Instant::now();
+        // The request's clock, as the scope this runs in has it — a peer's op is scoped by its
+        // `spent_ms`, this node's own by `OnActor`. Re-entered by hand in the tasks below:
+        // `tokio::spawn` does not inherit it, and a delete by query that paces itself from a
+        // clock started at spawn overshoots the client's timeout and loses its tally.
+        let arrived = request_started_at();
 
         if let Some(index) = self.mint_canvass_needed(&msg).await {
             let (delegated, reply) = ctx.reply_sender();
@@ -6934,12 +7009,12 @@ impl NodeOrchestrator {
             // The rest waits on a peer, so it runs in a task and this mailbox moves on.
             Answer::Later(rest) => {
                 let (delegated, reply) = ctx.reply_sender();
-                tokio::spawn(async move {
+                tokio::spawn(REQUEST_STARTED_AT.scope(arrived, async move {
                     let result = rest.await;
                     if let Some(reply) = reply {
                         reply.send(result);
                     }
-                });
+                }));
                 delegated
             }
         }

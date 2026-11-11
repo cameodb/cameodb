@@ -5307,6 +5307,8 @@ async fn a_delete_by_query_counts_refuses_past_the_limit_and_deletes_on_confirm(
     assert_eq!(status, 200, "{found}");
     assert_eq!(count(&found), 8);
     assert_eq!(found["deleted"], json!(0));
+    assert_eq!(found["remaining"], json!(8));
+    assert_eq!(found["complete"], json!(false));
 
     // Past the node's limit of 5: refused with the count, nothing deleted.
     let (status, refused) = post_json(
@@ -5320,6 +5322,8 @@ async fn a_delete_by_query_counts_refuses_past_the_limit_and_deletes_on_confirm(
     assert_eq!(count(&refused), 8);
     assert_eq!(refused["max_docs"], json!(5));
     assert_eq!(refused["deleted"], json!(0));
+    assert_eq!(refused["remaining"], json!(8));
+    assert_eq!(refused["complete"], json!(false));
 
     // The SDK answers the refusal rather than raising it: the count is what the caller decides on.
     let answer = client

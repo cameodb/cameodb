@@ -204,6 +204,17 @@ pub(crate) const NOTHING_PENDING: u64 = 0;
 /// arrive faster than an interval can cover.
 pub(crate) const COMMIT_BACKSTOP_MULTIPLE: u64 = 20;
 
+/// What a drain's writes made of an index's next commit — see [`HybridStore::commit_due`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitDue {
+    /// Not due: the interval has not passed and the count is under its threshold.
+    No,
+    /// Due by the interval or the count threshold; may wait a drain behind another commit.
+    Due,
+    /// At the backstop: commit now.
+    AtBackstop,
+}
+
 pub(crate) const WARMUP_BUDGET: Duration = Duration::from_secs(60);
 
 /// Counting semaphore bounding how many indices replay their WAL tail at once, across every
@@ -1009,9 +1020,18 @@ impl HybridStore {
         };
 
         if self.get_operations_count(index) > 0 {
+            // Reloaded between the commit and the checkpoint, as `commit_index` does: the
+            // reader is dropped from the map below, but a caller that cloned it before the
+            // close still searches through it, and a clone shares the reload. Without it that
+            // clone kept the pre-commit searcher while the count it is read beside went to
+            // zero — which a delete by query reads as "the searcher is current" and skips its
+            // presence check on.
             let committed = self
                 .commit_locked_writer(index, &mut writer)
-                .and_then(|seq| self.checkpoint_after_commit(index, seq));
+                .and_then(|seq| {
+                    self.smart_refresh_reader(index)?;
+                    self.checkpoint_after_commit(index, seq)
+                });
             if let Err(e) = committed {
                 tracing::warn!(
                     index = %index,
@@ -2032,6 +2052,39 @@ impl HybridStore {
     /// ACID-compliant commit threshold with optimized batching to reduce transaction overhead.
     /// Larger batches mean fewer commits and less fsync overhead while maintaining Durability::Immediate.
     pub(crate) fn should_commit_writer(&self, index: &str, operations_since_commit: u64) -> bool {
+        let base_ops = self.commit_base_ops(index);
+
+        // Additional optimization: larger thresholds for indices with high operation counts
+        // This detects bulk operation patterns and adjusts accordingly
+        if self.config.commit_interval_ms > 0 {
+            return self.interval_commit_due(index, operations_since_commit, base_ops);
+        }
+
+        let default_batch = self.config.default_batch_size as u64;
+        let threshold = if operations_since_commit > default_batch * 5 {
+            // For very large batches, allow up to 50% more accumulation
+            // This reduces fsync overhead during bulk imports
+            (base_ops as f64 * 1.5) as u64
+        } else {
+            base_ops
+        };
+
+        operations_since_commit >= threshold
+    }
+
+    /// The most operations an index may hold uncommitted however the commit is otherwise
+    /// decided: [`COMMIT_BACKSTOP_MULTIPLE`] times the count threshold. The interval policy's
+    /// own ceiling, and the one a writer whose batches all defer the commit decision is still
+    /// held to — see `StorageCommand::BatchWrite::defer_commit` in the server.
+    pub fn commit_backstop_ops(&self, index: &str) -> u64 {
+        self.commit_base_ops(index)
+            .saturating_mul(COMMIT_BACKSTOP_MULTIPLE)
+    }
+
+    /// The operation count a commit is normally decided on for `index`, scaled with the
+    /// index's memory budget: `default_batch_size` at the minimum budget, twenty times it at
+    /// the maximum.
+    fn commit_base_ops(&self, index: &str) -> u64 {
         // The budget for this index, measured at most once per `BUDGET_CACHE_TTL`. This is
         // the only place the measurement is taken: `commit_index` used to re-take it after
         // every single commit, which is ~300 `stat` calls on a fifty-segment index, on the
@@ -2082,23 +2135,7 @@ impl HybridStore {
         // Optimized scaling: 1x default (min) to 20x default (max)
         // e.g., default=1000: 1000 ops (32MB) -> 20000 ops (512MB)
         // This reduces commit frequency while maintaining ACID via Durability::Immediate
-        let base_ops = (default_batch * (1.0 + budget_ratio * 19.0)) as u64;
-
-        // Additional optimization: larger thresholds for indices with high operation counts
-        // This detects bulk operation patterns and adjusts accordingly
-        if self.config.commit_interval_ms > 0 {
-            return self.interval_commit_due(index, operations_since_commit, base_ops);
-        }
-
-        let threshold = if operations_since_commit > default_batch as u64 * 5 {
-            // For very large batches, allow up to 50% more accumulation
-            // This reduces fsync overhead during bulk imports
-            (base_ops as f64 * 1.5) as u64
-        } else {
-            base_ops
-        };
-
-        operations_since_commit >= threshold
+        (default_batch * (1.0 + budget_ratio * 19.0)) as u64
     }
 
     /// The commit policy when `commit_interval_ms` is set: commit once the oldest uncommitted
@@ -2118,12 +2155,27 @@ impl HybridStore {
             return true;
         }
 
-        // Never zero, so a mark set in the first millisecond is not read as "nothing pending".
-        let now = (self.commit_clock_epoch.elapsed().as_millis() as u64).max(1);
-        // `and_then` drops the shard guard before the insert below can ask for its write lock:
+        let now = self.commit_clock_now();
+        let since = self.start_pending_clock(index, now);
+        now.saturating_sub(since) >= self.config.commit_interval_ms
+    }
+
+    /// The commit clock's reading now: never zero, so a mark set in the first millisecond is
+    /// not read as "nothing pending".
+    fn commit_clock_now(&self) -> u64 {
+        (self.commit_clock_epoch.elapsed().as_millis() as u64).max(1)
+    }
+
+    /// When `index`'s oldest uncommitted operation arrived, on the commit clock — `now` if it
+    /// is the first since the last commit, which starts the clock there.
+    ///
+    /// Started lazily, by whoever first decides on a commit after the operation, so it must be
+    /// started on every drain that writes: a drain that skipped it left the next one to start
+    /// the clock from its own operation, and the interval measured from that instead.
+    fn start_pending_clock(&self, index: &str, now: u64) -> u64 {
+        // `map` drops the shard guard before the insert below can ask for its write lock:
         // the shape OB14 deadlocked on, written the way `should_commit_writer` now is.
         let since = self.pending_since.get(index).map(|entry| {
-            // First pending operation since the last commit: start its clock.
             let _ = entry.value().compare_exchange(
                 NOTHING_PENDING,
                 now,
@@ -2132,16 +2184,12 @@ impl HybridStore {
             );
             entry.value().load(Ordering::Relaxed)
         });
-        let since = match since {
-            Some(since) => since,
-            None => {
-                self.pending_since
-                    .entry(index.to_string())
-                    .or_insert_with(|| AtomicU64::new(now));
-                return false;
-            }
-        };
-        now.saturating_sub(since) >= self.config.commit_interval_ms
+        since.unwrap_or_else(|| {
+            self.pending_since
+                .entry(index.to_string())
+                .or_insert_with(|| AtomicU64::new(now));
+            now
+        })
     }
 
     /// Number of replayed WAL entries between commits during recovery.
@@ -2389,13 +2437,54 @@ impl HybridStore {
     /// Perform smart commit based on operation count.
     /// Returns Ok(true) if a commit was performed, Ok(false) if threshold not yet reached.
     pub fn maybe_commit_writer(&self, index: &str) -> Result<bool, StoreError> {
-        let ops_count = self.get_operations_count(index);
+        self.commit_if(index, self.commit_due(index, false) != CommitDue::No)
+    }
 
-        if self.should_commit_writer(index, ops_count) {
+    /// Commit only if the uncommitted count has reached [`Self::commit_backstop_ops`] — the
+    /// decision [`Self::commit_due`] makes for a `deferred` drain.
+    pub fn maybe_commit_writer_at_backstop(&self, index: &str) -> Result<bool, StoreError> {
+        self.commit_if(index, self.commit_due(index, true) == CommitDue::AtBackstop)
+    }
+
+    fn commit_if(&self, index: &str, due: bool) -> Result<bool, StoreError> {
+        if due {
             self.commit_index(index)?;
-            return Ok(true);
         }
-        Ok(false)
+        Ok(due)
+    }
+
+    /// Whether a drain's writes made `index`'s commit due, without making it.
+    ///
+    /// The shard's writer decides once per drain and commits at most one index that is merely
+    /// [`CommitDue::Due`] per drain, the rest carried to the next — a commit holds the writer
+    /// for every index on the shard. One [`CommitDue::AtBackstop`] commits at once: the backstop
+    /// is the bound on the WAL tail a restart replays, and is not to be carried past.
+    ///
+    /// `deferred` is a drain whose every write left the commit decision to its sender: the
+    /// interval and the count threshold are left to that sender, but not the ceiling — a sender
+    /// that keeps writing for its whole budget would otherwise grow the WAL tail and the
+    /// writer's delete queue without bound until it finished. The interval's clock is still
+    /// started, so a sender's commit that never comes is made up for by the next undeferred
+    /// write's interval measured from these operations, not from its own.
+    pub fn commit_due(&self, index: &str, deferred: bool) -> CommitDue {
+        let pending = self.get_operations_count(index);
+        if pending == 0 {
+            return CommitDue::No;
+        }
+        if pending >= self.commit_backstop_ops(index) {
+            return CommitDue::AtBackstop;
+        }
+        if deferred {
+            if self.config.commit_interval_ms > 0 {
+                self.start_pending_clock(index, self.commit_clock_now());
+            }
+            return CommitDue::No;
+        }
+        if self.should_commit_writer(index, pending) {
+            CommitDue::Due
+        } else {
+            CommitDue::No
+        }
     }
 
     /// Apply a single write and commit if the cumulative operations threshold is met.

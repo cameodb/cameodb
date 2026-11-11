@@ -15,15 +15,22 @@
 //!
 //! **A dropped clause refuses the delete.** A search runs what is left of a query and reports
 //! the rest; under `AND`, what is left matches more, and a delete would remove it.
+//!
+//! **Bounded by the cap, not by the match count.** The walk examines candidates a chunk at a
+//! time — ids resolved, checked, kept or dropped — and holds no set of every match: a count
+//! keeps a number, and a delete keeps at most its cap of ids and counts the candidates past it,
+//! which the request that continues it finds again. A count with nothing to check — no `text`
+//! clause, no write since the last commit — is the index's own count, and resolves no id.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
-use tantivy::collector::DocSetCollector;
+use tantivy::collector::Count;
+use tantivy::query::{EnableScoring, Query};
 use tantivy::query_grammar::{Delimiter, Occur, UserInputAst, UserInputLeaf};
 use tantivy::schema::Value as TantivyValue;
-use tantivy::{DocAddress, Searcher};
+use tantivy::{DocAddress, DocId, Searcher, SegmentOrdinal};
 
 use crate::query::{describe_discarded_all, prepare_query_parser};
 use crate::schema::StoredDocOwned;
@@ -33,6 +40,10 @@ use crate::*;
 /// The candidates a `text` clause's stored-value check reads in one redb transaction.
 const EXACT_CHECK_BATCH: usize = 1024;
 
+/// The candidates the walk resolves and checks at a time: what it holds beyond the ids it
+/// keeps, and how often it reads the clock between the walk's own checks.
+const WALK_CHUNK: usize = 4096;
+
 /// What a delete by query found on one shard.
 #[derive(Debug, Default, Clone)]
 pub struct DeleteMatches {
@@ -40,6 +51,29 @@ pub struct DeleteMatches {
     pub ids: Vec<String>,
     /// Candidates the index matched that a `text` clause's exact check turned away.
     pub skipped_inexact: usize,
+    /// Candidates past the cap: walked and counted, neither resolved nor checked. Left for
+    /// the request that continues the delete — which is why a `text` clause's are counted
+    /// before the stored-value check that may yet turn some away.
+    pub unexamined: usize,
+}
+
+/// What a delete by query would remove from one shard: the count, with no id kept.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DeleteCount {
+    /// Documents the query matches exactly.
+    pub matched: usize,
+    /// Candidates the index matched that a `text` clause's exact check turned away.
+    pub skipped_inexact: usize,
+}
+
+/// A screened delete query, ready to walk one shard's last commit.
+struct DeleteWalk {
+    searcher: Searcher,
+    fields: SchemaFields,
+    query: Box<dyn Query>,
+    exact: Vec<ExactText>,
+    /// Whether the index has writes since its last commit — see `keep_exact`.
+    uncommitted: bool,
 }
 
 /// A required `text` clause: the field's stored value, or one element of it, must equal this.
@@ -56,8 +90,40 @@ fn refused(reason: impl std::fmt::Display) -> StoreError {
 }
 
 impl HybridStore {
+    /// How many documents of `index` on this shard `query` would delete — the count phase of
+    /// a delete by query, and a dry run's answer.
+    ///
+    /// The index's own count when there is nothing to check; otherwise every candidate is
+    /// resolved and checked, a chunk at a time, and only the tally is kept.
+    pub fn delete_query_count(
+        &self,
+        index: &str,
+        query: &str,
+        deadline: Option<&SearchDeadline>,
+    ) -> Result<DeleteCount, StoreError> {
+        let Some(walk) = self.prepare_delete_walk(index, query, deadline)? else {
+            return Ok(DeleteCount::default());
+        };
+        if walk.exact.is_empty() && !walk.uncommitted {
+            let matched = deadline_or(walk.searcher.search(&walk.query, &Count), deadline)?;
+            return Ok(DeleteCount {
+                matched,
+                skipped_inexact: 0,
+            });
+        }
+        let mut count = DeleteCount::default();
+        self.walk_delete(index, &walk, deadline, &mut |part| {
+            count.matched += part.ids.len();
+            count.skipped_inexact += part.skipped_inexact;
+            true
+        })?;
+        Ok(count)
+    }
+
     /// The documents of `index` on this shard that `query` matches as a delete: screened,
-    /// every match collected, ids resolved, `text` clauses checked against the stored value.
+    /// ids resolved, `text` clauses checked against the stored value — up to about `cap` ids,
+    /// with the candidates past it counted in [`DeleteMatches::unexamined`]. The cap is
+    /// checked a chunk at a time, so the ids kept can run past it by up to one chunk.
     ///
     /// Reads the last committed searcher, so a document written since is not among them. A
     /// shard that holds no part of the index yet answers nothing to delete.
@@ -65,14 +131,41 @@ impl HybridStore {
         &self,
         index: &str,
         query: &str,
+        cap: usize,
         deadline: Option<&SearchDeadline>,
     ) -> Result<DeleteMatches, StoreError> {
-        let Some((reader, fields)) = self.get_reader(index)? else {
+        let Some(walk) = self.prepare_delete_walk(index, query, deadline)? else {
             return Ok(DeleteMatches::default());
+        };
+        let mut found = DeleteMatches::default();
+        let unexamined = self.walk_delete(index, &walk, deadline, &mut |part| {
+            found.ids.extend(part.ids);
+            found.skipped_inexact += part.skipped_inexact;
+            found.ids.len() < cap
+        })?;
+        found.unexamined = unexamined;
+        Ok(found)
+    }
+
+    /// Screen and parse `query` against `index`'s last commit on this shard; `None` when the
+    /// shard holds no part of the index yet.
+    fn prepare_delete_walk(
+        &self,
+        index: &str,
+        query: &str,
+        deadline: Option<&SearchDeadline>,
+    ) -> Result<Option<DeleteWalk>, StoreError> {
+        let Some((reader, fields)) = self.get_reader(index)? else {
+            return Ok(None);
         };
         let schema = self
             .get_schema_cached(index)?
             .unwrap_or_else(|| Arc::new(IndexSchema::default()));
+        // Read before the searcher is taken. A commit reloads the reader before it resets the
+        // count, so a count of zero read here means the searcher below is the latest commit and
+        // nothing has been written since: every match it holds is in the store, and the
+        // presence check in `keep_exact` has nothing to drop.
+        let uncommitted = self.get_operations_count(index) > 0;
         let searcher = reader.searcher();
         let tantivy_index = searcher.index();
 
@@ -96,27 +189,113 @@ impl HybridStore {
             )));
         }
 
-        let parsed = with_deadline(parsed, deadline);
-        let addresses = deadline_or(searcher.search(&parsed, &DocSetCollector), deadline)?;
-        let ids = resolve_ids(&searcher, &fields, addresses, deadline)?;
-        if exact.is_empty() {
-            return Ok(DeleteMatches {
-                ids,
-                skipped_inexact: 0,
-            });
-        }
-        self.keep_exact(index, ids, &exact, deadline)
+        Ok(Some(DeleteWalk {
+            query: with_deadline(parsed, deadline),
+            searcher,
+            fields,
+            exact,
+            uncommitted,
+        }))
     }
 
-    /// `ids` narrowed to the documents whose stored values equal every required `text` clause.
+    /// Walk every candidate of `walk`, segment by segment, and hand each chunk's survivors to
+    /// `take` once they are resolved and checked; once `take` answers `false` the candidates
+    /// left are only counted, and that count is returned.
+    ///
+    /// The walk is tantivy's unscored one, with the deadline sampled inside it, and deleted
+    /// documents skipped as a collector would. A store error stops the examining at once; the
+    /// walk it happened in runs out unexamined and the error is the answer.
+    fn walk_delete(
+        &self,
+        index: &str,
+        walk: &DeleteWalk,
+        deadline: Option<&SearchDeadline>,
+        take: &mut dyn FnMut(DeleteMatches) -> bool,
+    ) -> Result<usize, StoreError> {
+        let searcher = &walk.searcher;
+        let weight = walk
+            .query
+            .weight(EnableScoring::disabled_from_searcher(searcher))?;
+        let mut examining = true;
+        let mut unexamined = 0usize;
+        let mut failed: Option<StoreError> = None;
+        let mut chunk: Vec<DocId> = Vec::with_capacity(WALK_CHUNK);
+        for (ord, segment) in searcher.segment_readers().iter().enumerate() {
+            let ord = ord as SegmentOrdinal;
+            let alive = segment.alive_bitset();
+            let column = segment.fast_fields().str("id").ok().flatten();
+            let mut examine = |chunk: &mut Vec<DocId>| -> Result<bool, StoreError> {
+                if let Some(deadline) = deadline {
+                    deadline.check()?;
+                }
+                let ids = resolve_ids(searcher, &walk.fields, ord, column.as_ref(), chunk)?;
+                chunk.clear();
+                let part = self.keep_exact(index, ids, &walk.exact, walk.uncommitted, deadline)?;
+                Ok(take(part))
+            };
+            let walked = weight.for_each_no_score(segment, &mut |docs: &[DocId]| {
+                if failed.is_some() {
+                    return;
+                }
+                for &doc in docs {
+                    if alive.is_some_and(|alive| !alive.is_alive(doc)) {
+                        continue;
+                    }
+                    if examining {
+                        chunk.push(doc);
+                    } else {
+                        unexamined += 1;
+                    }
+                }
+                if examining && chunk.len() >= WALK_CHUNK {
+                    match examine(&mut chunk) {
+                        Ok(more) => examining = more,
+                        Err(err) => failed = Some(err),
+                    }
+                }
+            });
+            if let Some(err) = failed {
+                return Err(err);
+            }
+            deadline_or(walked, deadline)?;
+            if examining && !chunk.is_empty() {
+                examining = examine(&mut chunk)?;
+            }
+        }
+        Ok(unexamined)
+    }
+
+    /// `ids` narrowed to the documents the store still holds, and whose stored values equal
+    /// every required `text` clause.
+    ///
+    /// The searcher is the last commit's, and a document deleted since — by a delete by query
+    /// its budget stopped, whose commit is posted rather than awaited — is still in it. Counting
+    /// those would make the request that continues the delete report matches it cannot delete
+    /// and deletes it did not make, so with `uncommitted` writes on the index each id is looked
+    /// up in the store. With none, the lookup is skipped — a point read per match, the largest
+    /// cost of the find — and an id the index holds and the store does not is kept, so the
+    /// delete removes it from the index, as a batch delete of it would.
+    ///
+    /// A `text` clause reads each body anyway, which answers presence too.
     fn keep_exact(
         &self,
         index: &str,
         ids: Vec<String>,
         exact: &[ExactText],
+        uncommitted: bool,
         deadline: Option<&SearchDeadline>,
     ) -> Result<DeleteMatches, StoreError> {
         let mut kept = DeleteMatches::default();
+        if exact.is_empty() {
+            let mut ids = ids;
+            if uncommitted {
+                let present = self.keys_present_with(index, &ids, deadline)?;
+                let mut keep = present.into_iter();
+                ids.retain(|_| keep.next().unwrap_or(false));
+            }
+            kept.ids = ids;
+            return Ok(kept);
+        }
         for chunk in ids.chunks(EXACT_CHECK_BATCH) {
             let rows: HashMap<String, Vec<u8>> = self
                 .get_batch_by_keys_with(index, chunk, deadline)?
@@ -152,36 +331,20 @@ fn holds_exactly(body: &JsonValue, clause: &ExactText) -> bool {
     }
 }
 
-/// The ids behind `addresses`: from the fast `id` column where the segment has one, from the
-/// stored document otherwise.
+/// The ids behind one segment's `docs`: from the segment's fast `id` column where it has one,
+/// from the stored document otherwise.
 fn resolve_ids(
     searcher: &Searcher,
     fields: &SchemaFields,
-    addresses: std::collections::HashSet<DocAddress>,
-    deadline: Option<&SearchDeadline>,
+    segment_ord: SegmentOrdinal,
+    column: Option<&tantivy::columnar::StrColumn>,
+    docs: &[DocId],
 ) -> Result<Vec<String>, StoreError> {
-    let mut addresses: Vec<DocAddress> = addresses.into_iter().collect();
-    addresses.sort_unstable();
-    let mut ids = Vec::with_capacity(addresses.len());
-    let mut column = None;
-    let mut column_segment = None;
+    let mut ids = Vec::with_capacity(docs.len());
     let mut text = String::new();
-    for (n, address) in addresses.into_iter().enumerate() {
-        if n.is_multiple_of(4096)
-            && let Some(deadline) = deadline
-        {
-            deadline.check()?;
-        }
-        if column_segment != Some(address.segment_ord) {
-            column_segment = Some(address.segment_ord);
-            column = searcher.segment_readers()[address.segment_ord as usize]
-                .fast_fields()
-                .str("id")
-                .ok()
-                .flatten();
-        }
-        let from_column = column.as_ref().and_then(|column| {
-            let ord = column.term_ords(address.doc_id).next()?;
+    for &doc_id in docs {
+        let from_column = column.and_then(|column| {
+            let ord = column.term_ords(doc_id).next()?;
             text.clear();
             column
                 .ord_to_str(ord, &mut text)
@@ -192,7 +355,8 @@ fn resolve_ids(
         let id = match from_column {
             Some(id) => Some(id),
             None => {
-                let doc: tantivy::TantivyDocument = searcher.doc(address)?;
+                let doc: tantivy::TantivyDocument =
+                    searcher.doc(DocAddress::new(segment_ord, doc_id))?;
                 doc.get_first(fields.id)
                     .and_then(|value| value.as_str())
                     .map(str::to_string)

@@ -3,7 +3,7 @@
 
 use super::*;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
@@ -25,9 +25,11 @@ use storage::{HybridStore, IndexSchema, StorageConfig, StoreError, WalOp};
 /// Type alias for single write commands enqueued in the writer thread
 pub(super) type WriteCommand = (WalOp, tokio::sync::oneshot::Sender<Result<u64, StoreError>>);
 
-/// Type alias for batch write commands enqueued in the writer thread
+/// Type alias for batch write commands enqueued in the writer thread: the ops, whether the
+/// batch defers the commit decision (`StorageCommand::BatchWrite::defer_commit`), the reply.
 pub(super) type BatchCommand = (
     Vec<WalOp>,
+    bool,
     tokio::sync::oneshot::Sender<Result<Vec<u64>, StoreError>>,
 );
 
@@ -418,6 +420,29 @@ pub(super) fn guard_writer_op<T>(
     }
 }
 
+/// The commit a drain's writes made due, made on the writer thread and logged; an index that
+/// committed is recorded for re-warming. A failure is logged, not answered: every write it
+/// covers was durable and answered before it, and the WAL keeps them for the next commit or a
+/// replay.
+fn commit_after_writes(store: &HybridStore, index: &str, committed: &mut HashSet<String>) {
+    let committed_at = Instant::now();
+    match guard_writer_op(store, index, || store.commit_index(index)) {
+        Ok(()) => {
+            tracing::debug!(
+                index = %index,
+                elapsed_ms = committed_at.elapsed().as_millis() as u64,
+                "Writer: commit after this drain's writes"
+            );
+            committed.insert(index.to_string());
+        }
+        Err(e) => tracing::error!(
+            index = %index,
+            error = %e,
+            "Writer: commit failed; the WAL keeps these writes for the next commit or a replay"
+        ),
+    }
+}
+
 /// A read pool that has filled every blocking thread and completed nothing for longer than this
 /// is treated as wedged — threads stuck in a tantivy or redb call that will not return, which no
 /// per-read panic guard can catch because the threads never unwind. The bound sits well past any
@@ -767,9 +792,28 @@ pub(super) fn spawn_writer_thread(
                     let mut rebuilds: Vec<RebuildCommand> = Vec::new();
                     let mut committed_indices: HashSet<String> = HashSet::new();
                     let mut written_indices: HashSet<String> = HashSet::new();
+                    let mut deferred_only: HashSet<String> = HashSet::new();
                     let mut mixed: Vec<String> = Vec::new();
+                    // Indexes whose commit is due and waits behind another's — see Phase 4b.
+                    // Kept across drains, oldest first.
+                    let mut carried: VecDeque<String> = VecDeque::new();
 
-                    while let Some(first_cmd) = rx.blocking_recv() {
+                    loop {
+                    // With a commit carried, the writer does not wait for a command: it takes
+                    // one if there is one, and otherwise runs a drain of nothing, whose Phase 4b
+                    // makes the carried commit. With none, it waits, as it always has.
+                    let first_cmd = if carried.is_empty() {
+                        match rx.blocking_recv() {
+                            Some(cmd) => Some(cmd),
+                            None => break,
+                        }
+                    } else {
+                        match rx.try_recv() {
+                            Ok(cmd) => Some(cmd),
+                            Err(mpsc::error::TryRecvError::Empty) => None,
+                            Err(mpsc::error::TryRecvError::Disconnected) => break,
+                        }
+                    };
                     // Mark the writer busy for the whole batch it is about to drain and apply;
                     // `max(1)` keeps the stamp distinct from the 0 that means idle.
                     writer_heartbeat.store(writer_liveness.now_ticks().max(1), AtomicOrdering::Relaxed);
@@ -779,7 +823,7 @@ pub(super) fn spawn_writer_thread(
                     // Limit drain to prevent starvation - max 256 additional commands per iteration.
                     pub(super) const MAX_DRAIN_PER_ITERATION: usize = 256;
                     pending_cmds.clear();
-                    pending_cmds.push(first_cmd);
+                    pending_cmds.extend(first_cmd);
                     let mut drained = 0;
                     while drained < MAX_DRAIN_PER_ITERATION {
                         match rx.try_recv() {
@@ -807,16 +851,28 @@ pub(super) fn spawn_writer_thread(
                     // index several times results in one re-warm request.
                     committed_indices.clear();
                     // Indices this drain wrote to, whose commit is decided once every reply
-                    // has been sent — see Phase 4b.
+                    // has been sent — see Phase 4b — and among them, those only deferred
+                    // batches reached, recorded by Phase 4 as it applies them. The single
+                    // write path records nothing: a deferred batch is the exception, and it
+                    // carries its own flag.
                     written_indices.clear();
+                    deferred_only.clear();
 
                     for cmd in pending_cmds.drain(..) {
                         match cmd {
                             StorageCommand::Write { index, op, reply } => {
                                 write_groups.entry(index).or_default().push((op, reply));
                             }
-                            StorageCommand::BatchWrite { index, ops, reply } => {
-                                batch_groups.entry(index).or_default().push((ops, reply));
+                            StorageCommand::BatchWrite {
+                                index,
+                                ops,
+                                defer_commit,
+                                reply,
+                            } => {
+                                batch_groups
+                                    .entry(index)
+                                    .or_default()
+                                    .push((ops, defer_commit, reply));
                             }
                             StorageCommand::Commit { index, reply } => {
                                 commits.push((index, reply));
@@ -873,7 +929,9 @@ pub(super) fn spawn_writer_thread(
                             op_counts.push(1);
                             segments.push(MergedWriteReply::Single(reply));
                         }
-                        for (ops, reply) in batches {
+                        // A single write is in this drain, so the commit is decided as usual
+                        // whatever the batches' flags say.
+                        for (ops, _defer_commit, reply) in batches {
                             let count = ops.len();
                             batch_segments += 1;
                             merged_ops.extend(ops);
@@ -1017,14 +1075,27 @@ pub(super) fn spawn_writer_thread(
                     // Multiple BatchWrite commands for the same index are merged into
                     // a single apply_batch call, then results are split back to callers.
                     for (index, batches) in batch_groups.drain() {
+                        // No single write reached this index (Phase 3a took those), so the
+                        // commit decision is deferred when every batch here defers it.
+                        if batches.iter().all(|(_, defer_commit, _)| *defer_commit) {
+                            deferred_only.insert(index.clone());
+                        }
                         if batches.len() == 1 {
                             // Single batch — no coalescing overhead needed
-                            let (ops, reply) = batches.into_iter().next().unwrap();
+                            let (ops, _, reply) = batches.into_iter().next().unwrap();
+                            let ops_count = ops.len();
+                            let applied_at = Instant::now();
                             let res = guard_writer_op(&writer_store, &index, || {
                                 writer_store.apply_batch(&index, ops)
                             });
                             match &res {
                                 Ok(_) => {
+                                    tracing::debug!(
+                                        index = %index,
+                                        ops_count,
+                                        elapsed_ms = applied_at.elapsed().as_millis() as u64,
+                                        "Writer: batch write applied"
+                                    );
                                     written_indices.insert(index.clone());
                                 }
                                 Err(e) => tracing::error!(index = %index, error = %e, "Writer: batch write failed"),
@@ -1036,7 +1107,7 @@ pub(super) fn spawn_writer_thread(
                             let mut merged_ops: Vec<WalOp> = Vec::new();
                             let mut reply_segments: Vec<BatchReplySegment> = Vec::new();
 
-                            for (ops, reply) in batches {
+                            for (ops, _, reply) in batches {
                                 let op_count = ops.len();
                                 merged_ops.extend(ops);
                                 reply_segments.push((op_count, reply));
@@ -1092,29 +1163,49 @@ pub(super) fn spawn_writer_thread(
                     // that drain wait for it, and told them their write had failed when only the
                     // commit had — the write itself was durable, and the WAL still held it for the
                     // next commit or a replay. Once per index here, however many groups wrote to it.
+                    //
+                    // An index only deferred batches wrote to is held to the backstop alone:
+                    // their sender commits when it is done, and until then the supervisor's
+                    // idle commit or the next undeferred write's interval covers them, as they
+                    // cover any write — but not past the ceiling on the uncommitted count,
+                    // which a sender writing for its whole budget would otherwise run through.
+                    //
+                    // At most one commit that is merely due is made per drain. A commit holds
+                    // this thread, and with it every index on the shard: K indexes falling due
+                    // together used to commit back to back, and a write to an unrelated index
+                    // waited out all K. The rest are carried, oldest first, and made one per
+                    // drain after — a drain of nothing when no command is waiting — so a write
+                    // waits behind one commit at most. An index at the backstop is not carried:
+                    // that is the bound on what a restart replays.
                     for index in written_indices.drain() {
-                        match guard_writer_op(&writer_store, &index, || {
-                            writer_store.maybe_commit_writer(&index)
-                        }) {
-                            Ok(true) => {
-                                tracing::debug!(index = %index, "Writer: commit after this drain's writes");
-                                committed_indices.insert(index);
-                            }
-                            Ok(false) => {}
-                            Err(e) => tracing::error!(
-                                index = %index,
-                                error = %e,
-                                "Writer: commit failed; the WAL keeps these writes for the next commit or a replay"
-                            ),
+                        if carried.contains(&index) {
+                            continue;
                         }
+                        let deferred = deferred_only.contains(&index);
+                        match writer_store.commit_due(&index, deferred) {
+                            storage::CommitDue::AtBackstop => {
+                                commit_after_writes(&writer_store, &index, &mut committed_indices);
+                            }
+                            storage::CommitDue::Due => carried.push_back(index),
+                            storage::CommitDue::No => {}
+                        }
+                    }
+                    if let Some(index) = carried.pop_front() {
+                        commit_after_writes(&writer_store, &index, &mut committed_indices);
                     }
 
                     // Phase 5: Process commits after all writes are applied
                     for (index, reply) in commits.drain(..) {
+                        let committed_at = Instant::now();
                         let res = guard_writer_op(&writer_store, &index, || {
                             writer_store.commit_index(&index)
                         });
                         if res.is_ok() {
+                            tracing::debug!(
+                                index = %index,
+                                elapsed_ms = committed_at.elapsed().as_millis() as u64,
+                                "Writer: requested commit"
+                            );
                             committed_indices.insert(index.clone());
                         }
                         let _ = reply.send(res);
@@ -1560,6 +1651,17 @@ impl MicroshardActor {
         index: String,
         ops: Vec<WalOp>,
     ) -> Result<Vec<u64>, OrchestratorError> {
+        self.batch_write_via_channel(index, ops, false).await
+    }
+
+    /// [`Self::handle_batch_write_via_channel`], with the commit decision left to the caller —
+    /// see `StorageCommand::BatchWrite::defer_commit`.
+    async fn batch_write_via_channel(
+        &self,
+        index: String,
+        ops: Vec<WalOp>,
+        defer_commit: bool,
+    ) -> Result<Vec<u64>, OrchestratorError> {
         let index_for_log = index.clone();
         tracing::debug!(
             shard_id = %self.shard_id,
@@ -1571,6 +1673,7 @@ impl MicroshardActor {
         self.send_write_command(StorageCommand::BatchWrite {
             index,
             ops,
+            defer_commit,
             reply: reply_tx,
         })
         .await?;
@@ -1602,6 +1705,22 @@ impl MicroshardActor {
         rx.await
             .map_err(|_| OrchestratorError::Io(std::io::Error::other("Writer dropped reply")))?
             .map_err(OrchestratorError::Storage)
+    }
+
+    /// Ask the writer to commit without waiting for it.
+    ///
+    /// The command is queued work: it runs whether or not anyone is listening for the reply,
+    /// so the receiver is dropped and the caller is never held by the commit itself. A full
+    /// channel is no loss — a delete by query posts one on a budget stop purely so the request
+    /// that continues it counts against committed tombstones, and the supervisor's idle commit
+    /// or the next write's interval covers the same ground.
+    pub(super) fn post_commit_to_writer(&self, index: String) -> Result<(), OrchestratorError> {
+        let tx = self.writer_tx.load_full().ok_or_else(|| {
+            OrchestratorError::NotReady("Writer channel not initialized".to_string())
+        })?;
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        tx.try_send(StorageCommand::Commit { index, reply })
+            .map_err(|_| OrchestratorError::Io(std::io::Error::other("Writer channel full")))
     }
 
     /// Indexes this shard holds open, and its share of the node-wide cap (`0` when uncapped).
@@ -2167,6 +2286,25 @@ impl MicroshardActor {
         index: String,
         ids: Vec<String>,
     ) -> Result<usize, OrchestratorError> {
+        self.batch_delete(index, ids, false).await
+    }
+
+    /// [`Self::handle_batch_delete`], with the commit decision left to the caller — one round
+    /// of a delete by query, which commits once after its last round.
+    pub(super) async fn handle_deferred_batch_delete(
+        &self,
+        index: String,
+        ids: Vec<String>,
+    ) -> Result<usize, OrchestratorError> {
+        self.batch_delete(index, ids, true).await
+    }
+
+    async fn batch_delete(
+        &self,
+        index: String,
+        ids: Vec<String>,
+        defer_commit: bool,
+    ) -> Result<usize, OrchestratorError> {
         if ids.is_empty() {
             return Ok(0);
         }
@@ -2175,7 +2313,7 @@ impl MicroshardActor {
         let expected = ops.len();
 
         let sequences = self
-            .handle_batch_write_via_channel(index.clone(), ops)
+            .batch_write_via_channel(index.clone(), ops, defer_commit)
             .await?;
 
         self.signal_supervisor(index).await;
@@ -2186,51 +2324,61 @@ impl MicroshardActor {
         Ok(sequences.len())
     }
 
-    /// One phase of a delete by query on this shard (ROADMAP S1).
+    /// The documents of `index` on this shard that `query` matches as a delete (ROADMAP S1).
     ///
-    /// The matches are found on the read pool, against the last commit and under the request's
-    /// budget; a delete then removes them through the writer, in chunks of
-    /// [`DELETE_CHUNK`](super::delete_query::DELETE_CHUNK) ids per transaction, and with
-    /// `refresh` commits so search reflects it at once.
-    pub(super) async fn handle_delete_by_query(
+    /// Found on the read pool, against the last commit and under the request's budget. Both
+    /// phases of a delete by query start here; the delete then removes them through
+    /// [`Self::handle_deferred_batch_delete`], a round at a time — see
+    /// `delete_query::delete_by_query_on_shards` for how the rounds are cut.
+    ///
+    /// At most about `cap` ids are kept; the candidates past it are counted, not resolved.
+    pub(super) async fn find_delete_matches(
         &self,
         index: String,
         query: String,
-        mode: super::delete_query::DeleteMode,
-        refresh: bool,
-    ) -> Result<super::delete_query::DeleteTally, OrchestratorError> {
-        use super::delete_query::{DELETE_CHUNK, DeleteMode, DeleteTally};
+        cap: usize,
+    ) -> Result<storage::DeleteMatches, OrchestratorError> {
+        let store = self.store_for_delete()?;
+        let deadline = self.delete_deadline();
+        self.spawn_on_read_pool(move || {
+            store.delete_query_matches(&index, &query, cap, deadline.as_ref())
+        })
+        .await?
+        .map_err(store_error_to_orchestrator)
+    }
 
-        let store = Arc::clone(self.store.as_ref().ok_or_else(|| {
+    /// How many documents of `index` on this shard `query` would delete — the count phase of
+    /// a delete by query — on the read pool, under the request's budget, keeping no id.
+    pub(super) async fn count_delete_matches(
+        &self,
+        index: String,
+        query: String,
+    ) -> Result<storage::DeleteCount, OrchestratorError> {
+        let store = self.store_for_delete()?;
+        let deadline = self.delete_deadline();
+        self.spawn_on_read_pool(move || {
+            store.delete_query_count(&index, &query, deadline.as_ref())
+        })
+        .await?
+        .map_err(store_error_to_orchestrator)
+    }
+
+    fn store_for_delete(&self) -> Result<Arc<HybridStore>, OrchestratorError> {
+        self.store.as_ref().map(Arc::clone).ok_or_else(|| {
             OrchestratorError::NotReady("HybridStore not initialized".to_string())
-        })?);
-        let deadline = self
-            .read_budget
-            .map(|budget| storage::SearchDeadline::new(request_started_at(), budget));
-        let read_index = index.clone();
-        let found = self
-            .spawn_on_read_pool(move || {
-                store.delete_query_matches(&read_index, &query, deadline.as_ref())
-            })
-            .await?
-            .map_err(store_error_to_orchestrator)?;
+        })
+    }
 
-        let mut tally = DeleteTally {
-            matched: found.ids.len(),
-            skipped_inexact: found.skipped_inexact,
-            ..Default::default()
-        };
-        if mode == DeleteMode::Delete && !found.ids.is_empty() {
-            for chunk in found.ids.chunks(DELETE_CHUNK) {
-                tally.deleted += self
-                    .handle_batch_delete(index.clone(), chunk.to_vec())
-                    .await?;
-            }
-            if refresh {
-                self.admin_commit_via_channel(index).await?;
-            }
-        }
-        Ok(tally)
+    fn delete_deadline(&self) -> Option<storage::SearchDeadline> {
+        self.read_budget
+            .map(|budget| storage::SearchDeadline::new(request_started_at(), budget))
+    }
+
+    /// How many reads the shared read pool runs at once; `1` before it is attached.
+    pub(super) fn read_pool_width(&self) -> usize {
+        self.read_pool_health
+            .as_ref()
+            .map_or(1, |health| health.capacity)
     }
 
     /// Handles batch write requests via the dedicated writer thread.

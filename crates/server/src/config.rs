@@ -813,6 +813,10 @@ pub struct SearchConfig {
     /// fast it arrives, and a trickle is searchable within one. The count still applies,
     /// twenty times higher, as a backstop bounding what a restart replays.
     ///
+    /// Each shard runs a little longer than this, by up to half of it in steps of its ordinal,
+    /// so the shards of a node do not all commit in the same instant; and a shard's writer
+    /// makes one due commit per drain, so a write waits behind one commit, not every index's.
+    ///
     /// Durability is not what this trades: a write is durable when it is acknowledged,
     /// whatever this is set to. It trades how soon a search sees a write against how much
     /// work each commit amortizes.

@@ -54,7 +54,7 @@ mod tests;
 // list, on purpose, and everything else stays the crate's own business.
 pub use analysis::TOKENIZERS;
 pub use deadline::{DeadlineQuery, SearchDeadline};
-pub use delete_query::DeleteMatches;
+pub use delete_query::{DeleteCount, DeleteMatches};
 pub use merge::MergeStarted;
 pub use metrics::{FieldMetrics, MetricValue, MetricsSpec, merge_metrics_json};
 pub use projection::{
@@ -69,7 +69,7 @@ pub use schema::{
     facet_path_error, is_date_value, parse_date_to_timestamp_secs, select_default_fields,
 };
 pub use search::SearchOptions;
-pub use store::HybridStore;
+pub use store::{CommitDue, HybridStore};
 // `SchemaFields` is in the list because `HybridStore::get_or_create_index` returns it, not because
 // a caller reads it: its fields are crate-private, so outside the crate it is a handle to hold and
 // drop. Narrowing the type makes that signature a `private_interfaces` warning, which the

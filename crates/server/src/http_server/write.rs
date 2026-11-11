@@ -755,8 +755,8 @@ pub struct DeleteByQueryPayload {
 ///
 /// Two phases across the cluster: every node counts its matches, the limit is decided once on
 /// the sum, then every node deletes. Past `max_docs` without `confirm` the answer is `409` with
-/// the count, and nothing is deleted. Charged to the write allowance per document, as a bulk
-/// delete is.
+/// the count, and nothing is deleted. The count is charged to the read allowance as a search
+/// is; the delete to the write allowance per document, as a bulk delete is.
 pub(super) async fn delete_by_query_handler(
     Path(index): Path<String>,
     State(state): State<AppState>,
@@ -779,12 +779,36 @@ pub(super) async fn delete_by_query_handler(
     let max_docs = max_docs.unwrap_or(state.delete_max_docs);
     info!(index = %index, dry_run, confirm, "Delete by query request");
 
+    // The count walks every shard as a search does, so it is charged as one: a dry run, or a
+    // delete refused past `max_docs`, deletes nothing and would otherwise be charged nothing.
+    // The delete is charged to the write allowance below, on top.
+    let caller = caller_of(caller);
+    if let Verdict::Deny { retry_after_secs } = state.rate_limiter.check(&caller, 1) {
+        return Err(AppError::too_many_requests_in(
+            "Search rate limit exceeded: a delete by query's count is charged as a search.",
+            retry_after_secs,
+        ));
+    }
+
     let audited_query = state.audit.records_query_text().then(|| query.clone());
-    let respond = |tally: DeleteTally, status: StatusCode, extra: JsonValue| {
+    let respond = |tally: DeleteTally, status: StatusCode, extra: JsonValue, deleting: bool| {
+        // Whether everything the query matched is gone. A count — a dry run, or a refusal
+        // past `max_docs` — deleted nothing, so everything it matched remains and it is never
+        // complete; after a delete, false with ids left over — the request's budget ran out,
+        // or a shard or node failed — and the same request sent again continues it.
+        let remaining = if deleting {
+            tally.remaining
+        } else {
+            tally.matched
+        };
+        let complete =
+            deleting && remaining == 0 && tally.shards_failed == 0 && tally.nodes_failed.is_empty();
         let mut body = serde_json::json!({
             "matched": tally.matched,
             "deleted": tally.deleted,
             "skipped_inexact": tally.skipped_inexact,
+            "remaining": remaining,
+            "complete": complete,
             "max_docs": max_docs,
             "dry_run": dry_run,
             "shards": {"total": tally.shards, "failed": tally.shards_failed},
@@ -811,8 +835,12 @@ pub(super) async fn delete_by_query_handler(
         .delete_by_query(&index, &query, DeleteMode::Count, false)
         .await
         .map_err(AppError::from_route)?;
-    if dry_run || counted.matched == 0 {
-        return Ok(respond(counted, StatusCode::OK, JsonValue::Null));
+    if dry_run {
+        return Ok(respond(counted, StatusCode::OK, JsonValue::Null, false));
+    }
+    if counted.matched == 0 {
+        // Nothing to delete is a delete with nothing left to do.
+        return Ok(respond(counted, StatusCode::OK, JsonValue::Null, true));
     }
     if counted.matched > max_docs && !confirm {
         let error = format!(
@@ -824,14 +852,26 @@ pub(super) async fn delete_by_query_handler(
             counted,
             StatusCode::CONFLICT,
             serde_json::json!({"error": error, "code": "delete_limit_exceeded"}),
+            false,
         ));
     }
 
-    check_write_rate(&state, &caller_of(caller), counted.matched)?;
+    // Admitted on what it matched, as any write is on what it asks to write — the limiter
+    // caps that at everything the bucket holds — then given back what it did not delete. A
+    // delete its budget cuts short deletes less than it matched, and the request continuing
+    // it matches only what is left, so each pays for what it removed. A delete that errors
+    // gets nothing back: some of its rounds may have run, and it pays for what it was
+    // admitted to rather than for nothing.
+    check_write_rate(&state, &caller, counted.matched)?;
     let deleted = state
         .router
         .delete_by_query(&index, &query, DeleteMode::Delete, refresh)
         .await
         .map_err(AppError::from_route)?;
-    Ok(respond(deleted, StatusCode::OK, JsonValue::Null))
+    state.rate_limiter.refund_unused_write(
+        &caller,
+        u32::try_from(counted.matched).unwrap_or(u32::MAX),
+        u32::try_from(deleted.deleted).unwrap_or(u32::MAX),
+    );
+    Ok(respond(deleted, StatusCode::OK, JsonValue::Null, true))
 }

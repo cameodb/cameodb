@@ -396,6 +396,13 @@ impl Default for DispatchCounters {
 impl DispatchCounters {
     /// Fold one dequeue-to-answer sample into the estimates: the blend, and the class the job
     /// belonged to when it has one.
+    ///
+    /// Every class folds into the blend and the histogram, bulk included. Keeping bulk out was
+    /// tried, so that one long delete by query could not make the door refuse everything behind
+    /// it — and it made the door predict no wait at all for a backlog of bulk ops, which the
+    /// mailbox lane mostly carries: it admitted everything, and everything timed out. The depth
+    /// prediction has to know what the jobs in the queue cost, whatever class they are; a
+    /// delete by query now paces itself to the request budget, so its sample is bounded by it.
     pub(super) fn record_service(&self, class: OpClass, sample: Duration) {
         let sample_us = sample.as_micros() as u64;
         self.service_hist.record(sample);
@@ -520,10 +527,9 @@ impl QueueLoad {
 
     /// Predict against a measured tail of the service distribution rather than its mean.
     ///
-    /// Set for the mailbox lane and deliberately **not** for the worker pool. The pool's
-    /// behaviour under overload is the measured result F7 recorded, and changing what it admits
-    /// on would invalidate those arms without a run of its own — worth doing, separately, with
-    /// its own before and after.
+    /// Set for the mailbox lane and the worker pool alike, each over its own
+    /// [`DispatchCounters`] — the lane's histogram sees the lane's ops, which for the mailbox
+    /// are mostly bulk, and `/health`'s `mailbox_service_p90_ms` reads that same histogram.
     pub(super) fn tail_aware(mut self) -> Self {
         self.tail_aware = true;
         self
