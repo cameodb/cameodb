@@ -95,6 +95,75 @@ pub(crate) fn with_deadline(
     }
 }
 
+/// Whether the index answers `query`'s count without walking its matches: a single term's
+/// count is its document frequency and match-all's the live document count, both read off
+/// a segment with no deletes. Taken before [`with_deadline`] wraps the query.
+///
+/// It decides more than the count. A page collected beside a count walks every match —
+/// the count needs them all — and that walk is one tantivy cannot prune. Counted apart,
+/// the page walks alone and Block-WAND skips the blocks that cannot reach it. Any other
+/// query keeps the single walk: its count is a walk of its own, which costs about what
+/// the pruning saves, and more than that on a conjunction, which prunes nothing.
+fn counted_by_the_index(query: &dyn tantivy::query::Query) -> bool {
+    query.is::<tantivy::query::TermQuery>() || query.is::<tantivy::query::AllQuery>()
+}
+
+/// The count of `query`'s matches, with the metrics' extremes over them when asked.
+fn count_matches(
+    searcher: &tantivy::Searcher,
+    query: &dyn tantivy::query::Query,
+    counted_by_the_index: bool,
+    metrics: Option<&crate::metrics::MetricsCollector>,
+    deadline: Option<&SearchDeadline>,
+) -> Result<(usize, Option<Vec<crate::metrics::Extremes>>), StoreError> {
+    use tantivy::collector::Count;
+    Ok(match metrics {
+        None if counted_by_the_index => (deadline_or(query.count(searcher), deadline)?, None),
+        None => (deadline_or(searcher.search(query, &Count), deadline)?, None),
+        Some(metrics) => {
+            let (count, extremes) =
+                deadline_or(searcher.search(query, &(Count, metrics.clone())), deadline)?;
+            (count, Some(extremes))
+        }
+    })
+}
+
+/// A page's fruit, the match count, and the metrics' extremes when they were asked for.
+type Collected<F> = (F, usize, Option<Vec<crate::metrics::Extremes>>);
+
+/// `page` collected over `query`, with the match count and, when asked, the metrics'
+/// extremes: one walk for all three, except a relevance page whose count the index answers
+/// (see [`counted_by_the_index`]), which walks alone so it can prune. Metrics need every
+/// match, so asking for them always takes the single walk.
+fn collect_page<C: tantivy::collector::Collector>(
+    searcher: &tantivy::Searcher,
+    query: &dyn tantivy::query::Query,
+    page: C,
+    count_apart: bool,
+    metrics: Option<&crate::metrics::MetricsCollector>,
+    deadline: Option<&SearchDeadline>,
+) -> Result<Collected<C::Fruit>, StoreError> {
+    use tantivy::collector::Count;
+    Ok(match metrics {
+        None if count_apart => {
+            let fruit = deadline_or(searcher.search(query, &page), deadline)?;
+            let (count, _) = count_matches(searcher, query, true, None, deadline)?;
+            (fruit, count, None)
+        }
+        None => {
+            let (fruit, count) = deadline_or(searcher.search(query, &(page, Count)), deadline)?;
+            (fruit, count, None)
+        }
+        Some(metrics) => {
+            let (fruit, count, extremes) = deadline_or(
+                searcher.search(query, &(page, Count, metrics.clone())),
+                deadline,
+            )?;
+            (fruit, count, Some(extremes))
+        }
+    })
+}
+
 /// A search error under a tripped deadline is the deadline's error, whatever it rode out
 /// on. The walk reports through tantivy's error channel, which has no deadline variant,
 /// so the flag — not the message text — is what decides.
@@ -642,15 +711,18 @@ impl HybridStore {
         sort: Option<&SortSpec>,
         opts: &SearchOptions<'_>,
     ) -> Result<KeyOutcome, StoreError> {
-        let mut outcome = self.search_keys_unmeasured(index, query, limit, sort, opts)?;
-        if let Some(spec) = opts.metrics {
+        let mut outcome = self.walk_keys(index, query, limit, sort, opts)?;
+        // The walk measured as it went; a path that answered without one — an exact id,
+        // an index with no commit yet — is measured on its own.
+        if let (Some(spec), None) = (opts.metrics, &outcome.metrics) {
             outcome.metrics = Some(self.measure(index, query, spec, opts.deadline.as_ref())?);
         }
         Ok(outcome)
     }
 
-    /// [`search_keys`](Self::search_keys) without the metrics: the page of keys and the count.
-    fn search_keys_unmeasured(
+    /// [`search_keys`](Self::search_keys)'s page of keys and count, and the metrics when it
+    /// walked the matches for them.
+    fn walk_keys(
         &self,
         index: &str,
         query: &str,
@@ -679,8 +751,17 @@ impl HybridStore {
 
         let mut timings = SearchTimings::default();
 
+        // Built here so the walks below can measure as they collect.
+        let metrics = opts
+            .metrics
+            .map(|spec| crate::metrics::MetricsCollector::new(&tantivy_index.schema(), spec))
+            .transpose()?;
+        let measured = |extremes: Option<Vec<crate::metrics::Extremes>>| {
+            metrics.as_ref().zip(extremes).map(|(m, e)| m.metrics_from(e))
+        };
+
         // Count-only mode: limit=0 means return just total_hits without document data.
-        // Runs only the Count collector (cheaper than TopDocs) and skips all redb lookups.
+        // Counts without collecting a page, and skips all redb lookups.
         if limit == 0 {
             // For exact ID queries, we can short-circuit: total_hits is 0 or 1
             if let Some((id_value, _)) = parse_exact_id_query(query, &schema) {
@@ -737,11 +818,14 @@ impl HybridStore {
             } else {
                 parsed_query
             };
+            let countable = counted_by_the_index(parsed_query.as_ref());
             let parsed_query = with_deadline(parsed_query, opts.deadline.as_ref());
-            let count_collector = tantivy::collector::Count;
             let walk_start = Instant::now();
-            let total_hits = deadline_or(
-                searcher.search(&parsed_query, &count_collector),
+            let (total_hits, extremes) = count_matches(
+                &searcher,
+                parsed_query.as_ref(),
+                countable,
+                metrics.as_ref(),
                 opts.deadline.as_ref(),
             )?;
             timings.walk_ms = walk_start.elapsed().as_millis() as u64;
@@ -759,6 +843,7 @@ impl HybridStore {
                 narrowed_default_fields,
                 emptied,
                 timings,
+                metrics: measured(extremes),
                 ..Default::default()
             });
         }
@@ -847,6 +932,7 @@ impl HybridStore {
         } else {
             parsed_query
         };
+        let countable = counted_by_the_index(parsed_query.as_ref());
         // The deadline rides on the query from here on: every collector path below —
         // scored, sorted, count-only — walks segments through it.
         let parsed_query = with_deadline(parsed_query, opts.deadline.as_ref());
@@ -861,7 +947,7 @@ impl HybridStore {
         // Declared out here because the resolve stage is outside the sort block.
         let mut sorted_by_document_key = false;
 
-        let (top_docs, total_hits) = if let Some(sort_spec) = _sort {
+        let (top_docs, total_hits, extremes) = if let Some(sort_spec) = _sort {
             // A sort names one value under two names, and on an index with a shadow field they
             // are not the same name.
             //
@@ -934,28 +1020,29 @@ impl HybridStore {
                 ($t:ty, $key:expr) => {{
                     let top_docs_collector = tantivy::collector::TopDocs::with_limit(limit)
                         .order_by_fast_field::<$t>(column_name, order);
-                    let count_collector = tantivy::collector::Count;
 
-                    // Use MultiCollector to get both results and count in single query execution
-                    let mut multi_collector = tantivy::collector::MultiCollector::new();
-                    let top_docs_handle = multi_collector.add_collector(top_docs_collector);
-                    let count_handle = multi_collector.add_collector(count_collector);
-
+                    // A sorted page gains nothing from a count apart: it walks every match
+                    // whatever the count does, so one walk collects both.
                     let walk_start = Instant::now();
-                    let mut multi_fruit = deadline_or(
-                        searcher.search(&parsed_query, &multi_collector),
+                    let (sorted, total_hits, extremes): (
+                        Vec<(Option<$t>, tantivy::DocAddress)>,
+                        _,
+                        _,
+                    ) = collect_page(
+                        &searcher,
+                        parsed_query.as_ref(),
+                        top_docs_collector,
+                        false,
+                        metrics.as_ref(),
                         opts.deadline.as_ref(),
                     )?;
                     timings.walk_ms += walk_start.elapsed().as_millis() as u64;
-                    let sorted: Vec<(Option<$t>, tantivy::DocAddress)> =
-                        top_docs_handle.extract(&mut multi_fruit);
-                    let total_hits = count_handle.extract(&mut multi_fruit);
 
                     let docs: Vec<(Option<SortKey>, tantivy::DocAddress)> = sorted
                         .into_iter()
                         .map(|(key, addr)| (($key)(key), addr))
                         .collect();
-                    (SearchResult::Sorted(docs), total_hits)
+                    (SearchResult::Sorted(docs), total_hits, extremes)
                 }};
             }
 
@@ -997,20 +1084,20 @@ impl HybridStore {
                                 }
                             }
                         });
-                    let count_collector = tantivy::collector::Count;
-                    let mut multi_collector = tantivy::collector::MultiCollector::new();
-                    let top_docs_handle = multi_collector.add_collector(top_docs_collector);
-                    let count_handle = multi_collector.add_collector(count_collector);
-
                     let walk_start = Instant::now();
-                    let mut multi_fruit = deadline_or(
-                        searcher.search(&parsed_query, &multi_collector),
+                    let (sorted, total_hits, extremes): (
+                        Vec<((bool, u128), tantivy::DocAddress)>,
+                        _,
+                        _,
+                    ) = collect_page(
+                        &searcher,
+                        parsed_query.as_ref(),
+                        top_docs_collector,
+                        false,
+                        metrics.as_ref(),
                         opts.deadline.as_ref(),
                     )?;
                     timings.walk_ms += walk_start.elapsed().as_millis() as u64;
-                    let sorted: Vec<((bool, u128), tantivy::DocAddress)> =
-                        top_docs_handle.extract(&mut multi_fruit);
-                    let total_hits = count_handle.extract(&mut multi_fruit);
                     let docs: Vec<(Option<SortKey>, tantivy::DocAddress)> = sorted
                         .into_iter()
                         .map(|((present, ranked), addr)| {
@@ -1022,7 +1109,7 @@ impl HybridStore {
                             (present.then(|| SortKey::Ip(format!("{value:032x}"))), addr)
                         })
                         .collect();
-                    (SearchResult::Sorted(docs), total_hits)
+                    (SearchResult::Sorted(docs), total_hits, extremes)
                 }
                 // A text field with a fast column is sorted by the column, in the collector,
                 // like any other sortable type. Tantivy keys this on the term ordinal, which
@@ -1032,20 +1119,20 @@ impl HybridStore {
                 tantivy::schema::FieldType::Str(_) if field_entry.is_fast() => {
                     let top_docs_collector = tantivy::collector::TopDocs::with_limit(limit)
                         .order_by_string_fast_field(column_name, order);
-                    let count_collector = tantivy::collector::Count;
-                    let mut multi_collector = tantivy::collector::MultiCollector::new();
-                    let top_docs_handle = multi_collector.add_collector(top_docs_collector);
-                    let count_handle = multi_collector.add_collector(count_collector);
-
                     let walk_start = Instant::now();
-                    let mut multi_fruit = deadline_or(
-                        searcher.search(&parsed_query, &multi_collector),
+                    let (sorted, total_hits, extremes): (
+                        Vec<(Option<String>, tantivy::DocAddress)>,
+                        _,
+                        _,
+                    ) = collect_page(
+                        &searcher,
+                        parsed_query.as_ref(),
+                        top_docs_collector,
+                        false,
+                        metrics.as_ref(),
                         opts.deadline.as_ref(),
                     )?;
                     timings.walk_ms += walk_start.elapsed().as_millis() as u64;
-                    let sorted: Vec<(Option<String>, tantivy::DocAddress)> =
-                        top_docs_handle.extract(&mut multi_fruit);
-                    let total_hits = count_handle.extract(&mut multi_fruit);
 
                     // The key is the sort value — kept for every string sort now, since
                     // the merge orders on it. When the sort named the document key the
@@ -1055,7 +1142,7 @@ impl HybridStore {
                         .into_iter()
                         .map(|(key, addr)| (key.map(SortKey::Str), addr))
                         .collect();
-                    (SearchResult::Sorted(docs), total_hits)
+                    (SearchResult::Sorted(docs), total_hits, extremes)
                 }
                 tantivy::schema::FieldType::Str(_) => {
                     // No fast column on this field, so there is nothing to order on in the
@@ -1087,21 +1174,18 @@ impl HybridStore {
 
                     let top_docs_collector =
                         tantivy::collector::TopDocs::with_limit(budget).order_by_score();
-                    let count_collector = tantivy::collector::Count;
-                    let mut multi_collector = tantivy::collector::MultiCollector::new();
-                    let top_docs_handle = multi_collector.add_collector(top_docs_collector);
-                    let count_handle = multi_collector.add_collector(count_collector);
-
+                    // A relevance page, so it prunes like the default one below.
                     let walk_start = Instant::now();
-                    let mut multi_fruit = deadline_or(
-                        searcher.search(&parsed_query, &multi_collector),
+                    let (top_docs, total_hits, extremes) = collect_page(
+                        &searcher,
+                        parsed_query.as_ref(),
+                        top_docs_collector,
+                        countable,
+                        metrics.as_ref(),
                         opts.deadline.as_ref(),
                     )?;
                     timings.walk_ms += walk_start.elapsed().as_millis() as u64;
-                    let top_docs: Vec<(f32, tantivy::DocAddress)> =
-                        top_docs_handle.extract(&mut multi_fruit);
-                    let total_hits = count_handle.extract(&mut multi_fruit);
-                    (SearchResult::Unsorted(top_docs), total_hits)
+                    (SearchResult::Unsorted(top_docs), total_hits, extremes)
                 }
                 _ => {
                     return Err(StoreError::Io(std::io::Error::new(
@@ -1115,25 +1199,22 @@ impl HybridStore {
                 }
             }
         } else {
-            // Default: sort by relevance score using MultiCollector
+            // Default: by relevance. A query whose count the index answers collects its page
+            // alone, so the walk prunes (see `counted_by_the_index`).
             let top_docs_collector =
                 tantivy::collector::TopDocs::with_limit(limit).order_by_score();
-            let count_collector = tantivy::collector::Count;
-            let mut multi_collector = tantivy::collector::MultiCollector::new();
-            let top_docs_handle = multi_collector.add_collector(top_docs_collector);
-            let count_handle = multi_collector.add_collector(count_collector);
-
             let walk_start = Instant::now();
-            let mut multi_fruit = deadline_or(
-                searcher.search(&parsed_query, &multi_collector),
+            let (top_docs, total_hits, extremes) = collect_page(
+                &searcher,
+                parsed_query.as_ref(),
+                top_docs_collector,
+                countable,
+                metrics.as_ref(),
                 opts.deadline.as_ref(),
             )?;
             timings.walk_ms += walk_start.elapsed().as_millis() as u64;
-            let top_docs: Vec<(f32, tantivy::DocAddress)> =
-                top_docs_handle.extract(&mut multi_fruit);
-            let total_hits = count_handle.extract(&mut multi_fruit);
 
-            (SearchResult::Unsorted(top_docs), total_hits)
+            (SearchResult::Unsorted(top_docs), total_hits, extremes)
         };
 
         debug!(
@@ -1146,6 +1227,7 @@ impl HybridStore {
             "Tantivy search completed"
         );
 
+        let metrics = measured(extremes);
         let is_empty = match &top_docs {
             SearchResult::Sorted(docs) => docs.is_empty(),
             SearchResult::Unsorted(docs) => docs.is_empty(),
@@ -1159,6 +1241,7 @@ impl HybridStore {
                 narrowed_default_fields,
                 emptied,
                 timings,
+                metrics,
                 ..Default::default()
             });
         }
@@ -1412,7 +1495,7 @@ impl HybridStore {
             narrowed_default_fields,
             emptied,
             timings,
-            metrics: None,
+            metrics,
         })
     }
 

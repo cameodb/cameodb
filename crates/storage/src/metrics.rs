@@ -265,6 +265,7 @@ enum ColumnKind {
 }
 
 /// Collects the extremes of `fields` over the documents a query matches.
+#[derive(Clone)]
 pub(crate) struct MetricsCollector {
     fields: Vec<(String, ColumnKind)>,
     spec: MetricsSpec,

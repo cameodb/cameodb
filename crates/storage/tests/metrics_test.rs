@@ -154,6 +154,18 @@ fn a_page_and_a_count_carry_the_same_metrics_and_none_unless_asked() {
     assert!(plain.metrics.is_none());
 }
 
+/// An exact id is answered from the key-value store, with no walk for the metrics to ride
+/// on: they are measured on their own, over the one document the id names.
+#[test]
+fn an_exact_id_lookup_is_measured_over_its_one_document() {
+    let (_temp, store) = store();
+    for limit in [0, 5] {
+        let metrics = measure(&store, "id:b", limit, &spec(&["delta"], &["delta"]));
+        assert_eq!(metrics.min["delta"], Some(MetricValue::I64(12)), "limit {limit}");
+        assert_eq!(metrics.max["delta"], Some(MetricValue::I64(12)), "limit {limit}");
+    }
+}
+
 #[test]
 fn an_array_counts_every_element_and_a_match_with_no_value_is_null_not_zero() {
     let (_temp, store) = store();

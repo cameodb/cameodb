@@ -175,6 +175,14 @@ impl Weight for DeadlineWeight {
     }
 
     fn count(&self, reader: &SegmentReader) -> tantivy::Result<u32> {
+        // Delegated without sampling: the search path counts this way only a single term,
+        // whose count is its document frequency, and match-all, whose count is the live
+        // document count — both read rather than walked on a segment without deletes, and
+        // an unscored postings walk on one with them. Checked up front so a spent deadline
+        // is still answered by the deadline.
+        if self.deadline.expired() {
+            return Err(Self::marker());
+        }
         self.inner.count(reader)
     }
 
