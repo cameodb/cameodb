@@ -9,7 +9,7 @@
 
 _TOOLCHAIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# The pinned version, e.g. 1.99.0.
+# The pinned version, e.g. 1.99.1.
 rust_version() {
     local version
     version="$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' "$_TOOLCHAIN_ROOT/rust-toolchain.toml")"

@@ -4,5 +4,5 @@
 # release binary is checked for the compiler that built it. Upgrade steps: scripts/README.md,
 # "Dependency and Toolchain Updates".
 [toolchain]
-channel = "1.99.0"
+channel = "1.99.1"
 profile = "default"

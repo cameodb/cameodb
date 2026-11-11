@@ -7,7 +7,7 @@
 # `rustup default` then names the toolchain the image already carries rather than fetching one.
 # The build scripts pass rust-toolchain.toml's channel; this default is for a bare
 # `docker build`, and scripts/validate/deps.sh fails when the two disagree.
-ARG RUST_VERSION=1.99.0
+ARG RUST_VERSION=1.99.1
 ARG TARGET_ABI=musl
 FROM rust:${RUST_VERSION}-slim AS builder
 
