@@ -18,7 +18,7 @@
 ignore = [
     # ---- hickory-proto 0.25.2 (via libp2p 0.56.0) ----
     # Dependency chain: libp2p 0.56.0 → libp2p-dns / libp2p-mdns → hickory-resolver / hickory-proto
-    # Both advisories are fixed in hickory 0.26.x. libp2p has merged the bump
+    # These advisories are fixed in hickory 0.26.2. libp2p has merged the bump
     # (PR #6423, commit 6766985) but v0.57 is not released yet.
     # Upgrade requires verifying kameo 0.22.2 compatibility with libp2p 0.57.
 
@@ -31,6 +31,17 @@ ignore = [
     # Risk for CameoDB: Very low. Requires dnssec-ring or dnssec-aws-lc-rs feature,
     # which is not enabled in our libp2p configuration.
     "RUSTSEC-2026-0118",
+
+    # RUSTSEC-2026-0491: memory amplification from record counts in a DNS header
+    # Risk for CameoDB: Moderate. A spoofed DNS or mDNS packet can make the decoder reserve ~18 MB
+    # before it fails, so repeated packets can pressure memory. Only peer-discovery traffic decodes DNS.
+    "RUSTSEC-2026-0491",
+
+    # RUSTSEC-2026-0487, 0489, 0490: panics parsing SVCB/HTTPS records or zone files from text
+    # Risk for CameoDB: Very low. Text parsing is not used on network input here.
+    "RUSTSEC-2026-0487",
+    "RUSTSEC-2026-0489",
+    "RUSTSEC-2026-0490",
 
     # ---- paste 1.0.15 (via netlink-packet-core → if-watch → libp2p) ----
     # paste is a finished proc-macro by dtolnay (Rust core library team).
