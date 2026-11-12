@@ -38,7 +38,7 @@ if [ "$(printf '%s\n' "$VERSION" | wc -l | tr -d ' ')" -ne 1 ] || [ -z "$VERSION
     grep -n '^version = ' "$PROJECT_ROOT"/crates/*/Cargo.toml >&2
     exit 1
 fi
-CORPORATE_CA_CERT="/usr/local/share/ca-certificates/corporate-ca.crt"
+CORPORATE_CA_CERT="${CAMEODB_CA_CERT:-/usr/local/share/ca-certificates/corporate-ca.crt}"
 
 # Parse architectures from args (default: amd64)
 ARCHS=("${@:-amd64}")
@@ -78,7 +78,7 @@ echo -e "${BLUE}Starting CameoDB distribution build for: ${ARCHS[*]}${NC}"
 # shellcheck source=../toolchain.sh
 source "$PROJECT_ROOT/scripts/toolchain.sh"
 BUILDER_ARGS=(--build-arg "RUST_VERSION=$(rust_version)")
-if [[ -f "${CORPORATE_CA_CERT}" ]]; then
+if [[ -s "${CORPORATE_CA_CERT}" ]]; then
     BUILDER_ARGS+=(--secret "id=corporate-ca,src=${CORPORATE_CA_CERT}")
 fi
 

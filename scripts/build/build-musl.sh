@@ -69,7 +69,14 @@ build_in_container() {
         # Tagged with the compiler it carries, so moving rust-toolchain.toml builds a new image
         # instead of reusing one cached from an older compiler, which `:latest` used to do.
         echo "Building $image (one time per compiler; emulated if it is not this host's architecture)"
+        # A TLS-intercepting proxy's CA, when one is configured: without it `rustup target add`
+        # fails with `invalid peer certificate: UnknownIssuer`. Same variable and default as
+        # docker-push.sh; the id is a build arg so a different CA rebuilds the layer.
+        local ca="${CAMEODB_CA_CERT:-/usr/local/share/ca-certificates/corporate-ca.crt}"
+        local ca_args=()
+        [ -s "$ca" ] && ca_args=(--secret "id=corporate-ca,src=$ca" --build-arg "CORPORATE_CA_ID=$ca")
         docker build --platform "$platform" --build-arg "RUST_VERSION=$RUST_VERSION" \
+            ${ca_args[@]+"${ca_args[@]}"} \
             -f docker/Dockerfile.builder -t "$image" docker/
     fi
     # A per-target volume: two architectures sharing one CARGO_TARGET_DIR thrash each other's

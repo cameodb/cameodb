@@ -457,7 +457,7 @@ export CAMEODB_CA_CERT=/usr/local/share/ca-certificates/corporate-ca.crt
 ```
 
 `scripts/build/docker-push.sh` reads the same variable, defaulting to
-`/var/tmp/buildkit-ca/corporate-ca.crt`.
+`/usr/local/share/ca-certificates/corporate-ca.crt`.
 
 The examples below use that variable. Without a corporate CA, use `/dev/null` — the build
 skips an empty file rather than special-casing it:

@@ -152,7 +152,7 @@ Build for multiple platforms (amd64 + arm64) and push to DockerHub:
 The build needs your CA certificate or `cargo fetch` fails on every crates.io request. Place
 it at the default path, or point `CAMEODB_CA_CERT` at it:
 ```bash
-/var/tmp/buildkit-ca/corporate-ca.crt        # picked up automatically
+/usr/local/share/ca-certificates/corporate-ca.crt        # picked up automatically
 CAMEODB_CA_CERT=/path/to/ca.crt ./scripts/build/docker-push.sh --no-push
 ```
 It is passed to the build as the `corporate-ca` secret — mounted into the build stage only,

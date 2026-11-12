@@ -19,7 +19,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Trust corporate CA certificate if provided (for TLS-intercepting proxies)
+# CORPORATE_CA_ID is in the cache key and the secret is not (see the root Dockerfile).
+ARG CORPORATE_CA_ID=none
 RUN --mount=type=secret,id=corporate-ca,dst=/usr/local/share/ca-certificates/corporate-ca.crt \
+    echo "corporate CA id: ${CORPORATE_CA_ID}" && \
     if [ -s /usr/local/share/ca-certificates/corporate-ca.crt ]; then \
         cat /usr/local/share/ca-certificates/corporate-ca.crt >> /etc/ssl/certs/ca-certificates.crt && \
         update-ca-certificates; \

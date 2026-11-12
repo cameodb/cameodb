@@ -35,7 +35,7 @@ BUILDER_NAME="cameo-builder"
 PLATFORMS="linux/amd64,linux/arm64"
 # Corporate CA for TLS-intercepting proxies, passed to the build as the `corporate-ca`
 # secret. Override with CAMEODB_CA_CERT=/path/to/ca.crt; skipped when absent or empty.
-CORPORATE_CA_CERT="${CAMEODB_CA_CERT:-/var/tmp/buildkit-ca/corporate-ca.crt}"
+CORPORATE_CA_CERT="${CAMEODB_CA_CERT:-/usr/local/share/ca-certificates/corporate-ca.crt}"
 
 # Parse arguments: [VERSION] [--no-push] [--repo NAME]
 VERSION=""

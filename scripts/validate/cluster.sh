@@ -145,7 +145,7 @@ if [ -z "$IMAGE" ]; then
     IMAGE="cameodb:validate"
     # The same CA handling as scripts/build/docker-push.sh: behind a TLS-inspecting proxy the
     # build's `cargo fetch` fails on every crates.io request without it.
-    ca="${CAMEODB_CA_CERT:-/var/tmp/buildkit-ca/corporate-ca.crt}"
+    ca="${CAMEODB_CA_CERT:-/usr/local/share/ca-certificates/corporate-ca.crt}"
     # shellcheck source=../toolchain.sh
     source "$ROOT/scripts/toolchain.sh"
     build_args=(--build-arg "RUST_VERSION=$(rust_version)")
