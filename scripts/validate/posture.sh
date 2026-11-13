@@ -277,6 +277,8 @@ trickle_post() {
         -H 'content-type: application/x-ndjson' -H 'expect:' -T - 2>/dev/null
 }
 
+curl -s -o /dev/null -m 30 -X PUT "$BASE/api/probe/document" -H "content-type: application/json" \
+    -d '{"id":"seed","doc":{"t":"x"}}'
 TRICKLE_PIDS=()
 for _ in 1 2 3 4; do
     trickle_post > /dev/null &
@@ -287,10 +289,16 @@ done
 sleep 3
 
 check_eq "health stays available while saturated" "200" "$(status "$BASE/_cluster/health")"
-check_eq "excess requests shed with 503" "503" \
-    "$(status -X POST "$BASE/api/probe/search" -H 'content-type: application/json' -d '{"query":"x"}')"
-if curl -s -D - -o /dev/null -m 10 -X POST "$BASE/api/probe/search" \
-    -H 'content-type: application/json' -d '{"query":"x"}' | grep -qi '^retry-after:'; then
+# Four trickles against four permits: writes may hold only three (the door reserves one for
+# everything else), so three are admitted and the fourth is already refused. The writes are
+# what is saturated, so that is the class to probe; a search must still be admitted, which
+# is the point of the reservation. The index is created above, since a search
+# of one that does not is a 404.
+WRITE_ARGS=(-X POST "$BASE/api/probe/document/stream" -H "content-type: application/x-ndjson" -d "{\"id\":\"x\",\"doc\":{\"t\":\"y\"}}")
+check_eq "excess writes shed with 503" "503" "$(status "${WRITE_ARGS[@]}")"
+check_eq "a search is still admitted while writes are saturated" "200" \
+    "$(status -X POST "$BASE/api/probe/search" -H "content-type: application/json" -d "{\"query\":\"x\"}")"
+if curl -s -D - -o /dev/null -m 10 "${WRITE_ARGS[@]}" | grep -qi '^retry-after:'; then
     pass "503 carries Retry-After"
 else
     fail "503 carries Retry-After"
