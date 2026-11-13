@@ -1663,8 +1663,60 @@ async fn submit_op(
     answer
 }
 
-/// Writes that cannot run — their writer is not taking work — used to sit at the head of the
-/// worker, one holding its place and the rest behind it, and every search queued after them
+/// A job the worker took but never started is answered at shutdown, and the answer says it
+/// did not run. Dropped, it reached its caller as a closed channel, which reads as "may have
+/// run" — true of a job that started, not of these.
+#[tokio::test]
+async fn jobs_never_started_are_refused_at_worker_shutdown() {
+    let (tx, rx) = mpsc::channel::<OrchestratorJob>(64);
+    tokio::spawn(orchestrator_worker_loop(
+        rx,
+        stalled_writer_runner(),
+        0,
+        None,
+        4,
+        None,
+        None,
+    ));
+    // Width 4 runs three writes; the other three are set aside.
+    let mut answers = Vec::new();
+    for _ in 0..6 {
+        answers.push(submit_op(&tx, writer_op()).await);
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    tx.send(OrchestratorJob::Shutdown).await.expect("shutdown");
+    // Queued behind the shutdown: never taken off the channel at all.
+    let behind = tokio::sync::oneshot::channel();
+    let queued = tx
+        .send(OrchestratorJob::Execute {
+            arrived_at: Instant::now(),
+            op: writer_op(),
+            affinity_shard: None,
+            reply: behind.0,
+        })
+        .await;
+
+    let mut refused = 0;
+    for answer in answers.drain(3..) {
+        match tokio::time::timeout(Duration::from_secs(2), answer).await {
+            Ok(Ok(WorkerOutcome::Done(Err(OrchestratorError::NotReady(_))))) => refused += 1,
+            Ok(Ok(_)) => panic!("a job that never started was answered as if it ran"),
+            Ok(Err(_)) => panic!("a job that never started was dropped without an answer"),
+            Err(_) => panic!("a job that never started was left waiting"),
+        }
+    }
+    assert_eq!(refused, 3);
+    if queued.is_ok() {
+        let answer = tokio::time::timeout(Duration::from_secs(2), behind.1)
+            .await
+            .expect("answered");
+        assert!(matches!(
+            answer,
+            Ok(WorkerOutcome::Done(Err(OrchestratorError::NotReady(_))))
+        ));
+    }
+}
+
 /// waited for a writer it never needed. Reads are served past them.
 #[tokio::test]
 async fn reads_are_served_while_writes_wait_for_a_stalled_writer() {

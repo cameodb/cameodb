@@ -239,6 +239,11 @@ peer ignores the spent-budget field a forwarded operation now carries.
   merge — the reader a delete by query takes to be current. Found by reading the reload path,
   not seen in a run. Reloads of one index, and the first open of its reader, now run one at a
   time; a commit waits its turn, and a search leaves the reload to the one already running.
+- **A request the node had not started when it shut down is answered as not started.** A
+  request taken by a worker but still waiting for a slot when the node stopped was dropped, and
+  its client was told the outcome was not confirmed — the answer for an operation that may have
+  run. These had not run: each is now answered `503` with `the node is shutting down; the
+  operation was not started`, so a client can retry a write without checking for it first.
 
 ## [0.3.9] - 2026-11-05
 

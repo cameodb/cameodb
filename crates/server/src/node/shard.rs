@@ -1119,6 +1119,28 @@ pub(super) fn spawn_writer_thread(
                             });
                             match res {
                                 Ok((seq_ids, _new_docs)) => {
+                                    // Checked like the merged path above, and for its reason:
+                                    // slicing on faith would panic outside the per-command
+                                    // guard and take the writer thread down.
+                                    let op_counts: Vec<usize> =
+                                        reply_segments.iter().map(|(count, _)| *count).collect();
+                                    let Some(ranges) =
+                                        merged_reply_ranges(&op_counts, seq_ids.len())
+                                    else {
+                                        tracing::error!(
+                                            index = %index,
+                                            expected = total_ops,
+                                            got = seq_ids.len(),
+                                            "Writer: coalesced batch write returned the wrong number of sequence ids"
+                                        );
+                                        for (_op_count, reply) in reply_segments {
+                                            let _ = reply.send(Err(StoreError::Serialization(
+                                                "coalesced batch write returned the wrong number of sequence ids"
+                                                    .to_string(),
+                                            )));
+                                        }
+                                        continue;
+                                    };
                                     written_indices.insert(index.clone());
                                     tracing::debug!(
                                         index = %index,
@@ -1129,12 +1151,10 @@ pub(super) fn spawn_writer_thread(
                                     );
 
                                     // Split merged seq_ids back to each caller by their original op count
-                                    let mut offset = 0usize;
-                                    for (op_count, reply) in reply_segments {
-                                        let segment: Vec<u64> =
-                                            seq_ids[offset..offset + op_count].to_vec();
-                                        let _ = reply.send(Ok(segment));
-                                        offset += op_count;
+                                    for ((_op_count, reply), range) in
+                                        reply_segments.into_iter().zip(ranges)
+                                    {
+                                        let _ = reply.send(Ok(seq_ids[range].to_vec()));
                                     }
                                 }
                                 Err(e) => {
@@ -2419,63 +2439,44 @@ impl MicroshardActor {
             "MicroshardActor: Starting batch write"
         );
 
-        let docs = request.docs;
-        let index_name = request.index;
-
-        // Group operations by index
-        let mut ops_by_index: HashMap<String, Vec<WalOp>> = HashMap::new();
-
-        for doc_payload in docs {
-            let wal_op = WalOp::Put {
+        // A request names one index, so its documents are one batch: no grouping, and the
+        // index name is not cloned per document.
+        let index = request.index;
+        let wal_ops: Vec<WalOp> = request
+            .docs
+            .into_iter()
+            .map(|doc_payload| WalOp::Put {
                 id: doc_payload.id,
                 json_blob: Some(doc_payload.doc),
-            };
-
-            ops_by_index
-                .entry(index_name.clone())
-                .or_default()
-                .push(wal_op);
+            })
+            .collect();
+        if wal_ops.is_empty() {
+            return Ok(Vec::new());
         }
 
         tracing::debug!(
             shard_id = %self.shard_id,
-            unique_indices = ops_by_index.len(),
-            "MicroshardActor: Dispatching batch write to writer thread"
+            index = %index,
+            ops_count = wal_ops.len(),
+            "MicroshardActor: Sending batch to writer thread"
         );
-
-        // Dispatch each index batch to the dedicated writer thread
-        let mut all_seq_ids = Vec::new();
-        let mut written_indices = Vec::new();
-        for (index, wal_ops) in ops_by_index {
-            tracing::debug!(
-                shard_id = %self.shard_id,
-                index = %index,
-                ops_count = wal_ops.len(),
-                "MicroshardActor: Sending batch to writer thread"
-            );
-
-            let seq_ids = self
-                .handle_batch_write_via_channel(index.clone(), wal_ops)
-                .await?;
-            all_seq_ids.extend(seq_ids);
-            written_indices.push(index);
-        }
+        let seq_ids = self
+            .handle_batch_write_via_channel(index.clone(), wal_ops)
+            .await?;
 
         // Signal supervisor AFTER batch completes on the writer thread.
         // At this point counters are already incremented and the writer thread
         // may have already committed via maybe_commit_writer. The supervisor
         // starts its idle-timeout timer from here.
-        for index in written_indices {
-            self.signal_supervisor(index).await;
-        }
+        self.signal_supervisor(index).await;
 
         tracing::debug!(
             shard_id = %self.shard_id,
-            seq_count = all_seq_ids.len(),
+            seq_count = seq_ids.len(),
             "MicroshardActor: Batch write fully completed"
         );
 
-        Ok(all_seq_ids)
+        Ok(seq_ids)
     }
 
     /// Deletes all data for an index from this shard's storage.

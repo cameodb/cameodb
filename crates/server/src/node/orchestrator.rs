@@ -2530,6 +2530,28 @@ pub(super) async fn orchestrator_worker_loop<F, Fut>(
         }
     }
 
+    // Answer what never started. A job dropped here would reach its caller as a closed reply
+    // channel, which the router has to report as unconfirmed — it cannot tell a job that was
+    // never started from one that ran and lost its answer. These did not run, so they say so:
+    // the jobs set aside, and whatever is still in the channel behind the shutdown.
+    rx.close();
+    let mut unstarted: Vec<tokio::sync::oneshot::Sender<WorkerOutcome>> =
+        parked.drain(..).map(|job| job.reply).collect();
+    while let Ok(job) = rx.try_recv() {
+        if let OrchestratorJob::Execute { reply, .. } = job {
+            unstarted.push(reply);
+        }
+    }
+    for reply in unstarted {
+        left_queue();
+        if let Some(stats) = &dispatch_stats {
+            stats.job_left_pool();
+        }
+        let _ = reply.send(WorkerOutcome::Done(Err(OrchestratorError::NotReady(
+            "the node is shutting down; the operation was not started".to_string(),
+        ))));
+    }
+
     // Drain before returning. Operations run as spawned tasks now, and on the pinned path
     // this function is the argument to `block_on` — returning drops the worker's
     // current_thread runtime, which cancels every task still on it. That would abandon
