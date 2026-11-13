@@ -185,7 +185,7 @@ pub struct StorageConfig {
     /// never reaches it is not searchable until it does. Measured by time, the first costs one
     /// commit per interval however fast documents arrive, and the second is bounded too.
     ///
-    /// With an interval the count still applies, twenty times higher, as a backstop bounding
+    /// With an interval the count still applies, a hundred times higher, as a backstop bounding
     /// the WAL tail a restart replays. The idle commit after the last write is the node's, not
     /// this crate's: see `supervisor_timeout_secs`. `0` here is the count-only policy the
     /// library's own tests are written against; the node sets `[search] commit_interval_ms`.

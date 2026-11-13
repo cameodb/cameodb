@@ -97,7 +97,7 @@ All write operations follow a strict sequence to ensure atomicity across both st
    └─ Tantivy commit deferred (see "Commit policy"):
       ├─ Interval: once the oldest uncommitted write has waited commit_interval_ms
       │   (2 s on a node), checked by the writer thread after each drain, after replying
-      ├─ Backstop: 20× the count threshold derived from default_batch_size
+      ├─ Backstop: 100× default_batch_size in operations, or 4 writer arenas in bytes
       └─ Idle: supervisor_timeout_secs after the last write (3 s by default),
           enforced by the idle-commit supervisor in the server crate
 ```
@@ -585,14 +585,14 @@ the reader reloads, and a checkpoint transaction truncates the WAL it covers.
 | Trigger | Where | Rule |
 |---|---|---|
 | **Interval** | writer thread, after each drain | the oldest uncommitted write has waited `commit_interval_ms` |
-| **Backstop** | writer thread, after each drain | pending operations reach 20× the count threshold |
+| **Backstop** | writer thread, after each drain | pending operations reach 100× the count threshold, or pending bytes reach 4 writer arenas |
 | **Idle** | server crate's per-index supervisor | `supervisor_timeout_secs` with no writes to the index |
 | **Explicit** | writer thread | admin commit, eviction, the recovered tail at boot, shutdown |
 
-The count threshold is `default_batch_size` × (1 + 19 × budget ratio): 1,000 operations for a
-new index up to 20,000 at the maximum memory budget, so the backstop runs from 20,000 to
-400,000. It bounds the WAL tail a restart replays when writes arrive faster than an interval
-covers.
+The count threshold is `default_batch_size`: 1,000 operations by default, so the operation
+backstop is 100,000. The bytes backstop is four times `indexer_memory_min_mb` — 256 MB at the
+default 64. Both are per index, per shard, and together they bound the WAL tail a restart
+replays when writes arrive faster than an interval covers.
 
 The interval runs from the **oldest pending** write, not from the last commit, so an index
 that has been idle takes a write, waits an interval, and commits once — rather than committing
@@ -634,7 +634,7 @@ commit_interval_ms = 2000       # longest a write waits to become searchable und
 supervisor_timeout_secs = 3     # idle commit after the last write; keep >= the interval
 
 [storage]
-default_batch_size = 1000       # base of the count threshold (and of the 20x backstop)
+default_batch_size = 1000       # base of the count threshold (and of the 100x backstop)
 ```
 
 ## Tiered Cache Sizing for redb

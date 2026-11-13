@@ -817,7 +817,7 @@ pub struct SearchConfig {
     /// load committed on nearly every batch, and a trickle that never reached the count was
     /// not searchable until it did. By time, a bulk load commits once per interval however
     /// fast it arrives, and a trickle is searchable within one. The count still applies,
-    /// twenty times higher, as a backstop bounding what a restart replays, and so do the bytes:
+    /// a hundred times higher, as a backstop bounding what a restart replays, and so do the bytes:
     /// four writer arenas (`indexer_memory_min_mb`) per index per shard.
     ///
     /// Each shard runs a little longer than this, by up to half of it in steps of its ordinal,

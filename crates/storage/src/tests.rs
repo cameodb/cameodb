@@ -2723,7 +2723,7 @@ mod commit_interval_tests {
         );
     }
 
-    /// The backstop: twenty times the count commits at once, so a load faster than one interval
+    /// The backstop: a hundred times the count commits at once, so a load faster than one interval
     /// can cover still bounds the WAL tail a restart would replay.
     #[test]
     fn the_backstop_commits_without_waiting_for_the_clock() {

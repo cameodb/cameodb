@@ -67,9 +67,9 @@ A commit is not per document, and it is what makes a write searchable. Per `(sha
 1. **The commit interval** (`[search] commit_interval_ms`, 2 s by default). The writer thread
    commits once the oldest uncommitted write has waited that long, checked after each batch of
    writes it drains — after it has answered them, so no write's latency includes a commit.
-2. **A count backstop.** Twenty times `default_batch_size × (1 + budget_ratio × 19)` — 20 000
-   ops at the minimum indexer memory budget — commits regardless of the clock, bounding what a
-   restart replays.
+2. **The backstops.** A hundred times `default_batch_size` — 100 000 operations by default —
+   or four writer arenas (`indexer_memory_min_mb`) of uncommitted bytes commits regardless of
+   the clock, bounding what a restart replays.
 3. **The idle commit** (`[search] supervisor_timeout_secs`, 3 s by default), for the writes that
    end a burst and have nothing after them to trigger the interval.
 

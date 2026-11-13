@@ -5252,27 +5252,27 @@ async fn a_deferred_batch_still_commits_at_the_backstop() {
     let dir = tempfile::tempdir().expect("temp dir");
     let index = "backstop";
     let mut shard = started_shard(eager_commit_config(dir.path().to_path_buf())).await;
-    seed(&shard, index, 60).await;
+    seed(&shard, index, 150).await;
     let store = Arc::clone(shard.store.as_ref().expect("store"));
     let backstop = store.commit_backstop_ops() as usize;
-    assert!(backstop > 1 && backstop < 60, "backstop {backstop}");
+    assert!(backstop > 1 && backstop < 150, "backstop {backstop}");
 
     // Under the backstop: no commit.
     shard
         .handle_deferred_batch_delete(index.to_string(), ids(backstop - 1))
         .await
         .expect("deferred delete");
-    assert_eq!(searchable(&shard, index), 60);
+    assert_eq!(searchable(&shard, index), 150);
 
     // One more deferred op reaches it: committed.
     shard
         .handle_deferred_batch_delete(index.to_string(), vec![format!("d{}", backstop - 1)])
         .await
         .expect("deferred delete");
-    wait_searchable(&shard, index, 60 - backstop).await;
+    wait_searchable(&shard, index, 150 - backstop).await;
     assert_eq!(
         searchable(&shard, index),
-        60 - backstop,
+        150 - backstop,
         "the backstop commits what a deferring sender has written"
     );
     shard.shutdown_writer().await;

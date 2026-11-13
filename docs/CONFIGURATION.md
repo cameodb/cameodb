@@ -481,7 +481,7 @@ quick_repair = true
 wal_segment_size_mb = 64
 
 # Default batch size for bulk ingestion; also the base of the commit count (default: 1000).
-# With `[search] commit_interval_ms` set (the default), time triggers a commit and twenty times
+# With `[search] commit_interval_ms` set (the default), time triggers a commit and a hundred times
 # this count is only a backstop bounding what a restart replays; with it at 0, this count is
 # the commit threshold itself. Either way an index also commits once it holds four writer
 # arenas (4 x `indexer_memory_min_mb`) of uncommitted writes on a shard, so large documents

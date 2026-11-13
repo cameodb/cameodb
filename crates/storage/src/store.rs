@@ -202,7 +202,14 @@ pub(crate) const NOTHING_PENDING: u64 = 0;
 /// The interval is what normally triggers a commit; this, with [`COMMIT_BACKSTOP_ARENAS`], bounds
 /// the WAL tail a restart replays when writes arrive faster than an interval can cover. Counted
 /// in operations because a delete costs the writer a queued term whatever its size.
-pub(crate) const COMMIT_BACKSTOP_MULTIPLE: u64 = 20;
+///
+/// A hundred, so that at the default `default_batch_size` of 1,000 the interval stays the
+/// trigger under a bulk load. At twenty, a shard taking 15,000 documents a second reached the
+/// count in 1.3 s, ahead of its 2 s interval, and committed half again as often as the
+/// interval asks: bulk measured 57–59k docs/s against 61–63k with the count out of the way.
+/// The bytes bound what a restart replays whatever the document size, so the count is left to
+/// bound what bytes do not measure — the operations themselves, deletes above all.
+pub(crate) const COMMIT_BACKSTOP_MULTIPLE: u64 = 100;
 
 /// The uncommitted bytes an index may hold on a shard before it commits regardless of the
 /// clock, in writer arenas (`indexer_memory_min_mb`): what a restart replays is re-indexed

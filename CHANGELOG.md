@@ -113,6 +113,16 @@ peer ignores the spent-budget field a forwarded operation now carries.
   in place of the general advice about `AND` and phrases, which pointed elsewhere; without such a
   clause the general advice stays, and no longer reads a quoted value as a phrase; `describe_index` gives every field its keys
   in one order.
+- **Under a bulk load, the commit interval decides the commits again.** With
+  `commit_interval_ms` set, an index also commits once it holds a count of uncommitted operations
+  whatever the clock says, to bound what a restart replays. That count was 20 ×
+  `default_batch_size` — 20,000 by default, which a shard taking 15,000 documents a second
+  reaches in 1.3 s, ahead of its 2-second interval, so a bulk load committed about half again as
+  often as the interval asks. It is now 100 × `default_batch_size`, 100,000 by default; bulk at
+  eight connections on a 4-shard node measured 61–63k documents a second against 57–59k. An
+  index still commits once it holds four writer arenas (`indexer_memory_min_mb`) of uncommitted
+  bytes, so large documents do not stretch the replay. Both limits are per index, per shard. A
+  node that set `default_batch_size` to move this count gets five times the count it had.
 
 ### Fixed
 
