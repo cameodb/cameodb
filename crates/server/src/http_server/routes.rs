@@ -19,7 +19,6 @@ use axum::{
 };
 use cameodb_mcp::{MCP_SESSION_ID_HEADER, McpShutdownHandle, mcp_router};
 use futures::StreamExt;
-use tokio::sync::Semaphore;
 use tower_http::{
     catch_panic::CatchPanicLayer,
     compression::CompressionLayer,
@@ -41,6 +40,7 @@ use crate::http_server::catalogue::{
     create_config_handler, delete_index_handler, get_config_handler, list_cluster_indexes_handler,
     list_indexes_handler, update_schema_handler,
 };
+use crate::http_server::door::{DoorClass, DoorPermits, drain_refused_body};
 use crate::http_server::health::health_handler;
 use crate::http_server::oauth::{
     authorization_server_handler, authorize_page_handler, authorize_submit_handler,
@@ -119,10 +119,13 @@ pub fn create_router(state: AppState, config: &RouterConfig<'_>) -> (Router, Mcp
     // semaphore admits is already doomed — it just takes a body read, a parse and a trip to a
     // worker to find out. `QueueLoad` is the pool's own estimate of that backlog, and asking
     // it here refuses the same request for the price of a few atomic loads. See ROADMAP F7.
-    let semaphore = Arc::new(Semaphore::new(max_concurrent_requests));
+    //
+    // The permits are split by what a request is — see `door`: searches and writes each have a
+    // share of the count they cannot pass, so a flood of one leaves room for the other.
+    let door = DoorPermits::new(max_concurrent_requests);
     let queue_load = state.queue_load.clone();
     let concurrency_guard = from_fn(move |req: axum::extract::Request, next: Next| {
-        let sem = semaphore.clone();
+        let door = door.clone();
         let queue_load = queue_load.clone();
         async move {
             // Health checks may arrive with or without a trailing slash; exempt them all so a
@@ -143,27 +146,19 @@ pub fn create_router(state: AppState, config: &RouterConfig<'_>) -> (Router, Mcp
                 // `refuse` counts it and builds the one refusal text — the dispatch path
                 // answers with the same error, so the two layers cannot drift.
                 let err = load.refuse(predicted);
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    // When the predicted backlog clears, not a fixed delay — a client retrying
-                    // sooner than this is coming back into the overload it was shed from.
-                    [(
-                        header::RETRY_AFTER,
-                        load.retry_after_secs(predicted).to_string(),
-                    )],
-                    err.to_string(),
-                )
-                    .into_response();
+                // When the predicted backlog clears, not a fixed delay — a client retrying
+                // sooner than this is coming back into the overload it was shed from.
+                let retry_after = load.retry_after_secs(predicted).to_string();
+                return refuse_at_the_door(req, retry_after, err.to_string()).await;
             }
-            match sem.try_acquire_owned() {
+            let class = DoorClass::of(req.method(), path);
+            match door.try_admit(class) {
                 Ok(permit) => hold_permit_for_streamed_body(next.run(req).await, permit),
-                Err(_) => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    // Without this, clients retry immediately and deepen the overload.
-                    [(header::RETRY_AFTER, "1")],
-                    "Too many concurrent requests".to_string(),
-                )
-                    .into_response(),
+                // A second: without a `Retry-After`, clients retry immediately and deepen
+                // the overload.
+                Err(full) => {
+                    refuse_at_the_door(req, "1".to_string(), full.message().to_string()).await
+                }
             }
         }
     });
@@ -437,6 +432,31 @@ async fn fault_panic_handler() -> axum::response::Response {
 #[derive(Clone, Copy)]
 pub(crate) struct StreamedBody;
 
+/// Answer a request the door will not admit: `503`, when to come back, and why.
+///
+/// The request's body is read first, within [`drain_refused_body`]'s bounds, so the client
+/// reads the refusal rather than finding the connection closed under the body it was still
+/// sending. A body left unread closes the connection, and the response says so.
+async fn refuse_at_the_door(
+    req: axum::extract::Request,
+    retry_after: String,
+    message: String,
+) -> Response {
+    let drained = drain_refused_body(req).await;
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, retry_after)],
+        message,
+    )
+        .into_response();
+    if !drained {
+        response
+            .headers_mut()
+            .insert(header::CONNECTION, HeaderValue::from_static("close"));
+    }
+    response
+}
+
 /// Release `permit` with `response`, or, for a [`StreamedBody`], only once its body is done.
 ///
 /// A permit held by the guard ends when the handler returns, which for an ordinary response
@@ -445,10 +465,7 @@ pub(crate) struct StreamedBody;
 /// how many requests may be in flight, and a caller could open streams without limit. Moved
 /// into the body, the permit lasts as long as the stream: to its end, to the client leaving,
 /// or to the search giving up on a client that stopped reading.
-fn hold_permit_for_streamed_body(
-    response: Response,
-    permit: tokio::sync::OwnedSemaphorePermit,
-) -> Response {
+fn hold_permit_for_streamed_body<P: Send + 'static>(response: Response, permit: P) -> Response {
     if response.extensions().get::<StreamedBody>().is_none() {
         return response;
     }

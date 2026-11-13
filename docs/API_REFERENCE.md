@@ -134,10 +134,22 @@ retry-after: 1
 overloaded: a 803ms backlog against a 1000ms request
 ```
 
-The refusal is made at the door, before the body is read, from the node's own estimate of the
-backlog against the time left on `request_timeout_secs`. `Retry-After` is that predicted wait
-rounded up to whole seconds where the refusal knows it, and one second otherwise — retrying
-sooner puts the request back into the backlog it was shed from.
+The refusal is made at the door, before the request is parsed or queued, from the node's own
+estimate of the backlog against the time left on `request_timeout_secs`. `Retry-After` is that
+predicted wait rounded up to whole seconds where the refusal knows it, and one second otherwise —
+retrying sooner puts the request back into the backlog it was shed from.
+
+The door also bounds how many requests are in flight at once
+(`[network.http] max_concurrent_requests`), and how many of one kind: searches (both search
+routes and `/mcp`) may hold three quarters of that count, and so may writes (the document, bulk
+and delete-by-query routes), so a flood of one kind leaves room for the other. The body of the
+`503` says which bound was met: `Too many concurrent search requests`, `Too many concurrent write
+requests`, or `Too many concurrent requests` when the whole count is in use.
+
+A refused request's body is read and discarded before the `503` is sent, up to 4 MB and 250 ms,
+so a client still sending a bulk batch reads the refusal and its `Retry-After` rather than a
+closed connection. A larger or slower body is not waited for: the `503` carries `Connection:
+close`, and a client mid-upload may see the connection close instead.
 
 | Status | What it means | What a client should do |
 |--------|---------------|-------------------------|

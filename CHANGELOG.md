@@ -132,6 +132,17 @@ peer ignores the spent-budget field a forwarded operation now carries.
   count is the index's own and the find resolves ids alone. On a 4-shard node taking bulk and
   single writes beside 500 searches a second, a delete of 50,000 documents took 0.37–0.59 s
   against 0.53–1.14 s, and the searches beside the deletes had a median of 11 ms against 66–82 ms.
+- **A flood of searches no longer shuts writes out at the door, nor a flood of writes
+  searches.** `max_concurrent_requests` was one count for every request, so a search storm held
+  every permit and the node answered its writes and deletes `503` while its writer threads were
+  idle. Searches (both search routes and `/mcp`) may now hold three quarters of the count at
+  once, and so may writes (the document, bulk and delete-by-query routes); other routes are
+  bounded by the count alone. With 16 permits, 64 search connections and 4 writers, 40,222 writes
+  were refused in 15 s before and none after, the searches served at the same rate. The `503`
+  names the bound it met: `Too many concurrent search requests`, `Too many concurrent write
+  requests`, or `Too many concurrent requests`. A node that serves one kind only now admits
+  three quarters of the count — 96 of the default 128; one that runs pinned at the count on a
+  single kind raises it by a third to keep what it had.
 
 ### Fixed
 
@@ -244,6 +255,14 @@ peer ignores the spent-budget field a forwarded operation now carries.
   its client was told the outcome was not confirmed — the answer for an operation that may have
   run. These had not run: each is now answered `503` with `the node is shutting down; the
   operation was not started`, so a client can retry a write without checking for it first.
+- **A bulk request refused under load reads as `503`, not as a broken connection.** The door
+  refused a request without reading its body, and the connection closed while the client was
+  still sending: the client reported the `503` or a transport error, whichever it noticed first,
+  and in the second case had no `Retry-After` to wait by. Small requests were not affected. A
+  refused request's body is now read and discarded first, up to 4 MB and 250 ms; of 33,000
+  refused bulk batches of 2,000 documents, 1,258 reached the client as transport errors before
+  and none after, with no change in throughput. A larger or slower body is answered at once, as
+  before, with `Connection: close`.
 
 ## [0.3.9] - 2026-11-05
 

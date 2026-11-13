@@ -7,6 +7,7 @@
 
 mod admin;
 mod catalogue;
+mod door;
 mod error;
 mod health;
 mod oauth;

@@ -223,6 +223,18 @@ at a cost of one comparison; widening admission does not create capacity, it con
 refusals into expensive timeouts. If a node is shedding, either give it more capacity or
 lengthen the budget its callers allow.
 
+**One kind of request cannot take the whole count.** Searches — both search routes and `/mcp` —
+may hold three quarters of `max_concurrent_requests` at once, and so may writes — the document,
+bulk and delete-by-query routes; every other route is bounded by the count alone. At the
+default 128 that is 96 of each, so a flood of searches leaves 32 permits a search cannot take,
+and a write still gets in. Under one shared count a search flood held every permit and the node
+refused its writes while its writer threads were idle: with 16 permits, 64 search connections
+and 4 writers, 40,222 writes were refused in 15 s, and none with the shares. The price is that a
+node serving one kind only admits three quarters of the count: a pure bulk load pinned at the
+limit — reachable with a small count, not at the default — moved 15% fewer documents until the
+count was raised by a third. The `503` names the bound: `Too many concurrent search requests`,
+`Too many concurrent write requests`, or `Too many concurrent requests`.
+
 `[limits]` is what this node can hold; [`[security.limits]`](#rate-limiting-tool-calls-search-and-writes-securitylimits)
 is what one caller may ask of it. Unknown keys inside `[limits]` are refused at startup rather
 than ignored, so a typo cannot leave a limit silently at its default.

@@ -377,7 +377,9 @@ pub struct HttpConfig {
     /// Maximum concurrent in-flight HTTP requests (default: 128).
     ///
     /// Requests exceeding this limit receive HTTP 503 Service Unavailable.
-    /// This protects against connection-flooding DoS attacks.
+    /// This protects against connection-flooding DoS attacks. Searches may hold three quarters
+    /// of the count at once, and so may writes, so a flood of one kind leaves room for the
+    /// other — see `http_server::door`.
     #[serde(default = "default_http_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
 
