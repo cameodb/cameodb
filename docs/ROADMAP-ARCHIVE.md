@@ -6405,6 +6405,120 @@ second queue, was the smaller change and was not taken: it would have shed write
 with no request budget, where nothing is shed today. `/_admin/workers` reports `queue_capacity`
 for both queues together.
 
+## X. Stored documents, compressed ✅ Done
+
+Opened and closed 2026-11-13. A shard's `store.redb` holds every document as a JSON row in
+`data_<index>`, and on a text collection that file is most of what the node keeps: 3.0 GB of
+redb beside 211 MB of Tantivy files on the largest shard of the development node. The search
+index does not hold the document (its fields are indexed, not stored, apart from the id), so the
+row is the one copy, and the place a byte saved is a byte saved.
+
+### X1 — A document row is LZ4-compressed against its index's own first documents
+
+**What was measured first.** Documents here are small, a kilobyte or two, and repeat little
+inside themselves; what they repeat is each other: the field names, the fixed values, the
+phrasing of a collection. Each shard's rows were read from a copy of the file and recompressed
+three ways.
+
+| Sample (rows read) | LZ4 per row | LZ4 + a trained 64 KB dictionary | LZ4 over 16 neighbouring rows |
+|---|---|---|---|
+| Real text, 3,390 rows, 2.7 KB average | 75% of raw | 60% | 63% |
+| Real text, 936 rows, 1.7 KB | 82% | 27% | 39% |
+| Synthetic benchmark documents, 150,000 rows, 1.8 KB | 45% | 8% | 8% |
+
+A row alone saves a fifth on real text; against a dictionary of the collection's own documents,
+a half to three quarters. A decode costs 0.3–2.5 µs a row against 0.15 µs for a read of the raw
+row, and a page of ten hits pays 10–25 µs against search times in milliseconds. A compress costs
+1–9 µs a row. The samples of real text are small, and the third is generated, so the ratios are
+indications, not a promise.
+
+**Why not compress in blocks, as Tantivy's document store does.** It buffers documents to 16 KB
+and compresses the block, with a skip index to find a document's block and a small cache of
+decompressed ones. That works because a segment is written once and never changed. A row here is
+keyed by its document id and is updated and deleted in place: every write would read, decompress,
+change and rewrite 16 KB for a 1.7 KB document, and a second mapping from id to block would have
+to be kept right on every write. The neighbouring-rows column above shows what blocks buy: no
+more than the dictionary does on real text. Two ideas from Tantivy were kept: a stored row names
+its own codec, and compression happens outside the write transaction (see below).
+
+**What was built.** The row is either as written (a JSON object, first byte `{`, which is every
+row any earlier version wrote) or `0x01`, the length as written, the length of dictionary it was
+compressed against, and an LZ4 block. A row that would not shrink stays as written, and nothing
+under 64 bytes is tried.
+
+The dictionary is one per index per store, in a table `_doc_dict`, at most 65,535 bytes, which
+is the most LZ4 can refer back. It is **append-only**: while it has room, the documents a batch
+writes are appended to it whole, and once full it never changes. A row records how much of it
+it was compressed against and is decompressed against that prefix, so a row written when it
+held 12,000 bytes reads the same when it holds 65,535: nothing is versioned, nothing is
+re-encoded. A batch is compressed against the dictionary as last committed, before the write
+transaction opens, and the bytes it adds commit in that transaction; a row can only name bytes
+the table holds. A copy kept in memory per index may be behind the table and never ahead of it;
+a read that finds a row needing more than its copy holds reads the table again, once.
+
+Simulated on the same rows before it was built, the dictionary the writes fill reaches 30–61%
+of raw bytes where a trained one reaches 27–60% on the two real samples (the first 14 and 44
+documents fill it), and 12% where a trained one reaches 8% on the synthetic one. Filling it
+needs no training pass, no background work and no coordination: the shard's writer is the only
+thing that appends.
+
+**Where it reaches.** One write site, and the five reads of a stored row go through one decode:
+the page fetch, `get_by_key`, WAL replay at boot, a delete by query's check of its matches
+against the store, and the schema-field sample. `delete_index_data` removes the index's
+dictionary in the transaction that removes its rows and moves an epoch so a copy read before the
+delete is not put back after; the name's next documents start a dictionary of their own.
+
+**`cameodb compact --rewrite`.** The one way to compress what a node wrote before, and to take
+the early rows of a young index to the whole dictionary. For each data table it reads every row
+(decoding a row compressed against a dictionary that was still filling), fills a fresh
+dictionary from the table's first documents, and writes every row compressed against all of it,
+the dictionary going into the first transaction that holds a row naming it. Each table's count
+is checked as before. An in-place `compact` moves pages and does not touch a row.
+
+**What it cost and what it bought.** Release builds, a fresh node, the default read pool
+(15 threads), seeded with 200,000 documents, then bulk (four connections, batches of 500) and
+four single-write connections for 15 s each, then 500 searches a second for 20 s; two runs each.
+
+| | Before | After |
+|---|---|---|
+| Bulk ingest | 32.1k and 32.9k documents/s | 38.5k and 38.9k |
+| Single-write latency, p50 and p99 | 21 ms, 94–103 ms | 21 ms, 93–95 ms |
+| Search service time at 500/s on 200k documents, p50 / p99 | 1.10 ms / 1.77–1.91 ms | 0.97–1.10 ms / 1.49–1.89 ms |
+| `store.redb`, 200k benchmark documents | 78–84 MB | 48–49 MB |
+
+Bulk is faster because fewer bytes go into redb. Everything else is unchanged, within the spread
+of the runs. On a copy of the development node's largest shard a rewrite took `store.redb` from
+3,036 MB to 310 MB in nine seconds, every one of its 1,085,679 documents decoding to the same
+bytes as before; the two real-text tables came to 60.6% and 28.5% of their stored bytes, the
+synthetic one to 13.1%. Most of that shard is synthetic, so the shard total says more about the
+benchmark data than about yours: the real-text figures are the guide.
+
+**What it changes for an operator.** A 0.3.9 node cannot read a row 0.3.10 compressed, so there
+is no downgrade once 0.3.10 has written to a data directory; the changelog's upgrade note says
+so. Nothing is configured, and nothing needs migrating. Rows written before are read as they
+are and compressed when next written; a rewrite compresses them all. A rewrite now fails on a
+row that is neither a JSON object nor a compressed row, naming the document; it used to copy
+any bytes.
+
+**What it keeps.** Up to 64 KB of the first documents' text stays in an index's dictionary until
+the index is deleted, whether or not those documents are. A deployment for which that matters
+has a smaller alternative, a dictionary of field names and structure alone, which saves less; it
+was not built.
+
+**Left, not filed.**
+
+- *A second dictionary for an index whose documents drift.* The dictionary reflects the first
+  few dozen documents, so a collection that later changes shape compresses less well. The row's
+  header could carry a dictionary number and a second be started without touching old rows. It
+  waits for the drift to be seen.
+- *Compressing a bulk batch in parallel.* Once the dictionary is full a document's compression
+  depends only on the document and the dictionary, so a batch could be compressed on several
+  threads before the writer takes its transaction, as Tantivy compresses blocks on a thread of
+  its own. Bulk already rose by a fifth with the compression in the writer's own path, so it
+  waits for a measurement that says it is needed.
+- *A switch.* There is none: compression is always on. `store.redb` files already written stay as
+  they are until rewritten.
+
 ## V. Cluster HA — delivered items
 
 The introduction to this group and its open items are in [ROADMAP.md](../ROADMAP.md), under [V. Cluster HA](../ROADMAP.md#v-cluster-ha--replication-the-two-node-mirror-and-elasticity--partial).
