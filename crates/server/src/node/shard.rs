@@ -1391,6 +1391,98 @@ pub(super) fn writer_monitor(rt: WriterRuntime, mut handle: std::thread::JoinHan
     }
 }
 
+/// Reset an index's idle-commit timer. `false` means the supervisor task behind this sender is
+/// gone, so the caller must arm a new one; a full channel is a reset already on its way.
+fn nudge_supervisor(tx: &mpsc::Sender<()>) -> bool {
+    !matches!(tx.try_send(()), Err(mpsc::error::TrySendError::Closed(())))
+}
+
+/// One index's idle-commit supervisor: every nudge on `rx` restarts the timer, and a timer that
+/// runs out asks the writer thread to commit the index. It leaves the map once such a commit
+/// succeeds with no write behind it, so an idle index costs no task.
+///
+/// The writer's sender is read from the shared slot at each timeout, not captured when the
+/// supervisor is armed. A writer thread that crashed and was respawned has a new channel; a
+/// captured sender would be closed for good, and a supervisor that exited on it used to leave
+/// its map entry behind — later writes nudged the dead entry, never armed a new supervisor, and
+/// the index got no idle commit until restart. Reading the slot means the same supervisor simply
+/// reaches the replacement writer on its next timeout, and the writes acknowledged before the
+/// crash are committed without waiting for a later write.
+pub(super) async fn idle_commit_supervisor(
+    index: String,
+    mut rx: mpsc::Receiver<()>,
+    idle: Duration,
+    writer_slot: Arc<ArcSwapOption<mpsc::Sender<StorageCommand>>>,
+    supervisors: Arc<AsyncRwLock<HashMap<String, mpsc::Sender<()>>>>,
+) {
+    loop {
+        tokio::select! {
+            signal = rx.recv() => {
+                if signal.is_none() {
+                    // The map was cleared at shutdown. Exit without attempting a commit.
+                    tracing::debug!(index = %index, "Supervisor channel closed, exiting");
+                    return;
+                }
+                // A write arrived; the timer restarts with the next turn of the loop.
+            }
+            _ = tokio::time::sleep(idle) => {
+                let Some(writer_tx) = writer_slot.load_full() else {
+                    // The slot is emptied only at shutdown; there is no writer left to ask.
+                    tracing::debug!(index = %index, "Supervisor: writer stopped, exiting");
+                    return;
+                };
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                let sent = writer_tx
+                    .send(StorageCommand::Commit {
+                        index: index.clone(),
+                        reply: reply_tx,
+                    })
+                    .await
+                    .is_ok();
+                if !sent {
+                    // The writer thread is down and its replacement is not published yet. The
+                    // writes are still uncommitted, so stay armed and try the next timeout.
+                    tracing::debug!(index = %index, "Supervisor: writer channel closed, retrying after the next idle timeout");
+                    continue;
+                }
+
+                match reply_rx.await {
+                    Ok(Ok(())) => {
+                        tracing::debug!(index = %index, "Supervisor committed index via writer thread after idle timeout");
+                        // Leave the map only if nothing arrived while the commit ran.
+                        // A write in that window found this supervisor's sender and
+                        // nudged it rather than arming a new one, and may have landed
+                        // after the commit — exiting would drop its nudge and leave it
+                        // unsearchable until some later write. Every nudge is sent
+                        // under the map's read lock, so under the write lock the
+                        // channel is final: empty means no write is waiting on us, and
+                        // the next one will find no entry and arm a fresh supervisor.
+                        let mut supervisors = supervisors.write().await;
+                        if !rx.is_empty() {
+                            continue;
+                        }
+                        // A closed channel means shutdown cleared the map, and the entry under
+                        // this name — if there is one — belongs to a newer supervisor.
+                        if !rx.is_closed() {
+                            supervisors.remove(&index);
+                        }
+                        return;
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(index = %index, error = %e, "Supervisor commit failed via writer thread");
+                        // Stay armed; the next signal resets the timer, the next timeout retries.
+                    }
+                    Err(_) => {
+                        // The writer thread died with this commit in hand. Stay armed and ask
+                        // its replacement on the next timeout.
+                        tracing::debug!(index = %index, "Supervisor: commit reply dropped, retrying after the next idle timeout");
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl MicroshardActor {
     pub(super) fn new(
         shard_id: Uuid,
@@ -1828,7 +1920,7 @@ impl MicroshardActor {
     pub(super) async fn shutdown_writer(&mut self) {
         use tokio::time::{Duration, timeout};
 
-        // Clear supervisors (they hold cloned writer_tx)
+        // Clear supervisors: dropping their senders ends each idle-commit task.
         {
             let mut supervisors = self.supervisors.write().await;
             let count = supervisors.len();
@@ -1844,7 +1936,7 @@ impl MicroshardActor {
         self.shutting_down.store(true, AtomicOrdering::Relaxed);
 
         // Send shutdown signal and wait for thread exit. Taking the sender out of the shared slot
-        // also closes the channel to any lingering supervisor clone.
+        // also tells a supervisor caught mid-timeout that there is no writer left to ask.
         if let Some(tx) = self.writer_tx.swap(None) {
             if tx.send(StorageCommand::Shutdown).await.is_ok() {
                 let timeout_secs = self.writer_shutdown_timeout_secs;
@@ -2092,13 +2184,11 @@ impl MicroshardActor {
     /// The supervisor's role is idle-timeout commit: if no writes arrive for N seconds,
     /// it sends a Commit to the writer thread to flush any remaining uncommitted data.
     pub(super) async fn signal_supervisor(&self, index: String) {
-        // Snapshot the current sender for this supervisor's idle commits. If the writer is later
-        // replaced, this snapshot's channel closes; the supervisor's send then fails and it exits,
-        // and the next write re-arms a fresh supervisor with the new sender.
-        let writer_tx = match self.writer_tx.load_full() {
-            Some(tx) => tx,
-            None => return,
-        };
+        // No writer channel means the shard is not started or is shutting down; there is
+        // nothing an idle commit could be sent to.
+        if self.writer_tx.load().is_none() {
+            return;
+        }
 
         // Fast path: the supervisor for this index already exists, which is the case for
         // every write after the first. Taking the write lock here — as this used to — made
@@ -2106,101 +2196,39 @@ impl MicroshardActor {
         // scheduler a reason to park the task, on the hot path, purely to send a timer reset.
         {
             let supervisors = self.supervisors.read().await;
-            if let Some(tx) = supervisors.get(&index) {
-                let _ = tx.try_send(());
+            if let Some(tx) = supervisors.get(&index)
+                && nudge_supervisor(tx)
+            {
                 return;
             }
         }
 
         let mut supervisors = self.supervisors.write().await;
         // Re-check: another writer may have created the supervisor while we waited for the
-        // write lock.
-        if let Some(tx) = supervisors.get(&index) {
-            // Signal existing supervisor to reset its timer
-            let _ = tx.try_send(());
-        } else {
-            // Spawn new supervisor task
-            // Larger buffer to avoid dropping reset signals during bursts
-            let (tx, mut rx) = mpsc::channel(64);
-            let index_clone = index.clone();
-            // From the node config. This used to read `CAMEODB_SUPERVISOR_TIMEOUT_SECS`
-            // directly, which meant `[search] supervisor_timeout_secs` in a config file and
-            // `--supervisor-timeout-secs` on the command line were both silently ignored —
-            // the environment variable worked only because it bypassed the config system
-            // entirely. The config layer still maps that variable onto this field, so the
-            // env var keeps working; the file and the flag now work too.
-            let timeout_dur = Duration::from_secs(self.supervisor_timeout_secs);
-            let supervisors_arc = self.supervisors.clone();
-
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        result = rx.recv() => {
-                            match result {
-                                Some(()) => {
-                                    // Signal received, timer implicitly resets by continuing loop
-                                    continue;
-                                }
-                                None => {
-                                    // Channel closed (shutdown or supervisor map cleared).
-                                    // Exit cleanly without attempting commit.
-                                    tracing::debug!(index = %index_clone, "Supervisor channel closed, exiting");
-                                    break;
-                                }
-                            }
-                        }
-                        _ = tokio::time::sleep(timeout_dur) => {
-                            // Timer expired without a signal, trigger commit via writer thread
-                            let index_inner = index_clone.clone();
-                            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                            let send_ok = writer_tx.send(StorageCommand::Commit {
-                                index: index_inner.clone(),
-                                reply: reply_tx,
-                            }).await.is_ok();
-
-                            if !send_ok {
-                                // Writer thread channel closed (shutdown in progress).
-                                // Exit cleanly — no point retrying.
-                                tracing::debug!(index = %index_inner, "Supervisor: writer channel closed, exiting");
-                                break;
-                            }
-
-                            match reply_rx.await {
-                                Ok(Ok(())) => {
-                                    tracing::debug!(index = %index_inner, "Supervisor committed index via writer thread after idle timeout");
-                                    // Leave the map only if nothing arrived while the commit ran.
-                                    // A write in that window found this supervisor's sender and
-                                    // nudged it rather than arming a new one, and may have landed
-                                    // after the commit — exiting would drop its nudge and leave it
-                                    // unsearchable until some later write. Every nudge is sent
-                                    // under the map's read lock, so under the write lock the
-                                    // channel is final: empty means no write is waiting on us, and
-                                    // the next one will find no entry and arm a fresh supervisor.
-                                    let mut supervisors = supervisors_arc.write().await;
-                                    if !rx.is_empty() {
-                                        continue;
-                                    }
-                                    supervisors.remove(&index_clone);
-                                    break;
-                                }
-                                Ok(Err(e)) => {
-                                    tracing::error!(index = %index_inner, error = %e, "Supervisor commit failed via writer thread");
-                                    // Keep supervisor alive; next signal resets timer, next timeout retries
-                                    continue;
-                                }
-                                Err(_) => {
-                                    // Reply channel dropped — writer thread shut down mid-commit.
-                                    tracing::debug!(index = %index_inner, "Supervisor: reply dropped (writer shutdown), exiting");
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-
-            supervisors.insert(index, tx);
+        // write lock. An entry whose task is gone is replaced rather than nudged — a nudge to
+        // it reaches nobody, and the index would get no idle commit until restart.
+        if let Some(tx) = supervisors.get(&index)
+            && nudge_supervisor(tx)
+        {
+            return;
         }
+
+        // Larger buffer to avoid dropping reset signals during bursts
+        let (tx, rx) = mpsc::channel(64);
+        // From the node config. This used to read `CAMEODB_SUPERVISOR_TIMEOUT_SECS`
+        // directly, which meant `[search] supervisor_timeout_secs` in a config file and
+        // `--supervisor-timeout-secs` on the command line were both silently ignored —
+        // the environment variable worked only because it bypassed the config system
+        // entirely. The config layer still maps that variable onto this field, so the
+        // env var keeps working; the file and the flag now work too.
+        tokio::spawn(idle_commit_supervisor(
+            index.clone(),
+            rx,
+            Duration::from_secs(self.supervisor_timeout_secs),
+            Arc::clone(&self.writer_tx),
+            Arc::clone(&self.supervisors),
+        ));
+        supervisors.insert(index, tx);
     }
 
     /// Handles write requests via the dedicated writer thread.

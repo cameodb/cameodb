@@ -5083,6 +5083,11 @@ fn eager_commit_config(path: std::path::PathBuf) -> StorageConfig {
 }
 
 async fn started_shard(config: StorageConfig) -> MicroshardActor {
+    started_shard_with_idle(config, 600).await
+}
+
+/// A started shard whose idle commit fires after `idle_secs` without a write.
+async fn started_shard_with_idle(config: StorageConfig, idle_secs: u64) -> MicroshardActor {
     let mut shard = MicroshardActor::new(
         Uuid::new_v4(),
         config,
@@ -5093,7 +5098,7 @@ async fn started_shard(config: StorageConfig) -> MicroshardActor {
             read_budget: None,
             total_shards: 1,
             writer_shutdown_timeout_secs: 5,
-            supervisor_timeout_secs: 600,
+            supervisor_timeout_secs: idle_secs,
             writer_pin: WriterPin {
                 target: None,
                 outcome: Arc::new(AtomicI64::new(UNPINNED)),
@@ -5271,4 +5276,131 @@ async fn a_deferred_batch_still_commits_at_the_backstop() {
         "the backstop commits what a deferring sender has written"
     );
     shard.shutdown_writer().await;
+}
+
+/// An idle-commit entry whose task is gone is replaced by the next write, not nudged. A nudge
+/// to it reaches nobody, so the index would get no idle commit again until restart — which is
+/// what a writer-thread respawn used to leave behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_replaces_an_idle_commit_supervisor_that_is_gone() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let shard = started_shard_with_idle(writer_test_config(dir.path().to_path_buf()), 1).await;
+
+    let (gone, receiver) = mpsc::channel::<()>(1);
+    drop(receiver);
+    shard
+        .supervisors
+        .write()
+        .await
+        .insert("idx".to_string(), gone);
+
+    shard
+        .handle_write(WriteRequest {
+            index: "idx".to_string(),
+            id: "a".to_string(),
+            routing_key: String::new(),
+            doc: json!({"title": "written over a dead supervisor entry"}),
+        })
+        .await
+        .expect("write");
+
+    let live = shard
+        .supervisors
+        .read()
+        .await
+        .get("idx")
+        .map(|tx| !tx.is_closed());
+    assert_eq!(live, Some(true), "the write armed a live supervisor");
+    wait_searchable(&shard, "idx", 1).await;
+}
+
+/// The supervisor asks whichever writer is current when its timer runs out. While the writer
+/// thread is down the ask fails and the supervisor stays armed; once a replacement is
+/// published it gets the commit, with no further write to bring it.
+#[tokio::test]
+async fn the_idle_commit_reaches_a_writer_published_after_it_was_armed() {
+    let (dead, dead_rx) = mpsc::channel::<StorageCommand>(1);
+    drop(dead_rx);
+    let slot = Arc::new(arc_swap::ArcSwapOption::new(Some(Arc::new(dead))));
+    let supervisors = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+    let (nudge, nudges) = mpsc::channel::<()>(8);
+    supervisors
+        .write()
+        .await
+        .insert("idx".to_string(), nudge.clone());
+    let task = tokio::spawn(idle_commit_supervisor(
+        "idx".to_string(),
+        nudges,
+        Duration::from_millis(40),
+        Arc::clone(&slot),
+        Arc::clone(&supervisors),
+    ));
+
+    // A few timeouts against the closed channel: still armed, entry still in the map.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        !task.is_finished(),
+        "a down writer does not end the supervisor"
+    );
+    assert!(supervisors.read().await.contains_key("idx"));
+
+    let (live, mut commands) = mpsc::channel::<StorageCommand>(4);
+    slot.store(Some(Arc::new(live)));
+    let command = tokio::time::timeout(Duration::from_secs(5), commands.recv())
+        .await
+        .expect("the replacement writer is asked to commit")
+        .expect("channel open");
+    let StorageCommand::Commit { index, reply } = command else {
+        panic!("the supervisor sends a commit");
+    };
+    assert_eq!(index, "idx");
+    reply.send(Ok(())).expect("supervisor waits for the reply");
+
+    task.await.expect("supervisor ends after a clean commit");
+    assert!(
+        !supervisors.read().await.contains_key("idx"),
+        "an idle index keeps no supervisor"
+    );
+    drop(nudge);
+}
+
+/// End to end, on a build with the fault seams: the writer thread is killed while an index's
+/// idle commit is armed, and the writes around the crash are still published by the idle
+/// timeout. Run with `cargo test -p server --bin cameodb --features fault-injection`.
+#[cfg(feature = "fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_idle_commit_survives_a_writer_respawn() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let shard = started_shard_with_idle(writer_test_config(dir.path().to_path_buf()), 1).await;
+    let write = |index: &str, id: &str| WriteRequest {
+        index: index.to_string(),
+        id: id.to_string(),
+        routing_key: String::new(),
+        doc: json!({"title": "a document"}),
+    };
+
+    shard
+        .handle_write(write("idx", "armed"))
+        .await
+        .expect("write before the crash");
+    let crashed = shard
+        .handle_write(write("fault_kill_writer__", "boom"))
+        .await;
+    assert!(
+        crashed.is_err(),
+        "the trap index takes the writer thread down"
+    );
+
+    let mut respawned = false;
+    for _ in 0..200 {
+        if shard.handle_write(write("idx", "after")).await.is_ok() {
+            respawned = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(respawned, "the monitor respawns the writer");
+
+    // No commit is asked for here: only the idle timeout can publish these two.
+    wait_searchable(&shard, "idx", 2).await;
 }

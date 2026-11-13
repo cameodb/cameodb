@@ -207,6 +207,12 @@ peer ignores the spent-budget field a forwarded operation now carries.
   the sweep after a peer connects and the exchange after shards are registered ran outside the
   cancellation that ends peer tasks before the swarm stops, so one still waiting on a peer at that
   moment could panic inside the actor library.
+- **An index keeps its idle commit after a shard's writer thread is replaced.** A shard replaces
+  its writer thread if that thread dies. An index with an idle commit pending at that moment got
+  no idle commit again until the node restarted: the writes that ended a burst were durable, and
+  stayed out of search until a later write to the index brought a commit. The idle commit now
+  goes to the replacement writer, so the writes acknowledged before the crash are searchable
+  after `supervisor_timeout_secs` with no further write.
 
 ## [0.3.9] - 2026-11-05
 
