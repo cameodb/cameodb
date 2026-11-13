@@ -6212,6 +6212,199 @@ holds the untokenized value, so a sort orders by the value as written. Its match
 holds data takes it with a reindex, declared on the field itself or, keeping a `string` field as it
 is for exact matching, on a ghost of it.
 
+## W. Mixed-workload review ✅ Done
+
+Opened and closed 2026-11-13. Scoped against the code at `be89c87`, after the changes of
+2026-11-11 that stopped reads waiting behind writes (`9622b20`), bounded uncommitted writes by
+bytes (`5643279`) and paced a delete by query to its request's budget (`4f7eb9d`). The question
+was whether a node taking searches, bulk and single writes and occasional deletes by query at
+once — continuous ingestion beside agent and application searches — is in shape for production.
+
+**How it was reviewed.** The write, commit, dispatch and delete paths read in full; a probe test
+for each suspected defect, kept as a regression test where it failed; and a mixed run on one
+4-shard node: 500 searches a second offered, bulk at four connections in batches of 500, four
+single-write connections, and a delete by query of 50,000 documents every few seconds with one
+of 200,000 among them. The node's configuration set `search_threads = 8` on 15 cores, about half
+the default width, so the latencies below are those of a read pool run nearly full — see the
+last paragraph of this section. Every delete was followed to completion, then a dry run and a search of a
+deleted range, the node's health, and the worker pool's `abandoned`, `refused_at_admission` and
+`jobs_dropped`.
+
+**What held.** No lock or queue made reads wait for writes: with the read pool full and a
+hundred requests queued, every read thread was on the CPU and the writer, merge and indexing
+threads were idle. Every delete by query completed in one request; a dry run and a search of a
+deleted range answered 0; health stayed green and the three counters stayed 0, before the
+changes below and after them.
+
+**Measured**, two runs a build in alternating order, the deletes running:
+
+| | Before | After W1–W5 |
+|---|---|---|
+| Search p50 | 82, 66 ms | 11, 11 ms |
+| Search p99 | 478, 407 ms | 367, 352 ms |
+| Searches refused (`503`) | 624, 376 | 230, 178 |
+| Bulk | 28.7k, 28.9k docs/s | 30.8k, 32.1k docs/s |
+| Single writes | 79, 81 /s | 90, 93 /s |
+| A delete of 50,000 | 0.53–1.14 s | 0.37–0.59 s |
+
+Without deletes, searches beside bulk and single writes were unchanged: p99 9–12 ms on either
+build. One run with W6 and W7 in gave the same shape — search p50 13 ms, p99 300 ms, 290
+refused, no write or bulk batch refused.
+
+**The search p99 above is the test configuration's, not a delete's.** The first reading was
+that a delete by query's find, which walks every match on the read pool and takes up to half of
+it, was what left search p99 at some 300 ms. Measured apart, it is not:
+
+- Searches at 500 a second with one delete of 77,000 documents and no ingestion: p99 15 ms.
+- The same beside bulk and single writes, five runs: p99 73–99 ms, nothing refused. With the
+  find moved off the read pool, five runs: 44–99 ms. The pool's queue moved from about 9.5 to
+  11 while the delete ran, either way.
+- At 700 searches a second the pool of 8 filled as ingestion grew the index — the bench's
+  search matches every document and counts them, so its cost follows the index's size — and
+  refused 480–1,505 searches a run, starting some eight seconds after the delete had answered.
+- With `search_threads` at its default, the 15 cores of the node: p99 21–27 ms at 700 a second
+  and 8–9 ms at 500, nothing refused, and bulk and single writes no slower (32k documents and
+  101–105 writes a second, against 28–31k and 81–93 at 8).
+- `merge_num_threads` at 1, 2 and 4 made no difference to searches, bulk, single writes or the
+  delete: the merge threads were idle throughout.
+
+So the table above compares two builds fairly — both ran at 8 — and overstates what either
+would show on a node left at its defaults. Nothing was changed in the code for it. The sample
+configuration in `docs/CONFIGURATION.md` showed `search_threads = 8` as though it were the
+default, and now shows the setting commented out.
+
+**Left as found.** A delete by query still removes a document that was updated after the last
+commit so that it no longer matches; the API reference says so.
+
+### W1 — An index lost its idle commit when its writer thread was replaced
+
+✅ **Found and fixed 2026-11-13** (`443fd76`). Each index with uncommitted writes has an
+idle-commit supervisor: a task that asks the shard's writer thread to commit once no write has
+arrived for `supervisor_timeout_secs`. It captured the writer's channel when it was armed. A
+shard replaces its writer thread if that thread dies, on a new channel; the supervisor's next
+commit request failed on the closed one and the task exited, leaving its entry in the map that
+later writes look in. Those writes found the entry, sent their timer reset to nobody, and armed
+no new supervisor — so the index had no idle commit again until the node restarted. Reproduced
+on a build with the fault seams: three acknowledged writes were still out of search after four
+idle timeouts. They were durable throughout, and appeared with the next commit a later write
+brought.
+
+The supervisor now reads the writer's sender from the shard's shared slot at each timeout, so
+the same task reaches the replacement writer and commits what was acknowledged before the
+crash, with no further write. A request that fails because the replacement is not published yet,
+or a reply dropped by a writer that died with the commit in hand, leaves it armed for the next
+timeout. A write that finds an entry whose task is gone replaces it. Pinned by two tests on any
+build and one end to end on a fault-injection build.
+
+### W2 — The operation backstop committed ahead of the interval under bulk
+
+✅ **Done 2026-11-13** (`dfdde77`). With a commit interval set, an index also commits once it
+holds a count of uncommitted operations whatever the clock says, to bound what a restart
+replays. Until `5643279` that count grew with the index, from 20,000 to 400,000; since then it
+was a flat 20 × `default_batch_size`, 20,000 by default. A shard taking 15,000 documents a
+second reaches that in 1.3 s, ahead of its interval of 2 to 3 seconds by shard, so under bulk
+the count decided the commits, about half again as many as the interval asks.
+
+It is now 100 × `default_batch_size`. Bulk at eight connections, batches of 500, two runs a
+build: 57.2k and 58.7k documents a second before, 61.4k and 62.6k after. The bytes backstop of
+`5643279` — four writer arenas of uncommitted writes per index per shard — is unchanged and
+bounds the replay whatever the document size, so the count is left to bound what bytes do not
+measure: the operations, deletes above all. That the count was committing early is inferred
+from the thresholds and the throughput; counting the commits directly needed debug logging,
+which halved the load.
+
+### W3 — A delete by query checked every match against the store under ingestion
+
+✅ **Done 2026-11-13** (`d43df87`). The find reads the last commit, and a document deleted since
+is still in it, so each match is checked against the document store — one point read a match,
+the largest cost of the find — and a count walks every candidate to do the same. The check ran
+whenever the index had any uncommitted write. On an index under continuous ingestion that is
+always, though a put removes nothing the searcher holds: only a delete since the commit can
+leave a match the store no longer has.
+
+The store now counts uncommitted deletes per index beside its operations and bytes, and the
+find checks against the store only while that count is not zero. Otherwise the count phase is
+the index's own count and the find resolves ids alone. This is what moved the table above: the
+count and the find hold read threads for less time, so the searches beside a delete wait less.
+
+### W4 — Reader reloads were not serialized
+
+✅ **Done 2026-11-13** (`d43df87`), found by reading, not seen in a run. A commit reloads its
+index's reader on the writer thread; a search that finds a background merge has published new
+segments reloads it on a read thread. Tantivy's reload builds a searcher from `meta.json` and
+then stores it, with nothing ordering two callers, so a search's reload begun before a commit
+could store after the commit's own and leave the reader without the newest commit until the
+next commit or merge — while the index's pending count read zero, which a delete by query takes
+to mean the reader is current. A second reload of the same segments also discards the caches
+warmed for the first.
+
+Reloads of one index's reader, and its first open, now take turns under a lock kept with the
+index's `meta.json` probe. A commit, a close and a finished merge wait for their turn; a search
+that noticed a merge leaves the work to a reload already running, and looks again a second later
+if that one began before the change it saw.
+
+### W5 — Three small hardening changes on the write path
+
+✅ **Done 2026-11-13** (`e7edba2`), each a few lines.
+
+- *Jobs never started are answered at shutdown.* A job a worker had taken and not started was
+  dropped when the worker stopped, and its caller was told the outcome was not confirmed — the
+  answer for an operation that may have run. These are now refused with `503`, *the node is
+  shutting down; the operation was not started*, as are the jobs still in the worker's queue.
+- *The coalesced batch reply split is checked.* Several bulk requests to one index are applied
+  as one transaction and the sequence ids handed back by each request's count. The split
+  sliced the ids unchecked, outside the guard that catches a panic per command, where the path
+  beside it already checked; a wrong count would have taken the writer thread down.
+- *One batch per bulk request.* The shard grouped a request's documents by index name, a map
+  lookup and a clone of the name per document, though a request names one index.
+
+### W6 — One kind of request could take every permit at the door
+
+✅ **Done 2026-11-13** (`600ffbc`). `max_concurrent_requests` was one count for every request.
+Inside the node the worker pool keeps writes to three quarters of a worker's slots so reads
+always have some, and nothing did the same where requests arrive: a flood of searches held
+every permit and the node answered its writes and deletes `503` while its writer threads were
+idle. Under 2,000 searches a second offered, 10 of 12 deletes by query and 88% of single writes
+were refused.
+
+The door now classes a request by its method and path, before any body is read: searches (both
+search routes and `/mcp`), writes (the document, bulk and delete-by-query routes), and the rest.
+Searches may hold three quarters of the count at once, and so may writes; the rest are bounded
+by the count alone. With 16 permits, 64 search connections and 4 writers: 40,222 writes refused
+in 15 s before, none after, the searches served at the same rate. The `503` names the bound it
+met. The cost: a node serving one kind only admits three quarters of the count. Pinned at a
+count of 16 with bulk alone, it moved 15% fewer documents (252k against 295k a second), and
+with the count raised to 21 — the same sixteen writes admitted — as many as before (298k). At
+the default 128 the share is 96, past what a node's writer threads use.
+
+*Refusals read as broken connections.* A refusal was answered without reading the request's
+body, so the connection closed while a client was still sending a bulk batch, and the client
+reported the `503` or a transport error, whichever it saw first: 1,258 of 33,085 refused batches
+of 2,000 documents. A refused request's body is now read and discarded first, up to 4 MB and
+250 ms — none of 30,279 refusals reached the client as a transport error, and throughput at an
+equal write share was unchanged. Past those bounds the answer is immediate, as before, and says
+`Connection: close`. Having the client announce the body with `Expect: 100-continue` was the
+other option and was not taken: it needs every client to cooperate, and the drain serves the
+ones that do not.
+
+### W7 — Reads stalled once a worker held its limit of set-aside writes
+
+✅ **Done 2026-11-13** (`09cce73`). Since `9622b20` a worker sets a write aside when no writer
+slot is free and serves the reads behind it. It took both kinds off one queue, though, and
+stopped taking jobs once it held twice its width in set-aside writes, so that the queue's own
+capacity bounds the backlog: three writes running and eight set aside at a width of four, in the
+probe; 22 outstanding writes on one worker at the default width of eight. From there the
+searches queued behind them waited for a writer thread they did not need. Out of reach on a
+node of four or more shards at the default `max_concurrent_requests` (eight workers, 176
+writes), and reachable with one or two shards, or a raised limit, when a writer thread is slow.
+
+Each worker now has a queue for reads and a queue for writer work. At its limit of set-aside
+writes it stops reading the write queue and goes on reading the other; a full write queue
+refuses writes alone, where a full shared queue refused both. The refusal on a limit, without a
+second queue, was the smaller change and was not taken: it would have shed writes on a node
+with no request budget, where nothing is shed today. `/_admin/workers` reports `queue_capacity`
+for both queues together.
+
 ## V. Cluster HA — delivered items
 
 The introduction to this group and its open items are in [ROADMAP.md](../ROADMAP.md), under [V. Cluster HA](../ROADMAP.md#v-cluster-ha--replication-the-two-node-mirror-and-elasticity--partial).

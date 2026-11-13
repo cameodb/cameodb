@@ -319,8 +319,9 @@ memory_pressure_threshold_percent = 80
 
 # Maximum searches running concurrently on this node
 # (default: the cores available to the process, at least 2; max(2, CPU/2) if set to 0)
-# Searches beyond this limit queue instead of spawning more threads.
-search_threads = 8
+# Searches beyond this limit queue instead of spawning more threads. Left unset here: a value
+# under the core count holds searches to that many threads while the other cores sit idle.
+# search_threads = 8
 
 # Default search result limit (default: 10)
 # Note: Explicit limit 0 in queries means count-only mode (returns total_hits without documents)
@@ -2004,7 +2005,7 @@ total_memory_limit_mb = 2048
 indexer_memory_min_mb = 64
 indexer_memory_max_mb = 512
 memory_pressure_threshold_percent = 80
-search_threads = 8
+# search_threads is left at its default: the cores available to the process
 default_search_limit = 10
 
 [network.cluster]
