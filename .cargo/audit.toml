@@ -43,6 +43,19 @@ ignore = [
     "RUSTSEC-2026-0489",
     "RUSTSEC-2026-0490",
 
+    # ---- hickory DNSSEC validation (via libp2p-dns): no dnssec feature is enabled, so no validation runs ----
+    "RUSTSEC-2026-0504",
+    "RUSTSEC-2026-0505",
+    "RUSTSEC-2026-0511",
+    "RUSTSEC-2026-0512",
+    "RUSTSEC-2026-0514",
+    "RUSTSEC-2026-0530",
+    "RUSTSEC-2026-0531",
+    "RUSTSEC-2026-0532",
+
+    # ---- libp2p-gossipsub 0.49.5: in Cargo.lock only, no gossipsub feature enabled, not compiled ----
+    "RUSTSEC-2026-0534",
+
     # ---- paste 1.0.15 (via netlink-packet-core → if-watch → libp2p) ----
     # paste is a finished proc-macro by dtolnay (Rust core library team).
     # Advisory is informational only — no security vulnerability.

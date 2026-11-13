@@ -19,6 +19,18 @@ ignore = [
     { id = "RUSTSEC-2026-0487", reason = "transitive via libp2p 0.56.0; needs hickory-proto >=0.26.2 (libp2p 0.57), and kameo 0.22.2 still pins libp2p 0.56 (rechecked 2026-11-11: 0.22.2 is the latest kameo; its unreleased main uses libp2p 0.57); review-by 2027-03-31" },
     { id = "RUSTSEC-2026-0489", reason = "transitive via libp2p 0.56.0; needs hickory-proto >=0.26.2 (libp2p 0.57), and kameo 0.22.2 still pins libp2p 0.56 (rechecked 2026-11-11: 0.22.2 is the latest kameo; its unreleased main uses libp2p 0.57); review-by 2027-03-31" },
     { id = "RUSTSEC-2026-0490", reason = "transitive via libp2p 0.56.0; needs hickory-proto >=0.26.2 (libp2p 0.57), and kameo 0.22.2 still pins libp2p 0.56 (rechecked 2026-11-11: 0.22.2 is the latest kameo; its unreleased main uses libp2p 0.57); review-by 2027-03-31" },
+    # DNSSEC validation flaws in hickory-proto/-resolver 0.25: libp2p-dns resolves peer multiaddrs and never enables a dnssec feature, so no
+    # validation runs and these are not reachable from our configuration; they are listed because the crate is in the lockfile.
+    { id = "RUSTSEC-2026-0504", reason = "transitive via libp2p 0.56.0; needs hickory >=0.26.2 (libp2p 0.57), and kameo 0.22.2 still pins libp2p 0.56 (rechecked 2026-11-13: 0.22.2 is the latest kameo); review-by 2027-03-31" },
+    { id = "RUSTSEC-2026-0505", reason = "transitive via libp2p 0.56.0; needs hickory >=0.26.2 (libp2p 0.57), and kameo 0.22.2 still pins libp2p 0.56 (rechecked 2026-11-13: 0.22.2 is the latest kameo); review-by 2027-03-31" },
+    { id = "RUSTSEC-2026-0511", reason = "transitive via libp2p 0.56.0; needs hickory >=0.26.2 (libp2p 0.57), and kameo 0.22.2 still pins libp2p 0.56 (rechecked 2026-11-13: 0.22.2 is the latest kameo); review-by 2027-03-31" },
+    { id = "RUSTSEC-2026-0512", reason = "transitive via libp2p 0.56.0; needs hickory >=0.26.2 (libp2p 0.57), and kameo 0.22.2 still pins libp2p 0.56 (rechecked 2026-11-13: 0.22.2 is the latest kameo); review-by 2027-03-31" },
+    { id = "RUSTSEC-2026-0514", reason = "transitive via libp2p 0.56.0; needs hickory >=0.26.2 (libp2p 0.57), and kameo 0.22.2 still pins libp2p 0.56 (rechecked 2026-11-13: 0.22.2 is the latest kameo); review-by 2027-03-31" },
+    { id = "RUSTSEC-2026-0530", reason = "transitive via libp2p 0.56.0; needs hickory >=0.26.2 (libp2p 0.57), and kameo 0.22.2 still pins libp2p 0.56 (rechecked 2026-11-13: 0.22.2 is the latest kameo); review-by 2027-03-31" },
+    { id = "RUSTSEC-2026-0531", reason = "transitive via libp2p 0.56.0; needs hickory >=0.26.2 (libp2p 0.57), and kameo 0.22.2 still pins libp2p 0.56 (rechecked 2026-11-13: 0.22.2 is the latest kameo); review-by 2027-03-31" },
+    { id = "RUSTSEC-2026-0532", reason = "transitive via libp2p 0.56.0; needs hickory >=0.26.2 (libp2p 0.57), and kameo 0.22.2 still pins libp2p 0.56 (rechecked 2026-11-13: 0.22.2 is the latest kameo); review-by 2027-03-31" },
+    # libp2p-gossipsub is in Cargo.lock but compiled into nothing: no gossipsub feature is enabled on libp2p (cargo tree shows no path to it).
+    { id = "RUSTSEC-2026-0534", reason = "libp2p-gossipsub is in Cargo.lock only, not built (no gossipsub feature enabled); fix is libp2p-gossipsub 0.50.1 (libp2p 0.57), and kameo 0.22.2 still pins libp2p 0.56 (rechecked 2026-11-13); review-by 2027-03-31" },
     # paste is unmaintained but pulled in transitively via libp2p → if-watch → netlink-packet-core.
     # No actionable fix until the upstream chain replaces it.
     { id = "RUSTSEC-2024-0436", reason = "unmaintained `paste`, transitive via libp2p -> if-watch, kameo 0.22.2 still pins libp2p 0.56 (rechecked 2026-11-09: 0.22.2 is the latest kameo); review-by 2027-03-31" },
