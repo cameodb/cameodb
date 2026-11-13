@@ -8,9 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 **Upgrading from 0.3.9.** No config change is needed for a node to start, and every new setting
-is off until set. The storage format is unchanged: 0.3.10 opens 0.3.9's data, and 0.3.9 opens
-what 0.3.10 wrote unless an index declares one of the new tokenizers. Four things change what an
-existing deployment sees:
+is off until set. 0.3.10 opens 0.3.9's data as it is. Five things change what an existing
+deployment sees:
+
+- **0.3.9 cannot read what 0.3.10 writes.** Documents are now stored compressed (see Added), and
+  a 0.3.9 node reading a compressed row fails that read. There is no downgrade once 0.3.10 has
+  written to a data directory; keep a copy of the data directory if you need a way back.
 
 - **An index declaring `raw_fold`, `cjk`, `cjk_fold`, `cjk_ja_fold` or `cjk_ko_fold` needs
   0.3.10.** A 0.3.9 node cannot build them, so it cannot open such an index after a downgrade,
@@ -32,6 +35,18 @@ shard-map checksum and send each other their full maps, which costs only those s
 peer ignores the spent-budget field a forwarded operation now carries.
 
 ### Added
+
+- **Documents are stored compressed.** A document row in a shard's `store.redb` is LZ4-compressed
+  against a dictionary of the index's own first documents: up to 64 KB, filled as they are
+  written, then fixed. Each row records how much of the dictionary it was compressed against, so
+  every row stays readable as the dictionary fills and nothing is ever re-encoded. Nothing to
+  configure. Existing rows are read as they are and compressed when next written;
+  `cameodb compact --rewrite` compresses every row of a stopped node's files in one pass, each
+  index against a full dictionary. Measured on text indexes, rows take 29% and 61% of their
+  former bytes; a 3.0 GB shard of mostly synthetic benchmark documents rewrote to 310 MB in 9 s.
+  On the benchmark, bulk ingestion rose from 32–33k to 38–39k documents a second, and single
+  writes and search latency were unchanged. A dictionary holds text of the documents that
+  filled it until the index is deleted, including ones deleted since.
 
 - **`raw_fold` tokenizer: a whole value matched in any case.** `raw` keeps a value whole and keeps
   its case, and every analyzer that lowercases also splits into words, so a field of names, codes or

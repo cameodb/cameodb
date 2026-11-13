@@ -672,8 +672,18 @@ fn copy_into(src: &Database, dest: &Path, stop: &AtomicBool) -> Result<()> {
         );
     }
     for table in txn.list_tables()? {
-        copy_table(&txn, &dst, table.name(), stop)
-            .with_context(|| format!("copying table {}", table.name()))?;
+        let name = table.name();
+        // Rebuilt below, one entry per data table, from the documents themselves.
+        if name == DOC_DICT_TABLE {
+            continue;
+        }
+        if let Some(index) = name.strip_prefix("data_")
+            && recompress_table(&txn, &dst, name, index, stop)
+                .with_context(|| format!("copying table {name}"))?
+        {
+            continue;
+        }
+        copy_table(&txn, &dst, name, stop).with_context(|| format!("copying table {name}"))?;
     }
     // Each batch commit frees the pages it rewrote, so the copy grows past what it holds: by
     // two thirds, for 40 MB of mixed rows. Compacting it returns that, and nothing in it can
@@ -681,6 +691,97 @@ fn copy_into(src: &Database, dest: &Path, stop: &AtomicBool) -> Result<()> {
     let mut dst = dst;
     while dst.compact().context("compacting the copy")? {}
     Ok(())
+}
+
+/// The name of `storage::doc_codec::TABLE_DOC_DICT`.
+const DOC_DICT_TABLE: &str = "_doc_dict";
+
+/// Copy an index's document table, compressing every row against a dictionary built for the
+/// copy; `false` if the table is not one of documents.
+///
+/// A running node compresses only what it writes, against a dictionary its first writes fill.
+/// So a file from before compression holds its documents as written, and one that has seen both
+/// holds a mix. A rewrite reads every row anyway: the copy's dictionary is filled from the
+/// table's first documents before any row is written, and every row is then compressed against
+/// the whole of it — including the ones a live dictionary was still too short to help.
+fn recompress_table(
+    src: &ReadTransaction,
+    dst: &Database,
+    name: &str,
+    index: &str,
+    stop: &AtomicBool,
+) -> Result<bool> {
+    use storage::doc_codec::{self, DICT_CAP, TABLE_DOC_DICT};
+
+    let def = TableDefinition::<&str, &[u8]>::new(name);
+    let table = match src.open_table(def) {
+        Ok(table) => table,
+        Err(TableError::TableTypeMismatch { .. }) => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let old_dict: Vec<u8> = match src.open_table(TABLE_DOC_DICT) {
+        Ok(dicts) => redb::ReadableTable::get(&dicts, index)?
+            .map(|d| d.value().to_vec())
+            .unwrap_or_default(),
+        Err(TableError::TableDoesNotExist(_)) => Vec::new(),
+        Err(e) => return Err(e.into()),
+    };
+    let decode = |key: &str, stored: &[u8]| -> Result<Vec<u8>> {
+        doc_codec::decode(stored, &old_dict)
+            .map(|doc| doc.into_owned())
+            .with_context(|| format!("reading document {key}"))
+    };
+
+    let mut dict = Vec::new();
+    for row in redb::ReadableTable::iter(&table)? {
+        if dict.len() >= DICT_CAP {
+            break;
+        }
+        let (key, value) = row?;
+        doc_codec::grow(&mut dict, &decode(key.value(), value.value())?);
+    }
+
+    let expected = redb::ReadableTableMetadata::len(&table)?;
+    let mut rows = redb::ReadableTable::iter(&table)?;
+    let mut copied = 0u64;
+    let mut dict_written = false;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return Err(RewriteError::Stopped.into());
+        }
+        let txn = dst.begin_write()?;
+        let mut done = false;
+        {
+            // With the first rows that name it, and before any that could.
+            if !dict_written && !dict.is_empty() {
+                txn.open_table(TABLE_DOC_DICT)?
+                    .insert(index, dict.as_slice())?;
+            }
+            dict_written = true;
+            let mut out = txn.open_table(def)?;
+            let mut bytes = 0;
+            while bytes < REWRITE_BATCH_BYTES {
+                let Some(row) = rows.next() else {
+                    done = true;
+                    break;
+                };
+                let (key, value) = row?;
+                let doc = decode(key.value(), value.value())?;
+                let stored = doc_codec::encode(&doc, &dict).unwrap_or(doc);
+                bytes += key.value().len() + stored.len();
+                out.insert(key.value(), stored.as_slice())?;
+                copied += 1;
+            }
+        }
+        txn.commit()?;
+        if done {
+            break;
+        }
+    }
+    if copied != expected {
+        bail!("copied {copied} rows of the {expected} it holds");
+    }
+    Ok(true)
 }
 
 /// Copy one table, whatever its types are among those cameodb's files use.
@@ -1131,6 +1232,13 @@ mod tests {
         let path = dir.join("store.redb");
         let db = redb::Database::create(&path).unwrap();
         let body = vec![7u8; 1024];
+        // A document row as the node writes one, about a kilobyte.
+        let doc = |i: u64| {
+            format!(
+                r#"{{"json_blob":{{"n":{i},"title":"document {i}","text":"{}"}}}}"#,
+                format!("entry {i} of the register, as entered by the clerk; ").repeat(18)
+            )
+        };
         let txn = db.begin_write().unwrap();
         {
             txn.open_table(SCHEMA)
@@ -1147,7 +1255,7 @@ mod tests {
             }
             let mut data = txn.open_table(DATA).unwrap();
             for i in 0..8_000u64 {
-                data.insert(format!("doc-{i:06}").as_str(), body.as_slice())
+                data.insert(format!("doc-{i:06}").as_str(), doc(i).as_bytes())
                     .unwrap();
             }
             txn.open_table(ASSIGNMENTS)
@@ -1170,7 +1278,9 @@ mod tests {
 
     type Rows = Vec<(Vec<u8>, Vec<u8>)>;
 
-    /// Every row of every table, as bytes, for comparing two files.
+    /// Every row of every table, as bytes, for comparing two files. A document table's rows are
+    /// the documents they hold, however each is stored, and the dictionaries they are stored
+    /// against are not listed: a rewrite changes both and no document.
     fn contents(path: &Path) -> Vec<(String, Rows)> {
         fn rows<K: Key + 'static, V: Value + 'static>(
             txn: &ReadTransaction,
@@ -1196,6 +1306,16 @@ mod tests {
             .map(|t| t.name().to_string())
             .collect();
         names.sort();
+        names.retain(|name| name != DOC_DICT_TABLE);
+        let dict_of = |index: &str| -> Vec<u8> {
+            match txn.open_table(storage::doc_codec::TABLE_DOC_DICT) {
+                Ok(dicts) => redb::ReadableTable::get(&dicts, index)
+                    .unwrap()
+                    .map(|d| d.value().to_vec())
+                    .unwrap_or_default(),
+                Err(_) => Vec::new(),
+            }
+        };
         names
             .into_iter()
             .map(|name| {
@@ -1206,6 +1326,18 @@ mod tests {
                     "rows" => rows(&txn, ROWS),
                     n if n.starts_with("wal_") => rows(&txn, TableDefinition::<u64, &[u8]>::new(n)),
                     n => rows(&txn, TableDefinition::<&str, &[u8]>::new(n)),
+                };
+                let rows = match name.strip_prefix("data_") {
+                    Some(index) => {
+                        let dict = dict_of(index);
+                        rows.into_iter()
+                            .map(|(k, v)| {
+                                let doc = storage::doc_codec::decode(&v, &dict).unwrap();
+                                (k, doc.into_owned())
+                            })
+                            .collect()
+                    }
+                    None => rows,
                 };
                 (name, rows)
             })
@@ -1274,6 +1406,90 @@ mod tests {
             "in place {compacted:?}, rewritten {done:?}"
         );
         assert_eq!(contents(&b), expected);
+    }
+
+    /// How many of an index's rows the file holds compressed, how many as written, and the
+    /// length of its dictionary.
+    fn compression(path: &Path, index: &str) -> (usize, usize, usize) {
+        let db = redb::Database::open(path).unwrap();
+        let txn = db.begin_read().unwrap();
+        let name = format!("data_{index}");
+        let table = txn
+            .open_table(TableDefinition::<&str, &[u8]>::new(&name))
+            .unwrap();
+        let (mut compressed, mut written) = (0, 0);
+        for row in redb::ReadableTable::iter(&table).unwrap() {
+            match row.unwrap().1.value().first() {
+                Some(b'{') => written += 1,
+                _ => compressed += 1,
+            }
+        }
+        let dict = txn
+            .open_table(storage::doc_codec::TABLE_DOC_DICT)
+            .ok()
+            .and_then(|t| {
+                redb::ReadableTable::get(&t, index)
+                    .unwrap()
+                    .map(|d| d.value().len())
+            })
+            .unwrap_or(0);
+        (compressed, written, dict)
+    }
+
+    #[test]
+    fn a_rewrite_compresses_the_documents_a_file_holds_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = store_with_every_table(dir.path());
+        assert_eq!(compression(&path, "docs"), (0, 2_400, 0));
+        let expected = contents(&path);
+
+        rewrite(&path, false).unwrap();
+
+        assert_eq!(
+            compression(&path, "docs"),
+            (2_400, 0, storage::doc_codec::DICT_CAP)
+        );
+        assert_eq!(contents(&path), expected);
+    }
+
+    #[test]
+    fn a_rewrite_reads_rows_compressed_against_a_dictionary_that_was_still_filling() {
+        use storage::doc_codec::{TABLE_DOC_DICT, encode, grow};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.redb");
+        let doc = |i: u32| {
+            format!(r#"{{"json_blob":{{"n":{i},"note":"the same few words in every one of them, number {i}"}}}}"#)
+                .into_bytes()
+        };
+        {
+            // As a node leaves a small index: the dictionary part full, each row compressed
+            // against as much of it as there was, the first not at all.
+            let db = redb::Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut data = txn.open_table(DATA).unwrap();
+                let mut dict = Vec::new();
+                for i in 0..200u32 {
+                    let raw = doc(i);
+                    let stored = encode(&raw, &dict).unwrap_or_else(|| raw.clone());
+                    data.insert(format!("doc-{i:06}").as_str(), stored.as_slice())
+                        .unwrap();
+                    grow(&mut dict, &raw);
+                }
+                txn.open_table(TABLE_DOC_DICT)
+                    .unwrap()
+                    .insert("docs", dict.as_slice())
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let expected = contents(&path);
+        assert_eq!(compression(&path, "docs").1, 1);
+
+        rewrite(&path, false).unwrap();
+
+        assert_eq!(contents(&path), expected);
+        assert_eq!(compression(&path, "docs").0, 200);
     }
 
     #[test]

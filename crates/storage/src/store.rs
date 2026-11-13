@@ -1,6 +1,7 @@
 //! `HybridStore` state and the write side: index and writer lifecycle, batch
 //! and single writes, commits and checkpoints, WAL persistence and recovery,
 //! warmup, and schema storage.
+use crate::doc_codec::TABLE_DOC_DICT;
 use crate::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -410,6 +411,14 @@ pub struct HybridStore {
     pub(crate) schema_cache: Arc<DashMap<String, Arc<IndexSchema>>>,
     /// Cache of Tantivy field mappings per index
     pub(crate) fields_cache: Arc<DashMap<String, SchemaFields>>,
+    /// Each index's document dictionary as last read from or written to `TABLE_DOC_DICT`; see
+    /// [`crate::doc_codec`]. A copy may be behind the table, never ahead of it and never another
+    /// index's: an entry only ever gets longer, and `doc_dict_epoch` keeps one read before an
+    /// index was deleted from being put back after.
+    pub(crate) doc_dicts: Arc<DashMap<String, Arc<[u8]>>>,
+    /// Moves whenever an index's dictionary stops existing. A dictionary read under one value
+    /// is not cached under another.
+    pub(crate) doc_dict_epoch: Arc<AtomicU64>,
     /// Per-index initialization locks, serializing concurrent `get_or_create_index` calls.
     /// Tantivy's `INDEX_WRITER_LOCK` is a non-blocking flock on `.tantivy-writer.lock`, so
     /// two threads opening a writer for the same index race and one fails with `LockBusy`.
@@ -660,6 +669,8 @@ impl HybridStore {
             commit_clock_epoch: std::time::Instant::now(),
             schema_cache: Arc::new(DashMap::new()),
             fields_cache: Arc::new(DashMap::new()),
+            doc_dicts: Arc::new(DashMap::new()),
+            doc_dict_epoch: Arc::new(AtomicU64::new(0)),
             index_init_locks: Arc::new(DashMap::new()),
             schema_locks: Arc::new(DashMap::new()),
             warmed_generations: Arc::new(DashMap::new()),
@@ -678,6 +689,82 @@ impl HybridStore {
     /// Every write transaction is begun here. redb skips the repair on open only when the last
     /// durable commit recorded its allocator state, so a single commit made without the setting
     /// is enough to make the next crash pay for a full repair.
+    /// This index's document dictionary: the cached copy, or the table's if there is none.
+    pub(crate) fn doc_dict(&self, index: &str) -> Result<Arc<[u8]>, StoreError> {
+        if let Some(dict) = self.doc_dicts.get(index) {
+            return Ok(dict.value().clone());
+        }
+        self.reload_doc_dict(index)
+    }
+
+    /// Read this index's dictionary from the table, and cache it if it is news.
+    pub(crate) fn reload_doc_dict(&self, index: &str) -> Result<Arc<[u8]>, StoreError> {
+        let epoch = self.doc_dict_epoch.load(Ordering::SeqCst);
+        let read_txn = self.kv.begin_read()?;
+        let dict: Arc<[u8]> = match read_txn.open_table(TABLE_DOC_DICT) {
+            Ok(table) => match table.get(index)? {
+                Some(bytes) => Arc::from(bytes.value()),
+                None => Arc::from(&[][..]),
+            },
+            Err(redb::TableError::TableDoesNotExist(_)) => Arc::from(&[][..]),
+            Err(err) => return Err(err.into()),
+        };
+        self.publish_doc_dict(index, &dict, epoch);
+        Ok(dict)
+    }
+
+    /// Cache `dict`, read or written while the epoch was `epoch`, unless an index has been
+    /// deleted since or the cache already holds more of it.
+    ///
+    /// The check and the insert are under the map's lock for this name, and
+    /// [`Self::forget_doc_dict`] moves the epoch before it takes that lock: so a dictionary read
+    /// before a delete is either refused here or removed there.
+    fn publish_doc_dict(&self, index: &str, dict: &Arc<[u8]>, epoch: u64) {
+        let entry = self.doc_dicts.entry(index.to_string());
+        if self.doc_dict_epoch.load(Ordering::SeqCst) != epoch {
+            return;
+        }
+        match entry {
+            dashmap::mapref::entry::Entry::Occupied(mut held) => {
+                if held.get().len() < dict.len() {
+                    held.insert(dict.clone());
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                slot.insert(dict.clone());
+            }
+        }
+    }
+
+    /// The index's dictionary has just stopped existing: no copy of it may outlive that.
+    fn forget_doc_dict(&self, index: &str) {
+        self.doc_dict_epoch.fetch_add(1, Ordering::SeqCst);
+        self.doc_dicts.remove(index);
+    }
+
+    /// The document a stored row of `index` holds.
+    ///
+    /// `dict` is the caller's copy of the dictionary across a batch of rows, fetched on the
+    /// first row that needs one. A row that needs more than the copy holds was written after
+    /// the copy was taken, so the table is read again, once.
+    pub(crate) fn decode_row<'a>(
+        &self,
+        index: &str,
+        stored: &'a [u8],
+        dict: &mut Option<Arc<[u8]>>,
+    ) -> Result<std::borrow::Cow<'a, [u8]>, StoreError> {
+        let needed = doc_codec::dictionary_needed(stored);
+        if needed > 0 && dict.is_none() {
+            *dict = Some(self.doc_dict(index)?);
+        }
+        if dict.as_ref().is_some_and(|held| held.len() < needed) {
+            *dict = Some(self.reload_doc_dict(index)?);
+        }
+        doc_codec::decode(stored, dict.as_deref().unwrap_or(&[])).map_err(|e| {
+            StoreError::CorruptIndex(format!("a document row of index '{index}': {e}"))
+        })
+    }
+
     fn begin_write(&self) -> Result<redb::WriteTransaction, redb::TransactionError> {
         let mut txn = self.kv.begin_write()?;
         txn.set_quick_repair(self.config.quick_repair);
@@ -853,6 +940,8 @@ impl HybridStore {
         self.current_seq.remove(index);
         self.schema_cache.remove(index);
         self.fields_cache.remove(index);
+        // Only a copy: the next row that needs it reads the table again.
+        self.doc_dicts.remove(index);
         // The operations counter tracks documents buffered in the writer we just dropped.
         // Leaving it non-zero makes the next commit_index for this name believe there is
         // unflushed data.
@@ -1369,6 +1458,7 @@ impl HybridStore {
         let mut replayed_deletes_since_commit = 0u64;
         let mut skipped_duplicates = 0usize;
         let mut applied_ids: HashSet<String> = HashSet::new();
+        let mut doc_dict = None;
 
         for result in wal_table.range(range_start..=max_wal_seq)? {
             let (seq_guard, wal_data_guard) = result?;
@@ -1394,8 +1484,9 @@ impl HybridStore {
 
             match stored {
                 Some(doc_guard) => {
-                    replayed_bytes_since_commit += doc_guard.value().len() as u64;
-                    let stored_doc: StoredDocOwned = serde_json::from_slice(doc_guard.value())
+                    let doc_bytes = self.decode_row(index, doc_guard.value(), &mut doc_dict)?;
+                    replayed_bytes_since_commit += doc_bytes.len() as u64;
+                    let stored_doc: StoredDocOwned = serde_json::from_slice(&doc_bytes)
                         .map_err(|e| StoreError::Serialization(e.to_string()))?;
 
                     // Built as the write built it; a value its column cannot take is skipped
@@ -2802,6 +2893,13 @@ impl HybridStore {
             let _ = write_txn.delete_table(data_table_def)?;
             let _ = write_txn.delete_table(wal_table_def)?;
 
+            // The dictionary goes with the rows compressed against it: the name's next rows
+            // start one of their own.
+            {
+                let mut dict_table = write_txn.open_table(TABLE_DOC_DICT)?;
+                let _ = dict_table.remove(index)?;
+            }
+
             // Drop the recovery checkpoint together with the data it describes. A stale
             // checkpoint outlives the deleted index and, once the name is recreated, reads
             // as "already synced" far beyond the new WAL — which would skip recovery for an
@@ -2843,6 +2941,7 @@ impl HybridStore {
             }
         }
         write_txn.commit()?;
+        self.forget_doc_dict(index);
 
         if let Some(tombstone) = tombstone {
             self.schema_cache
@@ -3415,7 +3514,12 @@ impl HybridStore {
 
         struct PreparedOp {
             wal_bytes: Vec<u8>,
+            /// The row as it will be stored: compressed, or as written.
             doc_bytes: Option<Vec<u8>>,
+            /// The document's length before compression: what the Tantivy side will hold.
+            raw_len: usize,
+            /// The document as written, kept only while the dictionary still has room for it.
+            dict_feed: Option<Vec<u8>>,
             id: String,
             seq_id: u64,
             kind: PreparedKind,
@@ -3435,6 +3539,13 @@ impl HybridStore {
         // A refused value still aborts the whole batch and writes nothing; it now does so
         // before any table is opened rather than by dropping a transaction that had already
         // staged three hundred rows.
+        //
+        // Compression is here too. A row is compressed against the dictionary as this store
+        // last saw it committed, which is all a row may ever name; what this batch adds to the
+        // dictionary serves the batches after it.
+        let dict_epoch = self.doc_dict_epoch.load(Ordering::SeqCst);
+        let doc_dict = self.doc_dict(index)?;
+        let dict_has_room = doc_dict.len() < doc_codec::DICT_CAP;
         let mut prepared_ops = Vec::with_capacity(ops_len);
         for (op, seq_id) in ops.into_iter().zip(seq_ids_iter) {
             match op {
@@ -3449,10 +3560,15 @@ impl HybridStore {
                     // which is where recovery reads it from.
                     let wal_bytes = encode_wal_entry(&id);
 
-                    let doc_bytes = serde_json::to_vec(&StoredDoc {
+                    let raw = serde_json::to_vec(&StoredDoc {
                         json_blob: filtered_json_blob.as_ref(),
                     })
                     .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                    let raw_len = raw.len();
+                    let (doc_bytes, dict_feed) = match doc_codec::encode(&raw, &doc_dict) {
+                        Some(compressed) => (compressed, dict_has_room.then_some(raw)),
+                        None => (raw.clone(), dict_has_room.then_some(raw)),
+                    };
 
                     let tantivy_doc = fields.document(
                         &schema,
@@ -3465,6 +3581,8 @@ impl HybridStore {
                     prepared_ops.push(PreparedOp {
                         wal_bytes,
                         doc_bytes: Some(doc_bytes),
+                        raw_len,
+                        dict_feed,
                         id,
                         seq_id,
                         kind: PreparedKind::Put { tantivy_doc },
@@ -3476,6 +3594,8 @@ impl HybridStore {
                     prepared_ops.push(PreparedOp {
                         wal_bytes,
                         doc_bytes: None,
+                        raw_len: 0,
+                        dict_feed: None,
                         id,
                         seq_id,
                         kind: PreparedKind::Delete,
@@ -3543,6 +3663,7 @@ impl HybridStore {
         // Collect sequence IDs during processing
         let mut seq_ids = Vec::with_capacity(ops_len);
         let mut batch_bytes = 0u64;
+        let mut grown_dict: Option<Vec<u8>> = None;
 
         {
             // A schema row is metadata and is always written with `Immediate`; folding it into
@@ -3568,12 +3689,31 @@ impl HybridStore {
             let mut wal_table = write_txn.open_table(wal_table_def)?;
             let mut data_table = write_txn.open_table(data_table_def)?;
 
+            // The dictionary as the table holds it, while it may still grow. Read here, under
+            // the write lock, because the cached copy can be behind it.
+            let mut dict_table = if dict_has_room {
+                Some(write_txn.open_table(TABLE_DOC_DICT)?)
+            } else {
+                None
+            };
+            let mut growing: Option<Vec<u8>> = match &dict_table {
+                Some(table) => Some(
+                    table
+                        .get(index)?
+                        .map_or_else(Vec::new, |d| d.value().to_vec()),
+                ),
+                None => None,
+            };
+            let mut dict_grew = false;
+
             // Step 2: the transaction itself — the two table writes, and the bookkeeping that
             // depends on what they displaced. Every document was built above.
             for prepared in prepared_ops {
                 let PreparedOp {
                     wal_bytes,
                     doc_bytes,
+                    raw_len,
+                    dict_feed,
                     id,
                     seq_id,
                     kind,
@@ -3581,7 +3721,10 @@ impl HybridStore {
 
                 // Write to WAL
                 wal_table.insert(seq_id, wal_bytes.as_slice())?;
-                batch_bytes += (wal_bytes.len() + doc_bytes.as_ref().map_or(0, Vec::len)) as u64;
+                batch_bytes += (wal_bytes.len() + raw_len) as u64;
+                if let (Some(dict), Some(feed)) = (growing.as_mut(), dict_feed.as_deref()) {
+                    dict_grew |= doc_codec::grow(dict, feed);
+                }
 
                 // Collect sequence ID for final result
                 seq_ids.push(seq_id);
@@ -3620,9 +3763,23 @@ impl HybridStore {
                     }
                 }
             }
+
+            // What the batch added to the dictionary commits with the batch. Kept either way:
+            // the table may simply have held more than the cached copy did.
+            if let (Some(table), Some(dict)) = (dict_table.as_mut(), growing) {
+                if dict_grew {
+                    table.insert(index, dict.as_slice())?;
+                }
+                grown_dict = Some(dict);
+            }
         }
 
         write_txn.commit()?;
+
+        // Committed, so rows may now be compressed against it.
+        if let Some(dict) = grown_dict {
+            self.publish_doc_dict(index, &Arc::from(dict), dict_epoch);
+        }
 
         // The schema cache moves only once the row it describes is durable.
         if let Some(evolved) = evolved_schema {

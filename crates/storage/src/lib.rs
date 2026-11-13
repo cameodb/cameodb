@@ -36,6 +36,7 @@ mod analysis;
 mod deadline;
 mod delete_query;
 mod directory;
+pub mod doc_codec;
 mod matched;
 mod merge;
 mod metrics;

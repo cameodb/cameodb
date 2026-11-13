@@ -16,6 +16,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tantivy = { workspace = true }
+# The LZ4 tantivy itself depends on, same version: compresses document rows in redb.
+lz4_flex = { version = "0.13", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
 # The fst crate tantivy itself depends on, same version: reads the Croatian analyzer data.
 tantivy-fst = "0.5"
 # The Snowball stemmers tantivy itself depends on, same version: the Italian analyzer runs one

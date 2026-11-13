@@ -444,7 +444,10 @@ impl HybridStore {
 
         match read_txn.open_table(data_table_def) {
             Ok(data_table) => match data_table.get(key)? {
-                Some(value) => Ok(Some(value.value().to_vec())),
+                Some(value) => Ok(Some(
+                    self.decode_row(index, value.value(), &mut None)?
+                        .into_owned(),
+                )),
                 None => Ok(None),
             },
             Err(_) => Ok(None), // Table doesn't exist (index was deleted)
@@ -492,6 +495,8 @@ impl HybridStore {
         };
 
         let mut results = Vec::with_capacity(keys.len());
+        // One copy of the dictionary for the page, taken on the first row that needs it.
+        let mut doc_dict = None;
 
         for (i, key) in keys.iter().enumerate() {
             if i.is_multiple_of(256)
@@ -500,7 +505,8 @@ impl HybridStore {
                 deadline.check()?;
             }
             if let Some(value) = data_table.get(key.as_str())? {
-                results.push((key.clone(), value.value().to_vec()));
+                let doc = self.decode_row(index, value.value(), &mut doc_dict)?;
+                results.push((key.clone(), doc.into_owned()));
             }
             // Skip keys that don't exist (document may have been deleted)
         }
@@ -2354,6 +2360,7 @@ impl HybridStore {
         match read_txn.open_table(data_table_def) {
             Ok(data_table) => {
                 const MAX_SAMPLES: usize = 100; // Sample up to 100 documents
+                let mut doc_dict = None;
 
                 for (sample_count, result) in data_table.iter()?.enumerate() {
                     if sample_count >= MAX_SAMPLES {
@@ -2361,9 +2368,10 @@ impl HybridStore {
                     }
 
                     let (_, value) = result?;
+                    let doc = self.decode_row(index, value.value(), &mut doc_dict)?;
 
                     // Parse the document JSON to extract field names
-                    if let Ok(doc_data) = serde_json::from_slice::<JsonValue>(value.value()) {
+                    if let Ok(doc_data) = serde_json::from_slice::<JsonValue>(&doc) {
                         if let Some(json_blob) = doc_data.get("json_blob")
                             && let Some(json_obj) = json_blob.as_object()
                         {

@@ -4688,6 +4688,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "dashmap",
+ "lz4_flex",
  "redb",
  "rust-stemmers",
  "serde",

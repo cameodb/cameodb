@@ -631,8 +631,15 @@ systemctl start cameodb
 `--rewrite` copies every table of a file into `store.redb.rewrite` beside it, checks each
 table's row count, compacts the copy, and renames it over `store.redb`. Until that rename the
 original is only read, so at every moment `store.redb` is one complete file or the other. It
-ends at the same size in-place compaction can reach, never smaller; what it does not depend on
-is how the old file's free space is laid out.
+does not depend on how the old file's free space is laid out, and for a file whose documents
+are all compressed already it ends at the size in-place compaction can reach.
+
+It is also what compresses documents written before compression existed. A node compresses a
+document when it writes it, so a data directory from 0.3.9 or earlier keeps its documents as
+they were until each is next written. A rewrite compresses every document of every index as it
+copies, against a dictionary built from that index's first documents, and the file ends
+correspondingly smaller than `--dry-run` reports: that figure is the room the copy is
+guaranteed to fit in, not its final size.
 
 - **Free disk.** Each copy needs about the size `--dry-run` reports, on the same filesystem as
   the file. That is checked before each file starts, and a file without room is left alone
