@@ -341,6 +341,13 @@ originals are as they were. Running the command again continues either way.";
             (false, _) => "smaller",
         }
     );
+    if dry_run && matches!(mode, Mode::InPlace) {
+        println!(
+            "In-place compaction moves pages and compresses no document. A file written before \
+             documents were stored compressed holds them as written: `--rewrite --dry-run` \
+             estimates what compressing them would free."
+        );
+    }
     if report.kept > 0 {
         println!(
             "The originals still take {} beside the new files, as store.redb.old: nothing is \
@@ -565,10 +572,16 @@ fn open(path: &Path) -> Result<(Database, Arc<AtomicBool>)> {
 /// What the file's allocated pages take: the size in-place compaction ends at when nothing
 /// blocks it.
 fn allocated_bytes(db: &Database) -> Result<u64> {
+    Ok(allocation(db)?.0)
+}
+
+/// [`allocated_bytes`], and the size of one page.
+fn allocation(db: &Database) -> Result<(u64, u64)> {
     let txn = db.begin_write()?;
     let stats = txn.stats()?;
     txn.abort()?;
-    Ok(stats.allocated_pages() * stats.page_size() as u64)
+    let page = stats.page_size() as u64;
+    Ok((stats.allocated_pages() * page, page))
 }
 
 /// Rewrite one file into a new one and switch to it, or under `dry_run` estimate the result.
@@ -604,11 +617,14 @@ pub(crate) fn rewrite_file(
     let (src, repaired) = open(path)?;
     let estimate = allocated_bytes(&src)?.min(before);
     if dry_run {
-        // Only the check: the claim is given back as this returns.
+        // Only the check: the claim is given back as this returns. It is for the data as it
+        // lies, not as it will be once compressed: a copy's pages are not packed until it is
+        // compacted, and the claim should not be a guess.
         disk.reserve(path, &copy, estimate)?;
+        let saving = compression_saving(&src, allocation(&src)?.1, stop)?;
         return Ok(Outcome {
             before,
-            after: estimate,
+            after: estimate.saturating_sub(saving),
             repaired: repaired.load(Ordering::Relaxed),
             elapsed: started.elapsed(),
             kept: None,
@@ -691,6 +707,85 @@ fn copy_into(src: &Database, dest: &Path, stop: &AtomicBool) -> Result<()> {
     let mut dst = dst;
     while dst.compact().context("compacting the copy")? {}
     Ok(())
+}
+
+/// Rows of a data table a dry run compresses to estimate what a rewrite would save.
+const SAVING_SAMPLE_ROWS: u64 = 4_000;
+
+/// About how many bytes a rewrite would take off `src` by compressing its documents.
+///
+/// Per data table the way the rewrite itself will: a dictionary filled from the table's first
+/// documents, then rows compressed against it. Only an evenly spaced sample of rows is
+/// compressed, and the share of their bytes it takes off is taken to hold for the table's pages
+/// — the pages, not the bytes in them, because a table's rows are not packed into its pages
+/// without waste and the waste shrinks with the rows. The rows are read in key order whatever
+/// their number, which is what the rest of a dry run costs too. Rows already compressed count
+/// as what they take now, so a file a node has been writing to reports the saving that is left,
+/// not the one it already has.
+fn compression_saving(src: &Database, page_size: u64, stop: &AtomicBool) -> Result<u64> {
+    use redb::{ReadableTable, ReadableTableMetadata};
+    use storage::doc_codec::{self, DICT_CAP, TABLE_DOC_DICT};
+
+    let txn = src.begin_read()?;
+    let mut saving = 0u64;
+    for handle in txn.list_tables()? {
+        let name = handle.name();
+        let Some(index) = name.strip_prefix("data_") else {
+            continue;
+        };
+        let table = match txn.open_table(TableDefinition::<&str, &[u8]>::new(name)) {
+            Ok(table) => table,
+            Err(TableError::TableTypeMismatch { .. }) => continue,
+            Err(e) => return Err(e.into()),
+        };
+        let rows = table.len()?;
+        if rows == 0 {
+            continue;
+        }
+        let old_dict: Vec<u8> = match txn.open_table(TABLE_DOC_DICT) {
+            Ok(dicts) => dicts
+                .get(index)?
+                .map(|d| d.value().to_vec())
+                .unwrap_or_default(),
+            Err(TableError::TableDoesNotExist(_)) => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+        let decode = |stored: &[u8]| -> Result<Vec<u8>> {
+            Ok(doc_codec::decode(stored, &old_dict)
+                .with_context(|| format!("reading a document of {name}"))?
+                .into_owned())
+        };
+
+        let mut dict = Vec::new();
+        for row in table.iter()? {
+            if dict.len() >= DICT_CAP {
+                break;
+            }
+            doc_codec::grow(&mut dict, &decode(row?.1.value())?);
+        }
+
+        let stride = (rows / SAVING_SAMPLE_ROWS).max(1) as usize;
+        let (mut sampled, mut now, mut then) = (0u64, 0u64, 0u64);
+        for (i, row) in table.iter()?.enumerate() {
+            let (_, value) = row?;
+            if i % stride != 0 {
+                continue;
+            }
+            if i % 1024 == 0 && stop.load(Ordering::SeqCst) {
+                return Err(RewriteError::Stopped.into());
+            }
+            let doc = decode(value.value())?;
+            now += value.value().len() as u64;
+            then += doc_codec::encode(&doc, &dict).map_or(doc.len(), |c| c.len()) as u64;
+            sampled += 1;
+        }
+        if sampled > 0 && now > then {
+            let stats = table.stats()?;
+            let pages = stats.leaf_pages() + stats.branch_pages();
+            saving += ((pages * page_size) as f64 * (now - then) as f64 / now as f64) as u64;
+        }
+    }
+    Ok(saving)
 }
 
 /// The name of `storage::doc_codec::TABLE_DOC_DICT`.
@@ -1609,6 +1704,37 @@ mod tests {
         assert!(measured.after < before);
         assert_eq!(contents(&path), expected);
         assert!(!dir.path().join("store.redb.rewrite").exists());
+    }
+
+    #[test]
+    fn a_rewrite_dry_run_reports_what_compressing_the_documents_would_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = store_with_every_table(dir.path());
+        let uncompressed_estimate = {
+            let (db, _) = open(&path).unwrap();
+            allocated_bytes(&db).unwrap()
+        };
+
+        let estimated = rewrite_file(
+            &path,
+            true,
+            false,
+            &AtomicBool::new(false),
+            &DiskReservations::default(),
+        )
+        .unwrap();
+        let done = rewrite(&path, false).unwrap();
+
+        assert!(
+            estimated.after < uncompressed_estimate / 2,
+            "{estimated:?} against {uncompressed_estimate}"
+        );
+        // An estimate from a sample: close, not exact.
+        let (guess, actual) = (estimated.after as f64, done.after as f64);
+        assert!(
+            (guess - actual).abs() < actual * 0.35,
+            "estimated {guess}, rewrote to {actual}"
+        );
     }
 
     #[test]

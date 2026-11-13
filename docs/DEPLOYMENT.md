@@ -638,8 +638,11 @@ It is also what compresses documents written before compression existed. A node 
 document when it writes it, so a data directory from 0.3.9 or earlier keeps its documents as
 they were until each is next written. A rewrite compresses every document of every index as it
 copies, against a dictionary built from that index's first documents, and the file ends
-correspondingly smaller than `--dry-run` reports: that figure is the room the copy is
-guaranteed to fit in, not its final size.
+correspondingly smaller. `compact --dry-run` measures in-place compaction, which compresses
+nothing, so it does not show this: `compact --rewrite --dry-run` does. It compresses a sample of
+each index's documents and reports the size the file would end at, an estimate from the sample
+that is usually within a third of the result. The free disk it checks for is still the size of the
+data as it lies now.
 
 - **Free disk.** Each copy needs about the size `--dry-run` reports, on the same filesystem as
   the file. That is checked before each file starts, and a file without room is left alone
