@@ -1476,7 +1476,7 @@ curl -s http://localhost:9480/_admin/workers
     {
       "id": 0,
       "queue_depth": 0,
-      "queue_capacity": 512,
+      "queue_capacity": 1024,
       "in_flight": 0,
       "in_flight_capacity": 8,
       "jobs_completed": 0
@@ -1501,6 +1501,12 @@ curl -s http://localhost:9480/_admin/workers
   }
 }
 ```
+
+A worker has two queues, one for searches and other reads and one for writes, bulk requests and
+deletes, each holding half of `queue_capacity`; `queue_depth` counts both. Writes may hold three
+quarters of a worker's `in_flight_capacity`, and a worker that cannot start a write goes on
+taking reads, so a stalled or busy writer thread does not hold searches back; a full write queue
+refuses writes alone.
 
 `workers[]` is the balance check: an even `jobs_completed` row with a bad p99 is a different
 problem from a lopsided one, and `in_flight` at `in_flight_capacity` means the worker is the

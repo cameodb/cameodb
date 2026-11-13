@@ -263,6 +263,16 @@ peer ignores the spent-budget field a forwarded operation now carries.
   refused bulk batches of 2,000 documents, 1,258 reached the client as transport errors before
   and none after, with no change in throughput. A larger or slower body is answered at once, as
   before, with `Connection: close`.
+- **A worker goes on serving searches however many writes wait on it.** A worker sets a write
+  aside when no writer slot is free and serves the reads behind it, but it took reads and writes
+  off one queue, and stopped taking either once it held twice its width in set-aside writes — 22
+  writes on one worker at the default width of 8. The searches behind them then waited for a
+  writer thread they did not need. Out of reach on a node of four or more shards at the default
+  `max_concurrent_requests`, and reachable with one or two shards, or a raised limit, when a
+  writer thread is slow. Each worker now has a queue for reads and one for writes: at its limit
+  of set-aside writes it stops taking writes and goes on taking reads, and a full write queue
+  refuses writes alone. `/_admin/workers` reports `queue_capacity` for both queues together,
+  twice the figure it gave.
 
 ## [0.3.9] - 2026-11-05
 

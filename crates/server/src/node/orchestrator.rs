@@ -1896,6 +1896,72 @@ pub(super) enum OrchestratorJob {
     Shutdown,
 }
 
+/// The sending half of one worker's queues: one for reads, one for writer work.
+///
+/// A worker used to have one queue, and stopped taking jobs off it once it had set aside as
+/// many writes as it would hold — at which point the searches queued behind them waited for
+/// a writer they never needed. With a queue per kind the worker stops taking the kind it is
+/// full of and goes on taking the other, and a full write queue refuses writes alone.
+#[derive(Clone, Debug)]
+pub(super) struct WorkerLane {
+    reads: mpsc::Sender<OrchestratorJob>,
+    writes: mpsc::Sender<OrchestratorJob>,
+}
+
+/// The receiving half of one worker's queues; see [`WorkerLane`].
+pub(super) struct WorkerInbox {
+    reads: mpsc::Receiver<OrchestratorJob>,
+    writes: mpsc::Receiver<OrchestratorJob>,
+}
+
+/// A worker's two queues, each holding `capacity` jobs.
+pub(super) fn worker_channel(capacity: usize) -> (WorkerLane, WorkerInbox) {
+    let (reads_tx, reads_rx) = mpsc::channel(capacity);
+    let (writes_tx, writes_rx) = mpsc::channel(capacity);
+    (
+        WorkerLane {
+            reads: reads_tx,
+            writes: writes_tx,
+        },
+        WorkerInbox {
+            reads: reads_rx,
+            writes: writes_rx,
+        },
+    )
+}
+
+impl WorkerLane {
+    /// The queue `job` belongs on. A shutdown travels with the reads.
+    fn queue_for(&self, job: &OrchestratorJob) -> &mpsc::Sender<OrchestratorJob> {
+        match job {
+            OrchestratorJob::Execute { op, .. } if is_writer_work(op) => &self.writes,
+            _ => &self.reads,
+        }
+    }
+
+    pub(super) fn try_send(
+        &self,
+        job: OrchestratorJob,
+    ) -> Result<(), mpsc::error::TrySendError<OrchestratorJob>> {
+        self.queue_for(&job).try_send(job)
+    }
+
+    pub(super) async fn send(
+        &self,
+        job: OrchestratorJob,
+    ) -> Result<(), mpsc::error::SendError<OrchestratorJob>> {
+        self.queue_for(&job).send(job).await
+    }
+
+    #[cfg(test)]
+    pub(super) fn blocking_send(
+        &self,
+        job: OrchestratorJob,
+    ) -> Result<(), mpsc::error::SendError<OrchestratorJob>> {
+        self.queue_for(&job).blocking_send(job)
+    }
+}
+
 /// The cores this process may actually use, resolved once at startup.
 ///
 /// Two sources disagree, and both matter. `core_affinity::get_core_ids()` enumerates the
@@ -2284,7 +2350,7 @@ pub(super) fn writer_slot_cap(width: usize) -> usize {
 }
 
 pub(super) async fn orchestrator_worker_loop<F, Fut>(
-    mut rx: mpsc::Receiver<OrchestratorJob>,
+    mut inbox: WorkerInbox,
     run_op: F,
     worker_id: usize,
     counters: Option<Arc<WorkerCounters>>,
@@ -2300,7 +2366,8 @@ pub(super) async fn orchestrator_worker_loop<F, Fut>(
     let width = max_in_flight.max(1);
     let writer_cap = writer_slot_cap(width);
     // Jobs held back, per kind. A bound, not a target: reaching it stops the loop taking more
-    // off the channel, which is where the queue's own capacity and its refusals live.
+    // of that kind off its queue, which is where the queue's own capacity and its refusals
+    // live. The other kind's queue is still read — see [`WorkerLane`].
     let parked_limit = width * 2;
     let in_flight = Arc::new(tokio::sync::Semaphore::new(width));
     let gate = Arc::new(SlotGate::default());
@@ -2312,7 +2379,8 @@ pub(super) async fn orchestrator_worker_loop<F, Fut>(
     // already holding a write — held the head, and every search behind it waited for the
     // write, though reads share nothing with the writer thread.
     let mut parked: std::collections::VecDeque<Waiting> = std::collections::VecDeque::new();
-    let mut closed = false;
+    let mut reads_closed = false;
+    let mut writes_closed = false;
 
     // How much budget a job of this class needs left over to be worth starting.
     // Not `waited > budget`: admitting a job with barely any budget left is a
@@ -2478,7 +2546,7 @@ pub(super) async fn orchestrator_worker_loop<F, Fut>(
             launch(job, permit, writer);
         }
 
-        if closed && parked.is_empty() {
+        if reads_closed && writes_closed && parked.is_empty() {
             break;
         }
 
@@ -2496,50 +2564,63 @@ pub(super) async fn orchestrator_worker_loop<F, Fut>(
                 .map(|left| left.max(Duration::from_millis(1)))
         });
         let parked_writers = parked.iter().filter(|j| is_writer_work(&j.op)).count();
-        let can_receive = !closed
-            && parked_writers < parked_limit
-            && parked.len() - parked_writers < parked_limit;
+        let parked_reads = parked.len() - parked_writers;
+        // Each queue is read while its own kind has room. Writes set aside up to their limit
+        // close the write queue's branch and no other.
+        let take_reads = !reads_closed && parked_reads < parked_limit;
+        let take_writes = !writes_closed && parked_writers < parked_limit;
 
-        tokio::select! {
-            job = rx.recv(), if can_receive => match job {
-                Some(OrchestratorJob::Execute {
-                    arrived_at,
-                    op,
-                    affinity_shard,
-                    reply,
-                }) => parked.push_back(Waiting {
-                    arrived_at,
-                    op,
-                    affinity_shard,
-                    reply,
-                }),
-                Some(OrchestratorJob::Shutdown) => {
-                    debug!(
-                        worker_id = worker_id,
-                        "Orchestrator worker received shutdown signal"
-                    );
-                    break;
-                }
-                None => {
+        let received = tokio::select! {
+            job = inbox.reads.recv(), if take_reads => {
+                reads_closed = job.is_none();
+                job
+            }
+            job = inbox.writes.recv(), if take_writes => {
+                writes_closed = job.is_none();
+                job
+            }
+            _ = gate.freed.notified(), if !parked.is_empty() => continue,
+            _ = tokio::time::sleep(next_stale.unwrap_or_default()), if next_stale.is_some() => continue,
+        };
+        match received {
+            Some(OrchestratorJob::Execute {
+                arrived_at,
+                op,
+                affinity_shard,
+                reply,
+            }) => parked.push_back(Waiting {
+                arrived_at,
+                op,
+                affinity_shard,
+                reply,
+            }),
+            Some(OrchestratorJob::Shutdown) => {
+                debug!(
+                    worker_id = worker_id,
+                    "Orchestrator worker received shutdown signal"
+                );
+                break;
+            }
+            None => {
+                if reads_closed && writes_closed {
                     debug!(worker_id = worker_id, "Orchestrator worker exiting");
-                    closed = true;
                 }
-            },
-            _ = gate.freed.notified(), if !parked.is_empty() => {}
-            _ = tokio::time::sleep(next_stale.unwrap_or_default()), if next_stale.is_some() => {}
+            }
         }
     }
 
     // Answer what never started. A job dropped here would reach its caller as a closed reply
     // channel, which the router has to report as unconfirmed — it cannot tell a job that was
     // never started from one that ran and lost its answer. These did not run, so they say so:
-    // the jobs set aside, and whatever is still in the channel behind the shutdown.
-    rx.close();
+    // the jobs set aside, and whatever is still in either queue behind the shutdown.
     let mut unstarted: Vec<tokio::sync::oneshot::Sender<WorkerOutcome>> =
         parked.drain(..).map(|job| job.reply).collect();
-    while let Ok(job) = rx.try_recv() {
-        if let OrchestratorJob::Execute { reply, .. } = job {
-            unstarted.push(reply);
+    for queue in [&mut inbox.reads, &mut inbox.writes] {
+        queue.close();
+        while let Ok(job) = queue.try_recv() {
+            if let OrchestratorJob::Execute { reply, .. } = job {
+                unstarted.push(reply);
+            }
         }
     }
     for reply in unstarted {
@@ -2569,7 +2650,7 @@ pub(super) async fn orchestrator_worker_loop<F, Fut>(
 /// `pub(crate)`: returned by [`NodeOrchestrator::worker_tx`], which `main.rs` calls when it
 /// wires the router. Named nowhere outside `node/` — the callers bind it by inference.
 pub(crate) struct OrchestratorWorkerTx {
-    pub(super) workers: Arc<Vec<mpsc::Sender<OrchestratorJob>>>,
+    pub(super) workers: Arc<Vec<WorkerLane>>,
     pub(super) next_worker: Arc<AtomicUsize>,
     /// Per-worker atomic counters for observability.
     pub(super) worker_stats: Arc<Vec<Arc<WorkerCounters>>>,
@@ -2594,7 +2675,7 @@ pub(crate) struct OrchestratorWorkerTx {
 impl OrchestratorWorkerTx {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new_with_stats(
-        workers: Vec<mpsc::Sender<OrchestratorJob>>,
+        workers: Vec<WorkerLane>,
         worker_stats: Arc<Vec<Arc<WorkerCounters>>>,
         dispatch_stats: Arc<DispatchCounters>,
         per_worker_queue_capacity: usize,
@@ -2797,7 +2878,8 @@ impl OrchestratorWorkerTx {
                     target_core_id,
                     core_id,
                     queue_depth: counters.queue_depth.load(AtomicOrdering::Relaxed),
-                    queue_capacity: self.per_worker_queue_capacity,
+                    // Both queues together, as `queue_depth` counts both.
+                    queue_capacity: self.per_worker_queue_capacity * 2,
                     in_flight: counters.in_flight.load(AtomicOrdering::Relaxed),
                     in_flight_capacity: ORCHESTRATOR_WORKER_MAX_IN_FLIGHT,
                     jobs_completed: counters.jobs_completed.load(AtomicOrdering::Relaxed),
@@ -4542,7 +4624,7 @@ impl NodeOrchestrator {
         let mut worker_threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
 
         for worker_id in 0..worker_count {
-            let (tx, rx) = mpsc::channel::<OrchestratorJob>(per_worker_queue_capacity);
+            let (tx, rx) = worker_channel(per_worker_queue_capacity);
             worker_txs.push(tx);
             let engine = Arc::clone(&engine);
             let counters = Arc::clone(&worker_stats[worker_id]);

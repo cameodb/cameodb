@@ -1315,7 +1315,7 @@ fn a_service_estimate_larger_than_the_budget_cannot_wedge_the_node() {
 /// and the refusal is a `503` the client can act on rather than work done for nobody.
 #[tokio::test]
 async fn a_job_that_outlived_its_request_is_refused_at_dequeue() {
-    let (tx, rx) = mpsc::channel::<OrchestratorJob>(8);
+    let (tx, rx) = worker_channel(8);
     let stats = Arc::new(DispatchCounters::default());
     let live = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
@@ -1376,7 +1376,7 @@ async fn a_job_that_outlived_its_request_is_refused_at_dequeue() {
 /// No budget is the pre-F7 behaviour, and it has to stay reachable: a stale job runs.
 #[tokio::test]
 async fn without_a_budget_a_stale_job_still_runs() {
-    let (tx, rx) = mpsc::channel::<OrchestratorJob>(8);
+    let (tx, rx) = worker_channel(8);
     let live = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
 
@@ -1648,7 +1648,7 @@ fn stalled_writer_runner() -> impl Fn(Box<ClientOp>, Option<Uuid>) -> TestOp + C
 }
 
 async fn submit_op(
-    tx: &mpsc::Sender<OrchestratorJob>,
+    tx: &WorkerLane,
     op: Box<ClientOp>,
 ) -> tokio::sync::oneshot::Receiver<WorkerOutcome> {
     let (reply, answer) = tokio::sync::oneshot::channel();
@@ -1663,12 +1663,64 @@ async fn submit_op(
     answer
 }
 
+/// However many writes a worker has set aside, it goes on taking reads. With one queue for
+/// both kinds, a worker holding its limit of set-aside writes stopped taking jobs at all, and
+/// the search queued behind them waited for a writer it never needed: at a width of four,
+/// three writes running and eight set aside were enough.
+#[tokio::test]
+async fn reads_are_served_however_many_writes_are_set_aside() {
+    let (tx, rx) = worker_channel(64);
+    tokio::spawn(orchestrator_worker_loop(
+        rx,
+        stalled_writer_runner(),
+        0,
+        None,
+        4,
+        None,
+        None,
+    ));
+    // Three run, eight are set aside — the limit — and the rest stay in the write queue.
+    let mut writes = Vec::new();
+    for _ in 0..40 {
+        writes.push(submit_op(&tx, writer_op()).await);
+    }
+    for _ in 0..5 {
+        let answer = submit_op(&tx, placeholder_op()).await;
+        let served = tokio::time::timeout(Duration::from_secs(2), answer).await;
+        assert!(
+            matches!(served, Ok(Ok(WorkerOutcome::Done(Ok(_))))),
+            "a search behind stalled writes is served"
+        );
+    }
+    drop(writes);
+}
+
+/// A full write queue refuses writes and leaves the read queue open.
+#[tokio::test]
+async fn a_full_write_queue_does_not_refuse_reads() {
+    let (tx, _rx) = worker_channel(2);
+    let job = |op: Box<ClientOp>| OrchestratorJob::Execute {
+        arrived_at: Instant::now(),
+        op,
+        affinity_shard: None,
+        reply: tokio::sync::oneshot::channel().0,
+    };
+    tx.try_send(job(writer_op())).expect("first write");
+    tx.try_send(job(writer_op())).expect("second write");
+    assert!(matches!(
+        tx.try_send(job(writer_op())),
+        Err(mpsc::error::TrySendError::Full(_))
+    ));
+    tx.try_send(job(placeholder_op()))
+        .expect("a read still has its queue");
+}
+
 /// A job the worker took but never started is answered at shutdown, and the answer says it
 /// did not run. Dropped, it reached its caller as a closed channel, which reads as "may have
 /// run" — true of a job that started, not of these.
 #[tokio::test]
 async fn jobs_never_started_are_refused_at_worker_shutdown() {
-    let (tx, rx) = mpsc::channel::<OrchestratorJob>(64);
+    let (tx, rx) = worker_channel(64);
     tokio::spawn(orchestrator_worker_loop(
         rx,
         stalled_writer_runner(),
@@ -1720,7 +1772,7 @@ async fn jobs_never_started_are_refused_at_worker_shutdown() {
 /// waited for a writer it never needed. Reads are served past them.
 #[tokio::test]
 async fn reads_are_served_while_writes_wait_for_a_stalled_writer() {
-    let (tx, rx) = mpsc::channel::<OrchestratorJob>(64);
+    let (tx, rx) = worker_channel(64);
     tokio::spawn(orchestrator_worker_loop(
         rx,
         stalled_writer_runner(),
@@ -1750,7 +1802,7 @@ async fn reads_are_served_while_writes_wait_for_a_stalled_writer() {
 /// The slots left to reads: writer work never holds the whole width, whatever is queued.
 #[tokio::test]
 async fn writer_work_never_holds_the_whole_width() {
-    let (tx, rx) = mpsc::channel::<OrchestratorJob>(64);
+    let (tx, rx) = worker_channel(64);
     let writing = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
     let runner = {
@@ -1796,7 +1848,7 @@ async fn writer_work_never_holds_the_whole_width() {
 /// something else happens to finish.
 #[tokio::test]
 async fn a_parked_write_is_refused_at_its_deadline() {
-    let (tx, rx) = mpsc::channel::<OrchestratorJob>(64);
+    let (tx, rx) = worker_channel(64);
     let stats = Arc::new(DispatchCounters::default());
     tokio::spawn(orchestrator_worker_loop(
         rx,
@@ -1825,7 +1877,7 @@ async fn a_parked_write_is_refused_at_its_deadline() {
 /// Writes still start in the order they arrived: setting them aside does not reorder them.
 #[tokio::test]
 async fn parked_writes_start_in_arrival_order() {
-    let (tx, rx) = mpsc::channel::<OrchestratorJob>(64);
+    let (tx, rx) = worker_channel(64);
     let started = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let runner = {
         let started = Arc::clone(&started);
@@ -1867,7 +1919,7 @@ fn parking_runner() -> impl Fn(Box<ClientOp>, Option<Uuid>) -> TestOp + Clone {
 }
 
 async fn submit_aged(
-    tx: &mpsc::Sender<OrchestratorJob>,
+    tx: &WorkerLane,
     age: Duration,
 ) -> tokio::sync::oneshot::Receiver<WorkerOutcome> {
     let (reply, answer) = tokio::sync::oneshot::channel();
@@ -1898,7 +1950,7 @@ async fn submit_aged(
 /// [OB14]: the shard-writer deadlock found by the first M6 arm, 2026-09-25.
 #[tokio::test]
 async fn an_operation_that_never_returns_costs_one_slot_not_the_pool() {
-    let (tx, rx) = mpsc::channel::<OrchestratorJob>(8);
+    let (tx, rx) = worker_channel(8);
     let stats = Arc::new(DispatchCounters::default());
     let counters = Arc::new(WorkerCounters::default());
     // Small, so twenty budgets is a wall-clock fraction of a second.
@@ -1995,7 +2047,7 @@ async fn an_operation_that_never_returns_costs_one_slot_not_the_pool() {
 /// occupies a slot a live job could have used.
 #[tokio::test]
 async fn a_stale_job_is_shed_even_when_every_permit_is_held() {
-    let (tx, rx) = mpsc::channel::<OrchestratorJob>(8);
+    let (tx, rx) = worker_channel(8);
     let stats = Arc::new(DispatchCounters::default());
     // Deliberately long enough that the liveness cap — twenty budgets, so four seconds here —
     // cannot fire inside this test. Otherwise the cap would release the parked job's permit and
@@ -2042,9 +2094,7 @@ async fn a_stale_job_is_shed_even_when_every_permit_is_held() {
     );
 }
 
-async fn submit(
-    tx: &mpsc::Sender<OrchestratorJob>,
-) -> tokio::sync::oneshot::Receiver<WorkerOutcome> {
+async fn submit(tx: &WorkerLane) -> tokio::sync::oneshot::Receiver<WorkerOutcome> {
     let (reply, answer) = tokio::sync::oneshot::channel();
     tx.send(OrchestratorJob::Execute {
         arrived_at: Instant::now(),
@@ -2063,7 +2113,7 @@ async fn submit(
 /// measured 13-20% write regression, because enabling it halves `worker_count`.
 #[tokio::test]
 async fn a_worker_runs_several_operations_at_once() {
-    let (tx, rx) = mpsc::channel(16);
+    let (tx, rx) = worker_channel(16);
     let live = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
     tokio::spawn(orchestrator_worker_loop(
@@ -2101,7 +2151,7 @@ async fn a_worker_runs_several_operations_at_once() {
 /// only move the queue from the channel into memory.
 #[tokio::test]
 async fn a_worker_never_exceeds_its_width() {
-    let (tx, rx) = mpsc::channel(16);
+    let (tx, rx) = worker_channel(16);
     let live = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
     tokio::spawn(orchestrator_worker_loop(
@@ -2143,7 +2193,7 @@ async fn a_worker_never_exceeds_its_width() {
 /// catch it — the test runtime outlives the loop and the tasks would finish anyway.
 #[test]
 fn shutdown_answers_operations_it_already_accepted() {
-    let (tx, rx) = mpsc::channel::<OrchestratorJob>(16);
+    let (tx, rx) = worker_channel(16);
 
     // The first operation is quick and the rest are slow, so the loop is guaranteed to
     // read `Shutdown` — which needs a freed permit — while three are still running. With
