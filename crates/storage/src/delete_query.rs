@@ -20,7 +20,7 @@
 //! time — ids resolved, checked, kept or dropped — and holds no set of every match: a count
 //! keeps a number, and a delete keeps at most its cap of ids and counts the candidates past it,
 //! which the request that continues it finds again. A count with nothing to check — no `text`
-//! clause, no write since the last commit — is the index's own count, and resolves no id.
+//! clause, no delete since the last commit — is the index's own count, and resolves no id.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -72,7 +72,7 @@ struct DeleteWalk {
     fields: SchemaFields,
     query: Box<dyn Query>,
     exact: Vec<ExactText>,
-    /// Whether the index has writes since its last commit — see `keep_exact`.
+    /// Whether the index has deletes since its last commit — see `keep_exact`.
     uncommitted: bool,
 }
 
@@ -162,10 +162,15 @@ impl HybridStore {
             .get_schema_cached(index)?
             .unwrap_or_else(|| Arc::new(IndexSchema::default()));
         // Read before the searcher is taken. A commit reloads the reader before it resets the
-        // count, so a count of zero read here means the searcher below is the latest commit and
-        // nothing has been written since: every match it holds is in the store, and the
-        // presence check in `keep_exact` has nothing to drop.
-        let uncommitted = self.get_operations_count(index) > 0;
+        // count, so a count of zero read here means the searcher below holds every delete made
+        // so far: every match it holds is in the store, and the presence check in `keep_exact`
+        // has nothing to drop.
+        //
+        // Deletes, not writes of any kind. A put since the commit removes no row, so it gives
+        // the check nothing to find — and an index under continuous ingestion always has puts
+        // waiting, which made every delete by query on one pay a point read per match and walk
+        // every candidate just to count them.
+        let uncommitted = self.get_uncommitted_deletes(index) > 0;
         let searcher = reader.searcher();
         let tantivy_index = searcher.index();
 
@@ -271,7 +276,7 @@ impl HybridStore {
     /// The searcher is the last commit's, and a document deleted since — by a delete by query
     /// its budget stopped, whose commit is posted rather than awaited — is still in it. Counting
     /// those would make the request that continues the delete report matches it cannot delete
-    /// and deletes it did not make, so with `uncommitted` writes on the index each id is looked
+    /// and deletes it did not make, so with `uncommitted` deletes on the index each id is looked
     /// up in the store. With none, the lookup is skipped — a point read per match, the largest
     /// cost of the find — and an id the index holds and the store does not is kept, so the
     /// delete removes it from the index, as a batch delete of it would.

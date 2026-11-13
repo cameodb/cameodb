@@ -355,3 +355,45 @@ fn a_shard_without_the_index_has_nothing_to_delete() {
         .expect("no index is nothing to delete");
     assert!(found.ids.is_empty());
 }
+
+/// The matches are checked against the store only while a delete is waiting for its commit.
+/// A put waiting for one removes nothing the searcher holds, so an index under ingestion is
+/// found — and counted — from the index alone; a delete waiting is still in the searcher, and
+/// is dropped by the check.
+#[test]
+fn only_an_uncommitted_delete_sends_the_matches_to_the_store() {
+    let temp = TempDir::new().unwrap();
+    let store = sample(&temp);
+    let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+    store
+        .apply_batch(
+            INDEX,
+            vec![WalOp::Put {
+                id: "e".to_string(),
+                json_blob: Some(json!({"status": "live"})),
+            }],
+        )
+        .expect("put");
+    assert!(store.get_operations_count(INDEX) > 0);
+    assert_eq!(store.get_uncommitted_deletes(INDEX), 0);
+    assert_eq!(matched(&store, "status:expired"), (ids(&["a", "b"]), 0));
+    assert_eq!(counted(&store, "status:expired"), (2, 0));
+
+    store
+        .apply_batch(
+            INDEX,
+            vec![WalOp::Delete {
+                id: "b".to_string(),
+            }],
+        )
+        .expect("delete");
+    assert_eq!(store.get_uncommitted_deletes(INDEX), 1);
+    assert_eq!(matched(&store, "status:expired"), (ids(&["a"]), 0));
+    assert_eq!(counted(&store, "status:expired"), (1, 0));
+
+    store.commit_index(INDEX).expect("commit");
+    assert_eq!(store.get_uncommitted_deletes(INDEX), 0);
+    assert_eq!(matched(&store, "status:expired"), (ids(&["a"]), 0));
+    assert_eq!(counted(&store, "status:expired"), (1, 0));
+}

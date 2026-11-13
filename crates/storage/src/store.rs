@@ -396,6 +396,10 @@ pub struct HybridStore {
     /// Bytes written to each index since its last commit — the documents and the WAL entries —
     /// which is what a restart would replay. See [`COMMIT_BACKSTOP_ARENAS`].
     pub(crate) uncommitted_bytes: Arc<DashMap<String, AtomicU64>>,
+    /// Deletes applied to each index since its last commit. The searcher still holds those
+    /// documents, so a delete by query checks its matches against the store while this is not
+    /// zero — and only then; see [`Self::get_uncommitted_deletes`].
+    pub(crate) uncommitted_deletes: Arc<DashMap<String, AtomicU64>>,
     /// When each index's oldest uncommitted operation was counted, in milliseconds after
     /// `commit_clock_epoch`, or [`NOTHING_PENDING`]. What `commit_interval_ms` is measured
     /// from; see [`Self::should_commit_writer`].
@@ -651,6 +655,7 @@ impl HybridStore {
             current_seq: Arc::new(DashMap::new()),
             operations_counter: Arc::new(DashMap::new()),
             uncommitted_bytes: Arc::new(DashMap::new()),
+            uncommitted_deletes: Arc::new(DashMap::new()),
             pending_since: Arc::new(DashMap::new()),
             commit_clock_epoch: std::time::Instant::now(),
             schema_cache: Arc::new(DashMap::new()),
@@ -766,6 +771,7 @@ impl HybridStore {
         self.schema_cache.clear();
         self.operations_counter.clear();
         self.uncommitted_bytes.clear();
+        self.uncommitted_deletes.clear();
         self.pending_since.clear();
         self.current_seq.clear();
         self.index_size_cache
@@ -852,6 +858,7 @@ impl HybridStore {
         // unflushed data.
         self.operations_counter.remove(index);
         self.uncommitted_bytes.remove(index);
+        self.uncommitted_deletes.remove(index);
         self.pending_since.remove(index);
         // Warmup is invalidated by generation equality, and this name's next reader starts
         // its generation counter from zero. Dropping both entries is what makes the next
@@ -1359,6 +1366,7 @@ impl HybridStore {
         let mut replayed_count = 0;
         let mut replayed_since_commit = 0u64;
         let mut replayed_bytes_since_commit = 0u64;
+        let mut replayed_deletes_since_commit = 0u64;
         let mut skipped_duplicates = 0usize;
         let mut applied_ids: HashSet<String> = HashSet::new();
 
@@ -1407,6 +1415,7 @@ impl HybridStore {
                 None => {
                     let term = tantivy::Term::from_field_text(fields.id, &id);
                     writer.delete_term(term);
+                    replayed_deletes_since_commit += 1;
                 }
             }
 
@@ -1435,6 +1444,7 @@ impl HybridStore {
                 commit_writer_at(writer, seq_id)?;
                 replayed_since_commit = 0;
                 replayed_bytes_since_commit = 0;
+                replayed_deletes_since_commit = 0;
             }
 
             // Log progress every 1000 documents
@@ -1454,7 +1464,12 @@ impl HybridStore {
         // or supervisor idle timeout) flushes them; otherwise the no-op guard in commit_index
         // would leave them buffered until unrelated traffic arrives for this index.
         if replayed_since_commit > 0 {
-            self.add_operations(index, replayed_since_commit, replayed_bytes_since_commit);
+            self.add_operations(
+                index,
+                replayed_since_commit,
+                replayed_bytes_since_commit,
+                replayed_deletes_since_commit,
+            );
         }
 
         tracing::info!(
@@ -2226,8 +2241,31 @@ impl HybridStore {
             .unwrap_or(0)
     }
 
-    /// Count `operations`, of `bytes` in all, toward the index's next commit.
-    pub(crate) fn add_operations(&self, index: &str, operations: u64, bytes: u64) {
+    /// Deletes applied to `index` since its last commit.
+    ///
+    /// What a delete by query asks before it trusts the searcher: a document deleted since the
+    /// commit is still in the last searcher and no longer in the store. A put since the commit
+    /// leaves every document the searcher holds in the store, so puts alone — an index under
+    /// continuous ingestion — are no reason to look each match up.
+    pub fn get_uncommitted_deletes(&self, index: &str) -> u64 {
+        self.uncommitted_deletes
+            .get(index)
+            .map(|deletes| deletes.value().load(Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+
+    /// Count `operations`, of `bytes` in all and `deletes` of them deletes, toward the
+    /// index's next commit.
+    pub(crate) fn add_operations(&self, index: &str, operations: u64, bytes: u64, deletes: u64) {
+        // Before the operations, which is the count a commit is decided on: a commit that
+        // sees the operations then resets a delete count that already includes them.
+        if deletes > 0 {
+            self.uncommitted_deletes
+                .entry(index.to_string())
+                .or_insert_with(|| AtomicU64::new(0))
+                .value()
+                .fetch_add(deletes, Ordering::SeqCst);
+        }
         self.operations_counter
             .entry(index.to_string())
             .or_insert_with(|| AtomicU64::new(0))
@@ -2247,6 +2285,9 @@ impl HybridStore {
         }
         if let Some(bytes) = self.uncommitted_bytes.get(index) {
             bytes.value().store(0, Ordering::Relaxed);
+        }
+        if let Some(deletes) = self.uncommitted_deletes.get(index) {
+            deletes.value().store(0, Ordering::SeqCst);
         }
         // Nothing is waiting any more, so the next operation starts a fresh interval.
         if let Some(since) = self.pending_since.get(index) {
@@ -3226,6 +3267,10 @@ impl HybridStore {
         if ops.is_empty() {
             return Ok((Vec::new(), 0));
         }
+        let batch_deletes = ops
+            .iter()
+            .filter(|op| matches!(op, WalOp::Delete { .. }))
+            .count() as u64;
 
         tracing::debug!(
             index = %index,
@@ -3642,7 +3687,7 @@ impl HybridStore {
 
             // Counted before the writer is released, so a commit never sees the documents
             // without the count that makes it commit them.
-            self.add_operations(index, batch_size, batch_bytes);
+            self.add_operations(index, batch_size, batch_bytes, batch_deletes);
 
             tracing::debug!(
                 index = %index,

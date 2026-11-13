@@ -123,6 +123,15 @@ peer ignores the spent-budget field a forwarded operation now carries.
   index still commits once it holds four writer arenas (`indexer_memory_min_mb`) of uncommitted
   bytes, so large documents do not stretch the replay. Both limits are per index, per shard. A
   node that set `default_batch_size` to move this count gets five times the count it had.
+- **A delete by query on an index that is being written to no longer looks every match up in
+  the document store.** A document deleted since the last commit is still in the index the find
+  reads, so the find checked each match against the store whenever the index had any uncommitted
+  write, and its count walked every candidate for the same reason. On an index under continuous
+  ingestion that was every delete by query. Only an uncommitted delete can make a match stale,
+  so the check — and the walk a count needed — now runs only while one is waiting; otherwise the
+  count is the index's own and the find resolves ids alone. On a 4-shard node taking bulk and
+  single writes beside 500 searches a second, a delete of 50,000 documents took 0.37–0.59 s
+  against 0.53–1.14 s, and the searches beside the deletes had a median of 11 ms against 66–82 ms.
 
 ### Fixed
 
@@ -223,6 +232,13 @@ peer ignores the spent-budget field a forwarded operation now carries.
   stayed out of search until a later write to the index brought a commit. The idle commit now
   goes to the replacement writer, so the writes acknowledged before the crash are searchable
   after `supervisor_timeout_secs` with no further write.
+- **A search and a commit no longer reload an index's reader at the same time.** A search that
+  finds a background merge has finished reloads the index's reader, and so does every commit.
+  Two reloads at once finish in either order, so a search's reload begun before a commit could
+  replace the commit's, leaving the reader without the newest commit until the next commit or
+  merge — the reader a delete by query takes to be current. Found by reading the reload path,
+  not seen in a run. Reloads of one index, and the first open of its reader, now run one at a
+  time; a commit waits its turn, and a search leaves the reload to the one already running.
 
 ## [0.3.9] - 2026-11-05
 

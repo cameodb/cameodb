@@ -258,6 +258,9 @@ pub(crate) struct MetaProbe {
     /// On the commit clock, so a search decides whether a look is due with one atomic read.
     probed_ms: std::sync::atomic::AtomicU64,
     seen: std::sync::Mutex<Option<MetaStamp>>,
+    /// Held across a reload or a first open of the index's reader; see
+    /// [`HybridStore::reload_lock`].
+    reload: Arc<std::sync::Mutex<()>>,
 }
 
 impl MetaProbe {
@@ -265,8 +268,19 @@ impl MetaProbe {
         Self {
             probed_ms: std::sync::atomic::AtomicU64::new(0),
             seen: std::sync::Mutex::new(seen),
+            reload: Arc::new(std::sync::Mutex::new(())),
         }
     }
+}
+
+/// Whether a reload waits for one already running on the index, or leaves it to that one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReloadTurn {
+    /// A commit, a close, a finished merge: the caller's own change must be in the reader
+    /// when this returns.
+    Wait,
+    /// A search that noticed a change: any reload will do, and a search does not queue.
+    Skip,
 }
 
 impl HybridStore {
@@ -315,9 +329,34 @@ impl HybridStore {
             stamp.is_some() && *probe.seen.lock().unwrap_or_else(|e| e.into_inner()) != stamp;
         // Released before the reload, which writes this map.
         drop(probe);
-        if changed && let Err(e) = self.smart_refresh_reader(index) {
+        // Not waited for: a reload already running is either a commit's, which will see what
+        // this search saw, or began before it — and then the stamp it recorded differs from the
+        // file's, so the next look reloads.
+        if changed && let Err(e) = self.refresh_reader(index, ReloadTurn::Skip) {
             tracing::warn!(index = %index, error = %e, "Reload after a background merge failed");
         }
+    }
+
+    /// The lock that puts `index`'s reader reloads, and its first open, one after another.
+    ///
+    /// Tantivy's reload reads `meta.json`, builds a searcher from it, and then stores the
+    /// searcher; two reloads at once store in whichever order they finish. A search that
+    /// noticed a merge could begin its reload before a commit published, and store after the
+    /// commit's own reload had: the reader then held the pre-commit searcher while the index's
+    /// pending count read zero, which a delete by query takes to mean the searcher is current.
+    /// And the later of two reloads of the same segments discarded the caches warmed for the
+    /// first. One at a time, each reads the file after the one before it stored.
+    pub(crate) fn reload_lock(&self, index: &str) -> Arc<std::sync::Mutex<()>> {
+        if let Some(probe) = self.meta_probes.get(index) {
+            return Arc::clone(&probe.reload);
+        }
+        Arc::clone(
+            &self
+                .meta_probes
+                .entry(index.to_string())
+                .or_insert_with(|| MetaProbe::new(None))
+                .reload,
+        )
     }
 
     /// Record what `index`'s `meta.json` looked like **before** a reader was opened or reloaded,
@@ -343,6 +382,22 @@ impl HybridStore {
     /// measured the reader as it stood and cached that for `index_cache_expiry`; without this
     /// a client waiting on the node's own commit read the pre-commit count for the hour.
     pub(crate) fn smart_refresh_reader(&self, index: &str) -> Result<(), StoreError> {
+        self.refresh_reader(index, ReloadTurn::Wait)
+    }
+
+    /// [`Self::smart_refresh_reader`], waiting for a reload already running on `index` or
+    /// leaving the work to it — see [`ReloadTurn`] and [`Self::reload_lock`].
+    pub(crate) fn refresh_reader(&self, index: &str, turn: ReloadTurn) -> Result<(), StoreError> {
+        let lock = self.reload_lock(index);
+        let _reloading = match turn {
+            ReloadTurn::Wait => lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            ReloadTurn::Skip => match lock.try_lock() {
+                Ok(held) => held,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
+            },
+        };
+
         // Dropped after the reload, on both paths, not before it: a stats request between a
         // drop and the reload would measure the old reader and cache it again.
         // Fast path: Try to reload existing reader. Cloned out of the map first — a clone shares
@@ -555,6 +610,15 @@ impl HybridStore {
         // that hold no writer, so a search never pays another index's commit.
         self.admit_open_index(index, false);
 
+        // An open is a reload's equal: it reads `meta.json` and publishes a searcher. Under
+        // the reload lock, a commit's reload either finds the reader this puts in the map or
+        // ran before the file was read here — never in between, where it would find no reader
+        // to reload and leave this one on the pre-commit segments.
+        let reload_lock = self.reload_lock(index);
+        let opening = reload_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         // Taken before the open, for the same reason a reload takes it first.
         let opened_at = self.meta_stamp(index);
 
@@ -595,6 +659,7 @@ impl HybridStore {
             })?;
 
         self.note_meta_seen(index, opened_at);
+        drop(opening);
 
         // Warm up fields cache
         let tantivy_index = reader.value().searcher().index().clone();

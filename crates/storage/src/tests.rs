@@ -2745,14 +2745,14 @@ mod commit_interval_tests {
             let limit = store.commit_backstop_bytes();
             assert_eq!(limit, 16 * 1024 * 1024 * COMMIT_BACKSTOP_ARENAS);
 
-            store.add_operations("large", 3, limit - 1);
+            store.add_operations("large", 3, limit - 1, 0);
             assert!(
                 !store.should_commit_writer("large", 3),
                 "interval {interval}"
             );
             assert_eq!(store.commit_due("large", true), CommitDue::No);
 
-            store.add_operations("large", 1, 1);
+            store.add_operations("large", 1, 1, 0);
             assert!(
                 store.should_commit_writer("large", 4),
                 "interval {interval}"
@@ -2917,6 +2917,64 @@ mod commit_interval_tests {
                 .expect("backstop check")
         );
         assert_eq!(store.get_operations_count(index), 0);
+    }
+
+    /// Reloads of one index's reader take turns: a commit's waits for one already running,
+    /// and a search's leaves the work to it instead of queueing.
+    #[test]
+    fn reader_reloads_of_one_index_take_turns() {
+        use crate::search::ReloadTurn;
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = Arc::new(HybridStore::new(config(&temp_dir, INTERVAL_MS), 1).expect("store"));
+        let index = "turns";
+        store.apply_batch(index, vec![put("a")]).expect("write");
+        store.commit_index(index).expect("commit");
+        let (reader, _) = store.get_reader(index).expect("reader").expect("open");
+
+        // A second document, committed in Tantivy but not yet reloaded into the reader.
+        store.apply_batch(index, vec![put("b")]).expect("write");
+        {
+            let writer = store.writers.get(index).expect("writer").value().clone();
+            writer
+                .lock()
+                .expect("writer lock")
+                .commit()
+                .expect("commit");
+        }
+        assert_eq!(reader.searcher().num_docs(), 1);
+
+        let lock = store.reload_lock(index);
+        let running = lock.lock().expect("reload lock");
+
+        // A search's reload does not wait, and does not reload beside the one running.
+        store
+            .refresh_reader(index, ReloadTurn::Skip)
+            .expect("skipped");
+        assert_eq!(
+            reader.searcher().num_docs(),
+            1,
+            "left to the reload running"
+        );
+
+        // A commit's reload waits its turn.
+        let waiting = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || store.smart_refresh_reader("turns"))
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !waiting.is_finished(),
+            "a commit's reload waits for the one running"
+        );
+        assert_eq!(reader.searcher().num_docs(), 1);
+
+        drop(running);
+        waiting.join().expect("join").expect("reload");
+        assert_eq!(
+            reader.searcher().num_docs(),
+            2,
+            "then reloads, and sees the commit"
+        );
     }
 
     /// A reader cloned before an eviction sees the commit the eviction makes. The close drops
