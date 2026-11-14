@@ -6493,6 +6493,20 @@ bytes as before; the two real-text tables came to 60.6% and 28.5% of their store
 synthetic one to 13.1%. Most of that shard is synthetic, so the shard total says more about the
 benchmark data than about yours: the real-text figures are the guide.
 
+**On a full collection of real text.** A node holding 19.8 million rows of plain book text in four
+shards, written entirely before compression existed, had `compact --rewrite --dry-run` report
+52.7 GB → about 34.2 GB (35% off), from a sample of 4,000 rows per index. The rewrite, one file at
+a time with the node stopped, ended at 28.3 GB (46% off): 11.9–14.3 GB per shard became
+6.5–7.6 GB. The node then started on the rewritten files and its load check found the index in
+sync, all 19,784,894 documents present. The dry run is the cautious side of the result on text
+like this: rows of long running prose compress less than rows of repeated field names, and the
+estimate came out about 6 GB high. The Tantivy files of the same node (22.7 GB) are not touched
+by any of this, so the node's total went from about 75 GB to 51 GB, the rest being the search
+index. The estimate came with the same work: `--rewrite --dry-run` compresses a sample of each
+data table against a dictionary filled as the rewrite will fill it and reports the file's size
+less the share it saves of the table's pages, where a plain `--dry-run` measures only in-place
+compaction and says so.
+
 **What it changes for an operator.** A 0.3.9 node cannot read a row 0.3.10 compressed, so there
 is no downgrade once 0.3.10 has written to a data directory; the changelog's upgrade note says
 so. Nothing is configured, and nothing needs migrating. Rows written before are read as they
