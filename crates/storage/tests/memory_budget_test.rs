@@ -49,6 +49,7 @@ fn test_optimal_memory_budget_by_index_size() {
         default_batch_size: 1000,
         wal_sync: true,
         quick_repair: true,
+        document_compression: Default::default(),
         commit_interval_ms: 0,
         query: Default::default(),
     };
@@ -110,6 +111,7 @@ fn test_optimal_memory_budget_sums_directory_contents() {
         default_batch_size: 1000,
         wal_sync: true,
         quick_repair: true,
+        document_compression: Default::default(),
         commit_interval_ms: 0,
         query: Default::default(),
     };

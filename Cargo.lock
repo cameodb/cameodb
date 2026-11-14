@@ -4703,6 +4703,7 @@ dependencies = [
  "uuid",
  "walkdir",
  "xxhash-rust",
+ "zstd-safe 7.4.0",
 ]
 
 [[package]]

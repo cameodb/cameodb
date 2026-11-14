@@ -39,6 +39,7 @@ fn config(shard_path: &std::path::Path, wal_sync: bool) -> StorageConfig {
         default_batch_size: 100_000,
         wal_sync,
         quick_repair: true,
+        document_compression: Default::default(),
         commit_interval_ms: 0,
         query: Default::default(),
     }

@@ -6519,7 +6519,94 @@ the index is deleted, whether or not those documents are. A deployment for which
 has a smaller alternative, a dictionary of field names and structure alone, which saves less; it
 was not built.
 
+### X2 — zstd as a node's choice for the rows it writes
+
+Done 2026-11-14. X1 compresses with LZ4 because it is the cheapest to read. On long running
+text LZ4 leaves the most behind — 61% on the prose table below — and that is where zstd, which
+entropy-codes what LZ4 only copies, gains.
+
+**What was measured first.** Every option zstd offers for a row this size, on one shard of the
+development node, release build, one thread. Each table was split as a node would see it: the
+dictionary filled or trained from the table's first documents (at most 2 MB, at most half the
+rows), and only the rows after those measured, so no row was compressed against itself. Sizes
+include the row header.
+
+| 64 KB raw dictionary unless named | Prose, 2.7 KB a row | Generated, 1.8 KB | Short records, 1.7 KB |
+|---|---|---|---|
+| LZ4 | 61.0% · 14.2 / 1.6 µs | 13.2% · 4.7 / 0.3 µs | 29.5% · 5.6 / 0.4 µs |
+| zstd level −1 | 57.1% | 12.5% | 29.6% |
+| zstd level 1 | 45.0% · 8.6 / 3.8 µs | 12.0% · 2.2 / 1.2 µs | 25.1% · 3.8 / 1.9 µs |
+| zstd level 1, 128 KB / 256 KB / 512 KB | 43.6% / 44.3% / 44.3% | 12.6% / 12.6% / 12.5% | 24.1% / 24.5% / 24.5% |
+| zstd level 3 | 42.0% · 11.5 / 4.5 µs | 11.8% · 1.9 / 1.0 µs | 23.8% · 4.9 / 2.3 µs |
+| zstd level 3, 512 KB | 39.7% | 12.6% | 21.6% |
+| zstd level 5 | 41.0% · 21.2 µs to compress | 12.1% | 22.5% |
+| zstd level 1, trained 64 KB | 43.7% · 6.8 / 3.3 µs | 11.1% · 0.9 / 0.6 µs | 22.4% · 2.0 / 1.4 µs |
+| zstd level 3, trained 64 KB | 39.4% · 9.0 / 3.8 µs | 10.7% · 1.0 / 0.6 µs | 20.4% · 2.4 / 1.3 µs |
+
+(Times are to compress / to decompress a row.)
+
+- **Dictionary size: 64 KB, the same as LZ4's.** At level 1 a larger raw dictionary bought at
+  most 1.4 points, and on the generated documents it lost; only at level 3 and above did
+  256–512 KB buy 2 points. Keeping LZ4's size is also what lets both share one dictionary.
+- **Level: 1.** Level 3 saves 0.2–3 points for 25–35% more time to compress, and the prepared
+  dictionary zstd keeps per index per shard grows from 110 KB at level 1 to 206 KB at level 2
+  and 462 KB at level 3: 44 MB against 185 MB on a node with a hundred indexes on four shards.
+  Level 5 doubles the time to compress for one more point; negative levels lose most of the
+  gain on prose.
+- **The frame: zstd's standard one, at its default flags.** The row header already holds the
+  tag, the length and the dictionary, so the frame's magic number and content size are four to
+  six bytes a row said twice: leaving them out saved 0.2–0.3 points, 2.5% of a stored generated
+  row, at no measured cost. It was built that way first and then put back, because the
+  magicless format is zstd's "experimental" API and needs a reader told the frame is not
+  standard. Rows are the frame Tantivy writes for its own blocks, read by any zstd, and the
+  dependency uses the stable API only.
+- **Trained dictionaries were the best on every axis**, and are not built: see below.
+
+zstd at level 1 compresses faster than the safe-Rust LZ4 encoder used here, and decompresses
+about three times slower: 10–30 µs on a page of ten hits.
+
+**What was built.** `[storage] document_compression`, `"lz4"` or `"zstd"`; `"lz4"` is the
+default and what a config without the line gets. It is a setting of the node, read at each
+write, and decides writes only. A zstd row is `0x02`, then the same header as an LZ4 row — the
+length as written, the length of dictionary it was compressed against — then the frame. A store
+reads rows of either tag whatever it is set to, so an index may hold both, a changed setting
+re-encodes nothing, and two nodes of a cluster may differ.
+
+Both methods share the one dictionary, still at most 65,535 bytes and still append-only. To
+zstd it is a raw-content dictionary: text to refer back to, with no tables of its own, so a
+prefix of it is one too and a row compressed while it was filling reads against that prefix as
+an LZ4 row does. zstd prepares a dictionary before compressing against it, which per row would
+cost many times the row; the prepared form is made on the first zstd row compressed against a
+given length of dictionary and kept beside the cached bytes, and never made on a node set to
+LZ4. Decompression needs none. Contexts are kept per thread, and each row sets its own
+dictionary on the context, so no row can be compressed against another index's. A damaged
+row's claimed length is refused before it is allocated, as for LZ4, against zstd's own bound
+(32,768 to 1); a frame that decodes to more than the header says is refused by zstd.
+
+`compact --rewrite` compresses with the configured method whatever each row was written with,
+so it converts a data directory in either direction, and `--rewrite --dry-run` estimates the
+result. The crate is the zstd Tantivy already links (`zstd-safe` 7.4), so nothing new is built.
+`cargo run --release -p storage --example doc_compression_cost -- <copy of a store.redb>`
+measures both methods on any shard, leaving out the rows that filled the dictionary; on this
+shard it reports 61.0% / 45.0%, 13.2% / 12.0% and 29.6% / 25.2%.
+
+**Not measured:** a node under load. The bulk, single-write and search figures of X1 were not
+rerun with zstd.
+
 **Left, not filed.**
+
+- *A trained dictionary.* zstd can train a dictionary from samples (`ZDICT_trainFromBuffer`):
+  16–61 ms on 0.75–2 MB of an index's first documents here. Against it rows came out 1–2.4
+  points smaller than against the raw dictionary at level 1 (3–5 points at level 3), and both
+  compressed and decompressed faster. It would also hold fragments of many documents rather
+  than whole first ones. What it needs that this does not have: a point at which an index has
+  enough documents to train from, a second dictionary per index (rows before that point keep
+  naming the raw one) and a dictionary number in the row; LZ4 cannot use it. The way in would be
+  a new tag, so it can come later without touching what is written now.
+- *Level 3 for an index that is mostly read rarely and kept long.* Per-index, not per node; it
+  would need the schema to carry it.
+
+**Left by X1, not filed.**
 
 - *A second dictionary for an index whose documents drift.* The dictionary reflects the first
   few dozen documents, so a collection that later changes shape compresses less well. The row's

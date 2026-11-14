@@ -176,6 +176,13 @@ pub struct StorageConfig {
     /// records the state either way; this only decides what a crash costs.
     #[serde(default = "default_quick_repair")]
     pub quick_repair: bool,
+    /// What a document row is compressed with when this store writes one: `lz4`, the default,
+    /// or `zstd`.
+    ///
+    /// It decides writes only. A row records how it was compressed, so rows of either kind are
+    /// read whatever this is, and changing it re-encodes nothing; see [`doc_codec`].
+    #[serde(default)]
+    pub document_compression: doc_codec::DocCompression,
     /// How long, in milliseconds, an index's oldest uncommitted write may wait for the commit
     /// that makes it searchable, while writes keep arriving; `0` commits by count alone.
     ///
@@ -472,6 +479,7 @@ impl Default for StorageConfig {
             default_batch_size: 1000,
             wal_sync: true,
             quick_repair: default_quick_repair(),
+            document_compression: doc_codec::DocCompression::default(),
             commit_interval_ms: 0,
             query: QueryPolicy::default(),
         }

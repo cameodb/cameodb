@@ -5033,6 +5033,7 @@ impl NodeOrchestrator {
             default_batch_size: self.config.default_batch_size,
             wal_sync: self.config.wal_sync,
             quick_repair: self.config.quick_repair,
+            document_compression: self.config.document_compression,
             commit_interval_ms: staggered_commit_interval(
                 self.config.commit_interval_ms,
                 ordinal,

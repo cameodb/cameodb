@@ -538,6 +538,7 @@ async fn run(args: Vec<String>) -> Result<()> {
         search_threads: cameodb_config.search.search_threads,
         wal_sync: cameodb_config.storage.wal_sync,
         quick_repair: cameodb_config.storage.quick_repair,
+        document_compression: cameodb_config.storage.document_compression,
         default_batch_size: cameodb_config.storage.default_batch_size,
         indexer_num_threads: cameodb_config.search.indexer_num_threads,
         merge_num_threads: cameodb_config.search.merge_num_threads,
@@ -995,6 +996,10 @@ async fn run(args: Vec<String>) -> Result<()> {
         } else {
             "full (a restart after a crash scans each shard's file)"
         }
+    );
+    println!(
+        "  Document compression: {}",
+        cameodb_config.storage.document_compression
     );
     println!(
         "  Indexer Memory: {}-{}MB",

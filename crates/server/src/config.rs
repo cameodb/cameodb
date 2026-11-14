@@ -465,6 +465,13 @@ pub struct StorageConfig {
     #[serde(default = "default_quick_repair")]
     pub quick_repair: bool,
 
+    /// What a stored document is compressed with when this node writes it: `"lz4"` (default)
+    /// or `"zstd"`. zstd, at level 1, makes smaller rows for more CPU per document written and
+    /// read. It decides writes only: rows of either kind are read whatever this is, an index
+    /// may hold both, and changing it re-encodes nothing. Each node has its own.
+    #[serde(default)]
+    pub document_compression: storage::doc_codec::DocCompression,
+
     /// WAL segment size in MB (default: 64)
     #[serde(default = "default_wal_segment_size_mb")]
     pub wal_segment_size_mb: usize,
@@ -1740,6 +1747,7 @@ impl Default for StorageConfig {
             disk_usage_threshold_percent: default_disk_usage_threshold_percent(),
             wal_sync: default_wal_sync(),
             quick_repair: default_quick_repair(),
+            document_compression: Default::default(),
             wal_segment_size_mb: default_wal_segment_size_mb(),
             default_batch_size: default_default_batch_size(),
             num_shards_init: default_num_shards_init(),

@@ -39,14 +39,29 @@ peer ignores the spent-budget field a forwarded operation now carries.
 - **Documents are stored compressed.** A document row in a shard's `store.redb` is LZ4-compressed
   against a dictionary of the index's own first documents: up to 64 KB, filled as they are
   written, then fixed. Each row records how much of the dictionary it was compressed against, so
-  every row stays readable as the dictionary fills and nothing is ever re-encoded. Nothing to
-  configure. Existing rows are read as they are and compressed when next written;
+  every row stays readable as the dictionary fills and nothing is ever re-encoded. Nothing
+  needs configuring; zstd can be chosen instead (next entry). Existing rows are read as they are and compressed when next written;
   `cameodb compact --rewrite` compresses every row of a stopped node's files in one pass, each
   index against a full dictionary. Measured on text indexes, rows take 29% and 61% of their
   former bytes; a 3.0 GB shard of mostly synthetic benchmark documents rewrote to 310 MB in 9 s.
   On the benchmark, bulk ingestion rose from 32–33k to 38–39k documents a second, and single
   writes and search latency were unchanged. A dictionary holds text of the documents that
   filled it until the index is deleted, including ones deleted since.
+
+- **`[storage] document_compression`: LZ4 or zstd for stored documents.** `"lz4"` is the
+  default, and what a config without the setting gets; `"zstd"` compresses at zstd's level 1
+  against the same 64 KB dictionary. Measured on one shard's rows, each against a full
+  dictionary: prose of 2.7 KB a document is stored at 45.0% of its bytes with zstd against
+  61.0% with LZ4, short text records at 25.2% against 29.6%, generated benchmark documents at
+  12.0% against 13.2%. A row compresses in 2.3–9.0 µs with zstd against 4.5–9.0 µs with LZ4,
+  and decompresses in 1.1–4.2 µs against 0.3–1.3 µs; an index written with zstd keeps 110 KB
+  more per shard in memory. No node-level benchmark was run with zstd. The setting decides
+  writes only: a row records its method, a node reads both whatever it is set to, an index may
+  hold both, and changing the setting re-encodes nothing. `cameodb compact --rewrite`
+  recompresses every document with the configured method, in either direction, and
+  `--rewrite --dry-run` estimates the result. Per node; also `--storage-document-compression`
+  and `CAMEODB_STORAGE_DOCUMENT_COMPRESSION`. The startup summary names the method. No new
+  dependency is built: it is the zstd Tantivy already links.
 
 - **`raw_fold` tokenizer: a whole value matched in any case.** `raw` keeps a value whole and keeps
   its case, and every analyzer that lowercases also splits into words, so a field of names, codes or

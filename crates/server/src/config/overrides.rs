@@ -106,6 +106,11 @@ pub(crate) const OVERRIDES: &[Override] = &[
         apply: |c, v| { c.storage.quick_repair = parse_bool(v); Ok(()) },
     },
     Override {
+        flag: "--storage-document-compression", env: "CAMEODB_STORAGE_DOCUMENT_COMPRESSION", kind: FlagKind::Value,
+        placeholder: "<lz4|zstd>", help: "What stored documents are compressed with when written (default: lz4)",
+        apply: |c, v| { c.storage.document_compression = v.parse().map_err(anyhow::Error::msg)?; Ok(()) },
+    },
+    Override {
         flag: "--storage-default-batch-size", env: "CAMEODB_STORAGE_DEFAULT_BATCH_SIZE", kind: FlagKind::Value,
         placeholder: "<N>", help: "Documents per write batch before an automatic commit",
         apply: |c, v| { c.storage.default_batch_size = v.parse()?; Ok(()) },

@@ -46,6 +46,7 @@ fn test_config(path: std::path::PathBuf) -> StorageConfig {
         default_batch_size: 1000,
         wal_sync: true,
         quick_repair: true,
+        document_compression: Default::default(),
         commit_interval_ms: 0,
         query: Default::default(),
     }

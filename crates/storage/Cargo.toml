@@ -18,6 +18,10 @@ thiserror = { workspace = true }
 tantivy = { workspace = true }
 # The LZ4 tantivy itself depends on, same version: compresses document rows in redb.
 lz4_flex = { version = "0.13", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
+# The zstd tantivy itself depends on, same version, so no second copy of the C library is
+# built: the other way to compress document rows. Stable API only: rows are standard zstd
+# frames, as tantivy writes its own.
+zstd-safe = { version = "7", default-features = false, features = ["std"] }
 # The fst crate tantivy itself depends on, same version: reads the Croatian analyzer data.
 tantivy-fst = "0.5"
 # The Snowball stemmers tantivy itself depends on, same version: the Italian analyzer runs one

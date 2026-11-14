@@ -38,6 +38,7 @@ fn test_config(shard_path: &std::path::Path) -> StorageConfig {
         // was the one write whose two halves did not even agree on durability.
         wal_sync: false,
         quick_repair: true,
+        document_compression: Default::default(),
         commit_interval_ms: 0,
         query: Default::default(),
     }

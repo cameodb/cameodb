@@ -26,6 +26,7 @@ fn test_storage_engine_basics() {
         default_batch_size: 1000, // 1000 operations default
         wal_sync: true,
         quick_repair: true,
+        document_compression: Default::default(),
         commit_interval_ms: 0,
         query: Default::default(),
     };
@@ -131,6 +132,7 @@ fn test_storage_configuration() {
         default_batch_size: 500,
         wal_sync: false,
         quick_repair: true,
+        document_compression: Default::default(),
         commit_interval_ms: 0,
         query: Default::default(),
     };

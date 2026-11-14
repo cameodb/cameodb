@@ -29,7 +29,7 @@ and T, and R's R1 and R2, were released in 0.3.9 on 2026-11-05.
 [U. Post-0.3.9 features](docs/ROADMAP-ARCHIVE.md#u-post-039-features--done) (archived), opened 2026-11-06 with U1 and U2, with U3 added 2026-11-09, is built and waits in `[Unreleased]` for 0.3.10.
 [V. Cluster HA](#v-cluster-ha--replication-the-two-node-mirror-and-elasticity--partial), opened 2026-11-08, is the design for replication, the two-node mirror and elasticity, and the order of the cluster work; V1 and V13 are done, in 0.3.10.
 [W. Mixed-workload review](docs/ROADMAP-ARCHIVE.md#w-mixed-workload-review--done) (archived), filed and closed 2026-11-13, is a review of a node taking searches, bulk and single writes and deletes by query at once: W1–W7, in 0.3.10.
-[X. Stored documents, compressed](docs/ROADMAP-ARCHIVE.md#x-stored-documents-compressed--done) (archived), filed and closed 2026-11-13, stores a document row LZ4-compressed against a dictionary the index's own first documents fill: X1, in 0.3.10, and the first change to the storage format since 0.3.9.
+[X. Stored documents, compressed](docs/ROADMAP-ARCHIVE.md#x-stored-documents-compressed--done) (archived), filed and closed 2026-11-13, stores a document row LZ4-compressed against a dictionary the index's own first documents fill: X1, in 0.3.10, and the first change to the storage format since 0.3.9; X2, 2026-11-14, adds zstd as a node's choice beside LZ4.
 What 0.3.10 carries is set under [The 0.3.10 scope](#the-0310-scope-2026-11-09).
 
 ## How to read this file
@@ -82,7 +82,7 @@ on one.
 | T — OAuth for MCP clients | ✅ Done, released in 0.3.9 on 2026-11-05 | T1, the node as the OAuth 2.1 authorization server for `/mcp` — discovery, dynamic client registration, an approval page taking the key the user holds, PKCE, refresh; stateless, tokens read-only and ended by revoking the key — done 2026-11-03 |
 | V — Cluster HA | ◐ Partial | V1–V13, opened 2026-11-08; V1 (a node bringing new shards refused) and V13 (a node moved to another machine) done 2026-11-09, with OB26, O4 and N17's cluster items, in 0.3.10. A cluster is partitioned (`replication_factor = 1`, today's behaviour, for systems that are not critical or whose HA is in the hardware) or replicated; two nodes are partitioned or a mirror. Phase 1, HA: the mirror — document versions, the change stream, the copy operation (V2–V5), with the schema round working with a peer down (OB26's bootstrap is done); no shard placement needed. Phase 2, a robust partitioned cluster: N11, then cluster metadata on a quorum of voters with a single-key compare-and-set, no Raft log, and shards owned by the cluster (V6–V8). Phase 3: move, drain, rebalance (V10) and replication with fewer copies than nodes (V9). Phase 4: online reindex and splitting (V11, V12) |
 | U — Post-0.3.9 features | ✅ Done, unreleased (0.3.10) | U3, `raw_fold` — a whole value matched in any case, diacritics folded — done 2026-11-09, in 0.3.10. U1, CJK analyzers — `cjk` (characters and character pairs, so Chinese, Japanese and Korean are searchable by word) and `cjk_fold` (traditional Chinese folded to simplified first, so a query in either script finds both) — done 2026-11-06. U2, Japanese and Korean folds — `cjk_ja_fold` (old-style kanji to new) and `cjk_ko_fold` (Hanja to Hangul, with the initial-sound rule) — done 2026-11-06 |
-| X — Stored documents, compressed | ✅ Done, unreleased (0.3.10) | X1 done 2026-11-13: a document row in a shard's `store.redb` is LZ4-compressed against a 64 KB dictionary of the index's first documents, append-only so every row stays readable as it fills. Text rows take 29–61% of their bytes, bulk ingest +20%, search and single writes unchanged; `cameodb compact --rewrite` compresses what a node wrote before. 0.3.9 cannot read what 0.3.10 then writes |
+| X — Stored documents, compressed | ✅ Done, unreleased (0.3.10) | X1 done 2026-11-13: a document row in a shard's `store.redb` is LZ4-compressed against a 64 KB dictionary of the index's first documents, append-only so every row stays readable as it fills. Text rows take 29–61% of their bytes, bulk ingest +20%, search and single writes unchanged; `cameodb compact --rewrite` compresses what a node wrote before. 0.3.9 cannot read what 0.3.10 then writes. X2 done 2026-11-14: `[storage] document_compression = "lz4"` (default) or `"zstd"` (level 1), per node, for writes only — rows of both kinds are always read; prose rows 45% of their bytes against LZ4's 61%; dictionary size, level, frame and trained dictionaries measured |
 | W — Mixed-workload review | ✅ Done, unreleased (0.3.10) | W1–W7 done 2026-11-13: a review of one node taking searches, bulk and single writes and deletes by query together. One bug (an index lost its idle commit when its shard's writer thread was replaced), one cadence regression (the operation backstop committed ahead of the interval under bulk), a delete by query that paid a store lookup per match on any index under ingestion, unserialized reader reloads, admission at the door that let one kind of request take every permit, and a worker that stopped serving reads behind its limit of set-aside writes |
 
 ## Reconciliation, 2026-08-26
@@ -305,6 +305,9 @@ confined to clusters ([V2](#v2--document-versions-and-delete-markers)'s decision
   0.3.10 has compressed, so there is no downgrade once 0.3.10 has written to a data directory.
   There is nothing to configure, and nothing to migrate: rows written before are read as they
   are, and `cameodb compact --rewrite` compresses them.
+- **Added 2026-11-14, zstd beside LZ4:** [X2](docs/ROADMAP-ARCHIVE.md#x2--zstd-as-a-nodes-choice-for-the-rows-it-writes).
+  Done the same day. `[storage] document_compression`, `"lz4"` by default; no further change
+  to what 0.3.9 can read, which was already nothing 0.3.10 compressed.
 - **Not in 0.3.10:** N11, which opens V's phase 2, and V2–V5 and R3, which are 0.4.0. CH3 and P5
   stand as filed.
 
@@ -3312,7 +3315,7 @@ search latencies are those of a read pool set to half its default width, is reco
 
 ## X. Stored documents, compressed ✅ Done
 
-X1 is done; see [X. Stored documents, compressed](docs/ROADMAP-ARCHIVE.md#x-stored-documents-compressed--done). What it left alone —
+X1 and X2 are done; see [X. Stored documents, compressed](docs/ROADMAP-ARCHIVE.md#x-stored-documents-compressed--done). What it left alone —
 a second dictionary for an index whose documents drift, compression in parallel across a bulk batch — is recorded there.
 
 ---
@@ -3330,7 +3333,7 @@ was delivered, its stub stands above in its place; these groups were delivered w
 - ✅ [**K. Phase 19 — Field metrics: min and max**](docs/ROADMAP-ARCHIVE.md#k-phase-19--field-metrics-min-and-max--done) — K1–K3
 - ✅ [**U. Post-0.3.9 features**](docs/ROADMAP-ARCHIVE.md#u-post-039-features--done) — U1–U3
 - ✅ [**W. Mixed-workload review**](docs/ROADMAP-ARCHIVE.md#w-mixed-workload-review--done) — W1–W7
-- ✅ [**X. Stored documents, compressed**](docs/ROADMAP-ARCHIVE.md#x-stored-documents-compressed--done) — X1
+- ✅ [**X. Stored documents, compressed**](docs/ROADMAP-ARCHIVE.md#x-stored-documents-compressed--done) — X1–X2
 
 The archive also holds the original write-up of every delivered phase, the measurements, and the settled decisions:
 what the affinity flags cost, what the audit trail costs, the non-goals recorded so they are not re-litigated, and the

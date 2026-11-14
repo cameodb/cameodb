@@ -1,7 +1,7 @@
 //! `HybridStore` state and the write side: index and writer lifecycle, batch
 //! and single writes, commits and checkpoints, WAL persistence and recovery,
 //! warmup, and schema storage.
-use crate::doc_codec::TABLE_DOC_DICT;
+use crate::doc_codec::{DocDict, TABLE_DOC_DICT};
 use crate::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -415,7 +415,7 @@ pub struct HybridStore {
     /// [`crate::doc_codec`]. A copy may be behind the table, never ahead of it and never another
     /// index's: an entry only ever gets longer, and `doc_dict_epoch` keeps one read before an
     /// index was deleted from being put back after.
-    pub(crate) doc_dicts: Arc<DashMap<String, Arc<[u8]>>>,
+    pub(crate) doc_dicts: Arc<DashMap<String, Arc<DocDict>>>,
     /// Moves whenever an index's dictionary stops existing. A dictionary read under one value
     /// is not cached under another.
     pub(crate) doc_dict_epoch: Arc<AtomicU64>,
@@ -690,7 +690,7 @@ impl HybridStore {
     /// durable commit recorded its allocator state, so a single commit made without the setting
     /// is enough to make the next crash pay for a full repair.
     /// This index's document dictionary: the cached copy, or the table's if there is none.
-    pub(crate) fn doc_dict(&self, index: &str) -> Result<Arc<[u8]>, StoreError> {
+    pub(crate) fn doc_dict(&self, index: &str) -> Result<Arc<DocDict>, StoreError> {
         if let Some(dict) = self.doc_dicts.get(index) {
             return Ok(dict.value().clone());
         }
@@ -698,17 +698,17 @@ impl HybridStore {
     }
 
     /// Read this index's dictionary from the table, and cache it if it is news.
-    pub(crate) fn reload_doc_dict(&self, index: &str) -> Result<Arc<[u8]>, StoreError> {
+    pub(crate) fn reload_doc_dict(&self, index: &str) -> Result<Arc<DocDict>, StoreError> {
         let epoch = self.doc_dict_epoch.load(Ordering::SeqCst);
         let read_txn = self.kv.begin_read()?;
-        let dict: Arc<[u8]> = match read_txn.open_table(TABLE_DOC_DICT) {
-            Ok(table) => match table.get(index)? {
-                Some(bytes) => Arc::from(bytes.value()),
-                None => Arc::from(&[][..]),
-            },
-            Err(redb::TableError::TableDoesNotExist(_)) => Arc::from(&[][..]),
+        let bytes = match read_txn.open_table(TABLE_DOC_DICT) {
+            Ok(table) => table
+                .get(index)?
+                .map_or_else(Vec::new, |bytes| bytes.value().to_vec()),
+            Err(redb::TableError::TableDoesNotExist(_)) => Vec::new(),
             Err(err) => return Err(err.into()),
         };
+        let dict = Arc::new(DocDict::new(bytes));
         self.publish_doc_dict(index, &dict, epoch);
         Ok(dict)
     }
@@ -719,7 +719,7 @@ impl HybridStore {
     /// The check and the insert are under the map's lock for this name, and
     /// [`Self::forget_doc_dict`] moves the epoch before it takes that lock: so a dictionary read
     /// before a delete is either refused here or removed there.
-    fn publish_doc_dict(&self, index: &str, dict: &Arc<[u8]>, epoch: u64) {
+    fn publish_doc_dict(&self, index: &str, dict: &Arc<DocDict>, epoch: u64) {
         let entry = self.doc_dicts.entry(index.to_string());
         if self.doc_dict_epoch.load(Ordering::SeqCst) != epoch {
             return;
@@ -751,7 +751,7 @@ impl HybridStore {
         &self,
         index: &str,
         stored: &'a [u8],
-        dict: &mut Option<Arc<[u8]>>,
+        dict: &mut Option<Arc<DocDict>>,
     ) -> Result<std::borrow::Cow<'a, [u8]>, StoreError> {
         let needed = doc_codec::dictionary_needed(stored);
         if needed > 0 && dict.is_none() {
@@ -760,7 +760,8 @@ impl HybridStore {
         if dict.as_ref().is_some_and(|held| held.len() < needed) {
             *dict = Some(self.reload_doc_dict(index)?);
         }
-        doc_codec::decode(stored, dict.as_deref().unwrap_or(&[])).map_err(|e| {
+        let held = dict.as_deref().map_or(&[][..], DocDict::as_bytes);
+        doc_codec::decode(stored, held).map_err(|e| {
             StoreError::CorruptIndex(format!("a document row of index '{index}': {e}"))
         })
     }
@@ -3565,7 +3566,11 @@ impl HybridStore {
                     })
                     .map_err(|e| StoreError::Serialization(e.to_string()))?;
                     let raw_len = raw.len();
-                    let (doc_bytes, dict_feed) = match doc_codec::encode(&raw, &doc_dict) {
+                    let (doc_bytes, dict_feed) = match doc_codec::encode(
+                        &raw,
+                        &doc_dict,
+                        self.config.document_compression,
+                    ) {
                         Some(compressed) => (compressed, dict_has_room.then_some(raw)),
                         None => (raw.clone(), dict_has_room.then_some(raw)),
                     };
@@ -3778,7 +3783,7 @@ impl HybridStore {
 
         // Committed, so rows may now be compressed against it.
         if let Some(dict) = grown_dict {
-            self.publish_doc_dict(index, &Arc::from(dict), dict_epoch);
+            self.publish_doc_dict(index, &Arc::new(DocDict::new(dict)), dict_epoch);
         }
 
         // The schema cache moves only once the row it describes is durable.

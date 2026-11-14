@@ -681,6 +681,7 @@ mod tests {
             default_batch_size: 100_000,
             wal_sync: true,
             quick_repair: true,
+            document_compression: Default::default(),
             commit_interval_ms: 0,
             query: Default::default(),
         }
@@ -971,6 +972,7 @@ mod tests {
             default_batch_size: 100_000,
             wal_sync: true,
             quick_repair: true,
+            document_compression: Default::default(),
             commit_interval_ms: 0,
             query: Default::default(),
         };
@@ -1068,6 +1070,7 @@ mod tests {
             default_batch_size: 100_000,
             wal_sync: true,
             quick_repair: true,
+            document_compression: Default::default(),
             commit_interval_ms: 0,
             query: Default::default(),
         };
@@ -1162,6 +1165,7 @@ mod tests {
             default_batch_size: 100_000,
             wal_sync: true,
             quick_repair: true,
+            document_compression: Default::default(),
             commit_interval_ms: 0,
             query: Default::default(),
         };
@@ -1475,6 +1479,7 @@ mod tests {
             default_batch_size: 100,
             wal_sync: true,
             quick_repair: true,
+            document_compression: Default::default(),
             commit_interval_ms: 0,
             query: Default::default(),
         };
@@ -1541,6 +1546,7 @@ mod tests {
             default_batch_size: 1000,
             wal_sync: true,
             quick_repair: true,
+            document_compression: Default::default(),
             commit_interval_ms: 0,
             query: Default::default(),
         };
@@ -2680,6 +2686,7 @@ mod commit_interval_tests {
             default_batch_size: BATCH,
             wal_sync: false,
             quick_repair: true,
+            document_compression: Default::default(),
             commit_interval_ms,
             query: Default::default(),
         }
@@ -4226,6 +4233,7 @@ mod listing_tests {
             default_batch_size: 1000,
             wal_sync: false,
             quick_repair: true,
+            document_compression: Default::default(),
             commit_interval_ms: 0,
             query: Default::default(),
         }

@@ -263,6 +263,10 @@ wal_sync = true
 # opens each shard in milliseconds instead of repairing its whole file. Costs a second flush
 # per durable commit; turn off only for a single-write-bound workload. See docs/CONFIGURATION.md.
 quick_repair = true
+# What a stored document is compressed with when written: "lz4" (the default, also when the
+# line is absent) or "zstd" (level 1: smaller on text, more CPU per document read). Writes
+# only: rows of either kind are always read. See docs/CONFIGURATION.md.
+document_compression = "lz4"
 wal_segment_size_mb = 64
 default_batch_size = 5000
 # Shards the node creates on its first start, on empty data paths; persisted there and fixed

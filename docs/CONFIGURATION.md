@@ -490,6 +490,11 @@ wal_sync = true
 # second flush per durable commit — see "What `quick_repair` decides" below.
 quick_repair = true
 
+# What a stored document is compressed with when this node writes it: "lz4" (default, and what
+# a config without the line gets) or "zstd", at level 1. Decides writes only; rows of either
+# kind are read whatever this is — see "What `document_compression` decides" below.
+document_compression = "lz4"
+
 # WAL segment size in MB (default: 64)
 wal_segment_size_mb = 64
 
@@ -1910,6 +1915,41 @@ write, which is the whole of what `wal_sync = false` buys.
 
 Use it for bulk-loading data you can replay from an external source, and turn it back on before
 the node holds anything you cannot regenerate.
+
+#### What `document_compression` decides
+
+Every document is stored compressed, against a 64 KB dictionary of its index's own first
+documents; this picks the method a node compresses with when it writes one. There is no "off": a
+row that would not shrink is stored as written either way.
+
+| | `"lz4"` (default) | `"zstd"` |
+|---|---|---|
+| Stored rows, prose of 2.7 KB a document | 61.0% of the bytes as written | 45.0% |
+| Stored rows, short text records of 1.7 KB | 29.6% | 25.2% |
+| Stored rows, generated documents of 1.8 KB | 13.2% | 12.0% |
+| To compress a row, one thread | 4.5–9.0 µs | 2.3–9.0 µs |
+| To decompress a row | 0.3–1.3 µs | 1.1–4.2 µs |
+| Memory per index per shard, beside the dictionary | none | 110 KB, once the index has a zstd write |
+
+Measured on one shard of a development node, on rows that did not fill the dictionary
+(`cargo run --release -p storage --example doc_compression_cost -- <copy of a store.redb>`
+measures your own). zstd runs at level 1 and gains most where LZ4 gains least, on long running
+text. A page of ten hits decompresses ten rows, so the difference on a search is 10–30 µs.
+
+**It decides writes only.** A row records how it was compressed, so a node reads LZ4 and zstd
+rows whatever it is set to, and one index can hold both. Changing the setting takes a restart
+and re-encodes nothing: documents written afterwards use the new method, and the rest stay as
+they are until written again. `cameodb compact --rewrite`, with the node stopped, recompresses
+every document with the method the config names — the way to convert a whole data directory, in
+either direction.
+
+**It is per node.** Nodes of a cluster may differ; nothing about it crosses the wire. Set it
+the same everywhere unless you are comparing.
+
+**Versions.** 0.3.10 is the first version that compresses documents and the first that reads
+either kind, so the choice adds nothing to the upgrade: 0.3.9 can read neither.
+
+Also `--storage-document-compression <lz4|zstd>` and `CAMEODB_STORAGE_DOCUMENT_COMPRESSION`.
 
 #### What `quick_repair` decides
 

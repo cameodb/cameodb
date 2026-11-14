@@ -286,6 +286,8 @@ pub struct NodeConfig {
     pub wal_sync: bool,
     /// Record redb's allocator state per commit, so a crash restart skips the full repair
     pub quick_repair: bool,
+    /// What a stored document is compressed with when written: LZ4 or zstd
+    pub document_compression: storage::doc_codec::DocCompression,
     /// Default batch size for smart commit calculations
     pub default_batch_size: usize,
     /// Number of indexing worker threads per tantivy IndexWriter (default: 1)
@@ -373,6 +375,7 @@ impl Default for NodeConfig {
             search_threads: 8,
             wal_sync: true,
             quick_repair: true,
+            document_compression: Default::default(),
             default_batch_size: 1000,
             indexer_num_threads: 1,
             merge_num_threads: 2,

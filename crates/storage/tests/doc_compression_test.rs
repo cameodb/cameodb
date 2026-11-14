@@ -1,11 +1,14 @@
-//! Document rows are stored LZ4-compressed against a dictionary the index's own first documents
-//! fill (`storage::doc_codec`). What the store promises about that:
+//! Document rows are stored compressed, by LZ4 or zstd as the node is set, against a dictionary
+//! the index's own first documents fill (`storage::doc_codec`). What the store promises about
+//! that:
 //!
 //! - every document reads back as written, whichever state the dictionary was in when its row
 //!   was compressed, across a reopen and through WAL replay;
 //! - a row written before compression existed still reads, beside compressed ones;
 //! - a deleted index takes its dictionary with it, so the name's next documents do not read
 //!   against the old one;
+//! - the method is a setting of the store, read at each write: rows written under one are read
+//!   under the other, and an index holds both;
 //! - writers growing the dictionary and readers decoding against it do not need each other's
 //!   permission.
 
@@ -13,7 +16,7 @@ use std::sync::Arc;
 
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use serde_json::{Value, json};
-use storage::doc_codec::{DICT_CAP, TABLE_DOC_DICT, dictionary_needed};
+use storage::doc_codec::{DICT_CAP, DocCompression, TABLE_DOC_DICT, dictionary_needed};
 use storage::{HybridStore, IndexSchema, StorageConfig, WalOp};
 use tempfile::TempDir;
 
@@ -328,4 +331,73 @@ fn readers_decode_while_writers_fill_the_dictionary() {
         rows.len()
     };
     assert_eq!(table_len, 600);
+}
+
+/// The first byte of every row of `index` in the file, in key order.
+fn row_tags(shard_path: &std::path::Path, index: &str) -> Vec<u8> {
+    let db = redb::Database::open(shard_path.join("store.redb")).expect("open the file");
+    let read = db.begin_read().expect("read");
+    let name = format!("data_{index}");
+    let table = read
+        .open_table(TableDefinition::<&str, &[u8]>::new(&name))
+        .expect("data table");
+    table
+        .iter()
+        .expect("iter")
+        .map(|row| row.expect("row").1.value()[0])
+        .collect()
+}
+
+#[test]
+fn the_method_decides_writes_only_and_an_index_holds_rows_of_both() {
+    let dir = TempDir::new().unwrap();
+    let open_with = |method| {
+        HybridStore::new(
+            StorageConfig {
+                document_compression: method,
+                ..config(dir.path())
+            },
+            1,
+        )
+        .expect("open store")
+    };
+    let batch = |from: u32, to: u32| (from..to).map(put).collect::<Vec<_>>();
+
+    // Under LZ4, the default: the first batch fills the dictionary, the second uses it.
+    {
+        let store = open(dir.path());
+        store
+            .store_schema_and_cache(INDEX, &IndexSchema::default())
+            .unwrap();
+        store.apply_batch(INDEX, batch(0, 200)).unwrap();
+        store.apply_batch(INDEX, batch(200, 400)).unwrap();
+    }
+    assert!(row_tags(dir.path(), INDEX).iter().all(|tag| *tag == 0x01));
+
+    // The same node set to zstd: what is there is read, what is written is zstd, against the
+    // same dictionary, and nothing already written changes.
+    {
+        let store = open_with(DocCompression::Zstd);
+        for n in [0, 199, 200, 399] {
+            assert_eq!(stored_body(&store, INDEX, n), Some(body(n)));
+        }
+        store.apply_batch(INDEX, batch(400, 600)).unwrap();
+        // Rewriting a document re-encodes that row, as any write does.
+        store.apply_write(INDEX, put(200)).unwrap();
+        for n in 0..600 {
+            assert_eq!(stored_body(&store, INDEX, n), Some(body(n)), "doc-{n}");
+        }
+    }
+    let tags = row_tags(dir.path(), INDEX);
+    assert_eq!(tags.iter().filter(|tag| **tag == 0x02).count(), 201);
+    assert_eq!(tags.iter().filter(|tag| **tag == 0x01).count(), 399);
+    let (rows, dict) = on_disk(dir.path(), INDEX);
+    assert_eq!(dict, DICT_CAP);
+    assert!(rows.iter().all(|(_, needed)| *needed <= DICT_CAP));
+
+    // And back to LZ4, or to a build that was never told: every row still reads.
+    let store = open(dir.path());
+    for n in 0..600 {
+        assert_eq!(stored_body(&store, INDEX, n), Some(body(n)), "doc-{n}");
+    }
 }

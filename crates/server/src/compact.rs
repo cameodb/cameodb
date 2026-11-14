@@ -38,6 +38,8 @@ use redb::{
     TableError, TableHandle, Value,
 };
 
+use storage::doc_codec::DocCompression;
+
 use crate::config::{self, CameoDbConfig};
 
 /// redb's page cache for each file being compacted.
@@ -61,7 +63,13 @@ pub(crate) enum Mode {
     /// Copy every table into a new file and switch to it: needs free disk for the data the file
     /// holds, and leaves no free space behind. The original is deleted, or with `keep_old`
     /// stays beside the new file as `store.redb.old`.
-    Rewrite { keep_old: bool },
+    ///
+    /// Every document is compressed on the way, by `compression`: the node's configured
+    /// method, whatever the rows were written with.
+    Rewrite {
+        keep_old: bool,
+        compression: DocCompression,
+    },
 }
 
 /// What compacting one file did, or under `--dry-run` would do.
@@ -132,6 +140,8 @@ Options:
   --dry-run             Report the size each file would come down to, and change nothing
   --jobs <N>            Files worked on at once (default: every file; with --rewrite, 1)
   --rewrite             Copy each file into a new one beside it, then switch to the copy.
+                        Every document is compressed on the way, by the configured
+                        [storage] document_compression (lz4 unless set).
                         Needs free disk for the copy, about the size --dry-run reports, and
                         checks for it before each file: one without room is left alone.
   --keep                With --rewrite, keep each original as store.redb.old instead of
@@ -191,13 +201,16 @@ originals are as they were. Running the command again continues either way.";
     if keep_old && !rewrite {
         bail!("--keep goes with --rewrite: in-place compaction leaves no original to keep");
     }
+    let overrides = config::CliOverrides::parse(rest)?;
+    let config = CameoDbConfig::load_unvalidated(&overrides)?;
     let mode = if rewrite {
-        Mode::Rewrite { keep_old }
+        Mode::Rewrite {
+            keep_old,
+            compression: config.storage.document_compression,
+        }
     } else {
         Mode::InPlace
     };
-    let overrides = config::CliOverrides::parse(rest)?;
-    let config = CameoDbConfig::load_unvalidated(&overrides)?;
 
     // Claimed as a node claims them, before a file is opened, and held until this returns:
     // redb's own locks do not cross a container's bind mount, so they cannot be relied on to
@@ -236,10 +249,11 @@ originals are as they were. Running the command again continues either way.";
         files.len(),
         jobs,
         match mode {
-            Mode::Rewrite { keep_old: true } =>
+            Mode::Rewrite { keep_old: true, .. } =>
                 ", each into a new file; the originals are kept as store.redb.old",
-            Mode::Rewrite { keep_old: false } =>
-                ", each into a new file; each original is deleted once its copy is in place",
+            Mode::Rewrite {
+                keep_old: false, ..
+            } => ", each into a new file; each original is deleted once its copy is in place",
             Mode::InPlace => "",
         },
         if dry_run {
@@ -435,9 +449,10 @@ pub(crate) fn compact_all(
                     };
                     let result = match mode {
                         Mode::InPlace => compact_file(path, dry_run),
-                        Mode::Rewrite { keep_old } => {
-                            rewrite_file(path, dry_run, keep_old, stop, &disk)
-                        }
+                        Mode::Rewrite {
+                            keep_old,
+                            compression,
+                        } => rewrite_file(path, dry_run, keep_old, compression, stop, &disk),
                     };
                     on_done(path, &result);
                     let mut report = report.lock().unwrap_or_else(|p| p.into_inner());
@@ -604,6 +619,7 @@ pub(crate) fn rewrite_file(
     path: &Path,
     dry_run: bool,
     keep_old: bool,
+    compression: DocCompression,
     stop: &AtomicBool,
     disk: &DiskReservations,
 ) -> Result<Outcome> {
@@ -621,7 +637,7 @@ pub(crate) fn rewrite_file(
         // lies, not as it will be once compressed: a copy's pages are not packed until it is
         // compacted, and the claim should not be a guess.
         disk.reserve(path, &copy, estimate)?;
-        let saving = compression_saving(&src, allocation(&src)?.1, stop)?;
+        let saving = compression_saving(&src, allocation(&src)?.1, compression, stop)?;
         return Ok(Outcome {
             before,
             after: estimate.saturating_sub(saving),
@@ -635,7 +651,7 @@ pub(crate) fn rewrite_file(
     // on the original, held above, says so.
     remove_if_present(&copy)?;
     let reservation = disk.reserve(path, &copy, estimate)?;
-    let copied = copy_into(&src, &copy, stop);
+    let copied = copy_into(&src, &copy, compression, stop);
     drop(src);
     drop(reservation);
     if let Err(e) = copied {
@@ -674,7 +690,12 @@ pub(crate) fn rewrite_file(
 }
 
 /// Copy every table of `src` into a new file at `dest`, and check each one's row count.
-fn copy_into(src: &Database, dest: &Path, stop: &AtomicBool) -> Result<()> {
+fn copy_into(
+    src: &Database,
+    dest: &Path,
+    compression: DocCompression,
+    stop: &AtomicBool,
+) -> Result<()> {
     let mut builder = redb::Builder::new();
     builder.set_cache_size(CACHE_PER_FILE);
     let dst = builder
@@ -694,7 +715,7 @@ fn copy_into(src: &Database, dest: &Path, stop: &AtomicBool) -> Result<()> {
             continue;
         }
         if let Some(index) = name.strip_prefix("data_")
-            && recompress_table(&txn, &dst, name, index, stop)
+            && recompress_table(&txn, &dst, name, index, compression, stop)
                 .with_context(|| format!("copying table {name}"))?
         {
             continue;
@@ -722,9 +743,14 @@ const SAVING_SAMPLE_ROWS: u64 = 4_000;
 /// their number, which is what the rest of a dry run costs too. Rows already compressed count
 /// as what they take now, so a file a node has been writing to reports the saving that is left,
 /// not the one it already has.
-fn compression_saving(src: &Database, page_size: u64, stop: &AtomicBool) -> Result<u64> {
+fn compression_saving(
+    src: &Database,
+    page_size: u64,
+    compression: DocCompression,
+    stop: &AtomicBool,
+) -> Result<u64> {
     use redb::{ReadableTable, ReadableTableMetadata};
-    use storage::doc_codec::{self, DICT_CAP, TABLE_DOC_DICT};
+    use storage::doc_codec::{self, DICT_CAP, DocDict, TABLE_DOC_DICT};
 
     let txn = src.begin_read()?;
     let mut saving = 0u64;
@@ -763,6 +789,7 @@ fn compression_saving(src: &Database, page_size: u64, stop: &AtomicBool) -> Resu
             }
             doc_codec::grow(&mut dict, &decode(row?.1.value())?);
         }
+        let dict = DocDict::new(dict);
 
         let stride = (rows / SAVING_SAMPLE_ROWS).max(1) as usize;
         let (mut sampled, mut now, mut then) = (0u64, 0u64, 0u64);
@@ -776,7 +803,8 @@ fn compression_saving(src: &Database, page_size: u64, stop: &AtomicBool) -> Resu
             }
             let doc = decode(value.value())?;
             now += value.value().len() as u64;
-            then += doc_codec::encode(&doc, &dict).map_or(doc.len(), |c| c.len()) as u64;
+            then +=
+                doc_codec::encode(&doc, &dict, compression).map_or(doc.len(), |c| c.len()) as u64;
             sampled += 1;
         }
         if sampled > 0 && now > then {
@@ -804,9 +832,10 @@ fn recompress_table(
     dst: &Database,
     name: &str,
     index: &str,
+    compression: DocCompression,
     stop: &AtomicBool,
 ) -> Result<bool> {
-    use storage::doc_codec::{self, DICT_CAP, TABLE_DOC_DICT};
+    use storage::doc_codec::{self, DICT_CAP, DocDict, TABLE_DOC_DICT};
 
     let def = TableDefinition::<&str, &[u8]>::new(name);
     let table = match src.open_table(def) {
@@ -835,6 +864,7 @@ fn recompress_table(
         let (key, value) = row?;
         doc_codec::grow(&mut dict, &decode(key.value(), value.value())?);
     }
+    let dict = DocDict::new(dict);
 
     let expected = redb::ReadableTableMetadata::len(&table)?;
     let mut rows = redb::ReadableTable::iter(&table)?;
@@ -850,7 +880,7 @@ fn recompress_table(
             // With the first rows that name it, and before any that could.
             if !dict_written && !dict.is_empty() {
                 txn.open_table(TABLE_DOC_DICT)?
-                    .insert(index, dict.as_slice())?;
+                    .insert(index, dict.as_bytes())?;
             }
             dict_written = true;
             let mut out = txn.open_table(def)?;
@@ -862,7 +892,7 @@ fn recompress_table(
                 };
                 let (key, value) = row?;
                 let doc = decode(key.value(), value.value())?;
-                let stored = doc_codec::encode(&doc, &dict).unwrap_or(doc);
+                let stored = doc_codec::encode(&doc, &dict, compression).unwrap_or(doc);
                 bytes += key.value().len() + stored.len();
                 out.insert(key.value(), stored.as_slice())?;
                 copied += 1;
@@ -1444,6 +1474,7 @@ mod tests {
             path,
             false,
             keep_old,
+            DocCompression::Lz4,
             &AtomicBool::new(false),
             &DiskReservations::default(),
         )
@@ -1548,8 +1579,46 @@ mod tests {
     }
 
     #[test]
+    fn a_rewrite_compresses_with_the_method_it_is_given_whatever_the_rows_were() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = store_with_every_table(dir.path());
+        let expected = contents(&path);
+        let first_bytes = |path: &Path| -> std::collections::BTreeSet<u8> {
+            let db = redb::Database::open(path).unwrap();
+            let txn = db.begin_read().unwrap();
+            let table = txn.open_table(DATA).unwrap();
+            redb::ReadableTable::iter(&table)
+                .unwrap()
+                .map(|row| row.unwrap().1.value()[0])
+                .collect()
+        };
+        let rewrite_with = |compression| {
+            rewrite_file(
+                &path,
+                false,
+                false,
+                compression,
+                &AtomicBool::new(false),
+                &DiskReservations::default(),
+            )
+            .unwrap();
+        };
+
+        rewrite_with(DocCompression::Lz4);
+        assert_eq!(first_bytes(&path), [0x01].into());
+        rewrite_with(DocCompression::Zstd);
+        assert_eq!(first_bytes(&path), [0x02].into());
+        assert_eq!(contents(&path), expected);
+
+        // And back: the setting is a choice, not a one-way door.
+        rewrite_with(DocCompression::Lz4);
+        assert_eq!(first_bytes(&path), [0x01].into());
+        assert_eq!(contents(&path), expected);
+    }
+
+    #[test]
     fn a_rewrite_reads_rows_compressed_against_a_dictionary_that_was_still_filling() {
-        use storage::doc_codec::{TABLE_DOC_DICT, encode, grow};
+        use storage::doc_codec::{DocDict, TABLE_DOC_DICT, encode, grow};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("store.redb");
         let doc = |i: u32| {
@@ -1566,7 +1635,14 @@ mod tests {
                 let mut dict = Vec::new();
                 for i in 0..200u32 {
                     let raw = doc(i);
-                    let stored = encode(&raw, &dict).unwrap_or_else(|| raw.clone());
+                    // And of both kinds, as a node whose setting was changed leaves them.
+                    let method = if i % 2 == 0 {
+                        DocCompression::Lz4
+                    } else {
+                        DocCompression::Zstd
+                    };
+                    let stored = encode(&raw, &DocDict::new(dict.clone()), method)
+                        .unwrap_or_else(|| raw.clone());
                     data.insert(format!("doc-{i:06}").as_str(), stored.as_slice())
                         .unwrap();
                     grow(&mut dict, &raw);
@@ -1660,6 +1736,7 @@ mod tests {
             &path,
             false,
             true,
+            DocCompression::Lz4,
             &AtomicBool::new(true),
             &DiskReservations::default(),
         )
@@ -1696,6 +1773,7 @@ mod tests {
             &path,
             true,
             false,
+            DocCompression::Lz4,
             &AtomicBool::new(false),
             &DiskReservations::default(),
         )
@@ -1719,6 +1797,7 @@ mod tests {
             &path,
             true,
             false,
+            DocCompression::Lz4,
             &AtomicBool::new(false),
             &DiskReservations::default(),
         )
@@ -1756,7 +1835,10 @@ mod tests {
 
         let report = compact_all(
             &files,
-            Mode::Rewrite { keep_old: true },
+            Mode::Rewrite {
+                keep_old: true,
+                compression: DocCompression::Lz4,
+            },
             false,
             2,
             &AtomicBool::new(false),
@@ -1782,8 +1864,15 @@ mod tests {
         };
 
         for dry_run in [true, false] {
-            let err =
-                rewrite_file(&path, dry_run, false, &AtomicBool::new(false), &disk).unwrap_err();
+            let err = rewrite_file(
+                &path,
+                dry_run,
+                false,
+                DocCompression::Lz4,
+                &AtomicBool::new(false),
+                &disk,
+            )
+            .unwrap_err();
 
             assert!(
                 matches!(
