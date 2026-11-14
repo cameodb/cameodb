@@ -1149,6 +1149,11 @@ mod tests {
             t.retain(|k, _| k % 4 == 0).unwrap();
         }
         txn.commit().unwrap();
+        drop(db);
+        // redb 4.6 trims the unused tail of a file the first time it is opened again; settle
+        // that here so a test that compares sizes before and after a command sees only what the
+        // command did.
+        drop(redb::Database::open(&path).unwrap());
         path
     }
 
