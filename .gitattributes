@@ -1,0 +1,4 @@
+# The generated cjk tables are checked against a SHA-256 in their MANIFEST (a unit test in
+# crates/storage). Git's core.autocrlf on Windows would turn them into CRLF at checkout and
+# change the bytes, so they are never converted.
+crates/storage/src/analysis/cjk/data/* -text
