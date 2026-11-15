@@ -3,6 +3,8 @@
 #
 #   scripts/release/publish.sh            # dry run: report exactly what would change
 #   scripts/release/publish.sh --commit   # actually copy
+#   scripts/release/publish.sh --commit --prune
+#                                         # also delete earlier versions' packages from the site
 #
 # Dry run is the default because this stage writes into another repository's published tree,
 # overwriting files that are already live. It prints, per file, whether it is new, unchanged,
@@ -19,9 +21,11 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 COMMIT=0
+PRUNE=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --commit) COMMIT=1; shift ;;
+        --prune) PRUNE=1; shift ;;
         -h|--help) usage "${BASH_SOURCE[0]}" ;;
         *) reject_unknown_arg "$1" ;;
     esac
@@ -162,16 +166,28 @@ for f in "$DIST"/*.json "$SUMS" "$MANIFEST"; do
     if [ -f "$f.sha256" ]; then copy_one "$f.sha256" "$WEB_ROOT/$(basename "$f").sha256"; fi
 done
 
-# Nothing here deletes: a published artifact may be linked from release notes, an issue, or a
-# user's script, and removing it on the strength of a version bump is not this script's call.
-# But version-stamped files from an earlier release do linger, so name them — otherwise
-# downloads/linux/ silently accumulates every version ever shipped.
+# Nothing is deleted unless asked: a published artifact may be linked from release notes, an
+# issue, or a user's script, and removing it on the strength of a version bump is not this
+# script's call. But version-stamped files from an earlier release do linger, so name them —
+# otherwise downloads/linux/ silently accumulates every version ever shipped.
+#
+# --prune is that ask. It removes the version-stamped packages of other releases (the .deb, .rpm
+# and .msi, with their .bundle and .sha256), and only those: the unstamped binaries, SBOMs,
+# SHA256SUMS, MANIFEST.txt and cosign.pub are never candidates. Each earlier release stays in
+# its own dist/<version>/ here. Like the copy, it is a dry run until --commit.
 stale="$(find "$WEB_ROOT" -type f \( -name 'cameodb[-_]*' \) ! -name "*${VERSION}*" 2>/dev/null | sort)"
-if [ -n "$stale" ]; then
+if [ -n "$stale" ] && [ "$PRUNE" -eq 1 ]; then
+    section "prune earlier versions in $WEB_ROOT"
+    while IFS= read -r f; do
+        printf '  %sremove%s   %s\n' "$_c_red" "$_c_off" "${f#"$WEB_ROOT"/}"
+        if [ "$COMMIT" -eq 1 ]; then rm -f "$f"; fi
+    done <<< "$stale"
+    if [ "$COMMIT" -ne 1 ]; then info "dry run — nothing removed; re-run with --commit --prune"; fi
+elif [ -n "$stale" ]; then
     section "stale in $WEB_ROOT (left in place)"
     printf '%s\n' "$stale" | while IFS= read -r f; do info "${f#"$WEB_ROOT"/}"; done
     info ""
-    info "from earlier releases. Remove by hand if the site no longer links to them."
+    info "from earlier releases. Remove them with --prune (add --commit to do it), or by hand."
 fi
 
 section "done"

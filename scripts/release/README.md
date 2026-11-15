@@ -13,6 +13,7 @@ scripts/release/release.sh --stage sbom          # SPDX + CycloneDX
 scripts/release/release.sh --stage sign           # see COSIGN_PASSWORD below
 scripts/release/publish.sh                       # dry run — shows what would change
 scripts/release/publish.sh --commit              # copy into cameodb-web
+scripts/release/publish.sh --commit --prune      # ...and delete earlier versions' packages there
 ```
 
 Everything is staged under `dist/<version>/` (gitignored) and every stage after `build`
@@ -167,8 +168,13 @@ the old and new size and hash for a replacement. `--commit` performs the copy.
 
 It refuses to publish a release that is unsigned — any staged artifact without a `.bundle` — or
 one staged with `--allow-unhardened`, which the build stage records in `dist/<version>/.unhardened`
-because an unhardened binary signs and checksums exactly as cleanly as a hardened one. Nothing is
-ever deleted: version-stamped files from earlier releases are listed as stale and left in place.
+because an unhardened binary signs and checksums exactly as cleanly as a hardened one.
+
+Nothing is deleted by default: version-stamped files from earlier releases are listed as stale and
+left in place. `--prune` removes them: the `.deb`, `.rpm` and `.msi` of other versions, with their
+`.bundle` and `.sha256`, and nothing else (the unstamped binaries, SBOMs, `SHA256SUMS`,
+`MANIFEST.txt` and `cosign.pub` are never candidates). It is a dry run until `--commit`, like the
+copy: `publish.sh --commit --prune`. Earlier releases stay in their own `dist/<version>/`.
 
 ## Environment
 
