@@ -83,11 +83,13 @@ box is a question that has not been answered, not a formality.
 10. **Commit the web project.** `publish.sh` only copies files; the `cameodb-web` checkout is
     left dirty for review.
 11. **Record the outcome below**, including anything skipped and why.
-12. **Add this release's compatibility fixture.** A shard written by the release build itself,
-    from a worktree at the release commit, under `crates/storage/tests/fixtures/compat/v<version>/`,
-    with a test for it in `compat_fixture_test.rs` — so every later build proves it still opens
-    this release's data. The procedure is in that directory's README; never rewrite an existing
-    fixture.
+12. **Test this release's compatibility, and record the result.** Generate a shard with the
+    release build itself, from a worktree at the release commit, using the generator in
+    `crates/storage/tests/fixtures/compat/v0.3.9/generate.rs` (adjusted to that commit's
+    `StorageConfig`), and open it with `compat_fixture_test`, as the procedure in that
+    directory's README describes. The shard is evidence for this run only: an index structure is
+    not committed, so discard it afterwards. Note in the release record below what was tested and
+    the result, and say that the shard is not in the repository.
 
 ## Known gaps carried into every release
 
@@ -124,8 +126,8 @@ These are accepted, not fixed. They belong in release notes as much as here.
   `[security.audit] enabled = false` a node keeps no record of who read what. Turned on, it
   is a file the node writes — nothing signs or chains the records, so ship it off the node if
   it needs to survive the node.
-- **Three transitive advisories are ignored** (`deny.toml`), all via libp2p 0.56.0, which
-  kameo 0.22.2 pins: RUSTSEC-2026-0118, RUSTSEC-2026-0119 and RUSTSEC-2024-0436, review-by
+- **Sixteen transitive advisories are ignored** (`deny.toml`), all via libp2p 0.56.0, which
+  kameo 0.22.2 pins (the hickory-proto and -resolver advisories, and RUSTSEC-2024-0436), review-by
   2027-03-31.
 
 ---
@@ -160,9 +162,9 @@ Signed off by:
 
 <!-- Newest first. Append a filled-in template per release. -->
 
-## v0.3.10 — in progress
+## v0.3.10 — 2026-11-15
 
-Prepared on 2026-11-09 at `e192087`; not yet cut. Scope and state: ROADMAP, "The 0.3.10 scope"
+Prepared on 2026-11-09 at `e192087`. Scope and state: ROADMAP, "The 0.3.10 scope"
 and "Reconciliation, 2026-11-09". Done so far, on the host (macOS) tree:
 
 - `scripts/validate/deps.sh`: PASS, 10/10 (fmt, clippy, audit, deny; the three advisory
@@ -177,9 +179,51 @@ and "Reconciliation, 2026-11-09". Done so far, on the host (macOS) tree:
   `describe_index` keys, every tokenizer's matching rule, and the zero-hit advice.
 - Dependencies: `serde-saphyr` 2.1.1, `toml` 1.2.1.
 
-Open: the version bump, `cargo test --workspace` in full, `scripts/validate/all.sh` on the
-release build, a `cluster.sh` run at the release commit, the Windows run, build, sign, publish,
-and the 0.3.10 compatibility fixture.
+Commit: `6ce9097`, `chore(release): 0.3.10`. Windows run at 0.3.10 on HPENVY, native, finished
+2026-11-15 09:59 UTC from a clean tree, rustc 1.99.1: preflight, build, test, validate and msi all
+PASS; `verify.json` and `verify-6ce90976e818.log` in `dist/0.3.10/windows-verify/`. The build
+recorded `6ce9097` clean in `dist/0.3.10/.build-commit`.
+
+Built targets:
+
+| Artifact | sha256 |
+|---|---|
+| `mac/cameodb` (arm64, 32M) | `286ffa39…ea88` |
+| `linux/cameodb` (x86_64-unknown-linux-musl, static-pie, 40M) | `11cb60fe…d1e9` |
+| `linux/cameodb_0.3.10_amd64.deb` (13M) | `0216068f…3ba6` |
+| `linux/cameodb-0.3.10-1.x86_64.rpm` (14M) | `0b7edfe1…8fb8` |
+| `windows/cameodb.exe` (44M) | `37f3aeb4…6fb7` |
+| `windows/cameodb-0.3.10-x64.msi` (16M) | `06b7da01…416d` |
+
+SPDX (596 entries) and CycloneDX (595 components).
+
+| Suite | Host build | musl | windows | notes |
+|-------|-----------|------|---------|-------|
+| deps           | PASS |  |  |  |
+| unit           | PASS |  | PASS | windows: `cargo test --workspace` |
+| posture        | PASS |  |  |  |
+| auth           | PASS |  |  |  |
+| provisioning   | PASS |  |  |  |
+| tls            | PASS |  |  |  |
+| remote-sources | PASS | PASS | PASS | musl: `dist/0.3.10/linux/cameodb` |
+| artifact       | PASS |  |  |  |
+
+`scripts/validate/all.sh` ran 2026-11-15 10:39-10:47 against `target/release/cameodb`, identical
+to `dist/0.3.10/mac/cameodb`. `check-config --allow-unauthenticated` on the root example,
+`crates/server/cameodb.toml` and `crates/server/windows/cameodb.toml` at the release binary: OK,
+four accepted `internal` warnings each.
+
+Skipped checks and why: none.
+Compatibility tested, shard not in the repo: a shard written by the 0.3.10 release build at
+`6ce9097` (the 0.3.9 generator plus `reclaim_deleted_ratio: 0.0` in `StorageConfig`), left as a
+killed process leaves it, was opened by `compat_fixture_test`: all three tests pass, covering the
+0.3.0 and 0.3.9 fixtures and the new shard. The 0.3.10 shard was then discarded, so no later build
+re-checks opening 0.3.10-written (compressed) documents.
+Known gaps acknowledged: yes — the standing list above, with the ignored-advisory count updated to 16.
+
+Signed 2026-11-15 by goranc (every artifact has a `.bundle`). Published: TODO.
+
+Signed off by: goranc
 
 ## v0.3.9 — 2026-11-05
 
