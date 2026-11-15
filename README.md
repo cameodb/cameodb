@@ -63,12 +63,12 @@ docker run -d \
   -p 9480:9480 \
   -p 9580:9580 \
   -v $(pwd)/data/cameodb:/data/cameodb \
-  goranc/cameodb:latest
+  cameodb/cameodb:latest
 
 # 2. Launch the Interactive CLI (connects to the server)
 docker run -it --rm \
   --network host \
-  goranc/cameodb:latest \
+  cameodb/cameodb:latest \
   client --interactive --connect http://localhost:9480
 ```
 *(CameoDB's HTTP API is now available on `http://localhost:9480`)*
