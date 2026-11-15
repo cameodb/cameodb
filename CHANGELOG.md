@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.10] - 2026-11-15
+
 **Upgrading from 0.3.9.** No config change is needed for a node to start, and every new setting
 is off until set. 0.3.10 opens 0.3.9's data as it is. Five things change what an existing
 deployment sees:
